@@ -52,6 +52,11 @@ class TradeStore:
 
     async def init(self) -> None:
         self._db = await aiosqlite.connect(str(self.db_path))
+
+        # ── Fix 3: WAL mode for async-friendly concurrent reads/writes ──
+        await self._db.execute("PRAGMA journal_mode=WAL;")
+        await self._db.execute("PRAGMA synchronous=NORMAL;")
+
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
         log.info("trade_store_initialised", path=str(self.db_path))

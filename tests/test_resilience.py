@@ -109,7 +109,12 @@ class TestWebSocketResilience:
         with patch("asyncio.sleep", side_effect=track_sleep):
             await ws.start()
 
-        assert 5 in sleep_calls, "Sleep of 5 seconds expected between retries"
+        assert 5 not in sleep_calls, "Hardcoded 5 s sleep should no longer be used"
+        assert len(sleep_calls) >= 1, "At least one backoff sleep expected"
+        # First attempt: base(1) * 2^1 + jitter ∈ (2.0, 3.0)
+        assert 1.5 < sleep_calls[0] < 4.0, (
+            f"Expected exponential backoff ~2-3 s on attempt 1, got {sleep_calls[0]}"
+        )
 
     @pytest.mark.asyncio
     async def test_stop_during_reconnect(self):

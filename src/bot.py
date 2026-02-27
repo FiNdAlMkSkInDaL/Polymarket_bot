@@ -34,7 +34,7 @@ class TradingBot:
         # Components (initialised in start())
         self.executor = OrderExecutor(paper_mode=self.paper_mode)
         self.positions = PositionManager(self.executor)
-        self.whale_monitor = WhaleMonitor()
+        self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.trade_store = TradeStore()
         self.telegram = TelegramAlerter()
 
@@ -47,7 +47,8 @@ class TradingBot:
 
         # Lifecycle
         self._running = False
-        self._trade_queue: asyncio.Queue[TradeEvent] = asyncio.Queue()
+        self._latest_z: float = 0.0        # tracks most recent panic Z-score
+        self._trade_queue: asyncio.Queue[TradeEvent] = asyncio.Queue(maxsize=1000)
         self._ws: MarketWebSocket | None = None
         self._tasks: list[asyncio.Task] = []
 
@@ -61,6 +62,19 @@ class TradingBot:
         log.info("bot_starting", mode=mode_label)
         await self.telegram.send(f"🤖 Bot starting in <b>{mode_label}</b> mode")
 
+        try:
+            await self._run(mode_label)
+        except Exception as exc:
+            log.exception("bot_crashed", error=str(exc))
+            await self.telegram.send(
+                f"💥 <b>Bot crashed unexpectedly</b>\n"
+                f"<code>{type(exc).__name__}: {exc}</code>\n"
+                "Please restart the bot."
+            )
+            raise
+
+    async def _run(self, mode_label: str) -> None:
+        """Internal: initialise and run after startup message is sent."""
         # 1. Init trade store
         await self.trade_store.init()
 
@@ -68,6 +82,11 @@ class TradingBot:
         self._markets = await fetch_active_markets()
         if not self._markets:
             log.error("no_eligible_markets")
+            await self.telegram.send(
+                "⚠️ <b>Bot stopped — no eligible markets found.</b>\n"
+                "No markets currently meet the configured criteria.\n"
+                "Restart the bot manually when conditions change."
+            )
             return
 
         log.info("markets_selected", count=len(self._markets))
@@ -109,6 +128,7 @@ class TradingBot:
             asyncio.create_task(self._timeout_loop(), name="timeout_loop"),
             asyncio.create_task(self._stats_loop(), name="stats_loop"),
             asyncio.create_task(self.whale_monitor.start(), name="whale_monitor"),
+            asyncio.create_task(self._market_refresh_loop(), name="market_refresh"),
         ]
 
         # Handle graceful shutdown via SIGINT / SIGTERM
@@ -124,7 +144,7 @@ class TradingBot:
 
         # Wait for all tasks (they run indefinitely until stop())
         try:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.gather(*self._tasks, return_exceptions=False)
         except asyncio.CancelledError:
             pass
 
@@ -166,6 +186,13 @@ class TradingBot:
         log.warning("KILL_SWITCH_ACTIVATED")
         await self.telegram.notify_kill()
         await self.stop()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Adaptive polling helper
+    # ═══════════════════════════════════════════════════════════════════════
+    def _latest_zscore(self) -> float:
+        """Callback for WhaleMonitor — returns the most recent panic Z-score."""
+        return self._latest_z
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Core processing loop
@@ -223,6 +250,7 @@ class TradingBot:
 
         signal = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
         if signal:
+            self._latest_z = signal.zscore     # feed adaptive whale poller
             await self._on_panic_signal(signal, no_agg)
 
     async def _on_panic_signal(self, signal: PanicSignal, no_agg: OHLCVAggregator) -> None:
@@ -313,3 +341,62 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("stats_loop_error", error=str(exc))
+    async def _market_refresh_loop(self) -> None:
+        """Periodically re-discover markets, drop resolved ones, add new."""
+        interval = settings.strategy.market_refresh_minutes * 60
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                fresh = await fetch_active_markets()
+                if not fresh:
+                    log.warning("market_refresh_no_results")
+                    continue
+
+                existing_ids = {m.condition_id for m in self._markets}
+                new_markets = [m for m in fresh if m.condition_id not in existing_ids]
+
+                if not new_markets:
+                    log.info("market_refresh_no_new", total=len(self._markets))
+                    continue
+
+                # Wire up new markets
+                new_asset_ids: list[str] = []
+                for m in new_markets:
+                    self._market_map[m.yes_token_id] = m
+                    self._market_map[m.no_token_id] = m
+
+                    yes_agg = OHLCVAggregator(m.yes_token_id)
+                    no_agg = OHLCVAggregator(m.no_token_id)
+                    self._yes_aggs[m.yes_token_id] = yes_agg
+                    self._no_aggs[m.no_token_id] = no_agg
+
+                    detector = PanicDetector(
+                        market_id=m.condition_id,
+                        yes_asset_id=m.yes_token_id,
+                        no_asset_id=m.no_token_id,
+                        yes_aggregator=yes_agg,
+                        no_aggregator=no_agg,
+                    )
+                    self._detectors[m.condition_id] = detector
+                    new_asset_ids.extend([m.yes_token_id, m.no_token_id])
+
+                self._markets.extend(new_markets)
+
+                # Subscribe WebSocket to new tokens
+                if self._ws and new_asset_ids:
+                    await self._ws.add_assets(new_asset_ids)
+
+                log.info(
+                    "market_refresh_added",
+                    new=len(new_markets),
+                    total=len(self._markets),
+                )
+                await self.telegram.send(
+                    f"\U0001f504 <b>Market refresh</b>: added {len(new_markets)} new market(s), "
+                    f"now watching {len(self._markets)} total."
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("market_refresh_error", error=str(exc))

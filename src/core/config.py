@@ -9,7 +9,8 @@ Usage:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -35,6 +36,11 @@ def _env_float(key: str, default: float = 0.0) -> float:
     return float(raw) if raw else default
 
 
+def _env_int(key: str, default: int = 0) -> int:
+    raw = os.getenv(key, "")
+    return int(raw) if raw else default
+
+
 def _env_bool(key: str, default: bool = True) -> bool:
     return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
 
@@ -42,30 +48,41 @@ def _env_bool(key: str, default: bool = True) -> bool:
 # ── Strategy defaults ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class StrategyParams:
-    """Tunable knobs for the mean-reversion strategy."""
+    """Tunable knobs for the mean-reversion strategy.
+
+    Every field can be overridden via its corresponding env-var
+    (e.g.  ZSCORE_THRESHOLD=2.5  in .env).
+    """
 
     # Panic spike detector
-    zscore_threshold: float = 2.0
-    volume_ratio_threshold: float = 3.0
-    lookback_minutes: int = 60
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 2.0)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 3.0)
+    lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Take-profit
-    alpha_default: float = 0.50
-    alpha_min: float = 0.30
-    alpha_max: float = 0.70
-    min_spread_cents: float = 4.0  # minimum profit target in cents
+    alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
+    alpha_min: float = _env_float("ALPHA_MIN", 0.30)
+    alpha_max: float = _env_float("ALPHA_MAX", 0.70)
+    min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
 
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 5.0)
     max_wallet_risk_pct: float = _env_float("MAX_WALLET_RISK_PCT", 20.0)
 
     # Time limits
-    entry_timeout_seconds: int = 300   # 5 min to fill entry
-    exit_timeout_seconds: int = 1800   # 30 min to fill exit
+    entry_timeout_seconds: int = _env_int("ENTRY_TIMEOUT_SECONDS", 300)
+    exit_timeout_seconds: int = _env_int("EXIT_TIMEOUT_SECONDS", 1800)
 
     # Market selection filters
-    min_daily_volume_usd: float = 50_000.0
-    min_days_to_resolution: int = 7
+    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 50_000.0)
+    min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 7)
+    min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
+
+    # Discovery behaviour
+    discovery_tags: str = _env("DISCOVERY_TAGS", "politics,crypto")
+    reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", True)
+    one_market_per_event: bool = _env_bool("ONE_MARKET_PER_EVENT", True)
+    market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 30)
 
 
 @dataclass(frozen=True)
@@ -106,6 +123,28 @@ class Settings:
 
     # Logging
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))
+
+    # ── Security: mask secrets in repr / str / logs ─────────────────────
+    _SENSITIVE_PATTERN: re.Pattern = field(
+        default=re.compile(r"(SECRET|KEY|PASSPHRASE|TOKEN)", re.IGNORECASE),
+        repr=False,
+        compare=False,
+    )
+
+    def __repr__(self) -> str:
+        parts: list[str] = []
+        for f in fields(self):
+            if f.name.startswith("_"):
+                continue
+            value = getattr(self, f.name)
+            if self._SENSITIVE_PATTERN.search(f.name):
+                masked = (str(value)[:4] + "***") if value else "<empty>"
+                parts.append(f"{f.name}={masked!r}")
+            else:
+                parts.append(f"{f.name}={value!r}")
+        return f"{self.__class__.__name__}({', '.join(parts)})"
+
+    __str__ = __repr__
 
 
 # Singleton

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 import httpx
 
@@ -40,18 +41,63 @@ class WhaleActivity:
 
 
 class WhaleMonitor:
-    """Periodically polls Polygonscan for whale CTF token movements."""
+    """Periodically polls Polygonscan for whale CTF token movements.
+
+    The polling interval adapts to current market volatility: during panic
+    events (high Z-score) we poll aggressively (every ~2 s) to catch whale
+    entries, then decay back to the baseline as volatility subsides.
+    """
+
+    # ── Adaptive polling bounds ────────────────────────────────────────────
+    _BASELINE_MIN: float = 15.0     # slowest normal poll (seconds)
+    _BASELINE_MAX: float = 30.0     # default normal poll (seconds)
+    _PANIC_INTERVAL: float = 2.0    # fastest poll when Z > threshold
+    _DECAY_RATE: float = 0.10       # how fast the interval recovers per tick
 
     def __init__(
         self,
         whale_wallets: list[str] | None = None,
         poll_interval: int | None = None,
+        zscore_fn: Callable[[], float] | None = None,
+        zscore_threshold: float | None = None,
     ):
         self.wallets = [w.lower() for w in (whale_wallets or DEFAULT_WHALE_WALLETS)]
-        self.poll_interval = poll_interval or settings.whale_poll_interval_seconds
+        self.baseline_interval = float(poll_interval or settings.whale_poll_interval_seconds)
+        self._current_interval: float = self.baseline_interval
         self._recent: list[WhaleActivity] = []
         self._running = False
         self._last_block: int = 0
+
+        # ── Fix 5: Adaptive polling via panic Z-score callback ─────────────
+        self._zscore_fn = zscore_fn
+        self._zscore_threshold = zscore_threshold or settings.strategy.zscore_threshold
+
+    # ── adaptive interval ──────────────────────────────────────────────────
+    @property
+    def poll_interval(self) -> float:
+        return self._current_interval
+
+    def _update_interval(self) -> None:
+        """Adjust polling speed based on the latest Z-score."""
+        if self._zscore_fn is None:
+            return
+        zscore = self._zscore_fn()
+        if zscore >= self._zscore_threshold:
+            # Panic regime — poll as fast as possible
+            self._current_interval = self._PANIC_INTERVAL
+            log.debug(
+                "whale_poll_adaptive",
+                zscore=round(zscore, 2),
+                interval=self._current_interval,
+            )
+        else:
+            # Decay back towards baseline
+            self._current_interval = min(
+                self.baseline_interval,
+                self._current_interval + self._DECAY_RATE * (
+                    self.baseline_interval - self._current_interval
+                ) + 0.5,   # +0.5 s per tick ensures convergence
+            )
 
     # ── public API ──────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -60,10 +106,11 @@ class WhaleMonitor:
         log.info("whale_monitor_started", wallets=len(self.wallets))
         while self._running:
             try:
+                self._update_interval()
                 await self._poll()
             except Exception as exc:
                 log.warning("whale_poll_error", error=str(exc))
-            await asyncio.sleep(self.poll_interval)
+            await asyncio.sleep(self._current_interval)
 
     async def stop(self) -> None:
         self._running = False

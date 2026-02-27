@@ -9,6 +9,9 @@ User=botuser
 Group=botuser
 WorkingDirectory=/home/botuser/polymarket-bot
 Environment=PATH=/home/botuser/polymarket-bot/.venv/bin:/usr/bin:/bin
+# Ensure the tmpfs secrets dir exists before the sandbox namespace is set up
+ExecStartPre=/bin/mkdir -p /dev/shm/secrets
+ExecStartPre=/bin/chown botuser:botuser /dev/shm/secrets
 ExecStartPre=/bin/bash -c 'age -d -o /dev/shm/secrets/.env /home/botuser/polymarket-bot/.env.age || true'
 ExecStart=/home/botuser/polymarket-bot/.venv/bin/python -m src.cli run --paper
 ExecStopPost=/bin/bash -c 'rm -f /dev/shm/secrets/.env'

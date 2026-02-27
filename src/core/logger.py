@@ -38,6 +38,10 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
         handlers=[stream_handler, file_handler],
     )
 
+    # Silence noisy HTTP-level request logs from httpx / httpcore
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

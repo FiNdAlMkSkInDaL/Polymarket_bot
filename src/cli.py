@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-
 import click
 
 from src.core.logger import setup_logging

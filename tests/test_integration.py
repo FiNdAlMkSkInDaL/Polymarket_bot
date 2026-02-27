@@ -304,9 +304,9 @@ class TestWhaleMonitor:
         mock_response = AsyncMock()
         mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
+        mock_response.json = MagicMock(return_value={
             "result": "Max rate limit reached"  # string, not list
-        }
+        })
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
