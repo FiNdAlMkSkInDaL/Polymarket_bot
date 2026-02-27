@@ -120,3 +120,66 @@ def compute_take_profit(
     )
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Pillar 3 — Adaptive volatility-based TP rescaling
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_dynamic_spread(
+    sigma_30: float,
+    base_spread_cents: float | None = None,
+    *,
+    sigma_ref: float = 0.02,
+    sensitivity: float | None = None,
+    min_mult: float | None = None,
+    max_mult: float | None = None,
+) -> float:
+    """Scale the minimum take-profit spread based on 30-min rolling σ.
+
+    Formula::
+
+        spread = base × (1 + k × (σ₃₀ - σ_ref) / σ_ref)
+
+    Clamped to ``[base × min_mult,  base × max_mult]``.
+
+    When σ₃₀ > σ_ref (panic), spread widens → hold for bigger reversion.
+    When σ₃₀ < σ_ref (calm), spread tightens → scalp quickly.
+
+    Parameters
+    ----------
+    sigma_30:
+        30-minute rolling standard deviation of 1-min log returns.
+    base_spread_cents:
+        Baseline spread floor in cents.  Defaults to
+        ``settings.strategy.min_spread_cents``.
+    sigma_ref:
+        Reference σ for "normal" conditions (default 0.02).
+    sensitivity:
+        The *k* multiplier.  Defaults to
+        ``settings.strategy.tp_vol_sensitivity``.
+    min_mult / max_mult:
+        Clamp bounds as multiples of *base_spread_cents*.
+
+    Returns
+    -------
+    float — the dynamically-scaled minimum spread in cents.
+    """
+    strat = settings.strategy
+    base = base_spread_cents if base_spread_cents is not None else strat.min_spread_cents
+    k = sensitivity if sensitivity is not None else strat.tp_vol_sensitivity
+    lo = (min_mult if min_mult is not None else strat.tp_spread_min_mult) * base
+    hi = (max_mult if max_mult is not None else strat.tp_spread_max_mult) * base
+
+    if sigma_ref <= 0 or base <= 0:
+        return base
+
+    if sigma_30 <= 0:
+        # No volatility data yet — use base unchanged.
+        return base
+
+    ratio = (sigma_30 - sigma_ref) / sigma_ref
+    scaled = base * (1.0 + k * ratio)
+    result = max(lo, min(hi, scaled))
+
+    return round(result, 2)

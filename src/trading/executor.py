@@ -47,6 +47,8 @@ class Order:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     clob_order_id: str = ""
+    post_only: bool = False
+    rejection_reason: str = ""          # "would_cross" if POST_ONLY rejected
 
 
 class OrderExecutor:
@@ -101,8 +103,18 @@ class OrderExecutor:
         side: OrderSide,
         price: float,
         size: float,
+        *,
+        post_only: bool = False,
     ) -> Order:
         """Place a GTC limit order.
+
+        Parameters
+        ----------
+        post_only:
+            If ``True``, the order will be rejected by the CLOB if it
+            would immediately cross the spread (i.e., take liquidity).
+            The returned ``Order`` will have ``status=CANCELLED`` and
+            ``rejection_reason="would_cross"``.
 
         In paper mode the order is recorded locally and will be filled
         by :meth:`check_paper_fill` when the market price crosses.
@@ -118,6 +130,7 @@ class OrderExecutor:
             price=price,
             size=size,
             status=OrderStatus.LIVE,
+            post_only=post_only,
         )
 
         if not self.paper_mode:
@@ -135,6 +148,18 @@ class OrderExecutor:
                 resp = clob.create_and_post_order(order_args)
                 clob_id = ""
                 if isinstance(resp, dict):
+                    # Detect POST_ONLY rejection
+                    if post_only and resp.get("status") in ("rejected", "REJECTED"):
+                        order.status = OrderStatus.CANCELLED
+                        order.rejection_reason = "would_cross"
+                        log.info(
+                            "post_only_rejected",
+                            order_id=order.order_id,
+                            side=side.value,
+                            price=price,
+                        )
+                        self._orders[order.order_id] = order
+                        return order
                     clob_id = resp.get("orderID", "") or resp.get("id", "")
                 elif hasattr(resp, "orderID"):
                     clob_id = resp.orderID
@@ -146,6 +171,7 @@ class OrderExecutor:
                     side=side.value,
                     price=price,
                     size=size,
+                    post_only=post_only,
                 )
             except Exception as exc:
                 order.status = OrderStatus.CANCELLED
@@ -239,3 +265,15 @@ class OrderExecutor:
 
     def get_order(self, order_id: str) -> Order | None:
         return self._orders.get(order_id)
+
+    def cleanup_old_orders(self, max_age_seconds: float = 3600) -> int:
+        """Remove filled/cancelled orders older than *max_age_seconds*."""
+        cutoff = time.time() - max_age_seconds
+        to_remove = [
+            oid for oid, o in self._orders.items()
+            if o.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED)
+            and o.updated_at < cutoff
+        ]
+        for oid in to_remove:
+            del self._orders[oid]
+        return len(to_remove)

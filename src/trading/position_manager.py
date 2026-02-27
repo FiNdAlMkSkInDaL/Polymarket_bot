@@ -1,6 +1,15 @@
 """
 Position manager — tracks open positions, orchestrates the entry → exit
 lifecycle, and enforces risk limits.
+
+Risk controls:
+  - Configurable max open positions (``MAX_OPEN_POSITIONS``)
+  - Per-market concentration limit (``MAX_POSITIONS_PER_MARKET``)
+  - Per-event concentration limit (``MAX_POSITIONS_PER_EVENT``)
+  - Daily loss circuit breaker (``DAILY_LOSS_LIMIT_USD``)
+  - Max drawdown kill switch (``MAX_DRAWDOWN_CENTS``)
+  - Trailing stop-loss (``STOP_LOSS_CENTS``)
+  - Total exposure cap (``MAX_TOTAL_EXPOSURE_PCT``)
 """
 
 from __future__ import annotations
@@ -8,14 +17,17 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
+from src.data.orderbook import OrderbookTracker
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
+from src.trading.sizer import SizingResult, compute_depth_aware_size
 from src.trading.take_profit import TakeProfitResult, compute_take_profit
 
 log = get_logger(__name__)
@@ -36,6 +48,7 @@ class Position:
     id: str
     market_id: str
     no_asset_id: str
+    event_id: str = ""
 
     state: PositionState = PositionState.ENTRY_PENDING
 
@@ -56,6 +69,13 @@ class Position:
     # Signal metadata
     signal: PanicSignal | None = None
 
+    # Sizing metadata
+    sizing: SizingResult | None = None
+
+    # Chaser task handles (for cancellation on timeout / shutdown)
+    entry_chaser_task: asyncio.Task | None = field(default=None, repr=False)
+    exit_chaser_task: asyncio.Task | None = field(default=None, repr=False)
+
     # PnL
     pnl_cents: float = 0.0
 
@@ -72,44 +92,144 @@ class PositionManager:
       4. When the exit fills or times out → position is closed.
     """
 
+    # Maximum closed positions kept in memory for debugging
+    _MAX_CLOSED_KEPT = 50
+
     def __init__(
         self,
         executor: OrderExecutor,
         *,
-        max_open_positions: int = 3,
+        max_open_positions: int | None = None,
     ):
         self.executor = executor
-        self.max_open = max_open_positions
+        self.max_open = max_open_positions or settings.strategy.max_open_positions
         self._positions: dict[str, Position] = {}
         self._next_id = 1
-        self._wallet_balance_usd: float = 0.0  # Updated externally
+        self._wallet_balance_usd: float = 0.0
+        self._daily_pnl_cents: float = 0.0
+        self._daily_pnl_date: str = ""  # YYYY-MM-DD
+        self._cumulative_pnl_cents: float = 0.0
+        self._peak_pnl_cents: float = 0.0
+        self._max_drawdown_cents: float = 0.0
+        self._circuit_breaker_tripped: bool = False
 
-    # ── Wallet balance (simplified — would query on-chain in production) ───
+    # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
         self._wallet_balance_usd = usd
+
+    @property
+    def circuit_breaker_active(self) -> bool:
+        return self._circuit_breaker_tripped
+
+    def reset_daily_pnl(self) -> None:
+        """Call at UTC midnight to reset the daily loss tracker."""
+        self._daily_pnl_cents = 0.0
+        self._daily_pnl_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._circuit_breaker_tripped = False
+        log.info("daily_pnl_reset")
 
     # ── Open a new position on signal ──────────────────────────────────────
     async def open_position(
         self,
         signal: PanicSignal,
         no_aggregator: OHLCVAggregator,
+        *,
+        no_book: OrderbookTracker | None = None,
+        event_id: str = "",
+        days_to_resolution: int = 30,
+        book_depth_ratio: float = 1.0,
     ) -> Position | None:
-        """Attempt to open a mean-reversion position on a panic signal."""
+        """Attempt to open a mean-reversion position on a panic signal.
 
-        # Risk gate: max open positions
-        open_count = sum(
-            1 for p in self._positions.values() if p.state in (
-                PositionState.ENTRY_PENDING, PositionState.EXIT_PENDING,
-            )
-        )
-        if open_count >= self.max_open:
-            log.warning("max_positions_reached", open=open_count)
+        Parameters
+        ----------
+        no_book:
+            Live L2 order book for the NO token.  Used by the depth-aware
+            sizer to cap order size.  Falls back to fixed sizing with
+            a 50% haircut if ``None``.
+        """
+        strat = settings.strategy
+
+        # ── Circuit breaker check ──────────────────────────────────────────
+        if self._circuit_breaker_tripped:
+            log.warning("circuit_breaker_active", reason="daily_loss_or_drawdown")
             return None
 
-        # Risk gate: capital allocation
+        # ── Daily loss check ───────────────────────────────────────────────
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_pnl_date != today:
+            self.reset_daily_pnl()
+
+        daily_loss_limit_cents = strat.daily_loss_limit_usd * 100
+        if self._daily_pnl_cents <= -daily_loss_limit_cents:
+            self._circuit_breaker_tripped = True
+            log.warning(
+                "daily_loss_limit_hit",
+                daily_pnl=round(self._daily_pnl_cents, 2),
+                limit=daily_loss_limit_cents,
+            )
+            return None
+
+        # ── Max drawdown check ─────────────────────────────────────────────
+        if self._max_drawdown_cents >= strat.max_drawdown_cents:
+            self._circuit_breaker_tripped = True
+            log.warning(
+                "max_drawdown_hit",
+                drawdown=round(self._max_drawdown_cents, 2),
+                limit=strat.max_drawdown_cents,
+            )
+            return None
+
+        # ── Risk gate: max open positions ──────────────────────────────────
+        open_positions = self.get_open_positions()
+        if len(open_positions) >= self.max_open:
+            log.warning("max_positions_reached", open=len(open_positions))
+            return None
+
+        # ── Risk gate: per-market concentration ────────────────────────────
+        market_count = sum(
+            1 for p in open_positions if p.market_id == signal.market_id
+        )
+        if market_count >= strat.max_positions_per_market:
+            log.warning(
+                "per_market_limit",
+                market=signal.market_id,
+                count=market_count,
+                limit=strat.max_positions_per_market,
+            )
+            return None
+
+        # ── Risk gate: per-event concentration ─────────────────────────────
+        if event_id:
+            event_count = sum(
+                1 for p in open_positions if p.event_id == event_id
+            )
+            if event_count >= strat.max_positions_per_event:
+                log.warning(
+                    "per_event_limit",
+                    event_id=event_id,
+                    count=event_count,
+                    limit=strat.max_positions_per_event,
+                )
+                return None
+
+        # ── Risk gate: total exposure ──────────────────────────────────────
+        total_exposure = sum(
+            p.entry_price * p.entry_size for p in open_positions
+        )
+        max_exposure = self._wallet_balance_usd * strat.max_total_exposure_pct / 100.0
+        if total_exposure >= max_exposure and max_exposure > 0:
+            log.warning(
+                "exposure_limit",
+                exposure=round(total_exposure, 2),
+                limit=round(max_exposure, 2),
+            )
+            return None
+
+        # ── Risk gate: capital allocation ──────────────────────────────────
         max_trade = min(
-            settings.strategy.max_trade_size_usd,
-            self._wallet_balance_usd * settings.strategy.max_wallet_risk_pct / 100.0,
+            strat.max_trade_size_usd,
+            self._wallet_balance_usd * strat.max_wallet_risk_pct / 100.0,
         )
         if max_trade <= 0:
             log.warning("insufficient_balance", balance=self._wallet_balance_usd)
@@ -121,23 +241,56 @@ class PositionManager:
             log.warning("entry_price_invalid", ask=signal.no_best_ask)
             return None
 
-        # Size: how many shares can we buy?
-        entry_size = round(max_trade / entry_price, 2)
+        # ── Depth-aware sizing (Pillar 2) ──────────────────────────────────
+        if no_book is not None:
+            sizing = compute_depth_aware_size(
+                book=no_book,
+                entry_price=entry_price,
+                max_trade_usd=max_trade,
+                side="BUY",
+            )
+        else:
+            # Fallback: no book available — use fixed sizing with 50% haircut
+            fallback_usd = max_trade * 0.50
+            shares = round(fallback_usd / entry_price, 2)
+            if shares < 1:
+                shares = 0.0
+                fallback_usd = 0.0
+            from src.trading.sizer import SizingResult
+            sizing = SizingResult(
+                size_usd=fallback_usd,
+                size_shares=shares,
+                available_liq_usd=0.0,
+                method="fallback_no_book",
+                capped=False,
+            )
+
+        entry_size = sizing.size_shares
         if entry_size < 1:
-            entry_size = 1.0  # minimum 1 share
+            log.info(
+                "skip_entry_insufficient_size",
+                sizing_method=sizing.method,
+                available_liq=sizing.available_liq_usd,
+            )
+            return None
 
         # Pre-check: will the take-profit be viable?
+        actual_depth_ratio = book_depth_ratio
+        if no_book is not None and no_book.has_data:
+            actual_depth_ratio = no_book.book_depth_ratio
         tp = compute_take_profit(
             entry_price=entry_price,
             no_vwap=no_aggregator.rolling_vwap,
             realised_vol=no_aggregator.rolling_volatility,
             whale_confluence=signal.whale_confluence,
+            book_depth_ratio=actual_depth_ratio,
+            days_to_resolution=days_to_resolution,
         )
         if not tp.viable:
             log.info(
                 "skip_entry_low_spread",
                 spread=tp.spread_cents,
-                min_required=settings.strategy.min_spread_cents,
+                min_required=strat.min_spread_cents,
             )
             return None
 
@@ -157,6 +310,7 @@ class PositionManager:
             id=pos_id,
             market_id=signal.market_id,
             no_asset_id=signal.no_asset_id,
+            event_id=event_id,
             state=PositionState.ENTRY_PENDING,
             entry_order=order,
             entry_price=entry_price,
@@ -165,6 +319,7 @@ class PositionManager:
             signal=signal,
             tp_result=tp,
             target_price=tp.target_price,
+            sizing=sizing,
         )
 
         self._positions[pos.id] = pos
@@ -173,6 +328,7 @@ class PositionManager:
             "position_opened",
             pos_id=pos.id,
             market=signal.market_id,
+            event_id=event_id,
             entry=entry_price,
             size=entry_size,
             target=tp.target_price,
@@ -217,6 +373,15 @@ class PositionManager:
         pos.exit_reason = reason
         pos.pnl_cents = round((pos.exit_price - pos.entry_price) * pos.entry_size * 100, 2)
 
+        # Track daily PnL and drawdown
+        self._daily_pnl_cents += pos.pnl_cents
+        self._cumulative_pnl_cents += pos.pnl_cents
+        self._peak_pnl_cents = max(self._peak_pnl_cents, self._cumulative_pnl_cents)
+        self._max_drawdown_cents = max(
+            self._max_drawdown_cents,
+            self._peak_pnl_cents - self._cumulative_pnl_cents,
+        )
+
         log.info(
             "position_closed",
             pos_id=pos.id,
@@ -225,28 +390,46 @@ class PositionManager:
             pnl_cents=pos.pnl_cents,
             reason=reason,
             hold_seconds=round(pos.exit_time - pos.entry_time, 1),
+            daily_pnl=round(self._daily_pnl_cents, 2),
+            drawdown=round(self._max_drawdown_cents, 2),
         )
 
     # ── Timeout enforcement ────────────────────────────────────────────────
     async def check_timeouts(self) -> None:
-        """Cancel stale entry orders and force-exit stale positions."""
+        """Cancel stale entry orders, check stop-losses, and force-exit stale positions."""
         now = time.time()
+        stop_loss_cents = settings.strategy.stop_loss_cents
 
         for pos in list(self._positions.values()):
             # Entry timeout
             if pos.state == PositionState.ENTRY_PENDING:
                 elapsed = now - pos.entry_time
                 if elapsed > settings.strategy.entry_timeout_seconds:
+                    # Cancel chaser task if running
+                    if pos.entry_chaser_task and not pos.entry_chaser_task.done():
+                        pos.entry_chaser_task.cancel()
                     if pos.entry_order:
                         await self.executor.cancel_order(pos.entry_order)
                     pos.state = PositionState.CANCELLED
                     pos.exit_reason = "entry_timeout"
                     log.info("entry_timeout", pos_id=pos.id, elapsed_s=round(elapsed))
 
-            # Exit timeout — force market sell
+            # Exit timeout or stop-loss
             elif pos.state == PositionState.EXIT_PENDING:
                 elapsed = now - pos.entry_time
+
+                # Stop-loss: check if current NO price moved against us
+                should_stop = False
+                if stop_loss_cents > 0 and pos.entry_price > 0:
+                    # Unrealised loss check deferred to bot loop where
+                    # we have access to current prices — here we only
+                    # handle cases signalled by the bot via force_stop_loss()
+                    pass
+
                 if elapsed > settings.strategy.exit_timeout_seconds:
+                    # Cancel chaser task if running
+                    if pos.exit_chaser_task and not pos.exit_chaser_task.done():
+                        pos.exit_chaser_task.cancel()
                     # Cancel the existing limit sell
                     if pos.exit_order:
                         await self.executor.cancel_order(pos.exit_order)
@@ -261,10 +444,64 @@ class PositionManager:
                         size=pos.entry_size,
                     )
                     pos.exit_order = exit_order
-
-                    # In paper mode, this will fill instantly on next tick
-                    # In live mode, the CLOB IOC logic handles it
                     self.on_exit_filled(pos, reason="timeout")
+
+    async def force_stop_loss(self, pos: Position) -> None:
+        """Force-close a position via market sell due to stop-loss trigger."""
+        if pos.state != PositionState.EXIT_PENDING:
+            return
+
+        # Cancel exit chaser if running
+        if pos.exit_chaser_task and not pos.exit_chaser_task.done():
+            pos.exit_chaser_task.cancel()
+
+        if pos.exit_order:
+            await self.executor.cancel_order(pos.exit_order)
+
+        exit_order = await self.executor.place_limit_order(
+            market_id=pos.market_id,
+            asset_id=pos.no_asset_id,
+            side=OrderSide.SELL,
+            price=0.01,
+            size=pos.entry_size,
+        )
+        pos.exit_order = exit_order
+        self.on_exit_filled(pos, reason="stop_loss")
+
+        log.warning(
+            "stop_loss_triggered",
+            pos_id=pos.id,
+            entry=pos.entry_price,
+            exit=pos.exit_price,
+            pnl_cents=pos.pnl_cents,
+        )
+
+    # ── Cleanup ────────────────────────────────────────────────────────────
+    def cleanup_closed(self) -> list[Position]:
+        """Remove and return closed/cancelled positions (keep last N)."""
+        closed = [
+            p for p in self._positions.values()
+            if p.state in (PositionState.CLOSED, PositionState.CANCELLED)
+        ]
+        # Sort by exit_time desc, keep only the most recent
+        closed.sort(key=lambda p: p.exit_time or p.created_at, reverse=True)
+
+        to_remove = closed[self._MAX_CLOSED_KEPT:]
+        for p in to_remove:
+            del self._positions[p.id]
+
+        return to_remove
+
+    def get_open_market_ids(self) -> set[str]:
+        """Return set of market_ids with open positions."""
+        return {
+            p.market_id for p in self._positions.values()
+            if p.state in (
+                PositionState.ENTRY_PENDING,
+                PositionState.ENTRY_FILLED,
+                PositionState.EXIT_PENDING,
+            )
+        }
 
     # ── Query helpers ───────────────────────────────────────────────────────
     def get_open_positions(self) -> list[Position]:

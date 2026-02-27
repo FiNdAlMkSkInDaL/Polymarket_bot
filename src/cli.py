@@ -5,6 +5,7 @@ Usage:
     python -m src.cli run --paper          # Paper trading (default)
     python -m src.cli run --live           # Live trading (after criteria met)
     python -m src.cli stats                # Print aggregate stats
+    python -m src.cli scores               # Print current market scores
     python -m src.cli kill                 # Emergency shutdown
 """
 
@@ -76,6 +77,54 @@ def kill() -> None:
     """Send a kill signal (placeholder — in production, signal via Telegram or PID)."""
     click.echo("🛑  Kill signal sent.  If running as systemd, use:")
     click.echo("    sudo systemctl stop polymarket-bot")
+
+
+@main.command()
+def scores() -> None:
+    """Discover markets and print their quality scores (no trading)."""
+
+    async def _scores() -> None:
+        from src.data.market_lifecycle import MarketLifecycleManager
+
+        lm = MarketLifecycleManager()
+        active = await lm.initial_discovery()
+
+        click.echo("\n📈  Market Quality Scores")
+        click.echo("═" * 80)
+
+        # Active tier
+        click.echo(f"\n🟢  Active ({len(lm.active)} markets)")
+        click.echo("─" * 80)
+        for am in sorted(lm.active.values(), key=lambda x: x.score.total, reverse=True):
+            bd = am.score
+            q = am.info.question[:55].ljust(55)
+            click.echo(
+                f"  {q}  "
+                f"TOTAL={bd.total:5.1f}  "
+                f"vol={bd.volume:4.0f} liq={bd.liquidity:4.0f} "
+                f"sprd={bd.spread:4.0f} ttr={bd.time_to_resolve:4.0f} "
+                f"prng={bd.price_range:4.0f} freq={bd.trade_freq:4.0f} "
+                f"whale={bd.whale_interest:4.0f}"
+            )
+
+        # Observing tier
+        if lm.observing:
+            click.echo(f"\n🟡  Observing ({len(lm.observing)} markets)")
+            click.echo("─" * 80)
+            for om in sorted(
+                lm.observing.values(), key=lambda x: x.score.total, reverse=True
+            ):
+                bd = om.score
+                q = om.info.question[:55].ljust(55)
+                click.echo(
+                    f"  {q}  "
+                    f"TOTAL={bd.total:5.1f}  "
+                    f"vol={bd.volume:4.0f} liq={bd.liquidity:4.0f}"
+                )
+
+        click.echo()
+
+    asyncio.run(_scores())
 
 
 if __name__ == "__main__":

@@ -44,9 +44,16 @@ class _BarBuilder:
     prices: list[float] = field(default_factory=list)
     sizes: list[float] = field(default_factory=list)
 
+    _MAX_TICKS = 10_000  # cap per bar to prevent unbounded growth
+
     def add(self, price: float, size: float, ts: float) -> None:
         if not self.prices:
             self.open_time = ts
+        if len(self.prices) >= self._MAX_TICKS:
+            # Keep most recent half to maintain statistical validity
+            half = self._MAX_TICKS // 2
+            self.prices = self.prices[half:]
+            self.sizes = self.sizes[half:]
         self.prices.append(price)
         self.sizes.append(size)
 
@@ -99,6 +106,7 @@ class OHLCVAggregator:
         # Pre-computed stats (updated on each bar close)
         self.rolling_vwap: float = 0.0
         self.rolling_volatility: float = 0.0
+        self.rolling_volatility_30m: float = 0.0  # 30-min window for TP rescaling
         self.avg_bar_volume: float = 0.0
 
     # ── public API ──────────────────────────────────────────────────────────
@@ -165,3 +173,13 @@ class OHLCVAggregator:
         closes = np.maximum(closes, 1e-8)
         log_returns = np.diff(np.log(closes))
         self.rolling_volatility = float(log_returns.std()) if len(log_returns) > 1 else 0.0
+
+        # ── 30-minute short-window volatility for TP rescaling ─────────
+        window_30 = list(self.bars)[-30:]
+        if len(window_30) >= 3:
+            closes_30 = np.array([b.close for b in window_30])
+            closes_30 = np.maximum(closes_30, 1e-8)
+            lr_30 = np.diff(np.log(closes_30))
+            self.rolling_volatility_30m = float(lr_30.std()) if len(lr_30) > 1 else 0.0
+        else:
+            self.rolling_volatility_30m = self.rolling_volatility

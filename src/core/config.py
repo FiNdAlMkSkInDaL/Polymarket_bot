@@ -79,10 +79,46 @@ class StrategyParams:
     min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
 
     # Discovery behaviour
-    discovery_tags: str = _env("DISCOVERY_TAGS", "politics,crypto")
+    discovery_tags: str = _env("DISCOVERY_TAGS", "")  # empty = all categories
     reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", True)
     one_market_per_event: bool = _env_bool("ONE_MARKET_PER_EVENT", True)
     market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 30)
+
+    # Market scoring
+    min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
+    observation_period_minutes: int = _env_int("OBSERVATION_PERIOD_MINUTES", 5)
+    demotion_cycles_before_evict: int = _env_int("DEMOTION_CYCLES_BEFORE_EVICT", 3)
+    api_rate_limit_per_sec: int = _env_int("API_RATE_LIMIT_PER_SEC", 5)
+
+    # Risk controls
+    max_open_positions: int = _env_int("MAX_OPEN_POSITIONS", 5)
+    max_positions_per_market: int = _env_int("MAX_POSITIONS_PER_MARKET", 1)
+    max_positions_per_event: int = _env_int("MAX_POSITIONS_PER_EVENT", 2)
+    daily_loss_limit_usd: float = _env_float("DAILY_LOSS_LIMIT_USD", 25.0)
+    max_drawdown_cents: float = _env_float("MAX_DRAWDOWN_CENTS", 2500.0)
+    stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 8.0)
+    signal_cooldown_minutes: int = _env_int("SIGNAL_COOLDOWN_MINUTES", 15)
+    max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
+
+    # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
+    chase_interval_ms: int = _env_int("CHASE_INTERVAL_MS", 250)
+    max_chase_depth_cents: float = _env_float("MAX_CHASE_DEPTH_CENTS", 3.0)
+    post_only_enabled: bool = _env_bool("POST_ONLY_ENABLED", True)
+
+    # ── Pillar 2: Liquidity-Sensing Sizing ─────────────────────────────────
+    max_impact_pct: float = _env_float("MAX_IMPACT_PCT", 15.0)
+    impact_depth_cents: float = _env_float("IMPACT_DEPTH_CENTS", 5.0)
+
+    # ── Pillar 3: Adaptive TP Rescaling ────────────────────────────────────
+    tp_rescale_interval_s: int = _env_int("TP_RESCALE_INTERVAL_S", 15)
+    tp_vol_sensitivity: float = _env_float("TP_VOL_SENSITIVITY", 1.5)
+    tp_spread_min_mult: float = _env_float("TP_SPREAD_MIN_MULT", 0.5)
+    tp_spread_max_mult: float = _env_float("TP_SPREAD_MAX_MULT", 3.0)
+
+    # ── Pillar 4: Stale-Data Kill-Switch ───────────────────────────────────
+    latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 1500)
+    latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
+    latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
 
 @dataclass(frozen=True)

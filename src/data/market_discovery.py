@@ -1,10 +1,11 @@
 """
 Market discovery — enumerate Polymarket CLOB markets, filter for
-high-volume geopolitical binary events, and return tradeable asset ids.
+high-volume binary events, and return tradeable asset ids.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -16,6 +17,28 @@ from src.core.config import settings
 from src.core.logger import get_logger
 
 log = get_logger(__name__)
+
+# Module-level rate limiter (shared across all discovery functions)
+_rate_sem: asyncio.Semaphore | None = None
+
+
+def _get_rate_sem() -> asyncio.Semaphore:
+    global _rate_sem
+    if _rate_sem is None:
+        _rate_sem = asyncio.Semaphore(settings.strategy.api_rate_limit_per_sec)
+    return _rate_sem
+
+
+async def _rate_limited_get(
+    client: httpx.AsyncClient, url: str, params: dict | None = None
+) -> httpx.Response:
+    """GET with semaphore-based rate limiting."""
+    sem = _get_rate_sem()
+    async with sem:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        await asyncio.sleep(1.0 / max(settings.strategy.api_rate_limit_per_sec, 1))
+        return resp
 
 
 @dataclass
@@ -30,11 +53,17 @@ class MarketInfo:
     end_date: datetime | None
     active: bool
 
+    # Extended fields for scoring & lifecycle
+    event_id: str = ""
+    liquidity_usd: float = 0.0
+    score: float = 0.0
+    accepting_orders: bool = True
+
 
 async def fetch_active_markets(
     min_volume: float | None = None,
     min_days_to_resolution: int | None = None,
-    limit: int = 50,
+    limit: int = 200,
 ) -> list[MarketInfo]:
     """Discover tradeable markets using a tiered strategy.
 
@@ -145,34 +174,52 @@ async def _fetch_gamma_markets(
     min_days_to_resolution: int,
     limit: int,
 ) -> list[MarketInfo]:
-    """Fetch markets from the Gamma API as a fallback."""
+    """Fetch markets from the Gamma API as a fallback (with pagination)."""
     gamma_url = "https://gamma-api.polymarket.com/markets"
     markets: list[MarketInfo] = []
     rejections: list[dict] = []
 
+    _PAGE_SIZE = 100
+    _MAX_PAGES = 10
+
     async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.get(
-                gamma_url,
-                params={"active": "true", "closed": "false", "limit": 100},
-            )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            log.warning("gamma_fetch_http_error", status=exc.response.status_code)
-            return []
+        offset = 0
+        for _page in range(_MAX_PAGES):
+            if len(markets) >= limit:
+                break
+            try:
+                resp = await _rate_limited_get(
+                    client,
+                    gamma_url,
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": _PAGE_SIZE,
+                        "offset": offset,
+                    },
+                )
+            except httpx.HTTPStatusError as exc:
+                log.warning("gamma_fetch_http_error", status=exc.response.status_code)
+                break
 
-        items = resp.json()
-        if not isinstance(items, list):
-            items = items.get("data", []) if isinstance(items, dict) else []
+            items = resp.json()
+            if not isinstance(items, list):
+                items = items.get("data", []) if isinstance(items, dict) else []
 
-        for m in items:
-            # Gamma uses different field names — normalise to the CLOB schema
-            normalised = _normalize_gamma_market(m)
-            info, reason = _parse_market(normalised, min_volume, min_days_to_resolution)
-            if info:
-                markets.append(info)
-            elif reason and len(rejections) < 10:
-                rejections.append(reason)
+            if not items:
+                break
+
+            for m in items:
+                normalised = _normalize_gamma_market(m)
+                info, reason = _parse_market(normalised, min_volume, min_days_to_resolution)
+                if info:
+                    markets.append(info)
+                elif reason and len(rejections) < 10:
+                    rejections.append(reason)
+
+            offset += _PAGE_SIZE
+            if len(items) < _PAGE_SIZE:
+                break
 
     if not markets:
         _log_rejections(rejections, source="gamma_markets")
@@ -184,17 +231,16 @@ async def _fetch_gamma_events(
     min_days_to_resolution: int,
     limit: int,
 ) -> list[MarketInfo]:
-    """Fetch markets via the Gamma /events endpoint with tag filtering.
+    """Fetch markets via the Gamma /events endpoint.
 
-    Tags (e.g. ``politics``, ``crypto``) are a native property of events,
-    not markets, so this endpoint is the only way to do category-based
-    selection.  We iterate the ``markets`` array inside each event and
-    optionally enforce one-market-per-event (the highest-volume market)
+    If ``discovery_tags`` is empty, fetches ALL categories (no tag filter).
+    Supports pagination via ``offset`` to walk the full event universe.
+
+    Optionally enforces one-market-per-event (the highest-volume market)
     to prevent correlated sub-questions from flooding the watchlist.
     """
-    tags = [t.strip() for t in settings.strategy.discovery_tags.split(",") if t.strip()]
-    if not tags:
-        tags = ["politics", "crypto"]
+    tags_raw = settings.strategy.discovery_tags.strip()
+    tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
 
     one_per_event = settings.strategy.one_market_per_event
     gamma_url = "https://gamma-api.polymarket.com/events"
@@ -202,69 +248,86 @@ async def _fetch_gamma_events(
     rejections: list[dict] = []
     seen_events: set[str] = set()
 
+    _PAGE_SIZE = 100
+    _MAX_PAGES = 10  # safety cap per tag (or total if no tags)
+
     async with httpx.AsyncClient(timeout=30) as client:
-        for tag in tags:
+        tag_list = tags if tags else [""]  # empty string = no tag filter
+        for tag in tag_list:
             if len(markets) >= limit:
                 break
 
-            try:
-                resp = await client.get(
-                    gamma_url,
-                    params={
-                        "active": "true",
-                        "closed": "false",
-                        "limit": 100,
-                        "tag": tag,
-                    },
-                )
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                log.warning(
-                    "gamma_events_http_error",
-                    status=exc.response.status_code,
-                    tag=tag,
-                )
-                continue
+            offset = 0
+            for _page in range(_MAX_PAGES):
+                if len(markets) >= limit:
+                    break
 
-            events = resp.json()
-            if not isinstance(events, list):
-                events = events.get("data", []) if isinstance(events, dict) else []
+                params: dict = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": _PAGE_SIZE,
+                    "offset": offset,
+                }
+                if tag:
+                    params["tag"] = tag
 
-            for event in events:
-                event_id = str(event.get("id", ""))
-                if one_per_event and event_id in seen_events:
-                    continue
-
-                sub_markets = event.get("markets", [])
-                if not isinstance(sub_markets, list):
-                    continue
-
-                # Normalise, parse, and rank by 24h volume
-                candidates: list[tuple[MarketInfo, float]] = []
-                for m in sub_markets:
-                    normalised = _normalize_gamma_market(m)
-                    info, reason = _parse_market(
-                        normalised, min_volume, min_days_to_resolution,
+                try:
+                    resp = await _rate_limited_get(client, gamma_url, params)
+                except httpx.HTTPStatusError as exc:
+                    log.warning(
+                        "gamma_events_http_error",
+                        status=exc.response.status_code,
+                        tag=tag or "all",
                     )
-                    if info:
-                        candidates.append((info, info.daily_volume_usd))
-                    elif reason and len(rejections) < 10:
-                        rejections.append(reason)
+                    break
 
-                if not candidates:
-                    continue
+                events = resp.json()
+                if not isinstance(events, list):
+                    events = events.get("data", []) if isinstance(events, dict) else []
 
-                if one_per_event:
-                    # Take the highest-volume market from this event
-                    best = max(candidates, key=lambda c: c[1])
-                    markets.append(best[0])
-                    seen_events.add(event_id)
-                else:
-                    markets.extend(c[0] for c in candidates)
+                if not events:
+                    break  # no more pages
+
+                for event in events:
+                    event_id = str(event.get("id", ""))
+                    if one_per_event and event_id in seen_events:
+                        continue
+
+                    sub_markets = event.get("markets", [])
+                    if not isinstance(sub_markets, list):
+                        continue
+
+                    # Normalise, parse, and rank by 24h volume
+                    candidates: list[tuple[MarketInfo, float]] = []
+                    for m in sub_markets:
+                        normalised = _normalize_gamma_market(m)
+                        # Inject event_id
+                        normalised["event_id"] = event_id
+                        info, reason = _parse_market(
+                            normalised, min_volume, min_days_to_resolution,
+                        )
+                        if info:
+                            candidates.append((info, info.daily_volume_usd))
+                        elif reason and len(rejections) < 10:
+                            rejections.append(reason)
+
+                    if not candidates:
+                        continue
+
+                    if one_per_event:
+                        best = max(candidates, key=lambda c: c[1])
+                        markets.append(best[0])
+                        seen_events.add(event_id)
+                    else:
+                        markets.extend(c[0] for c in candidates)
+
+                offset += _PAGE_SIZE
+                if len(events) < _PAGE_SIZE:
+                    break  # last page
 
             log.info(
                 "gamma_events_tag_done",
-                tag=tag,
+                tag=tag or "all",
                 markets_so_far=len(markets),
             )
 
@@ -340,6 +403,7 @@ def _normalize_gamma_market(m: dict) -> dict:
         "enableOrderBook": m.get("enableOrderBook", True),
         "groupItemTitle": m.get("groupItemTitle", ""),
         "liquidity": liquidity_float,
+        "event_id": str(m.get("eventId") or m.get("event_id", "")),
     }
 
 
@@ -468,6 +532,9 @@ def _parse_market(
             daily_volume_usd=volume,
             end_date=end_date,
             active=True,
+            event_id=str(raw.get("event_id", "")),
+            liquidity_usd=float(raw.get("liquidity", 0)),
+            accepting_orders=bool(raw.get("acceptingOrders", True)),
         ), None
 
     except (KeyError, TypeError, ValueError) as exc:

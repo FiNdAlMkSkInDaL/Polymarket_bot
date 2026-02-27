@@ -50,12 +50,14 @@ class MarketWebSocket:
         asset_ids: list[str],
         trade_queue: asyncio.Queue[TradeEvent],
         *,
+        book_queue: asyncio.Queue | None = None,
         ws_url: str | None = None,
         queue_maxsize: int = 1000,
     ):
         self.asset_ids = asset_ids
         # ── Fix 2: Bounded queue — drop oldest when full ───────────────────
         self.trade_queue = trade_queue
+        self.book_queue: asyncio.Queue = book_queue or asyncio.Queue(maxsize=2000)
         self._queue_maxsize = queue_maxsize
         self.ws_url = ws_url or settings.clob_ws_url
         self._ws: Any = None
@@ -116,6 +118,22 @@ class MarketWebSocket:
                 except Exception as exc:
                     log.warning("ws_subscribe_failed", asset_id=aid, error=str(exc))
 
+    async def remove_assets(self, ids_to_remove: list[str]) -> None:
+        """Unsubscribe from asset IDs and remove from tracking."""
+        removing = [aid for aid in ids_to_remove if aid in self.asset_ids]
+        if not removing:
+            return
+        for aid in removing:
+            self.asset_ids.remove(aid)
+        if self._ws:
+            for aid in removing:
+                try:
+                    unsub_msg = {"type": "unsubscribe", "channel": "market", "assets_ids": [aid]}
+                    await self._ws.send(json.dumps(unsub_msg))
+                    log.info("ws_unsubscribed", asset_id=aid)
+                except Exception as exc:
+                    log.warning("ws_unsubscribe_failed", asset_id=aid, error=str(exc))
+
     # ── internal ───────────────────────────────────────────────────────────
     async def _connect_and_consume(self) -> None:
         async with websockets.connect(self.ws_url, ping_interval=20) as ws:
@@ -164,8 +182,15 @@ class MarketWebSocket:
                     await self._enqueue(event)
 
         elif event_type in ("price_change", "book"):
-            # Order book snapshots may be useful later; skip for now.
-            pass
+            # Route orderbook events to the book queue
+            try:
+                self.book_queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                try:
+                    self.book_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self.book_queue.put_nowait(msg)
 
     async def _enqueue(self, event: TradeEvent) -> None:
         """Put *event* on the queue. If the queue is full, drop the oldest
