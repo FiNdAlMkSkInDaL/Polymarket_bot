@@ -35,6 +35,7 @@ class TradeEvent:
     price: float              # in [0, 1] dollars
     size: float               # number of shares
     is_yes: bool              # True if this is a YES outcome token
+    is_taker: bool = False    # True if trade crossed the spread (aggressor)
 
 
 # ── WebSocket subscriber ───────────────────────────────────────────────────
@@ -62,6 +63,8 @@ class MarketWebSocket:
         self.ws_url = ws_url or settings.clob_ws_url
         self._ws: Any = None
         self._running = False
+        self._last_message_time: float = 0.0
+        self._silence_timeout = settings.strategy.ws_silence_timeout_s
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -109,7 +112,8 @@ class MarketWebSocket:
         if self._ws:
             for aid in added:
                 subscribe_msg = {
-                    "type": "market",
+                    "type": "subscribe",
+                    "channel": "market",
                     "assets_ids": [aid],
                 }
                 try:
@@ -138,9 +142,10 @@ class MarketWebSocket:
     async def _connect_and_consume(self) -> None:
         async with websockets.connect(self.ws_url, ping_interval=20) as ws:
             self._ws = ws
+            self._last_message_time = time.time()
             log.info("ws_connected", url=self.ws_url)
 
-            # Subscribe to all assets in a single message
+            # Subscribe to market channel (trades + price_change events)
             subscribe_msg = {
                 "type": "subscribe",
                 "channel": "market",
@@ -148,16 +153,39 @@ class MarketWebSocket:
             }
             await ws.send(json.dumps(subscribe_msg))
             for asset_id in self.asset_ids:
-                log.info("ws_subscribed", asset_id=asset_id)
+                log.info("ws_subscribed", asset_id=asset_id, channels="market")
 
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    msg = json.loads(raw)
-                    await self._handle_message(msg)
-                except json.JSONDecodeError:
-                    log.warning("ws_bad_json", raw=raw[:200])
+            # Launch silence watchdog alongside message consumer
+            silence_task = asyncio.create_task(
+                self._silence_watchdog(ws), name="ws_silence_watchdog"
+            )
+            try:
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    self._last_message_time = time.time()
+                    try:
+                        msg = json.loads(raw)
+                        await self._handle_message(msg)
+                    except json.JSONDecodeError:
+                        log.warning("ws_bad_json", raw=raw[:200])
+            finally:
+                silence_task.cancel()
+
+    async def _silence_watchdog(self, ws: Any) -> None:
+        """Close the WebSocket if no messages arrive for ``_silence_timeout``
+        seconds, forcing a reconnect via the outer backoff loop."""
+        while self._running:
+            await asyncio.sleep(1.0)
+            elapsed = time.time() - self._last_message_time
+            if elapsed > self._silence_timeout:
+                log.warning(
+                    "ws_silence_timeout",
+                    silence_s=round(elapsed, 1),
+                    threshold_s=self._silence_timeout,
+                )
+                await ws.close()
+                return
 
     async def _handle_message(self, msg: dict | list) -> None:
         """Parse incoming WS messages and emit TradeEvents."""
@@ -220,8 +248,19 @@ class MarketWebSocket:
             outcome = (data.get("outcome") or data.get("side") or "").upper()
             is_yes = outcome != "NO"
 
+            raw_ts = float(data.get("timestamp") or data.get("ts") or 0)
+            # Polymarket sends µs-epoch; normalise to seconds so the
+            # latency guard can compare against time.time().
+            if raw_ts > 1e15:          # microseconds
+                raw_ts /= 1_000_000
+            elif raw_ts > 1e12:        # milliseconds
+                raw_ts /= 1_000
+            elif raw_ts == 0:
+                raw_ts = time.time()
+            # else: already seconds
+
             return TradeEvent(
-                timestamp=float(data.get("timestamp") or data.get("ts") or time.time()),
+                timestamp=raw_ts,
                 market_id=str(market_id),
                 asset_id=str(asset_id),
                 side=data.get("side", "buy"),

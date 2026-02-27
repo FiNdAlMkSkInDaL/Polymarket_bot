@@ -60,6 +60,21 @@ class DrainingMarket:
     reason: str = "resolved"
 
 
+@dataclass
+class EmergencyDrainMarket:
+    """Market in emergency drain due to ghost liquidity detection.
+
+    The bot immediately cancels entry orders and force-exits open
+    positions.  Recovery requires depth returning to ≥50% of the
+    baseline for ``ghost_recovery_s`` continuous seconds.
+    """
+    info: MarketInfo
+    reason: str = "ghost_liquidity"
+    triggered_at: float = 0.0
+    baseline_depth: float = 0.0
+    recovery_start: float = 0.0     # when depth first recovered
+
+
 class MarketLifecycleManager:
     """Manages the three-tier market universe.
 
@@ -77,6 +92,7 @@ class MarketLifecycleManager:
         self.observing: dict[str, ObservingMarket] = {}
         self.active: dict[str, ActiveMarket] = {}
         self.draining: dict[str, DrainingMarket] = {}
+        self.emergency: dict[str, EmergencyDrainMarket] = {}
 
         self._rate_sem = asyncio.Semaphore(settings.strategy.api_rate_limit_per_sec)
 
@@ -121,6 +137,8 @@ class MarketLifecycleManager:
         trade_counts: dict[str, float] | None = None,
         whale_tokens: set[str] | None = None,
         open_position_markets: set[str] | None = None,
+        taker_counts: dict[str, int] | None = None,
+        total_counts: dict[str, int] | None = None,
     ) -> tuple[list[MarketInfo], list[str]]:
         """Re-discover, re-score, promote/demote/evict.
 
@@ -130,6 +148,8 @@ class MarketLifecycleManager:
         trade_counts = trade_counts or {}
         whale_tokens = whale_tokens or set()
         open_position_markets = open_position_markets or set()
+        taker_counts = taker_counts or {}
+        total_counts = total_counts or {}
 
         # 1. Fetch fresh universe
         fresh = await fetch_active_markets()
@@ -177,6 +197,16 @@ class MarketLifecycleManager:
                 or am.info.no_token_id in whale_tokens
             )
 
+            # Aggregate taker/total counts across both tokens
+            mkt_taker = (
+                taker_counts.get(am.info.yes_token_id, 0)
+                + taker_counts.get(am.info.no_token_id, 0)
+            )
+            mkt_total = (
+                total_counts.get(am.info.yes_token_id, 0)
+                + total_counts.get(am.info.no_token_id, 0)
+            )
+
             score = compute_score(
                 daily_volume_usd=am.info.daily_volume_usd,
                 liquidity_usd=am.info.liquidity_usd,
@@ -185,6 +215,8 @@ class MarketLifecycleManager:
                 mid_price=mid_price,
                 trades_per_minute=tpm,
                 has_whale_activity=has_whale,
+                taker_count=mkt_taker,
+                total_count=mkt_total,
             )
             am.score = score
             am.info.score = score.total
@@ -217,7 +249,10 @@ class MarketLifecycleManager:
                 am.low_score_cycles = 0
 
         # 5. Promote observation-tier markets
-        self._promote_ready(orderbook_trackers, trade_counts, whale_tokens)
+        self._promote_ready(
+            orderbook_trackers, trade_counts, whale_tokens,
+            taker_counts, total_counts,
+        )
 
         # 6. Add genuinely new markets to observation
         existing = set(self.active) | set(self.observing) | set(self.draining)
@@ -255,7 +290,7 @@ class MarketLifecycleManager:
 
     def is_tradeable(self, condition_id: str) -> bool:
         """Can the bot open a NEW position on this market?"""
-        return condition_id in self.active
+        return condition_id in self.active and condition_id not in self.emergency
 
     def is_tracked(self, condition_id: str) -> bool:
         """Is this market in any tier?"""
@@ -263,6 +298,7 @@ class MarketLifecycleManager:
             condition_id in self.active
             or condition_id in self.observing
             or condition_id in self.draining
+            or condition_id in self.emergency
         )
 
     def get_active_markets(self) -> list[MarketInfo]:
@@ -278,6 +314,8 @@ class MarketLifecycleManager:
             result.append(om.info)
         for dm in self.draining.values():
             result.append(dm.info)
+        for em in self.emergency.values():
+            result.append(em.info)
         return result
 
     def record_signal(self, condition_id: str) -> None:
@@ -319,6 +357,88 @@ class MarketLifecycleManager:
         """Move a market to the draining tier."""
         self._move_to_draining(condition_id, reason)
 
+    def emergency_drain(
+        self, condition_id: str, baseline_depth: float, reason: str = "ghost_liquidity"
+    ) -> None:
+        """Move a market to the EMERGENCY_DRAIN state.
+
+        Triggered by the Ghost Liquidity Circuit Breaker when depth drops
+        > 50% in < 2s without matching trades.  The bot immediately cancels
+        entry orders and force-exits open positions.
+        """
+        info = None
+        if condition_id in self.active:
+            info = self.active.pop(condition_id).info
+        elif condition_id in self.observing:
+            info = self.observing.pop(condition_id).info
+
+        if info:
+            self.emergency[condition_id] = EmergencyDrainMarket(
+                info=info,
+                reason=reason,
+                triggered_at=time.time(),
+                baseline_depth=baseline_depth,
+            )
+            log.warning(
+                "emergency_drain_triggered",
+                condition_id=condition_id,
+                reason=reason,
+                baseline_depth=round(baseline_depth, 2),
+            )
+
+    def check_emergency_recovery(
+        self,
+        orderbook_trackers: dict[str, OrderbookTracker],
+    ) -> list[str]:
+        """Check if any emergency-drained markets have recovered.
+
+        Recovery requires depth to be ≥ 50% of the pre-ghost baseline
+        for ``ghost_recovery_s`` continuous seconds.
+
+        Returns list of condition_ids that recovered back to active.
+        """
+        recovery_s = settings.strategy.ghost_recovery_s
+        recovered: list[str] = []
+        now = time.time()
+
+        for cid in list(self.emergency):
+            em = self.emergency[cid]
+
+            # Find the right book tracker
+            tracker = (
+                orderbook_trackers.get(em.info.yes_token_id)
+                or orderbook_trackers.get(em.info.no_token_id)
+            )
+            if not tracker or not tracker.has_data:
+                em.recovery_start = 0.0
+                continue
+
+            current_depth = tracker.current_total_depth()
+            threshold = em.baseline_depth * 0.50
+
+            if current_depth >= threshold:
+                if em.recovery_start <= 0:
+                    em.recovery_start = now
+                elif (now - em.recovery_start) >= recovery_s:
+                    # Depth has been stable for recovery_s — promote back
+                    self.active[cid] = ActiveMarket(info=em.info)
+                    del self.emergency[cid]
+                    recovered.append(cid)
+                    log.info(
+                        "emergency_drain_recovered",
+                        condition_id=cid,
+                        depth=round(current_depth, 2),
+                        baseline=round(em.baseline_depth, 2),
+                    )
+            else:
+                em.recovery_start = 0.0  # reset recovery timer
+
+        return recovered
+
+    def is_emergency_drained(self, condition_id: str) -> bool:
+        """Is this market in emergency drain?"""
+        return condition_id in self.emergency
+
     # ────────────────────────── Internals ──────────────────────────────────
 
     def _promote_ready(
@@ -326,11 +446,15 @@ class MarketLifecycleManager:
         orderbook_trackers: dict[str, OrderbookTracker] | None = None,
         trade_counts: dict[str, float] | None = None,
         whale_tokens: set[str] | None = None,
+        taker_counts: dict[str, int] | None = None,
+        total_counts: dict[str, int] | None = None,
     ) -> None:
         """Promote observed markets to active if period elapsed + score OK."""
         orderbook_trackers = orderbook_trackers or {}
         trade_counts = trade_counts or {}
         whale_tokens = whale_tokens or set()
+        taker_counts = taker_counts or {}
+        total_counts = total_counts or {}
 
         obs_period = settings.strategy.observation_period_minutes * 60
         min_score = settings.strategy.min_market_score
@@ -355,6 +479,16 @@ class MarketLifecycleManager:
                 or om.info.no_token_id in whale_tokens
             )
 
+            # Aggregate taker/total counts for MTI penalty
+            mkt_taker = (
+                taker_counts.get(om.info.yes_token_id, 0)
+                + taker_counts.get(om.info.no_token_id, 0)
+            )
+            mkt_total = (
+                total_counts.get(om.info.yes_token_id, 0)
+                + total_counts.get(om.info.no_token_id, 0)
+            )
+
             score = compute_score(
                 daily_volume_usd=om.info.daily_volume_usd,
                 liquidity_usd=om.info.liquidity_usd,
@@ -363,6 +497,8 @@ class MarketLifecycleManager:
                 mid_price=mid_price,
                 trades_per_minute=tpm,
                 has_whale_activity=has_whale,
+                taker_count=mkt_taker,
+                total_count=mkt_total,
             )
 
             if score.total >= min_score:
@@ -394,6 +530,7 @@ class MarketLifecycleManager:
         self.active.pop(condition_id, None)
         self.observing.pop(condition_id, None)
         self.draining.pop(condition_id, None)
+        self.emergency.pop(condition_id, None)
         log.info("market_evicted", condition_id=condition_id)
 
     async def _check_resolved(

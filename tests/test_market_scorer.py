@@ -174,3 +174,62 @@ class TestComputeScore:
     def test_weights_sum_to_one(self):
         from src.data.market_scorer import _WEIGHTS
         assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-6
+
+
+# ── MTI penalty (Pillar 9) ───────────────────────────────────────────────
+
+class TestMTIPenalty:
+    """Market Taker Intensity penalty tests."""
+
+    def test_no_penalty_below_threshold(self):
+        """MTI below threshold → no penalty → mti_penalty == 0."""
+        bd = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            taker_count=50,
+            total_count=100,  # MTI = 0.50, below default 0.80
+        )
+        assert bd.mti_penalty == 0.0
+
+    def test_penalty_above_threshold(self):
+        """MTI above threshold → penalty applied → lower score."""
+        bd_clean = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            taker_count=0,
+            total_count=100,
+        )
+        bd_toxic = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            taker_count=90,
+            total_count=100,  # MTI = 0.90, above 0.80
+        )
+        assert bd_toxic.mti_penalty > 0
+        assert bd_toxic.total < bd_clean.total
+
+    def test_no_trades_no_penalty(self):
+        """Zero total counts → no penalty (avoid division by zero)."""
+        bd = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            taker_count=0,
+            total_count=0,
+        )
+        assert bd.mti_penalty == 0.0
+
+    def test_mti_in_as_dict(self):
+        """MTI field appears in the score breakdown dict."""
+        bd = compute_score(daily_volume_usd=10_000, liquidity_usd=5_000)
+        d = bd.as_dict()
+        assert "mti" in d
+
+    def test_score_clamped_to_zero(self):
+        """Even with extreme penalty, score floor is 0."""
+        bd = compute_score(
+            daily_volume_usd=10,
+            liquidity_usd=10,
+            taker_count=100,
+            total_count=100,  # MTI = 1.0
+        )
+        assert bd.total >= 0.0

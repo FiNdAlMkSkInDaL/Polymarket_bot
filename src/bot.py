@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.config import settings
+from src.core.heartbeat import BookHeartbeat
 from src.core.latency_guard import LatencyGuard, LatencyState
 from src.core.logger import get_logger, setup_logging
 from src.data.market_discovery import MarketInfo, fetch_active_markets
@@ -31,6 +32,7 @@ from src.data.orderbook import OrderbookTracker
 from src.data.websocket_client import MarketWebSocket, TradeEvent
 from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
+from src.signals.adverse_selection_guard import AdverseSelectionGuard
 from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
@@ -56,6 +58,10 @@ class TradingBot:
         self.lifecycle = MarketLifecycleManager()
         self.latency_guard = LatencyGuard()
 
+        # Shared fast-kill event for adverse-selection guard
+        self._fast_kill_event = asyncio.Event()
+        self._fast_kill_event.set()  # start clear — chasers may proceed
+
         # Per-market state
         self._markets: list[MarketInfo] = []
         self._yes_aggs: dict[str, OHLCVAggregator] = {}  # keyed by yes_token_id
@@ -64,6 +70,9 @@ class TradingBot:
         self._market_map: dict[str, MarketInfo] = {}      # asset_id → MarketInfo
         self._book_trackers: dict[str, OrderbookTracker] = {}  # asset_id → tracker
         self._trade_counts: dict[str, float] = {}  # asset_id → trades/min
+        self._taker_counts: dict[str, int] = {}    # asset_id → taker-initiated trades
+        self._total_counts: dict[str, int] = {}    # asset_id → total classified trades
+        self._recent_trade_volume: dict[str, list[tuple[float, float]]] = {}  # cond_id → [(ts, size)]
 
         # Lifecycle
         self._running = False
@@ -144,6 +153,22 @@ class TradingBot:
             all_asset_ids, self._trade_queue, book_queue=self._book_queue
         )
 
+        # Adverse-selection guard (Pillar 5)
+        self._adverse_guard = AdverseSelectionGuard(
+            executor=self.executor,
+            book_trackers=self._book_trackers,
+            fast_kill_event=self._fast_kill_event,
+        )
+
+        # Book heartbeat (Pillar 8)
+        self._heartbeat = BookHeartbeat(
+            book_trackers=self._book_trackers,
+            latency_guard=self.latency_guard,
+            fast_kill_event=self._fast_kill_event,
+            executor=self.executor,
+            telegram=self.telegram,
+        )
+
         self._tasks = [
             asyncio.create_task(self._ws.start(), name="ws"),
             asyncio.create_task(self._process_trades(), name="trade_processor"),
@@ -154,6 +179,9 @@ class TradingBot:
             asyncio.create_task(self._market_refresh_loop(), name="market_refresh"),
             asyncio.create_task(self._cleanup_loop(), name="cleanup"),
             asyncio.create_task(self._tp_rescale_loop(), name="tp_rescale"),
+            asyncio.create_task(self._adverse_guard.start(), name="adverse_sel"),
+            asyncio.create_task(self._heartbeat.run(), name="heartbeat"),
+            asyncio.create_task(self._ghost_liquidity_loop(), name="ghost_liquidity"),
         ]
 
         # Handle graceful shutdown via SIGINT / SIGTERM
@@ -234,6 +262,12 @@ class TradingBot:
 
         await self.whale_monitor.stop()
 
+        # Stop new guard and heartbeat
+        if hasattr(self, "_adverse_guard"):
+            await self._adverse_guard.stop()
+        if hasattr(self, "_heartbeat"):
+            self._heartbeat.stop()
+
         for task in self._tasks:
             task.cancel()
 
@@ -296,6 +330,35 @@ class TradingBot:
             self._trade_counts[event.asset_id] = (
                 self._trade_counts.get(event.asset_id, 0.0) + 1.0
             )
+
+            # ── MTI: classify trade as taker or maker ──────────────────
+            book = self._book_trackers.get(event.asset_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                is_taker = False
+                if event.side == "buy" and snap.best_ask > 0 and event.price >= snap.best_ask:
+                    is_taker = True
+                elif event.side == "sell" and snap.best_bid > 0 and event.price <= snap.best_bid:
+                    is_taker = True
+                event.is_taker = is_taker
+
+                self._total_counts[event.asset_id] = (
+                    self._total_counts.get(event.asset_id, 0) + 1
+                )
+                if is_taker:
+                    self._taker_counts[event.asset_id] = (
+                        self._taker_counts.get(event.asset_id, 0) + 1
+                    )
+
+            # ── Ghost liquidity: record recent trade volume ────────────
+            market_info = self._market_map.get(event.asset_id)
+            if market_info:
+                cid = market_info.condition_id
+                if cid not in self._recent_trade_volume:
+                    self._recent_trade_volume[cid] = []
+                self._recent_trade_volume[cid].append(
+                    (event.timestamp, event.price * event.size)
+                )
 
             # Route to the correct aggregator (always, even when blocked)
             yes_agg = self._yes_aggs.get(event.asset_id)
@@ -405,6 +468,12 @@ class TradingBot:
         if no_book and no_book.has_data:
             book_depth = no_book.book_depth_ratio
 
+        # Fetch fee rates for this token
+        # Determine if market is fee-enabled based on category
+        fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
+        market_tags = (getattr(market, 'tags', '') or '').lower()
+        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+
         pos = await self.positions.open_position(
             sig,
             no_agg,
@@ -412,6 +481,7 @@ class TradingBot:
             event_id=market.event_id,
             days_to_resolution=days,
             book_depth_ratio=book_depth,
+            fee_enabled=fee_enabled,
         )
         if pos:
             # Launch entry chaser as a child task (Pillar 1)
@@ -490,6 +560,9 @@ class TradingBot:
                 target_size=pos.entry_size,
                 anchor_price=pos.entry_price,
                 latency_guard=self.latency_guard,
+                tp_target_price=pos.target_price,
+                fee_rate_bps=pos.entry_fee_bps,
+                fast_kill_event=self._fast_kill_event,
             )
             result = await chaser.run()
 
@@ -525,6 +598,8 @@ class TradingBot:
                 target_size=pos.entry_size,
                 anchor_price=pos.target_price,
                 latency_guard=self.latency_guard,
+                fee_rate_bps=pos.exit_fee_bps,
+                fast_kill_event=self._fast_kill_event,
             )
             result = await chaser.run()
 
@@ -589,6 +664,9 @@ class TradingBot:
                         realised_vol=sigma_30,
                         book_depth_ratio=depth_ratio,
                         whale_confluence=whale,
+                        entry_fee_bps=pos.entry_fee_bps,
+                        exit_fee_bps=pos.exit_fee_bps,
+                        desired_margin_cents=settings.strategy.desired_margin_cents,
                     )
 
                     # Tighten if calm: if current BBO is already profitable
@@ -643,6 +721,7 @@ class TradingBot:
                             side=OrderSide.SELL,
                             price=pos.target_price,
                             size=pos.entry_size,
+                            fee_rate_bps=pos.exit_fee_bps,
                         )
                         pos.exit_order = exit_order
 
@@ -659,6 +738,111 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("tp_rescale_error", error=str(exc))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Pillar 9 — Ghost Liquidity Circuit Breaker
+    # ═══════════════════════════════════════════════════════════════════════
+    def _trade_volume_in_window(self, condition_id: str, window_s: float) -> float:
+        """Sum of trade volume (USD) for *condition_id* in the last *window_s* seconds."""
+        entries = self._recent_trade_volume.get(condition_id, [])
+        if not entries:
+            return 0.0
+        cutoff = time.time() - window_s
+        return sum(vol for ts, vol in entries if ts >= cutoff)
+
+    def _prune_trade_volume(self) -> None:
+        """Remove trade-volume entries older than 5 seconds."""
+        cutoff = time.time() - 5.0
+        for cid in list(self._recent_trade_volume):
+            self._recent_trade_volume[cid] = [
+                (ts, vol) for ts, vol in self._recent_trade_volume[cid] if ts >= cutoff
+            ]
+            if not self._recent_trade_volume[cid]:
+                del self._recent_trade_volume[cid]
+
+    async def _ghost_liquidity_loop(self) -> None:
+        """Fast loop (500ms): detect ghost liquidity and trigger emergency drain.
+
+        Ghost = depth drops > 50% in < 2s WITHOUT matching trade volume.
+        """
+        interval_s = settings.strategy.ghost_check_interval_ms / 1000.0
+        ghost_window = settings.strategy.ghost_window_s
+        ghost_threshold = -settings.strategy.ghost_depth_drop_threshold  # e.g. -0.50
+
+        while self._running:
+            try:
+                self._prune_trade_volume()
+
+                # Check active markets for ghost liquidity
+                for cid in list(self.lifecycle.active):
+                    am = self.lifecycle.active.get(cid)
+                    if not am:
+                        continue
+
+                    # Check both YES and NO book trackers
+                    for token_id in (am.info.yes_token_id, am.info.no_token_id):
+                        tracker = self._book_trackers.get(token_id)
+                        if not tracker or not tracker.has_data:
+                            continue
+
+                        dv = tracker.depth_velocity(ghost_window)
+                        if dv is None:
+                            continue
+
+                        if dv <= ghost_threshold:
+                            # Check if there were trades to explain the depth drop
+                            trade_vol = self._trade_volume_in_window(cid, ghost_window)
+                            if trade_vol > 0:
+                                continue  # legitimate consumption, not ghost
+
+                            # GHOST DETECTED — emergency drain
+                            baseline = tracker.current_total_depth()
+                            # Use pre-drop depth approximation
+                            if dv < -0.99:
+                                baseline_pre = baseline * 100.0  # near-total wipe
+                            else:
+                                baseline_pre = baseline / (1.0 + dv)
+
+                            self.lifecycle.emergency_drain(cid, baseline_pre)
+
+                            # Force-exit any open positions in this market
+                            for pos in self.positions.get_open_positions():
+                                if pos.market_id == cid:
+                                    if pos.state == PositionState.EXIT_PENDING:
+                                        await self.positions.force_stop_loss(pos)
+                                    elif pos.state == PositionState.ENTRY_PENDING:
+                                        if pos.entry_order:
+                                            await self.executor.cancel_order(pos.entry_order)
+                                        pos.state = PositionState.CANCELLED
+                                        pos.exit_reason = "ghost_liquidity"
+
+                            log.warning(
+                                "ghost_liquidity_detected",
+                                condition_id=cid,
+                                depth_velocity=round(dv, 3),
+                                baseline_depth=round(baseline_pre, 2),
+                            )
+                            await self.telegram.send(
+                                f"👻 <b>Ghost Liquidity</b> detected!\n"
+                                f"Market: <code>{cid[:16]}</code>\n"
+                                f"Depth drop: {abs(dv)*100:.0f}% in {ghost_window}s\n"
+                                f"Emergency drain activated."
+                            )
+                            break  # only need one token to trigger per market
+
+                # Check emergency markets for recovery
+                recovered = self.lifecycle.check_emergency_recovery(self._book_trackers)
+                for cid in recovered:
+                    log.info("ghost_liquidity_recovered", condition_id=cid)
+                    await self.telegram.send(
+                        f"✅ <b>Ghost recovered</b>: <code>{cid[:16]}</code> back to ACTIVE"
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("ghost_liquidity_error", error=str(exc))
+            await asyncio.sleep(interval_s)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Background loops
@@ -680,7 +864,9 @@ class TradingBot:
                         if not no_agg or no_agg.current_price <= 0:
                             continue
                         unrealised_loss = (pos.entry_price - no_agg.current_price) * 100
-                        if unrealised_loss >= stop_loss_cents:
+                        # Use fee-adaptive stop-loss trigger
+                        sl_threshold = pos.sl_trigger_cents if pos.sl_trigger_cents > 0 else stop_loss_cents
+                        if unrealised_loss >= sl_threshold:
                             await self.positions.force_stop_loss(pos)
                             await self.trade_store.record(pos)
                             await self.telegram.notify_exit(
@@ -742,6 +928,12 @@ class TradingBot:
                 for aid in self._trade_counts:
                     self._trade_counts[aid] = self._trade_counts[aid] / max(decay_mins, 1)
 
+                # Decay taker/total counts (halve each refresh cycle)
+                for aid in list(self._taker_counts):
+                    self._taker_counts[aid] = max(0, self._taker_counts[aid] // 2)
+                for aid in list(self._total_counts):
+                    self._total_counts[aid] = max(0, self._total_counts[aid] // 2)
+
                 open_markets = self.positions.get_open_market_ids()
                 whale_tokens = self.whale_monitor.get_whale_tokens()
 
@@ -750,6 +942,8 @@ class TradingBot:
                     trade_counts=self._trade_counts,
                     whale_tokens=whale_tokens,
                     open_position_markets=open_markets,
+                    taker_counts=self._taker_counts,
+                    total_counts=self._total_counts,
                 )
 
                 # Evict markets

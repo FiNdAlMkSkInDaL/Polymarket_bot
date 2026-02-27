@@ -13,6 +13,7 @@ bid/ask spread, depth, and mid-price used by:
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,7 @@ class OrderbookSnapshot:
     ask_depth_usd: float = 0.0   # sum of top-5 ask levels
     mid_price: float = 0.0
     timestamp: float = 0.0
+    server_time: float = 0.0     # server-reported timestamp (epoch s)
     fresh: bool = True            # False when latency guard is BLOCKED
 
 
@@ -57,6 +59,9 @@ class OrderbookTracker:
         self._bids: list[_Level] = []  # sorted desc by price
         self._asks: list[_Level] = []  # sorted asc by price
         self._last_update: float = 0.0
+        self._last_server_time: float = 0.0
+        # Depth history ring buffer for Ghost Liquidity detection
+        self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
 
     def on_price_change(self, data: dict) -> None:
         """Process a ``price_change`` WS event.
@@ -98,6 +103,14 @@ class OrderbookTracker:
                 self._update_side(self._asks, price, size, descending=False)
 
         self._last_update = time.time()
+        # Extract server timestamp if present
+        srv = data.get("timestamp") or data.get("server_timestamp") or data.get("ts")
+        if srv is not None:
+            try:
+                self._last_server_time = float(srv)
+            except (TypeError, ValueError):
+                pass
+        self._record_depth()
 
     def on_book_snapshot(self, data: dict) -> None:
         """Process a full ``book`` snapshot (replaces current state)."""
@@ -121,6 +134,13 @@ class OrderbookTracker:
         self._asks.sort(key=lambda l: l.price)
 
         self._last_update = time.time()
+        srv = data.get("timestamp") or data.get("server_timestamp") or data.get("ts")
+        if srv is not None:
+            try:
+                self._last_server_time = float(srv)
+            except (TypeError, ValueError):
+                pass
+        self._record_depth()
 
     def snapshot(self, *, fresh: bool = True) -> OrderbookSnapshot:
         """Return current top-of-book summary.
@@ -148,6 +168,7 @@ class OrderbookTracker:
             ask_depth_usd=round(ask_depth, 2),
             mid_price=round(mid, 4),
             timestamp=self._last_update,
+            server_time=self._last_server_time,
             fresh=fresh,
         )
 
@@ -179,6 +200,47 @@ class OrderbookTracker:
     @property
     def has_data(self) -> bool:
         return self._last_update > 0
+
+    # ── depth tracking for Ghost Liquidity detection ─────────────────────
+    def _record_depth(self) -> None:
+        """Append current total depth to the ring buffer."""
+        depth = self.current_total_depth()
+        self._depth_history.append((time.time(), depth))
+
+    def current_total_depth(self) -> float:
+        """Return combined top-5 bid + ask depth in USD."""
+        bid_d = sum(l.price * l.size for l in self._bids[:5])
+        ask_d = sum(l.price * l.size for l in self._asks[:5])
+        return round(bid_d + ask_d, 2)
+
+    def depth_velocity(self, window_s: float = 2.0) -> float | None:
+        """Compute the fractional depth change over *window_s* seconds.
+
+        Returns
+        -------
+        float | None
+            ``(D_now - D_past) / D_past`` if sufficient history, else ``None``.
+            A value of -0.50 means depth dropped 50%.
+        """
+        if len(self._depth_history) < 2:
+            return None
+
+        now = time.time()
+        target_time = now - window_s
+
+        # Find the sample closest to target_time
+        past_depth: float | None = None
+        for ts, depth in self._depth_history:
+            if ts <= target_time:
+                past_depth = depth
+            else:
+                break
+
+        if past_depth is None or past_depth <= 0:
+            return None
+
+        current_depth = self.current_total_depth()
+        return (current_depth - past_depth) / past_depth
 
     # ── internal ───────────────────────────────────────────────────────
     def _update_side(

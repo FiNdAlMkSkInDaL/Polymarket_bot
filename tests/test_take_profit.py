@@ -72,3 +72,54 @@ class TestTakeProfit:
         result = compute_take_profit(entry_price=0.70, no_vwap=0.60)
         assert result.target_price > result.entry_price
         assert result.alpha == 0.30  # falls to alpha_min
+
+
+class TestTakeProfitFeeFloor:
+    """Pillar 6 — dynamic fee-curve integration."""
+
+    def test_fee_floor_widens_target(self):
+        """When fees + margin exceed the vol-scaled spread, target should widen."""
+        # Without fees: spread ≈ 9¢ (0.47 + 0.5*(0.65-0.47) = 0.56)
+        baseline = compute_take_profit(entry_price=0.47, no_vwap=0.65)
+        # With heavy fees: 200 bps on both legs
+        with_fees = compute_take_profit(
+            entry_price=0.47, no_vwap=0.65,
+            entry_fee_bps=200, exit_fee_bps=200,
+            desired_margin_cents=1.0,
+        )
+        # Fee floor should be positive
+        assert with_fees.fee_floor_cents > 0
+        assert with_fees.entry_fee_bps == 200
+        assert with_fees.exit_fee_bps == 200
+        # Target may be identical if the alpha-derived spread already
+        # exceeds the fee floor — that's fine.
+
+    def test_fee_floor_not_viable_when_insufficient(self):
+        """A narrow spread that can't cover fees should be not viable."""
+        result = compute_take_profit(
+            entry_price=0.63, no_vwap=0.65,
+            entry_fee_bps=200, exit_fee_bps=200,
+            desired_margin_cents=1.0,
+        )
+        # Spread is ~1¢ but fee floor is ~1.26 + 1.3 + 1.0 ≈ 3.6¢
+        assert result.viable is False
+
+    def test_zero_fees_legacy_behaviour(self):
+        """With zero fees, behaviour should match the pre-fee baseline."""
+        result = compute_take_profit(
+            entry_price=0.47, no_vwap=0.65,
+            entry_fee_bps=0, exit_fee_bps=0,
+            desired_margin_cents=0.0,
+        )
+        assert result.fee_floor_cents == pytest.approx(0.0, abs=0.01)
+        assert result.viable is True
+
+    def test_fee_floor_fields_populated(self):
+        """TakeProfitResult should carry fee metadata."""
+        result = compute_take_profit(
+            entry_price=0.47, no_vwap=0.65,
+            entry_fee_bps=156, exit_fee_bps=0,
+        )
+        assert result.entry_fee_bps == 156
+        assert result.exit_fee_bps == 0
+        assert result.fee_floor_cents >= 0

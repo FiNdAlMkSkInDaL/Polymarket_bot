@@ -120,6 +120,50 @@ class StrategyParams:
     latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
     latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
+    # ── Pillar 5: Anti-Adverse-Selection ("Fast-Kill") ─────────────────────
+    adverse_sel_enabled: bool = _env_bool("ADVERSE_SEL_ENABLED", True)
+    adverse_sel_tick_threshold: int = _env_int("ADVERSE_SEL_TICK_THRESHOLD", 5000)
+    adverse_sel_book_stale_ms: int = _env_int("ADVERSE_SEL_BOOK_STALE_MS", 30000)
+    adverse_sel_cooldown_s: float = _env_float("ADVERSE_SEL_COOLDOWN_S", 2.0)
+    adverse_sel_poll_ms: int = _env_int("ADVERSE_SEL_POLL_MS", 50)
+    adverse_sel_polygon_head_lag_ms: int = _env_int("ADVERSE_SEL_POLYGON_HEAD_LAG_MS", 3000)
+    binance_ws_url: str = _env(
+        "BINANCE_WS_URL", "wss://stream.binance.com:9443/ws/btcusdc@trade"
+    )
+
+    # ── Pillar 6: Dynamic Fee-Curve Integration ────────────────────────────
+    fee_cache_ttl_s: int = _env_int("FEE_CACHE_TTL_S", 300)
+    fee_default_bps: int = _env_int("FEE_DEFAULT_BPS", 200)
+    desired_margin_cents: float = _env_float("DESIRED_MARGIN_CENTS", 1.0)
+
+    # ── Pillar 7: Hybrid-Aggressive Chaser Escalation ──────────────────────
+    chaser_max_rejections: int = _env_int("CHASER_MAX_REJECTIONS", 3)
+    chaser_escalation_ticks: int = _env_int("CHASER_ESCALATION_TICKS", 1)
+
+    # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
+    heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
+    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 1500)
+    ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 5.0)
+
+    # ── Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) ───────────
+    # MTI — Maker/Taker Imbalance penalty
+    mti_threshold: float = _env_float("MTI_THRESHOLD", 0.80)
+    mti_penalty_points: float = _env_float("MTI_PENALTY_POINTS", 40.0)
+
+    # Fee-adaptive stop-loss
+    fee_max_pct: float = _env_float("FEE_MAX_PCT", 1.56)  # peak fee %
+    fee_enabled_categories: str = _env("FEE_ENABLED_CATEGORIES", "crypto,sports")
+
+    # Ghost Liquidity Circuit Breaker
+    ghost_depth_drop_threshold: float = _env_float("GHOST_DEPTH_DROP_THRESHOLD", 0.50)
+    ghost_window_s: float = _env_float("GHOST_WINDOW_S", 2.0)
+    ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 30.0)
+    ghost_check_interval_ms: int = _env_int("GHOST_CHECK_INTERVAL_MS", 500)
+
+    # Whale cluster detection
+    whale_cluster_lookback_blocks: int = _env_int("WHALE_CLUSTER_LOOKBACK_BLOCKS", 10000)
+    whale_cluster_refresh_hours: float = _env_float("WHALE_CLUSTER_REFRESH_HOURS", 6.0)
+
 
 @dataclass(frozen=True)
 class Settings:

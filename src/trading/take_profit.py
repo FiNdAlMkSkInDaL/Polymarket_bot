@@ -27,7 +27,10 @@ class TakeProfitResult:
     target_price: float
     alpha: float
     spread_cents: float     # target_price - entry_price  (in cents)
-    viable: bool            # False if spread < min_spread_cents
+    viable: bool            # False if spread < fee-adjusted minimum
+    fee_floor_cents: float = 0.0  # entry_fee + exit_fee + margin (cents)
+    entry_fee_bps: int = 0
+    exit_fee_bps: int = 0
 
 
 def compute_take_profit(
@@ -38,6 +41,9 @@ def compute_take_profit(
     book_depth_ratio: float = 1.0,
     whale_confluence: bool = False,
     days_to_resolution: int = 30,
+    entry_fee_bps: int = 0,
+    exit_fee_bps: int = 0,
+    desired_margin_cents: float | None = None,
 ) -> TakeProfitResult:
     """Calculate the dynamic take-profit target.
 
@@ -56,6 +62,13 @@ def compute_take_profit(
         If True, whale confirmation pushes α higher.
     days_to_resolution:
         Days until market resolves.  Closer → lower α.
+    entry_fee_bps:
+        Taker fee on entry leg in basis points (e.g. 156).
+    exit_fee_bps:
+        Taker fee on exit leg in basis points.  Use 0 for maker exit.
+    desired_margin_cents:
+        Minimum profit margin in cents above fee costs.  Defaults to
+        ``settings.strategy.desired_margin_cents``.
 
     Returns
     -------
@@ -100,7 +113,27 @@ def compute_take_profit(
 
     spread_cents = (target - entry_price) * 100.0
 
-    viable = spread_cents >= strat.min_spread_cents
+    # ── Fee-floor enforcement ──────────────────────────────────────────────
+    margin = (
+        desired_margin_cents
+        if desired_margin_cents is not None
+        else strat.desired_margin_cents
+    )
+    entry_fee_cents = entry_price * entry_fee_bps / 10_000 * 100
+    exit_fee_cents = target * exit_fee_bps / 10_000 * 100
+    fee_floor_cents = round(entry_fee_cents + exit_fee_cents + margin, 4)
+
+    # Widen the target if the vol-scaled spread is below the fee floor
+    if spread_cents < fee_floor_cents:
+        # Solve: target' = entry + fee_floor/100, then re-check exit fee
+        # One Newton step is sufficient for convergence.
+        target_adj = entry_price + fee_floor_cents / 100.0
+        exit_fee_adj = target_adj * exit_fee_bps / 10_000 * 100
+        fee_floor_cents = round(entry_fee_cents + exit_fee_adj + margin, 4)
+        target = entry_price + fee_floor_cents / 100.0
+        spread_cents = fee_floor_cents
+
+    viable = spread_cents >= max(strat.min_spread_cents, fee_floor_cents)
 
     result = TakeProfitResult(
         entry_price=round(entry_price, 4),
@@ -108,6 +141,9 @@ def compute_take_profit(
         alpha=round(alpha, 4),
         spread_cents=round(spread_cents, 2),
         viable=viable,
+        fee_floor_cents=round(fee_floor_cents, 2),
+        entry_fee_bps=entry_fee_bps,
+        exit_fee_bps=exit_fee_bps,
     )
 
     log.info(

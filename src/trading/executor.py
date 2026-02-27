@@ -105,6 +105,7 @@ class OrderExecutor:
         size: float,
         *,
         post_only: bool = False,
+        fee_rate_bps: int = 0,
     ) -> Order:
         """Place a GTC limit order.
 
@@ -145,6 +146,9 @@ class OrderExecutor:
                     side=BUY if side == OrderSide.BUY else SELL,
                     token_id=asset_id,
                 )
+                # Attach fee rate to the signed payload when taking liquidity
+                if fee_rate_bps > 0:
+                    order_args.fee_rate_bps = fee_rate_bps
                 resp = clob.create_and_post_order(order_args)
                 clob_id = ""
                 if isinstance(resp, dict):
@@ -255,6 +259,14 @@ class OrderExecutor:
         return filled
 
     # ── Query helpers ───────────────────────────────────────────────────────
+    @property
+    def open_order_count(self) -> int:
+        """Number of currently resting (live or partially filled) orders."""
+        return sum(
+            1 for o in self._orders.values()
+            if o.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        )
+
     def get_open_orders(self, market_id: str | None = None) -> list[Order]:
         return [
             o

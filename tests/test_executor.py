@@ -100,3 +100,38 @@ class TestOrderExecutorPaper:
         assert len(executor.get_open_orders("MKT_A")) == 1
         assert len(executor.get_open_orders("MKT_B")) == 1
         assert len(executor.get_open_orders()) == 2
+
+    @pytest.mark.asyncio
+    async def test_place_with_fee_rate_bps(self, executor):
+        """fee_rate_bps kwarg should be accepted without error."""
+        order = await executor.place_limit_order(
+            market_id="MKT_1",
+            asset_id="NO_TOKEN",
+            side=OrderSide.BUY,
+            price=0.45,
+            size=10.0,
+            fee_rate_bps=156,
+        )
+        assert order.status == OrderStatus.LIVE
+        assert order.price == 0.45
+
+
+class TestLatencyGuardForceBlock:
+    def test_force_block_sets_blocked_state(self):
+        from src.core.latency_guard import LatencyGuard, LatencyState
+
+        guard = LatencyGuard(block_ms=500, warn_ms=200, recovery_count=3)
+        assert guard.state == LatencyState.HEALTHY
+
+        guard.force_block("test_reason")
+        assert guard.state == LatencyState.BLOCKED
+        assert guard.is_blocked() is True
+
+    def test_force_block_resets_consecutive(self):
+        from src.core.latency_guard import LatencyGuard, LatencyState
+
+        guard = LatencyGuard(block_ms=500, warn_ms=200, recovery_count=3)
+        guard._consecutive_healthy = 5
+
+        guard.force_block("test")
+        assert guard._consecutive_healthy == 0

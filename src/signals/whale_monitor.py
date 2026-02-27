@@ -101,6 +101,10 @@ class WhaleMonitor:
         self._zscore_fn = zscore_fn
         self._zscore_threshold = zscore_threshold or settings.strategy.zscore_threshold
 
+        # ── Wallet cluster detection (funded-from-same-CEX grouping) ───────
+        self._clusters: dict[str, str] = {}  # wallet → cluster_id (funder)
+        self._cluster_map_built_at: float = 0.0
+
     def set_market_map(self, market_map: dict[str, tuple[str, str]]) -> None:
         """Register token ID → (condition_id, side) mapping.
 
@@ -145,10 +149,15 @@ class WhaleMonitor:
         """Begin background polling loop."""
         self._running = True
         log.info("whale_monitor_started", wallets=len(self.wallets))
+
+        # Build initial cluster map
+        await self._maybe_rebuild_clusters()
+
         while self._running:
             try:
                 self._update_interval()
                 await self._poll()
+                await self._maybe_rebuild_clusters()
             except Exception as exc:
                 log.warning("whale_poll_error", error=str(exc))
             await asyncio.sleep(self._current_interval)
@@ -177,7 +186,11 @@ class WhaleMonitor:
         lookback_seconds: int | None = None,
         min_wallets: int = 2,
     ) -> bool:
-        """Return True if ≥ *min_wallets* distinct whales bought the NO token."""
+        """Return True if ≥ *min_wallets* distinct **entities** bought the NO token.
+
+        Uses wallet-cluster deduplication: wallets funded from the same CEX
+        deposit address are treated as a single entity.
+        """
         lookback = lookback_seconds or settings.whale_lookback_seconds
         cutoff = time.time() - lookback
         wallets = {
@@ -187,7 +200,9 @@ class WhaleMonitor:
             and a.direction == "buy_no"
             and a.timestamp >= cutoff
         }
-        return len(wallets) >= min_wallets
+        # Deduplicate by cluster
+        entities = {self._clusters.get(w, w) for w in wallets}
+        return len(entities) >= min_wallets
 
     def has_whale_sells(
         self,
@@ -212,6 +227,26 @@ class WhaleMonitor:
             for a in self._recent
             if a.timestamp >= cutoff
         }
+
+    def get_unique_entity_count(
+        self,
+        token_id: str,
+        lookback_seconds: int | None = None,
+    ) -> int:
+        """Return the number of unique whale entities active on *token_id*.
+
+        Entities are determined by wallet-cluster deduplication.
+        """
+        lookback = lookback_seconds or settings.whale_lookback_seconds
+        cutoff = time.time() - lookback
+        wallets = {
+            a.wallet
+            for a in self._recent
+            if a.market_token_id.lower() == token_id.lower()
+            and a.timestamp >= cutoff
+        }
+        entities = {self._clusters.get(w, w) for w in wallets}
+        return len(entities)
 
     @property
     def recent_activity(self) -> list[WhaleActivity]:
@@ -308,3 +343,91 @@ class WhaleMonitor:
 
         except (ValueError, TypeError, KeyError) as exc:
             log.debug("whale_tx_parse_error", error=str(exc))
+
+    # ── Wallet cluster detection ───────────────────────────────────────────
+
+    async def _maybe_rebuild_clusters(self) -> None:
+        """Rebuild the wallet cluster map if stale (every N hours)."""
+        refresh_s = settings.strategy.whale_cluster_refresh_hours * 3600.0
+        if (time.time() - self._cluster_map_built_at) < refresh_s:
+            return
+        await self._build_cluster_map()
+
+    async def _build_cluster_map(self) -> None:
+        """Query Polygonscan for the first funder of each whale wallet.
+
+        Wallets funded from the same address are grouped into a cluster.
+        Chain funding (A → B → C) is resolved transitively.
+        """
+        if not settings.polygonscan_api_key:
+            self._cluster_map_built_at = time.time()
+            return
+
+        api_url = "https://api.polygonscan.com/api"
+        funder_of: dict[str, str] = {}  # wallet → first funder address
+        wallet_set = set(self.wallets)
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            for wallet in self.wallets:
+                try:
+                    params = {
+                        "module": "account",
+                        "action": "txlist",
+                        "address": wallet,
+                        "startblock": 0,
+                        "endblock": 99999999,
+                        "sort": "asc",
+                        "page": 1,
+                        "offset": 20,
+                        "apikey": settings.polygonscan_api_key,
+                    }
+                    resp = await client.get(api_url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    txs = data.get("result", [])
+                    if not isinstance(txs, list):
+                        continue
+
+                    # Find the first incoming ETH/MATIC transfer
+                    for tx in txs:
+                        to_addr = tx.get("to", "").lower()
+                        from_addr = tx.get("from", "").lower()
+                        value = int(tx.get("value", "0"))
+                        if to_addr == wallet and value > 0 and from_addr:
+                            funder_of[wallet] = from_addr
+                            break
+
+                except Exception as exc:
+                    log.debug(
+                        "cluster_lookup_error",
+                        wallet=wallet[:10],
+                        error=str(exc),
+                    )
+                # Rate-limit: small delay between lookups
+                await asyncio.sleep(0.25)
+
+        # Resolve transitive chains:  if funder is also a tracked wallet,
+        # walk up the chain until we find a non-tracked address.
+        def _resolve(w: str, depth: int = 0) -> str:
+            if depth > 10:  # prevent infinite loops
+                return w
+            funder = funder_of.get(w)
+            if not funder:
+                return w
+            if funder in wallet_set:
+                return _resolve(funder, depth + 1)
+            return funder
+
+        self._clusters = {w: _resolve(w) for w in self.wallets}
+        self._cluster_map_built_at = time.time()
+
+        # Log cluster summary
+        from collections import Counter
+        cluster_sizes = Counter(self._clusters.values())
+        multi = {cid: cnt for cid, cnt in cluster_sizes.items() if cnt > 1}
+        log.info(
+            "whale_clusters_built",
+            total_wallets=len(self.wallets),
+            unique_entities=len(cluster_sizes),
+            multi_wallet_clusters=len(multi),
+        )

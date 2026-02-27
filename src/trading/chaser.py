@@ -13,6 +13,11 @@ The chaser respects:
     within the CLOB's API rate ceiling.
   - The ``LatencyGuard`` state — pauses requoting (but does NOT cancel
     the resting order) when data is stale.
+  - **Escalation**: After *N* consecutive POST_ONLY rejections, the
+    chaser may cross the spread with a marketable limit order (subject
+    to an alpha-sufficiency pre-check).
+  - **Fast-kill event**: An ``asyncio.Event`` shared with the adverse-
+    selection guard — when cleared, all placement is paused.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ class ChaserState(str, Enum):
     QUOTING = "QUOTING"
     CANCELLING = "CANCELLING"
     REQUOTING = "REQUOTING"
+    ESCALATING = "ESCALATING"
     FILLED = "FILLED"
     ABANDONED = "ABANDONED"
 
@@ -70,6 +76,17 @@ class OrderChaser:
         the BBO before abandoning.
     chase_interval_ms:
         Minimum milliseconds between requote iterations.
+    tp_target_price:
+        Expected take-profit exit price — used by the escalation alpha-
+        sufficiency check.  Required for BUY-side escalation.
+    fee_rate_bps:
+        Taker fee for the token — used when escalating to a marketable
+        limit order and for the alpha check.
+    fast_kill_event:
+        Shared ``asyncio.Event`` — when *cleared*, all order placement
+        is paused until the event is set again.
+    max_post_only_rejections:
+        Number of consecutive POST_ONLY rejections before escalating.
     """
 
     def __init__(
@@ -85,6 +102,10 @@ class OrderChaser:
         latency_guard: LatencyGuard | None = None,
         max_chase_depth_cents: float | None = None,
         chase_interval_ms: int | None = None,
+        tp_target_price: float | None = None,
+        fee_rate_bps: int = 0,
+        fast_kill_event: asyncio.Event | None = None,
+        max_post_only_rejections: int | None = None,
     ):
         strat = settings.strategy
         self.executor = executor
@@ -107,6 +128,19 @@ class OrderChaser:
         self._interval_s = max(configured, min_interval) / 1000.0
 
         self._post_only = strat.post_only_enabled
+
+        # Escalation parameters (Pillar 7)
+        self._tp_target = tp_target_price
+        self._fee_bps = fee_rate_bps
+        self._fast_kill = fast_kill_event
+        self._max_rejections = (
+            max_post_only_rejections
+            if max_post_only_rejections is not None
+            else strat.chaser_max_rejections
+        )
+        self._escalation_ticks = strat.chaser_escalation_ticks
+        self._desired_margin = strat.desired_margin_cents
+        self._rejection_count: int = 0
 
         # State
         self.state = ChaserState.QUOTING
@@ -137,6 +171,9 @@ class OrderChaser:
 
     async def _chase_loop(self) -> Order | None:
         """Main requote loop."""
+        # Wait for fast-kill clearance before initial placement
+        await self._wait_fast_kill()
+
         # Place the initial order
         initial_price = self._optimal_quote()
         if initial_price is None:
@@ -152,6 +189,13 @@ class OrderChaser:
 
         while self.state not in (ChaserState.FILLED, ChaserState.ABANDONED):
             await asyncio.sleep(self._interval_s)
+
+            # ── Fast-kill gate ────────────────────────────────────
+            if self._fast_kill and not self._fast_kill.is_set():
+                # Adverse-selection guard has fired — pause all placement
+                # but keep resting order (it may already be cancelled by
+                # the guard's cancel_all)
+                continue
 
             # ── Latency gate ──────────────────────────────────────
             if self._latency_guard and self._latency_guard.is_blocked():
@@ -195,12 +239,25 @@ class OrderChaser:
             # Yield to let cancel propagate
             await asyncio.sleep(0)
 
+            # Wait for fast-kill clearance before re-quoting
+            await self._wait_fast_kill()
+
             self.state = ChaserState.REQUOTING
             await self._place(optimal)
 
         return self.resting_order
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    async def _wait_fast_kill(self, timeout: float = 0.1) -> None:
+        """Block until the fast-kill event is set (chasers may proceed)."""
+        if self._fast_kill is None:
+            return
+        try:
+            await asyncio.wait_for(self._fast_kill.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # Will be retried on next loop iteration
+            pass
 
     def _optimal_quote(self) -> float | None:
         """The price at which to rest the order (top-of-book, maker side)."""
@@ -234,17 +291,28 @@ class OrderChaser:
 
         # Handle POST_ONLY rejection
         if order.rejection_reason == "would_cross":
+            self._rejection_count += 1
             log.info(
                 "chaser_post_only_rejected",
                 side=self.side.value,
                 price=price,
                 asset=self.asset_id[:16],
+                rejection_count=self._rejection_count,
+                max_rejections=self._max_rejections,
             )
+
+            # ── Escalation check (Pillar 7) ───────────────────────
+            if self._rejection_count >= self._max_rejections:
+                await self._escalate()
+                return
+
             # Will be retried on next iteration at a new price
             self.resting_order = None
             self.state = ChaserState.QUOTING
             return
 
+        # Successful placement — reset rejection counter
+        self._rejection_count = 0
         self.resting_order = order
         self.state = ChaserState.QUOTING
         log.debug(
@@ -254,6 +322,98 @@ class OrderChaser:
             remaining=self._remaining,
             order_id=order.order_id,
         )
+
+    async def _escalate(self) -> None:
+        """Transition to ESCALATING: cross the spread with a marketable
+        limit order after N consecutive POST_ONLY rejections.
+
+        Before crossing, runs an alpha-sufficiency check to ensure the
+        full round-trip cost (including taker fee) still beats the
+        minimum profit margin.
+        """
+        self.state = ChaserState.ESCALATING
+        snap = self.book.snapshot()
+        tick = 0.01 * self._escalation_ticks
+
+        if self.side == OrderSide.BUY:
+            cross_price = (snap.best_ask + tick) if snap.best_ask > 0 else None
+        else:
+            cross_price = (snap.best_bid - tick) if snap.best_bid > 0 else None
+
+        if cross_price is None or cross_price <= 0:
+            log.warning("escalation_no_bbo", side=self.side.value)
+            self.state = ChaserState.ABANDONED
+            return
+
+        # ── Alpha-sufficiency check ───────────────────────────────
+        if not self._alpha_check(cross_price):
+            log.info(
+                "escalation_alpha_fail",
+                side=self.side.value,
+                cross_price=round(cross_price, 4),
+                tp_target=self._tp_target,
+                fee_bps=self._fee_bps,
+            )
+            self.state = ChaserState.ABANDONED
+            return
+
+        # Place marketable limit (post_only=False, include fee)
+        log.info(
+            "chaser_escalating",
+            side=self.side.value,
+            cross_price=round(cross_price, 4),
+            fee_bps=self._fee_bps,
+        )
+        order = await self.executor.place_limit_order(
+            market_id=self.market_id,
+            asset_id=self.asset_id,
+            side=self.side,
+            price=round(cross_price, 2),
+            size=round(self._remaining, 2),
+            post_only=False,
+            fee_rate_bps=self._fee_bps,
+        )
+
+        self._rejection_count = 0
+
+        if order.status in (OrderStatus.FILLED,):
+            self._on_filled(order)
+        elif order.status in (OrderStatus.CANCELLED,):
+            log.warning("escalation_order_failed", reason=order.rejection_reason)
+            self.state = ChaserState.ABANDONED
+        else:
+            self.resting_order = order
+            self.state = ChaserState.QUOTING
+
+    def _alpha_check(self, cross_price: float) -> bool:
+        """Verify the trade still has positive expected alpha after fees.
+
+        For BUY entries:
+            net_spread = (tp_target - cross_price) * 100
+                         - entry_fee_cents - exit_fee_cents
+
+        For SELL exits:
+            net_spread = (cross_price - entry_anchor) * 100
+                         - taker_fee_cents
+
+        Must exceed ``desired_margin_cents``.
+        """
+        if self.side == OrderSide.BUY:
+            if self._tp_target is None:
+                # No TP target supplied — allow escalation (caller's risk)
+                return True
+            gross_spread = (self._tp_target - cross_price) * 100
+            entry_fee = cross_price * self._fee_bps / 10_000 * 100
+            # Assume maker exit (0 fee) as the optimistic case
+            exit_fee = 0.0
+            net = gross_spread - entry_fee - exit_fee
+        else:
+            # SELL side: anchor is the entry price we're trying to sell above
+            gross_spread = (cross_price - self.anchor_price) * 100
+            taker_fee = cross_price * self._fee_bps / 10_000 * 100
+            net = gross_spread - taker_fee
+
+        return net >= self._desired_margin
 
     async def _cancel_resting(self) -> None:
         """Cancel the current resting order (if any)."""

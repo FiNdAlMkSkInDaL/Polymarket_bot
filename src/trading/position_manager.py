@@ -27,6 +27,7 @@ from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
+from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
 from src.trading.sizer import SizingResult, compute_depth_aware_size
 from src.trading.take_profit import TakeProfitResult, compute_take_profit
 
@@ -72,12 +73,20 @@ class Position:
     # Sizing metadata
     sizing: SizingResult | None = None
 
+    # Fee tracking (basis points)
+    entry_fee_bps: int = 0
+    exit_fee_bps: int = 0
+
     # Chaser task handles (for cancellation on timeout / shutdown)
     entry_chaser_task: asyncio.Task | None = field(default=None, repr=False)
     exit_chaser_task: asyncio.Task | None = field(default=None, repr=False)
 
     # PnL
     pnl_cents: float = 0.0
+
+    # Fee tracking
+    fee_enabled: bool = True
+    sl_trigger_cents: float = 0.0     # fee-adaptive stop-loss threshold
 
     created_at: float = field(default_factory=time.time)
 
@@ -138,6 +147,7 @@ class PositionManager:
         event_id: str = "",
         days_to_resolution: int = 30,
         book_depth_ratio: float = 1.0,
+        fee_enabled: bool = True,
     ) -> Position | None:
         """Attempt to open a mean-reversion position on a panic signal.
 
@@ -147,6 +157,9 @@ class PositionManager:
             Live L2 order book for the NO token.  Used by the depth-aware
             sizer to cap order size.  Falls back to fixed sizing with
             a 50% haircut if ``None``.
+        fee_enabled:
+            Whether this market category charges dynamic fees (crypto/sports).
+            Used to compute the fee-adaptive stop-loss and net PnL.
         """
         strat = settings.strategy
 
@@ -278,6 +291,13 @@ class PositionManager:
         actual_depth_ratio = book_depth_ratio
         if no_book is not None and no_book.has_data:
             actual_depth_ratio = no_book.book_depth_ratio
+
+        # Derive fee bps from the dynamic fee curve for TP computation
+        from src.trading.fees import get_fee_rate
+        entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
+        entry_fee_bps = round(entry_fee_frac * 10000)
+        exit_fee_bps = 0  # maker exit → no taker fee
+
         tp = compute_take_profit(
             entry_price=entry_price,
             no_vwap=no_aggregator.rolling_vwap,
@@ -285,6 +305,8 @@ class PositionManager:
             whale_confluence=signal.whale_confluence,
             book_depth_ratio=actual_depth_ratio,
             days_to_resolution=days_to_resolution,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=exit_fee_bps,
         )
         if not tp.viable:
             log.info(
@@ -297,6 +319,13 @@ class PositionManager:
         # Place entry order
         pos_id = f"POS-{self._next_id}"
         self._next_id += 1
+
+        # Compute fee-adaptive stop-loss
+        sl_trigger = compute_adaptive_stop_loss_cents(
+            sl_base_cents=strat.stop_loss_cents,
+            entry_price=entry_price,
+            fee_enabled=fee_enabled,
+        )
 
         order = await self.executor.place_limit_order(
             market_id=signal.market_id,
@@ -320,6 +349,8 @@ class PositionManager:
             tp_result=tp,
             target_price=tp.target_price,
             sizing=sizing,
+            fee_enabled=fee_enabled,
+            sl_trigger_cents=sl_trigger,
         )
 
         self._positions[pos.id] = pos
@@ -333,6 +364,8 @@ class PositionManager:
             size=entry_size,
             target=tp.target_price,
             alpha=tp.alpha,
+            sl_trigger=sl_trigger,
+            fee_enabled=fee_enabled,
         )
 
         return pos
@@ -371,7 +404,14 @@ class PositionManager:
         )
         pos.exit_time = time.time()
         pos.exit_reason = reason
-        pos.pnl_cents = round((pos.exit_price - pos.entry_price) * pos.entry_size * 100, 2)
+
+        # Net-of-fee PnL using dynamic fee curve
+        pos.pnl_cents = compute_net_pnl_cents(
+            entry_price=pos.entry_price,
+            exit_price=pos.exit_price,
+            size=pos.entry_size,
+            fee_enabled=pos.fee_enabled,
+        )
 
         # Track daily PnL and drawdown
         self._daily_pnl_cents += pos.pnl_cents

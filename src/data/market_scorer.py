@@ -42,6 +42,7 @@ class ScoreBreakdown:
     price_range: float = 0.0
     trade_freq: float = 0.0
     whale_interest: float = 0.0
+    mti_penalty: float = 0.0
     total: float = 0.0
 
     def as_dict(self) -> dict:
@@ -53,6 +54,7 @@ class ScoreBreakdown:
             "prng": round(self.price_range, 1),
             "freq": round(self.trade_freq, 1),
             "whale": round(self.whale_interest, 1),
+            "mti": round(self.mti_penalty, 1),
             "total": round(self.total, 1),
         }
 
@@ -132,6 +134,23 @@ def score_whale_interest(has_whale_activity: bool) -> float:
     return 100.0 if has_whale_activity else 0.0
 
 
+def compute_mti_penalty(taker_count: int, total_count: int) -> float:
+    """Compute the Maker/Taker Imbalance penalty.
+
+    If > threshold% of trades are taker-initiated (aggressive), the market
+    is penalised — high taker ratios indicate toxic/informed flow.
+
+    Returns the penalty in points (0 or ``mti_penalty_points``).
+    """
+    if total_count <= 0:
+        return 0.0
+    mti = taker_count / total_count
+    threshold = settings.strategy.mti_threshold
+    if mti > threshold:
+        return settings.strategy.mti_penalty_points
+    return 0.0
+
+
 def compute_score(
     *,
     daily_volume_usd: float = 0.0,
@@ -141,11 +160,17 @@ def compute_score(
     mid_price: float = 0.5,
     trades_per_minute: float = 0.0,
     has_whale_activity: bool = False,
+    taker_count: int = 0,
+    total_count: int = 0,
 ) -> ScoreBreakdown:
     """Compute the composite 0-100 quality score for a market.
 
     Returns a ScoreBreakdown with individual component scores and total.
+    The MTI (Maker/Taker Imbalance) penalty is subtracted from the
+    weighted sum when taker flow exceeds the configured threshold.
     """
+    penalty = compute_mti_penalty(taker_count, total_count)
+
     bd = ScoreBreakdown(
         volume=score_volume(daily_volume_usd),
         liquidity=score_liquidity(liquidity_usd),
@@ -154,9 +179,10 @@ def compute_score(
         price_range=score_price_range(mid_price),
         trade_freq=score_trade_frequency(trades_per_minute),
         whale_interest=score_whale_interest(has_whale_activity),
+        mti_penalty=penalty,
     )
 
-    bd.total = (
+    weighted_sum = (
         bd.volume * _WEIGHTS["volume"]
         + bd.liquidity * _WEIGHTS["liquidity"]
         + bd.spread * _WEIGHTS["spread"]
@@ -165,5 +191,7 @@ def compute_score(
         + bd.trade_freq * _WEIGHTS["trade_freq"]
         + bd.whale_interest * _WEIGHTS["whale_interest"]
     )
+
+    bd.total = max(0.0, min(100.0, weighted_sum - penalty))
 
     return bd

@@ -58,6 +58,7 @@ class MarketInfo:
     liquidity_usd: float = 0.0
     score: float = 0.0
     accepting_orders: bool = True
+    tags: str = ""
 
 
 async def fetch_active_markets(
@@ -535,6 +536,7 @@ def _parse_market(
             event_id=str(raw.get("event_id", "")),
             liquidity_usd=float(raw.get("liquidity", 0)),
             accepting_orders=bool(raw.get("acceptingOrders", True)),
+            tags=raw.get("tags", raw.get("category", "")),
         ), None
 
     except (KeyError, TypeError, ValueError) as exc:

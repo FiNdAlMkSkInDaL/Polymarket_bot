@@ -14,6 +14,7 @@ from src.data.market_discovery import MarketInfo
 from src.data.market_lifecycle import (
     ActiveMarket,
     DrainingMarket,
+    EmergencyDrainMarket,
     MarketLifecycleManager,
     ObservingMarket,
 )
@@ -273,3 +274,85 @@ class TestPromotion:
         )
         lm._promote_ready()
         assert "CID_LOW" in lm.observing
+
+
+# ── Ghost Liquidity Circuit Breaker (Pillar 9) ───────────────────────────
+
+class TestGhostLiquidity:
+    """Tests for emergency_drain / check_emergency_recovery."""
+
+    def test_emergency_drain(self):
+        """Emergency drain moves market from active to emergency."""
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_GHOST")
+        lm.active["CID_GHOST"] = ActiveMarket(
+            info=m, low_score_cycles=0
+        )
+        lm.emergency_drain("CID_GHOST", baseline_depth=1000.0)
+
+        assert "CID_GHOST" not in lm.active
+        assert lm.is_emergency_drained("CID_GHOST")
+        assert not lm.is_tradeable("CID_GHOST")
+
+    def test_emergency_drain_not_active_is_noop(self):
+        """Draining a non-active market is a no-op."""
+        lm = MarketLifecycleManager()
+        lm.emergency_drain("CID_NONEXIST", baseline_depth=1000.0)
+        assert not lm.is_emergency_drained("CID_NONEXIST")
+
+    def test_recovery_too_early(self):
+        """Recovery check returns empty within recovery window."""
+        from unittest.mock import MagicMock
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_REC")
+        lm.active["CID_REC"] = ActiveMarket(
+            info=m, low_score_cycles=0
+        )
+        lm.emergency_drain("CID_REC", baseline_depth=1000.0)
+
+        # Build a mock tracker with depth at full recovery
+        tracker = MagicMock()
+        tracker.has_data = True
+        tracker.current_total_depth.return_value = 1000.0
+        trackers = {m.yes_token_id: tracker}
+
+        # Immediately after drain → recovery_start just got set, but window not elapsed
+        recovered = lm.check_emergency_recovery(trackers)
+        assert "CID_REC" not in recovered
+
+    def test_recovery_restores_active(self):
+        """After recovery window, if depth restored → market returns to active."""
+        from unittest.mock import MagicMock
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_REC2")
+        lm.active["CID_REC2"] = ActiveMarket(
+            info=m, low_score_cycles=0
+        )
+        lm.emergency_drain("CID_REC2", baseline_depth=1000.0)
+
+        em = lm.emergency["CID_REC2"]
+        # Simulate time passing: set recovery_start in the past
+        em.recovery_start = time.time() - settings.strategy.ghost_recovery_s - 1
+
+        tracker = MagicMock()
+        tracker.has_data = True
+        tracker.current_total_depth.return_value = 800.0  # >= 50% of 1000
+        trackers = {m.yes_token_id: tracker}
+
+        recovered = lm.check_emergency_recovery(trackers)
+
+        assert "CID_REC2" in recovered
+        assert "CID_REC2" in lm.active
+        assert "CID_REC2" not in lm.emergency
+
+    def test_emergency_tracked(self):
+        """Emergency-drained markets show up in get_all_tracked()."""
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_TRK")
+        lm.active["CID_TRK"] = ActiveMarket(
+            info=m, low_score_cycles=0
+        )
+        lm.emergency_drain("CID_TRK", baseline_depth=500.0)
+        tracked = lm.get_all_tracked()
+        tracked_cids = [mi.condition_id for mi in tracked]
+        assert "CID_TRK" in tracked_cids

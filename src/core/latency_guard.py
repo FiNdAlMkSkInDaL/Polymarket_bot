@@ -152,6 +152,17 @@ class LatencyGuard:
         """Convenience: True when execution must be halted."""
         return self._state == LatencyState.BLOCKED
 
+    def force_block(self, reason: str = "external") -> None:
+        """Force the guard into BLOCKED state from an external source.
+
+        Used by the ``BookHeartbeat`` and ``AdverseSelectionGuard`` to
+        halt execution without waiting for a latency check.
+        """
+        if self._state != LatencyState.BLOCKED:
+            log.warning("latency_force_blocked", reason=reason)
+        self._state = LatencyState.BLOCKED
+        self._consecutive_healthy = 0
+
     def reset(self) -> None:
         """Reset to initial state (e.g. on WS reconnect)."""
         self._state = LatencyState.HEALTHY

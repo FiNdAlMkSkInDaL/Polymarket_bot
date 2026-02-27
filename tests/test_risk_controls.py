@@ -112,6 +112,7 @@ class TestPnLTracking:
             entry_price=0.50,
             entry_size=10.0,
             target_price=0.55,
+            fee_enabled=False,
         )
         pos.exit_order = MagicMock(filled_avg_price=0.55)
         pm._positions["POS-1"] = pos
@@ -133,6 +134,7 @@ class TestPnLTracking:
             state=PositionState.EXIT_PENDING,
             entry_price=0.50,
             entry_size=10.0,
+            fee_enabled=False,
         )
         pos.exit_order = MagicMock(filled_avg_price=0.45)
         pm._positions["POS-2"] = pos
