@@ -44,6 +44,7 @@ class FeeCache:
         ttl_s: int | None = None,
         default_bps: int | None = None,
         base_url: str | None = None,
+        max_size: int = 500,
     ):
         strat = settings.strategy
         self._ttl = ttl_s if ttl_s is not None else strat.fee_cache_ttl_s
@@ -51,6 +52,7 @@ class FeeCache:
         self._base_url = (base_url or settings.clob_http_url).rstrip("/")
         # {token_id: (fee_rate_bps, fetched_at)}
         self._cache: dict[str, tuple[int, float]] = {}
+        self._max_size = max_size
         self._lock = asyncio.Lock()
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -76,7 +78,23 @@ class FeeCache:
 
             bps = await self._fetch(token_id)
             self._cache[token_id] = (bps, now)
+            self._evict_if_over_limit()
             return bps
+
+    def _evict_if_over_limit(self) -> None:
+        """Evict stale and then oldest entries if cache exceeds max_size."""
+        if len(self._cache) <= self._max_size:
+            return
+        now = time.time()
+        # First pass: drop expired entries
+        stale = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
+        for k in stale:
+            del self._cache[k]
+        # Second pass: LRU evict oldest if still over limit
+        if len(self._cache) > self._max_size:
+            oldest = sorted(self._cache, key=lambda k: self._cache[k][1])
+            for k in oldest[: len(self._cache) - self._max_size]:
+                del self._cache[k]
 
     def get_fee_rate_sync(self, token_id: str) -> int:
         """Non-async accessor — returns cached value or the default.

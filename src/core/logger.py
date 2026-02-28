@@ -2,23 +2,28 @@
 Structured logging configuration using structlog.
 
 Produces JSON lines to both stdout and a rotating file for post-hoc analysis.
+All disk I/O is offloaded to a background thread via QueueHandler/QueueListener
+so that log calls never block the asyncio event loop.
 """
 
 from __future__ import annotations
 
+import atexit
 import logging
 import logging.handlers
+import queue
 import sys
 from pathlib import Path
 
 import structlog
 
 _CONFIGURED = False
+_LISTENER: logging.handlers.QueueListener | None = None
 
 
 def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
     """Initialise structured logging.  Safe to call multiple times."""
-    global _CONFIGURED
+    global _CONFIGURED, _LISTENER
     if _CONFIGURED:
         return
 
@@ -38,10 +43,21 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(level)
 
+    # Offload all handler I/O to a background thread via QueueHandler.
+    # This guarantees log calls never block the asyncio event loop.
+    log_queue: queue.Queue[logging.LogRecord] = queue.Queue(-1)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+
+    _LISTENER = logging.handlers.QueueListener(
+        log_queue, file_handler, stream_handler, respect_handler_level=True,
+    )
+    _LISTENER.start()
+    atexit.register(_LISTENER.stop)
+
     logging.basicConfig(
         format="%(message)s",
         level=level,
-        handlers=[stream_handler, file_handler],
+        handlers=[queue_handler],
     )
 
     # Silence noisy HTTP-level request logs from httpx / httpcore

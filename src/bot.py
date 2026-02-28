@@ -94,7 +94,7 @@ class TradingBot:
 
         # Shared fast-kill event for adverse-selection guard
         self._fast_kill_event = asyncio.Event()
-        self._fast_kill_event.set()  # start clear — chasers may proceed
+        self._fast_kill_event.set()  # start SET — chasers may proceed (clear = paused)
 
         # Per-market state
         self._markets: list[MarketInfo] = []
@@ -295,7 +295,7 @@ class TradingBot:
             # Register via the signal module instead (handles Ctrl-C).
             signal.signal(
                 signal.SIGINT,
-                lambda *_: asyncio.get_event_loop().call_soon_threadsafe(
+                lambda *_: loop.call_soon_threadsafe(
                     lambda: asyncio.ensure_future(self.stop())
                 ),
             )
@@ -1142,7 +1142,8 @@ class TradingBot:
                     if self._l2_ws else 0
                 )
                 memory_bytes = (
-                    _process.memory_info().rss if _process else None
+                    (await asyncio.to_thread(_process.memory_info)).rss
+                    if _process else None
                 )
                 uptime_s = round(time.monotonic() - self._start_time, 1)
 
@@ -1168,21 +1169,10 @@ class TradingBot:
                     "observing_markets": len(self.lifecycle.observing),
                 }
 
-                # Atomic write: tmp → rename
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=str(health_dir), suffix=".tmp"
+                # Atomic write: offload blocking file I/O to a thread
+                await asyncio.to_thread(
+                    self._write_health_sync, health, health_dir, health_path,
                 )
-                try:
-                    with _os.fdopen(fd, "w") as f:
-                        _json.dump(health, f, indent=2)
-                    _os.replace(tmp_path, str(health_path))
-                except Exception:
-                    # Clean up the temp file if rename fails
-                    try:
-                        _os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
 
                 log.debug("health_report_written", path=str(health_path))
 
@@ -1190,6 +1180,25 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("health_reporter_error", error=str(exc))
+
+    @staticmethod
+    def _write_health_sync(health: dict, health_dir: Any, health_path: Any) -> None:
+        """Synchronous atomic write — called via ``asyncio.to_thread``."""
+        import json as _json
+        import os as _os
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(dir=str(health_dir), suffix=".tmp")
+        try:
+            with _os.fdopen(fd, "w") as f:
+                _json.dump(health, f, indent=2)
+            _os.replace(tmp_path, str(health_path))
+        except Exception:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     async def _market_refresh_loop(self) -> None:
         """Periodically re-discover, re-score, promote/demote/evict."""

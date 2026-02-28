@@ -149,7 +149,7 @@ class OrderExecutor:
                 # Attach fee rate to the signed payload when taking liquidity
                 if fee_rate_bps > 0:
                     order_args.fee_rate_bps = fee_rate_bps
-                resp = clob.create_and_post_order(order_args)
+                resp = await asyncio.to_thread(clob.create_and_post_order, order_args)
                 clob_id = ""
                 if isinstance(resp, dict):
                     # Detect POST_ONLY rejection
@@ -204,7 +204,7 @@ class OrderExecutor:
         if not self.paper_mode and order.clob_order_id:
             try:
                 clob = self._get_clob_client()
-                clob.cancel(order.clob_order_id)
+                await asyncio.to_thread(clob.cancel, order.clob_order_id)
                 log.info("order_cancelled_live", clob_id=order.clob_order_id)
             except Exception as exc:
                 log.warning("order_cancel_failed", error=str(exc))

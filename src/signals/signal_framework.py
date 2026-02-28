@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -154,8 +155,7 @@ class SpreadCompressionSignal(SignalGenerator):
         self.market_id = market_id
         self.compression_pct = compression_pct or settings.strategy.spread_compression_pct
         self.min_history = min_history
-        self._spread_history: list[float] = []
-        self._max_history = 120  # rolling window
+        self._spread_history: deque[float] = deque(maxlen=120)
 
     @property
     def name(self) -> str:
@@ -164,8 +164,6 @@ class SpreadCompressionSignal(SignalGenerator):
     def record_spread(self, spread: float) -> None:
         """Record a spread observation for rolling average computation."""
         self._spread_history.append(spread)
-        if len(self._spread_history) > self._max_history:
-            self._spread_history = self._spread_history[-self._max_history:]
 
     def evaluate(self, **kwargs: Any) -> SignalResult | None:
         """Expects kwargs: ``no_book`` (:class:`OrderbookTracker`)."""

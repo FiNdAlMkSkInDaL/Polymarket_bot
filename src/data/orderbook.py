@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from src.core.logger import get_logger
+from src.data.types import Level as _Level
 
 log = get_logger(__name__)
 
@@ -38,13 +39,6 @@ class OrderbookSnapshot:
     server_time: float = 0.0     # server-reported timestamp (epoch s)
     fresh: bool = True            # False when latency guard is BLOCKED
     spread_score: float = 0.0    # live L2 spread score (0-100)
-
-
-@dataclass
-class _Level:
-    """A single price level in the book."""
-    price: float
-    size: float
 
 
 class OrderbookTracker:
@@ -154,6 +148,16 @@ class OrderbookTracker:
                 pass
         self._record_depth()
         self._check_bbo_change()
+
+    @property
+    def best_bid(self) -> float:
+        """Best (highest) bid price, or 0.0 if empty."""
+        return self._bids[0].price if self._bids else 0.0
+
+    @property
+    def best_ask(self) -> float:
+        """Best (lowest) ask price, or 0.0 if empty."""
+        return self._asks[0].price if self._asks else 0.0
 
     def snapshot(self, *, fresh: bool = True) -> OrderbookSnapshot:
         """Return current top-of-book summary.
@@ -341,12 +345,19 @@ class L2OrderBookAdapter(OrderbookTracker):
         )
 
     def levels(self, side: str, n: int = 5) -> list[_Level]:
-        l2_levels = self._l2.levels(side, n)
-        return [_Level(lv.price, lv.size) for lv in l2_levels]
+        return self._l2.levels(side, n)
 
     @property
     def spread_cents(self) -> float:
         return self._l2.spread_cents
+
+    @property
+    def best_bid(self) -> float:
+        return self._l2.best_bid
+
+    @property
+    def best_ask(self) -> float:
+        return self._l2.best_ask
 
     @property
     def book_depth_ratio(self) -> float:

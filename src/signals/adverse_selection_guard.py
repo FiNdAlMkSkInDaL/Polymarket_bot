@@ -190,9 +190,9 @@ class AdverseSelectionGuard:
             log.info("polygon_rpc_disabled", reason="no POLYGON_RPC_URL")
             return
 
-        while self._running:
-            try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            while self._running:
+                try:
                     # Get latest block number
                     resp = await client.post(
                         rpc_url,
@@ -219,11 +219,11 @@ class AdverseSelectionGuard:
                     block_data = resp2.json().get("result", {})
                     block_ts = int(block_data.get("timestamp", "0x0"), 16)
                     self._polygon_head_lag_ms = abs(time.time() - block_ts) * 1000
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                log.debug("polygon_head_error", error=str(exc))
-            await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    log.debug("polygon_head_error", error=str(exc))
+                await asyncio.sleep(0.5)
 
     # ── Decision loop ───────────────────────────────────────────────────────
 

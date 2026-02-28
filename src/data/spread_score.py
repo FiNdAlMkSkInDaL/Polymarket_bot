@@ -34,6 +34,7 @@ def compute_spread_score(
     bid_levels: list[tuple[float, float]],   # [(price, size), ...]
     ask_levels: list[tuple[float, float]],
     top_n: int = 3,
+    timestamp: float | None = None,
 ) -> SpreadScore:
     """Compute a spread score from L2 book state.
 
@@ -53,7 +54,7 @@ def compute_spread_score(
         Contains raw spread, depth-weighted spread and a 0-100 score.
     """
     if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
-        return SpreadScore(timestamp=time.time())
+        return SpreadScore(timestamp=(timestamp or time.time()))
 
     raw_spread = best_ask - best_bid
     raw_spread_cents = round(raw_spread * 100, 4)
@@ -95,7 +96,7 @@ def compute_spread_score(
         raw_spread_cents=raw_spread_cents,
         depth_weighted_spread_cents=dw_spread_cents,
         score=round(score, 2),
-        timestamp=time.time(),
+        timestamp=(timestamp or time.time()),
     )
 
 

@@ -33,6 +33,8 @@ class FakeBook:
 
     def __init__(self, bid: float = 0.0, ask: float = 0.0):
         self.has_data = bid > 0 or ask > 0
+        self.best_bid = bid
+        self.best_ask = ask
         self._snap = FakeBookSnap(bid, ask)
 
     def snapshot(self):

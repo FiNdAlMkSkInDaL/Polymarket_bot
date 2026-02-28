@@ -101,7 +101,9 @@ class TradeStore:
         self._db: aiosqlite.Connection | None = None
 
         # Cumulative counter of SQLite lock-contention retries
-        # (application-level, supplements PRAGMA busy_timeout)
+        # (application-level, supplements PRAGMA busy_timeout).
+        # NOTE: currently only incremented by checkpoint methods;
+        # PRAGMA busy_timeout handles most contention transparently.
         self.db_lock_retries: int = 0
 
     async def init(self) -> None:
@@ -302,6 +304,7 @@ class TradeStore:
                 )
             await self._db.commit()
         except Exception:
+            self.db_lock_retries += 1
             await self._db.rollback()
             raise
         log.debug("checkpoint_orders", count=len(orders))
@@ -353,6 +356,7 @@ class TradeStore:
                 )
             await self._db.commit()
         except Exception:
+            self.db_lock_retries += 1
             await self._db.rollback()
             raise
         log.debug("checkpoint_positions", count=len(positions))

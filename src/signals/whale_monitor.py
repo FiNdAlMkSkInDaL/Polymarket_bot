@@ -260,6 +260,10 @@ class WhaleMonitor:
         if not settings.polygonscan_api_key:
             return
 
+        # Always trim stale entries, even when no new txs arrive
+        cutoff = time.time() - 3600
+        self._recent = [a for a in self._recent if a.timestamp >= cutoff]
+
         api_url = "https://api.polygonscan.com/api"
 
         async with httpx.AsyncClient(timeout=20) as client:

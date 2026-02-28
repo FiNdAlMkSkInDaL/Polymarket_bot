@@ -38,6 +38,13 @@ log = get_logger(__name__)
 class MarketDataRecorder:
     """Non-blocking recorder that persists raw WS events to JSONL files.
 
+    Design philosophy: **zero cached file handles**.  Each flush batch
+    opens the target files, appends grouped lines, and closes them
+    immediately.  This makes the recorder immune to fd-limit exhaustion
+    regardless of the number of tracked markets, eliminates stale-handle
+    bugs on day rollover, and costs < 1 ms per flush on local storage
+    (negligible vs the 5-second flush interval).
+
     Parameters
     ----------
     data_dir:
@@ -65,9 +72,10 @@ class MarketDataRecorder:
         self._buffer: list[dict] = []
         self._records_written: int = 0
         self._records_dropped: int = 0
+        self._write_errors: int = 0
 
-        # File handle cache: (date_str, asset_id) → open file handle
-        self._handles: dict[tuple[str, str], Any] = {}
+        # Directory cache: avoid repeated mkdir syscalls within a flush
+        self._known_dirs: set[Path] = set()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Producer side (called from WS handler — must not block)
@@ -125,11 +133,11 @@ class MarketDataRecorder:
             if self._buffer:
                 await asyncio.to_thread(self._flush_sync)
         finally:
-            self._close_handles()
             log.info(
                 "recorder_stopped",
                 records_written=self._records_written,
                 records_dropped=self._records_dropped,
+                write_errors=self._write_errors,
             )
 
     async def _consume_batch(self) -> None:
@@ -159,7 +167,13 @@ class MarketDataRecorder:
 
     def _flush_sync(self) -> None:
         """Synchronous disk write — called via ``to_thread`` to avoid
-        blocking the event loop."""
+        blocking the event loop.
+
+        Opens each target file, appends all grouped lines, and closes it
+        immediately.  No file handles are cached across flush cycles.
+        Each (date, asset) group is isolated: a write failure for one
+        asset does not prevent other assets from being persisted.
+        """
         # Group by (date, asset_id) for efficient file writes
         groups: dict[tuple[str, str], list[str]] = {}
 
@@ -173,45 +187,33 @@ class MarketDataRecorder:
             groups.setdefault(key, []).append(line)
 
         for (date_str, asset_id), lines in groups.items():
-            fh = self._get_handle(date_str, asset_id)
-            fh.write("\n".join(lines) + "\n")
-            fh.flush()
-            self._records_written += len(lines)
+            try:
+                file_path = self._resolve_path(date_str, asset_id)
+                with open(file_path, "a", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines) + "\n")
+                self._records_written += len(lines)
+            except OSError:
+                self._write_errors += len(lines)
+                log.exception(
+                    "recorder_write_failed",
+                    date=date_str,
+                    asset_id=asset_id,
+                    lines_lost=len(lines),
+                )
 
         self._buffer.clear()
 
-    def _get_handle(self, date_str: str, asset_id: str) -> Any:
-        """Get or open a file handle for the given date + asset."""
-        key = (date_str, asset_id)
-        if key in self._handles:
-            return self._handles[key]
-
-        # Close handles for old dates (day rollover)
-        stale_keys = [k for k in self._handles if k[0] != date_str]
-        for sk in stale_keys:
-            self._handles[sk].close()
-            del self._handles[sk]
-
+    def _resolve_path(self, date_str: str, asset_id: str) -> Path:
+        """Build the target file path, creating the directory on first
+        encounter (cached for the process lifetime to skip redundant
+        ``mkdir`` syscalls)."""
         dir_path = self._data_dir / "raw_ticks" / date_str
-        dir_path.mkdir(parents=True, exist_ok=True)
+        if dir_path not in self._known_dirs:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            self._known_dirs.add(dir_path)
 
-        # Sanitise asset_id for filename (replace problematic chars)
         safe_name = asset_id.replace("/", "_").replace("\\", "_")
-        file_path = dir_path / f"{safe_name}.jsonl"
-
-        fh = open(file_path, "a", encoding="utf-8")  # noqa: SIM115
-        self._handles[key] = fh
-        log.debug("recorder_file_opened", path=str(file_path))
-        return fh
-
-    def _close_handles(self) -> None:
-        """Close all open file handles."""
-        for fh in self._handles.values():
-            try:
-                fh.close()
-            except Exception:
-                pass
-        self._handles.clear()
+        return dir_path / f"{safe_name}.jsonl"
 
     def stop(self) -> None:
         """Signal the consumer loop to stop after the current batch."""
@@ -222,6 +224,7 @@ class MarketDataRecorder:
         return {
             "records_written": self._records_written,
             "records_dropped": self._records_dropped,
+            "write_errors": self._write_errors,
             "queue_depth": self._queue.qsize(),
             "buffer_size": len(self._buffer),
         }

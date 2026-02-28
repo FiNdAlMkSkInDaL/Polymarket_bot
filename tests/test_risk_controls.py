@@ -31,10 +31,9 @@ def _make_signal(market_id: str = "MKT_A") -> PanicSignal:
     )
 
 
-def _make_no_agg(price: float = 0.55) -> OHLCVAggregator:
+def _make_no_agg(price: float = 0.65) -> OHLCVAggregator:
     agg = OHLCVAggregator("NO_TOKEN")
-    agg._vwap_sum = price * 100
-    agg._vwap_vol = 100
+    agg.rolling_vwap = price
     return agg
 
 

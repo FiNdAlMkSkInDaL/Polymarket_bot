@@ -100,6 +100,10 @@ class StrategyParams:
     alpha_max: float = _env_float("ALPHA_MAX", 0.70)
     min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
 
+    # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
+    # entropy, fee efficiency, tick viability, and signal strength.
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 40.0)
+
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 5.0)
     max_wallet_risk_pct: float = _env_float("MAX_WALLET_RISK_PCT", 20.0)

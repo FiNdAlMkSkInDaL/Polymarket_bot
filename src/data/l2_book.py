@@ -35,6 +35,7 @@ from sortedcontainers import SortedDict
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.spread_score import SpreadScore, compute_spread_score
+from src.data.types import Level as _Level
 
 log = get_logger(__name__)
 
@@ -45,14 +46,6 @@ class BookState(enum.Enum):
     BUFFERING = "buffering"
     SYNCED = "synced"
     DESYNCED = "desynced"
-
-
-# ── Level dataclass (compatible with OrderbookTracker._Level) ──────────────
-@dataclass(slots=True)
-class _Level:
-    """A single price level in the book."""
-    price: float
-    size: float
 
 
 # ── Snapshot dataclass (re-exported for convenience) ───────────────────────
@@ -241,9 +234,8 @@ class L2OrderBook:
         self._state = BookState.SYNCED
         self._desync_count = 0
 
-        # Update BBO + spread score
+        # Update BBO + spread score (also records depth if BBO changed)
         self._update_bbo_and_score()
-        self._record_depth()
 
         log.info(
             "l2_synced",
@@ -314,10 +306,10 @@ class L2OrderBook:
 
         # ── Apply the delta ───────────────────────────────────────────
         self._apply_delta_changes(data)
-        self._last_update = time.time()
+        now = time.time()
+        self._last_update = now
         self._extract_server_time(data)
-        self._update_bbo_and_score()
-        self._record_depth()
+        self._update_bbo_and_score(now)
         return True
 
     def _apply_delta_changes(self, data: dict) -> None:
@@ -384,7 +376,7 @@ class L2OrderBook:
     # ═══════════════════════════════════════════════════════════════════════
     #  BBO tracking & spread score
     # ═══════════════════════════════════════════════════════════════════════
-    def _update_bbo_and_score(self) -> None:
+    def _update_bbo_and_score(self, now: float | None = None) -> None:
         """Recompute spread score if BBO changed."""
         bb = self.best_bid
         ba = self.best_ask
@@ -395,8 +387,11 @@ class L2OrderBook:
         self._prev_best_bid = bb
         self._prev_best_ask = ba
 
+        if now is None:
+            now = time.time()
+
         if bb <= 0 or ba <= 0:
-            self._spread_score = SpreadScore(timestamp=time.time())
+            self._spread_score = SpreadScore(timestamp=now)
             return
 
         # Detect crossed book → treat as desync
@@ -422,8 +417,11 @@ class L2OrderBook:
         ]
 
         self._spread_score = compute_spread_score(
-            bb, ba, bid_levels, ask_levels, top_n=top_n
+            bb, ba, bid_levels, ask_levels, top_n=top_n, timestamp=now,
         )
+
+        # Record depth only when BBO actually changed
+        self._record_depth(now)
 
         # Fire BBO change callback
         if self._on_bbo_change is not None:
@@ -534,9 +532,9 @@ class L2OrderBook:
         ]
 
     # ── Ghost liquidity support ────────────────────────────────────────
-    def _record_depth(self) -> None:
+    def _record_depth(self, now: float | None = None) -> None:
         depth = self.current_total_depth()
-        self._depth_history.append((time.time(), depth))
+        self._depth_history.append(((now or time.time()), depth))
 
     def current_total_depth(self) -> float:
         bid_d = sum(

@@ -20,12 +20,11 @@ ExecStopPost=/bin/bash -c 'rm -f /dev/shm/secrets/.env'
 Restart=always
 RestartSec=10
 
-# Security hardening
+# Resource limits — defense-in-depth against fd exhaustion
+LimitNOFILE=65536
+
+# Security hardening (namespace-based options omitted — not supported on this hypervisor)
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/botuser/polymarket-bot/logs /home/botuser/polymarket-bot/data /dev/shm/secrets
-PrivateTmp=true
 
 # Logging
 StandardOutput=journal

@@ -26,6 +26,7 @@ from src.core.guard import DeploymentGuard
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
+from src.signals.edge_filter import compute_edge_score
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
@@ -266,6 +267,21 @@ class PositionManager:
             log.warning("entry_price_invalid", ask=signal.no_best_ask)
             return None
 
+        # ── Edge quality gate (information-theoretic) ──────────────────
+        # Weighted geometric mean of regime entropy, fee efficiency,
+        # tick viability, and signal quality.  Replaces the old naive
+        # min/max price-range clamp with a principled EV gate.
+        edge = compute_edge_score(
+            entry_price=entry_price,
+            no_vwap=no_aggregator.rolling_vwap,
+            zscore=signal.zscore,
+            volume_ratio=signal.volume_ratio,
+            whale_confluence=signal.whale_confluence,
+            fee_enabled=fee_enabled,
+        )
+        if not edge.viable:
+            return None
+
         # ── Depth-aware sizing (Pillar 2) ──────────────────────────────────
         if no_book is not None:
             sizing = compute_depth_aware_size(
@@ -479,6 +495,14 @@ class PositionManager:
             fee_enabled=pos.fee_enabled,
         )
 
+        # Release heavy references to allow GC of closures and metadata
+        pos.entry_chaser_task = None
+        pos.exit_chaser_task = None
+        pos.signal = None
+        pos.sizing = None
+        pos.kelly_result = None
+        pos.tp_result = None
+
         # Track daily PnL and drawdown
         self._daily_pnl_cents += pos.pnl_cents
         self._cumulative_pnl_cents += pos.pnl_cents
@@ -499,6 +523,9 @@ class PositionManager:
             daily_pnl=round(self._daily_pnl_cents, 2),
             drawdown=round(self._max_drawdown_cents, 2),
         )
+
+        # Auto-cleanup old closed/cancelled positions
+        self.cleanup_closed()
 
     # ── Timeout enforcement ────────────────────────────────────────────────
     async def check_timeouts(self) -> None:

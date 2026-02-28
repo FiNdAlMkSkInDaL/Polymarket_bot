@@ -39,6 +39,10 @@ from src.data.l2_book import BookState, L2OrderBook, fetch_l2_snapshot
 
 log = get_logger(__name__)
 
+# Pre-allocated event-type sets used in the hot message dispatch path.
+_DELTA_EVENTS = frozenset(("price_change", "book_delta", "delta"))
+_SNAPSHOT_EVENTS = frozenset(("book", "snapshot", "book_snapshot"))
+
 
 class L2WebSocket:
     """Persistent WebSocket connection for Polymarket L2 order book data.
@@ -243,9 +247,9 @@ class L2WebSocket:
         if not book:
             return
 
-        if event_type in ("price_change", "book_delta", "delta"):
+        if event_type in _DELTA_EVENTS:
             book.on_delta(msg)
-        elif event_type in ("book", "snapshot", "book_snapshot"):
+        elif event_type in _SNAPSHOT_EVENTS:
             # Some WS implementations push full snapshots inline
             # Treat as snapshot data
             try:

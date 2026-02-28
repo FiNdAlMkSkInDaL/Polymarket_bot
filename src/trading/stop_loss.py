@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from src.core.config import settings
 from src.core.logger import get_logger
+from src.trading.position_manager import PositionState
 
 if TYPE_CHECKING:
     from src.data.ohlcv import OHLCVAggregator
@@ -99,8 +100,6 @@ class StopLossMonitor:
         if not self._running:
             return
 
-        from src.trading.position_manager import PositionState
-
         # Fast-path: find EXIT_PENDING positions for this asset
         positions_for_asset = [
             p for p in self._pm.get_open_positions()
@@ -158,7 +157,6 @@ class StopLossMonitor:
         Retained for test backward-compatibility.  The live path uses
         :meth:`on_bbo_update` which is driven by BBO callbacks.
         """
-        from src.trading.position_manager import PositionState
 
         # Temporarily override the configured SL for this invocation
         saved = self._stop_loss_cents
@@ -190,9 +188,10 @@ class StopLossMonitor:
         """Best source of current price: orderbook mid → last trade."""
         book = self._books.get(asset_id)
         if book and book.has_data:
-            snap = book.snapshot()
-            if snap.best_bid > 0 and snap.best_ask > 0:
-                return (snap.best_bid + snap.best_ask) / 2.0
+            bb = book.best_bid
+            ba = book.best_ask
+            if bb > 0 and ba > 0:
+                return (bb + ba) / 2.0
 
         agg = self._no_aggs.get(asset_id)
         if agg and agg.current_price > 0:
@@ -201,8 +200,6 @@ class StopLossMonitor:
         return 0.0
 
     async def _trigger_stop(self, pos, mid: float, threshold: float) -> None:
-        from src.trading.position_manager import PositionState
-
         if pos.state != PositionState.EXIT_PENDING:
             return  # may have been closed between check and trigger
 
