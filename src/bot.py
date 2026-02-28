@@ -234,6 +234,8 @@ class TradingBot:
             latency_guard=self.latency_guard,
             fast_kill_event=self._fast_kill_event,
             executor=self.executor,
+            ws_transport=self._l2_ws,
+            get_position_assets=self._positioned_asset_ids,
             telegram=self.telegram,
         )
 
@@ -365,6 +367,16 @@ class TradingBot:
         self._trade_counts.pop(m.yes_token_id, None)
         self._trade_counts.pop(m.no_token_id, None)
         self._markets = [x for x in self._markets if x.condition_id != m.condition_id]
+
+    def _positioned_asset_ids(self) -> set[str]:
+        """Return asset IDs that currently have open positions.
+
+        Used by the heartbeat to decide which books need fresh data.
+        """
+        return {
+            pos.no_asset_id
+            for pos in self.positions.get_open_positions()
+        }
 
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
