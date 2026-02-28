@@ -318,12 +318,18 @@ def generate_folds(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _collect_files_for_dates(data_dir: str, dates: list[str]) -> list[Path]:
-    """Gather all JSONL tick files for the given date strings."""
+    """Gather all tick files (JSONL and Parquet) for the given date strings."""
     from src.backtest.data_recorder import MarketDataRecorder
 
     files: list[Path] = []
+    base = Path(data_dir)
     for d in dates:
+        # Raw JSONL from raw_ticks/<date>/
         files.extend(MarketDataRecorder.data_files_for_date(data_dir, d))
+        # Processed Parquet from <data_dir>/<date>/
+        parquet_dir = base / d
+        if parquet_dir.exists():
+            files.extend(sorted(parquet_dir.glob("*.parquet")))
     return files
 
 

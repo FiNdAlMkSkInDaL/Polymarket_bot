@@ -22,6 +22,10 @@ import click
 
 from src.core.config import DeploymentEnv
 from src.core.logger import setup_logging
+from src.data.synthetic import (
+    _DEFAULT_NO_ASSET as _SYNTH_NO,
+    _DEFAULT_YES_ASSET as _SYNTH_YES,
+)
 
 
 def _startup_banner(env: DeploymentEnv, confirm: bool) -> None:
@@ -255,8 +259,8 @@ def scores() -> None:
 @click.option("--fee-max-pct", default=1.56, help="Max fee rate percentage.")
 @click.option("--no-fees", is_flag=True, help="Disable dynamic fee curve.")
 @click.option("--market-id", default="BACKTEST", help="Market condition ID.")
-@click.option("--yes-asset", default="YES_TOKEN", help="YES token asset ID.")
-@click.option("--no-asset", default="NO_TOKEN", help="NO token asset ID.")
+@click.option("--yes-asset", default=_SYNTH_YES, help="YES token asset ID.")
+@click.option("--no-asset", default=_SYNTH_NO, help="NO token asset ID.")
 def backtest(
     data_dir: str,
     asset_id: str | None,
@@ -307,8 +311,8 @@ def backtest(
 @click.option("--max-drawdown", default=0.15, help="Max acceptable drawdown (fraction).")
 @click.option("--initial-cash", default=1000.0, help="Starting cash balance (USD).")
 @click.option("--market-id", default="BACKTEST", help="Market condition ID.")
-@click.option("--yes-asset", default="YES_TOKEN", help="YES token asset ID.")
-@click.option("--no-asset", default="NO_TOKEN", help="NO token asset ID.")
+@click.option("--yes-asset", default=_SYNTH_YES, help="YES token asset ID.")
+@click.option("--no-asset", default=_SYNTH_NO, help="NO token asset ID.")
 @click.option("--latency-ms", default=150.0, help="Simulated latency in milliseconds.")
 @click.option("--fee-max-pct", default=1.56, help="Max fee rate percentage.")
 @click.option("--no-fees", is_flag=True, help="Disable dynamic fee curve.")
@@ -380,17 +384,28 @@ def data() -> None:
 )
 @click.option("--num-assets", default=2, type=int, help="Number of distinct assets.")
 @click.option("--seed", default=None, type=int, help="Random seed for reproducibility.")
+@click.option("--gap-prob", default=0.0, type=float, help="Probability of injecting sequence gaps.")
+@click.option("--spike-prob", default=0.0, type=float, help="Probability of injecting price spikes.")
+@click.option("--spread-compress-prob", default=0.0, type=float, help="Probability of injecting spread compressions.")
 def data_mock(
     output_dir: str,
     num_rows: int,
     duration_hours: float,
     num_assets: int,
     seed: int | None,
+    gap_prob: float,
+    spike_prob: float,
+    spread_compress_prob: float,
 ) -> None:
     """Generate synthetic Polymarket L2/trade JSONL data for testing."""
     from src.data.synthetic import SyntheticGenerator
 
-    gen = SyntheticGenerator(seed=seed)
+    gen = SyntheticGenerator(
+        seed=seed,
+        gap_probability=gap_prob,
+        spike_probability=spike_prob,
+        spread_compress_probability=spread_compress_prob,
+    )
     ts_start = time.time()
     raw_dir = gen.generate(
         output_dir,

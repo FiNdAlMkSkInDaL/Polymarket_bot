@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from src.core.logger import get_logger
@@ -468,9 +469,12 @@ class ParquetConverter:
         file_path = partition_dir / f"{category}.parquet"
 
         if file_path.exists():
-            # Append mode: read existing, concatenate, and merge row groups
+            # Append mode: read existing, concatenate, and re-sort
             existing = pq.read_table(str(file_path))
             table = pa.concat_tables([existing, table])
+            # Re-sort the merged table so the partition stays ordered
+            indices = pc.sort_indices(table, sort_keys=[("local_ts", "ascending")])
+            table = table.take(indices)
 
         pq.write_table(
             table,

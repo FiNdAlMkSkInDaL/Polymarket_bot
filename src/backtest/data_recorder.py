@@ -240,11 +240,27 @@ class MarketDataRecorder:
 
     @staticmethod
     def available_dates(data_dir: str | Path) -> list[str]:
-        """List all recorded dates in YYYY-MM-DD order."""
-        tick_dir = Path(data_dir) / "raw_ticks"
-        if not tick_dir.exists():
-            return []
-        return sorted(
-            d.name for d in tick_dir.iterdir()
-            if d.is_dir() and len(d.name) == 10 and d.name[4] == "-"
-        )
+        """List all recorded dates in YYYY-MM-DD order.
+
+        Scans both the ``raw_ticks/`` sub-directory (JSONL layout) and
+        the top-level data directory (processed Parquet layout) for
+        date-named folders.
+        """
+        base = Path(data_dir)
+        date_names: set[str] = set()
+
+        # Raw JSONL layout: <data_dir>/raw_ticks/YYYY-MM-DD/
+        tick_dir = base / "raw_ticks"
+        if tick_dir.exists():
+            for d in tick_dir.iterdir():
+                if d.is_dir() and len(d.name) == 10 and d.name[4] == "-":
+                    date_names.add(d.name)
+
+        # Processed Parquet layout: <data_dir>/YYYY-MM-DD/
+        for d in base.iterdir():
+            if d.is_dir() and len(d.name) == 10 and d.name[4] == "-":
+                # Must contain at least one .parquet file
+                if any(d.glob("*.parquet")):
+                    date_names.add(d.name)
+
+        return sorted(date_names)

@@ -96,11 +96,17 @@ class SyntheticGenerator:
         volatility: float = 0.8,
         trade_probability: float = 0.25,
         snapshot_interval_s: float = _SNAPSHOT_INTERVAL_S,
+        gap_probability: float = 0.0,
+        spike_probability: float = 0.0,
+        spread_compress_probability: float = 0.0,
     ) -> None:
         self._rng = random.Random(seed)
         self._volatility = volatility
         self._trade_prob = trade_probability
         self._snapshot_interval = snapshot_interval_s
+        self._gap_prob = gap_probability
+        self._spike_prob = spike_probability
+        self._spread_compress_prob = spread_compress_probability
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -242,7 +248,18 @@ class SyntheticGenerator:
 
     def _step_price(self, price: float, dt: float) -> float:
         """Advance price one step via geometric Brownian motion,
-        clamped to (0.02, 0.98) to keep it in the prediction-market range."""
+        clamped to (0.02, 0.98) to keep it in the prediction-market range.
+
+        When *spike_probability* > 0, occasional multiplicative shocks
+        (5–20 %) are injected to test downstream spike-detection filters.
+        """
+        # ── Optional price spike ───────────────────────────────────────
+        if self._spike_prob > 0 and self._rng.random() < self._spike_prob:
+            direction = self._rng.choice([-1, 1])
+            shock = self._rng.uniform(1.05, 1.20)
+            new_price = price * (shock if direction == 1 else 1.0 / shock)
+            return max(0.02, min(0.98, new_price))
+
         # GBM: dS = sigma * S * sqrt(dt) * Z
         annual_dt = dt / (365.25 * 86400)
         z = self._rng.gauss(0, 1)
@@ -258,8 +275,15 @@ class SyntheticGenerator:
     def _make_snapshot(self, asset: _AssetState, ts: float) -> _GeneratedRecord:
         """Generate a full L2 book snapshot."""
         asset.seq += 1
+        # ── Optional sequence gap ──────────────────────────────────────
+        if self._gap_prob > 0 and self._rng.random() < self._gap_prob:
+            asset.seq += self._rng.randint(1, 5)
         exch_ts = self._exchange_ts(ts)
-        spread = self._rng.uniform(0.005, 0.03)
+        # ── Optional spread compression ───────────────────────────────
+        if self._spread_compress_prob > 0 and self._rng.random() < self._spread_compress_prob:
+            spread = self._rng.uniform(0.0005, 0.002)
+        else:
+            spread = self._rng.uniform(0.005, 0.03)
         best_bid = max(0.01, asset.mid_price - spread / 2)
         best_ask = min(0.99, asset.mid_price + spread / 2)
 
@@ -298,6 +322,9 @@ class SyntheticGenerator:
     def _make_delta(self, asset: _AssetState, ts: float) -> _GeneratedRecord:
         """Generate an L2 book delta (price_change)."""
         asset.seq += 1
+        # ── Optional sequence gap ──────────────────────────────────────
+        if self._gap_prob > 0 and self._rng.random() < self._gap_prob:
+            asset.seq += self._rng.randint(1, 5)
         exch_ts = self._exchange_ts(ts)
 
         num_changes = self._rng.randint(1, 3)
@@ -339,6 +366,9 @@ class SyntheticGenerator:
     def _make_trade(self, asset: _AssetState, ts: float) -> _GeneratedRecord:
         """Generate a trade event."""
         asset.seq += 1
+        # ── Optional sequence gap ──────────────────────────────────────
+        if self._gap_prob > 0 and self._rng.random() < self._gap_prob:
+            asset.seq += self._rng.randint(1, 5)
         exch_ts = self._exchange_ts(ts)
 
         side = self._rng.choice(["buy", "sell"])

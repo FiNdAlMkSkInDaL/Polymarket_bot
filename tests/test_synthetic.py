@@ -247,3 +247,124 @@ class TestSyntheticGenerator:
             exch_ts = p.get("timestamp")
             if exch_ts is not None:
                 assert rec["local_ts"] > exch_ts
+
+
+# ── Edge-case injection tests ─────────────────────────────────────────────
+
+
+class TestEdgeCaseInjection:
+    """Verify that configurable edge-case injection works."""
+
+    def test_sequence_gaps_injected(self, tmp_path: Path) -> None:
+        """With high gap_probability, at least one sequence gap exists."""
+        gen = SyntheticGenerator(seed=42, gap_probability=0.5)
+        raw_dir = gen.generate(tmp_path, num_rows=2_000, duration_hours=1.0)
+
+        records = _read_all_records(raw_dir)
+
+        # Collect sequences per asset_id
+        seqs_by_asset: dict[str, list[int]] = {}
+        for rec in records:
+            p = rec["payload"]
+            seq = p.get("seq")
+            if seq is not None:
+                seqs_by_asset.setdefault(rec["asset_id"], []).append(seq)
+
+        # At least one asset must have a gap (diff > 1 between consecutive seqs)
+        has_gap = False
+        for asset_id, seqs in seqs_by_asset.items():
+            sorted_seqs = sorted(set(seqs))
+            for i in range(1, len(sorted_seqs)):
+                if sorted_seqs[i] - sorted_seqs[i - 1] > 1:
+                    has_gap = True
+                    break
+            if has_gap:
+                break
+
+        assert has_gap, "Expected at least one sequence gap with gap_probability=0.5"
+
+    def test_price_spikes_injected(self, tmp_path: Path) -> None:
+        """With high spike_probability, at least one large return exists."""
+        gen = SyntheticGenerator(seed=42, spike_probability=0.5)
+        raw_dir = gen.generate(tmp_path, num_rows=2_000, duration_hours=1.0)
+
+        records = _read_all_records(raw_dir)
+        trades = [rec for rec in records if rec["source"] == "trade"]
+        assert len(trades) > 10
+
+        # Group trade prices by asset and look for >5% tick-to-tick moves
+        prices_by_asset: dict[str, list[float]] = {}
+        for rec in trades:
+            p = rec["payload"]
+            prices_by_asset.setdefault(rec["asset_id"], []).append(float(p["price"]))
+
+        has_spike = False
+        for prices in prices_by_asset.values():
+            for i in range(1, len(prices)):
+                ret = abs(prices[i] - prices[i - 1]) / max(prices[i - 1], 0.01)
+                if ret > 0.04:
+                    has_spike = True
+                    break
+            if has_spike:
+                break
+
+        assert has_spike, "Expected at least one price spike with spike_probability=0.5"
+
+    def test_spread_compression_injected(self, tmp_path: Path) -> None:
+        """With high spread_compress_probability, at least one tight spread exists."""
+        gen = SyntheticGenerator(seed=42, spread_compress_probability=0.5)
+        raw_dir = gen.generate(tmp_path, num_rows=2_000, duration_hours=1.0)
+
+        records = _read_all_records(raw_dir)
+        snapshots = [
+            rec for rec in records
+            if rec["source"] == "l2"
+            and rec["payload"].get("event_type") == "book"
+        ]
+        assert len(snapshots) > 0
+
+        has_tight = False
+        for rec in snapshots:
+            p = rec["payload"]
+            bids = p.get("bids", [])
+            asks = p.get("asks", [])
+            if bids and asks:
+                spread = float(asks[0]["price"]) - float(bids[0]["price"])
+                if spread < 0.003:
+                    has_tight = True
+                    break
+
+        assert has_tight, "Expected at least one compressed spread"
+
+    def test_edge_cases_off_by_default(self, tmp_path: Path) -> None:
+        """Default generator (all probabilities=0) produces no oversize seq
+        gaps and no compressed spreads below the natural rounding floor.
+
+        Note: L2 sequence gaps are *natural* even without gap injection
+        because trades consume ``asset.seq`` without emitting a ``seq``
+        field in their payload.  Rounding bid/ask to 2 dp can also
+        produce zero-width spreads from normal spread ranges, so we
+        only verify that no gap injection code fires (bounded gap size).
+        """
+        gen = SyntheticGenerator(seed=42)
+        raw_dir = gen.generate(tmp_path, num_rows=2_000, duration_hours=1.0)
+
+        records = _read_all_records(raw_dir)
+
+        # With gap_probability=0, the only seq "gaps" come from trades
+        # consuming seq IDs without emitting them.  Verify no single
+        # gap exceeds a reasonable bound.
+        seqs_by_asset: dict[str, list[int]] = {}
+        for rec in records:
+            seq = rec["payload"].get("seq")
+            if seq is not None:
+                seqs_by_asset.setdefault(rec["asset_id"], []).append(seq)
+        for asset_id, seqs in seqs_by_asset.items():
+            sorted_seqs = sorted(set(seqs))
+            for i in range(1, len(sorted_seqs)):
+                gap = sorted_seqs[i] - sorted_seqs[i - 1]
+                assert gap <= 10, (
+                    f"Oversized gap at asset {asset_id}: "
+                    f"seq {sorted_seqs[i-1]} → {sorted_seqs[i]} (gap={gap}). "
+                    f"With gap_probability=0 this should not happen."
+                )

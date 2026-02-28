@@ -588,3 +588,76 @@ class TestSingleFoldSmoke:
         assert len(folds) >= 1
         assert len(folds[0].train_dates) > 0
         assert len(folds[0].test_dates) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WFO Parquet support
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestWfoParquetSupport:
+    """Verify that WFO can discover and load Parquet files."""
+
+    def test_collect_files_finds_parquet(self, tmp_path: Path):
+        """_collect_files_for_dates picks up Parquet files from <data_dir>/<date>/."""
+        from src.backtest.wfo_optimizer import _collect_files_for_dates
+
+        # Create processed Parquet layout: <data_dir>/2026-01-01/general.parquet
+        date_dir = tmp_path / "2026-01-01"
+        date_dir.mkdir()
+        pq_file = date_dir / "general.parquet"
+        pq_file.write_bytes(b"PAR1fake")  # dummy content
+
+        files = _collect_files_for_dates(str(tmp_path), ["2026-01-01"])
+        assert any(f.suffix == ".parquet" for f in files)
+        assert pq_file in files
+
+    def test_collect_files_prefers_both_formats(self, tmp_path: Path):
+        """Both JSONL and Parquet files are collected when present."""
+        from src.backtest.wfo_optimizer import _collect_files_for_dates
+
+        # JSONL layout
+        jsonl_dir = tmp_path / "raw_ticks" / "2026-01-01"
+        jsonl_dir.mkdir(parents=True)
+        jsonl_file = jsonl_dir / "asset.jsonl"
+        jsonl_file.write_text("{}\n")
+
+        # Parquet layout
+        pq_dir = tmp_path / "2026-01-01"
+        pq_dir.mkdir()
+        pq_file = pq_dir / "general.parquet"
+        pq_file.write_bytes(b"PAR1fake")
+
+        files = _collect_files_for_dates(str(tmp_path), ["2026-01-01"])
+        suffixes = {f.suffix for f in files}
+        assert ".jsonl" in suffixes
+        assert ".parquet" in suffixes
+
+    def test_available_dates_includes_parquet_dirs(self, tmp_path: Path):
+        """available_dates discovers date directories with Parquet files."""
+        from src.backtest.data_recorder import MarketDataRecorder
+
+        # Raw JSONL date
+        jsonl_dir = tmp_path / "raw_ticks" / "2026-01-01"
+        jsonl_dir.mkdir(parents=True)
+        (jsonl_dir / "asset.jsonl").write_text("{}\n")
+
+        # Processed Parquet date (no raw_ticks entry)
+        pq_dir = tmp_path / "2026-01-02"
+        pq_dir.mkdir()
+        (pq_dir / "general.parquet").write_bytes(b"PAR1fake")
+
+        dates = MarketDataRecorder.available_dates(str(tmp_path))
+        assert "2026-01-01" in dates
+        assert "2026-01-02" in dates
+
+    def test_available_dates_ignores_non_parquet_dirs(self, tmp_path: Path):
+        """Date-like directories without .parquet files are NOT included."""
+        from src.backtest.data_recorder import MarketDataRecorder
+
+        # Create a date-like dir with no Parquet files
+        empty_dir = tmp_path / "2026-01-03"
+        empty_dir.mkdir()
+        (empty_dir / "readme.txt").write_text("not parquet")
+
+        dates = MarketDataRecorder.available_dates(str(tmp_path))
+        assert "2026-01-03" not in dates
