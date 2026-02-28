@@ -24,7 +24,7 @@ RestartSec=10
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/botuser/polymarket-bot/logs /dev/shm/secrets
+ReadWritePaths=/home/botuser/polymarket-bot/logs /home/botuser/polymarket-bot/data /dev/shm/secrets
 PrivateTmp=true
 
 # Logging

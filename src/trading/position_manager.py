@@ -369,6 +369,7 @@ class PositionManager:
             days_to_resolution=days_to_resolution,
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=exit_fee_bps,
+            fee_enabled=fee_enabled,
         )
         if not tp.viable:
             log.info(

@@ -95,6 +95,23 @@ class TestBookHeartbeat:
         assert hb.is_suspended is False
 
     @pytest.mark.asyncio
+    async def test_one_fresh_among_stale_no_suspend(self, components):
+        """If at least one tracker is fresh (WS alive), do not suspend
+        even if other trackers are stale (low-activity markets)."""
+        guard, event, executor = components
+        now = time.time()
+
+        trackers = {
+            "STALE_1": _make_tracker("STALE_1", last_update=now - 10.0),
+            "STALE_2": _make_tracker("STALE_2", last_update=now - 20.0),
+            "FRESH":   _make_tracker("FRESH",   last_update=now),
+        }
+        hb = BookHeartbeat(trackers, guard, event, executor)
+
+        await hb._check()
+        assert hb.is_suspended is False
+
+    @pytest.mark.asyncio
     async def test_empty_trackers_no_suspend(self, components):
         """No trackers means nothing to check — should not suspend."""
         guard, event, executor = components
@@ -125,18 +142,34 @@ class TestBookHeartbeat:
 
     @pytest.mark.asyncio
     async def test_server_time_gap_triggers_suspend(self, components):
-        """Server-clock gap should also trigger suspension."""
+        """When ALL trackers have stale server_time AND stale local_update,
+        the heartbeat should suspend (indicates dead WS)."""
         guard, event, executor = components
         now = time.time()
 
-        # Local update is fresh, but server_time is old
+        # Both local and server timestamps are stale → WS is dead
+        trackers = {
+            "ASSET_A": _make_tracker("ASSET_A", last_update=now - 5.0, server_time=now - 5.0),
+        }
+        hb = BookHeartbeat(trackers, guard, event, executor)
+
+        await hb._check()
+        assert hb.is_suspended is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_local_stale_server_no_suspend(self, components):
+        """If local updates are flowing (WS alive) but server_time is
+        lagging (clock skew), do NOT suspend — messages are arriving."""
+        guard, event, executor = components
+        now = time.time()
+
         trackers = {
             "ASSET_A": _make_tracker("ASSET_A", last_update=now, server_time=now - 5.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
         await hb._check()
-        assert hb.is_suspended is True
+        assert hb.is_suspended is False
 
     def test_stop(self, components):
         guard, event, executor = components

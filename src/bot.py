@@ -1137,7 +1137,7 @@ class TradingBot:
                 heartbeat_state = "unknown"
                 if hasattr(self, "_heartbeat"):
                     heartbeat_state = (
-                        "suspended" if self._heartbeat._suspended else "alive"
+                        "suspended" if self._heartbeat.is_suspended else "alive"
                     )
                 latency_state = self.latency_guard.state.value
 

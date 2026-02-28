@@ -4,6 +4,7 @@ Tests for the dynamic take-profit calculator.
 
 import pytest
 
+from src.trading.fees import compute_net_pnl_cents
 from src.trading.take_profit import compute_take_profit, TakeProfitResult
 
 
@@ -105,10 +106,10 @@ class TestTakeProfitFeeFloor:
         assert result.viable is False
 
     def test_zero_fees_legacy_behaviour(self):
-        """With zero fees, behaviour should match the pre-fee baseline."""
+        """With fee_enabled=False (non-fee market), fee floor should be zero."""
         result = compute_take_profit(
             entry_price=0.47, no_vwap=0.65,
-            entry_fee_bps=0, exit_fee_bps=0,
+            fee_enabled=False,
             desired_margin_cents=0.0,
         )
         assert result.fee_floor_cents == pytest.approx(0.0, abs=0.01)
@@ -123,3 +124,88 @@ class TestTakeProfitFeeFloor:
         assert result.entry_fee_bps == 156
         assert result.exit_fee_bps == 0
         assert result.fee_floor_cents >= 0
+
+
+class TestFeeConsistencyGuarantee:
+    """Prove that every viable trade is profitable after fees.
+
+    This is the critical correctness invariant: compute_take_profit's fee
+    floor must use the EXACT same fee model as compute_net_pnl_cents.
+    If a trade clears the fee floor and is marked ``viable=True``, selling
+    at the target price must always yield positive net PnL.
+    """
+
+    ENTRY_PRICES = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+    VWAPS = [0.30, 0.50, 0.65, 0.80, 0.95]
+    SIZES = [1.0, 10.0, 100.0]
+
+    @pytest.mark.parametrize("entry", ENTRY_PRICES)
+    @pytest.mark.parametrize("vwap", VWAPS)
+    @pytest.mark.parametrize("size", SIZES)
+    def test_viable_trade_always_net_positive(self, entry, vwap, size):
+        """If compute_take_profit says viable, selling at target must profit."""
+        if vwap <= entry:
+            return  # skip edge-case where VWAP <= entry (fallback path)
+
+        tp = compute_take_profit(
+            entry_price=entry,
+            no_vwap=vwap,
+            fee_enabled=True,
+        )
+
+        if not tp.viable:
+            return  # correctly rejected — nothing to check
+
+        # Compute net PnL using the same function the live bot uses
+        net_pnl = compute_net_pnl_cents(
+            entry_price=tp.entry_price,
+            exit_price=tp.target_price,
+            size=size,
+            fee_enabled=True,
+        )
+        assert net_pnl > 0, (
+            f"VIABLE TRADE LOST MONEY: entry={entry}, target={tp.target_price}, "
+            f"size={size}, net_pnl={net_pnl}c, fee_floor={tp.fee_floor_cents}c, "
+            f"spread={tp.spread_cents}c"
+        )
+
+    @pytest.mark.parametrize("entry", ENTRY_PRICES)
+    def test_fee_floor_matches_actual_fees(self, entry):
+        """The fee floor in the TP calculator must >= actual roundtrip fees."""
+        vwap = min(entry + 0.20, 0.99)
+        tp = compute_take_profit(
+            entry_price=entry,
+            no_vwap=vwap,
+            fee_enabled=True,
+            desired_margin_cents=0.0,  # strip margin to test pure fee floor
+        )
+
+        if not tp.viable:
+            return
+
+        # Actual fees from the PnL model
+        from src.trading.fees import get_fee_rate
+        actual_entry_fee = get_fee_rate(tp.entry_price, fee_enabled=True) * 100.0
+        actual_exit_fee = get_fee_rate(tp.target_price, fee_enabled=True) * 100.0
+        actual_roundtrip = actual_entry_fee + actual_exit_fee
+
+        assert tp.fee_floor_cents >= actual_roundtrip - 0.01, (
+            f"Fee floor {tp.fee_floor_cents}c < actual roundtrip {actual_roundtrip}c "
+            f"at entry={entry}"
+        )
+
+    def test_worst_case_p50_both_legs_profitable(self):
+        """p=0.50 is peak fee (1.56%). A viable trade there must still profit."""
+        tp = compute_take_profit(
+            entry_price=0.50,
+            no_vwap=0.70,
+            fee_enabled=True,
+        )
+        assert tp.viable is True
+        net = compute_net_pnl_cents(
+            entry_price=tp.entry_price,
+            exit_price=tp.target_price,
+            size=10.0,
+            fee_enabled=True,
+        )
+        assert net > 0, f"Peak-fee trade lost money: {net}c"

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from src.core.config import settings
 from src.core.logger import get_logger
+from src.trading.fees import get_fee_rate
 
 log = get_logger(__name__)
 
@@ -43,6 +44,7 @@ def compute_take_profit(
     days_to_resolution: int = 30,
     entry_fee_bps: int = 0,
     exit_fee_bps: int = 0,
+    fee_enabled: bool = True,
     desired_margin_cents: float | None = None,
 ) -> TakeProfitResult:
     """Calculate the dynamic take-profit target.
@@ -63,9 +65,14 @@ def compute_take_profit(
     days_to_resolution:
         Days until market resolves.  Closer → lower α.
     entry_fee_bps:
-        Taker fee on entry leg in basis points (e.g. 156).
+        Taker fee on entry leg in basis points (e.g. 156).  Stored in
+        the result for reference only — fee floor uses the dynamic
+        quadratic curve to stay consistent with ``compute_net_pnl_cents``.
     exit_fee_bps:
         Taker fee on exit leg in basis points.  Use 0 for maker exit.
+        Stored for reference only.
+    fee_enabled:
+        Whether Polymarket dynamic fees apply.  Passed to ``get_fee_rate``.
     desired_margin_cents:
         Minimum profit margin in cents above fee costs.  Defaults to
         ``settings.strategy.desired_margin_cents``.
@@ -114,13 +121,15 @@ def compute_take_profit(
     spread_cents = (target - entry_price) * 100.0
 
     # ── Fee-floor enforcement ──────────────────────────────────────────────
+    # Use the same quadratic fee curve as compute_net_pnl_cents so that
+    # a trade clearing the fee floor is always profitable after fees.
     margin = (
         desired_margin_cents
         if desired_margin_cents is not None
         else strat.desired_margin_cents
     )
-    entry_fee_cents = entry_price * entry_fee_bps / 10_000 * 100
-    exit_fee_cents = target * exit_fee_bps / 10_000 * 100
+    entry_fee_cents = get_fee_rate(entry_price, fee_enabled=fee_enabled) * 100.0
+    exit_fee_cents = get_fee_rate(target, fee_enabled=fee_enabled) * 100.0
     fee_floor_cents = round(entry_fee_cents + exit_fee_cents + margin, 4)
 
     # Widen the target if the vol-scaled spread is below the fee floor
@@ -128,7 +137,7 @@ def compute_take_profit(
         # Solve: target' = entry + fee_floor/100, then re-check exit fee
         # One Newton step is sufficient for convergence.
         target_adj = entry_price + fee_floor_cents / 100.0
-        exit_fee_adj = target_adj * exit_fee_bps / 10_000 * 100
+        exit_fee_adj = get_fee_rate(target_adj, fee_enabled=fee_enabled) * 100.0
         fee_floor_cents = round(entry_fee_cents + exit_fee_adj + margin, 4)
         target = entry_price + fee_floor_cents / 100.0
         spread_cents = fee_floor_cents

@@ -97,31 +97,52 @@ class BookHeartbeat:
         if not self._books:
             return
 
-        # Compute max gap across all trackers
-        max_local_gap_ms = 0.0
-        max_server_gap_ms = 0.0
+        # ── Compute freshest and stalest gaps across all trackers ──────
+        #
+        # Purpose: detect dead WebSocket connections, NOT individual
+        # market inactivity.  With 100+ markets subscribed, low-activity
+        # markets will naturally have gaps >> 1.5 s even when the WS is
+        # perfectly healthy.
+        #
+        # Strategy: use the *freshest* tracker (min gap) to judge WS
+        # health.  If even the freshest tracker is stale, the connection
+        # is genuinely dead and we should suspend.
+        freshest_local_ms = float("inf")
+        freshest_server_ms = float("inf")
+        stalest_local_ms = 0.0
         stalest_asset = ""
+        active_count = 0
 
         for asset_id, tracker in self._books.items():
             if tracker._last_update <= 0:
                 continue  # never received data yet
 
+            active_count += 1
             local_age = (now - tracker._last_update) * 1000
-            if local_age > max_local_gap_ms:
-                max_local_gap_ms = local_age
+
+            if local_age < freshest_local_ms:
+                freshest_local_ms = local_age
+            if local_age > stalest_local_ms:
+                stalest_local_ms = local_age
                 stalest_asset = asset_id
 
             server_time = getattr(tracker, "_last_server_time", 0.0)
             if server_time > 0:
                 server_gap = (now - server_time) * 1000
-                if server_gap > max_server_gap_ms:
-                    max_server_gap_ms = server_gap
+                if server_gap < freshest_server_ms:
+                    freshest_server_ms = server_gap
 
-        max_gap = max(max_local_gap_ms, max_server_gap_ms)
+        if active_count == 0:
+            return  # no trackers have ever received data
 
-        if max_gap > self._stale_ms:
+        # Best (freshest) gap across both local and server clocks
+        best_gap = freshest_local_ms
+        if freshest_server_ms < float("inf"):
+            best_gap = min(best_gap, freshest_server_ms)
+
+        if best_gap > self._stale_ms:
             if not self._is_suspended:
-                await self._suspend(max_gap, stalest_asset)
+                await self._suspend(best_gap, stalest_asset)
         else:
             if self._is_suspended:
                 await self._resume()
