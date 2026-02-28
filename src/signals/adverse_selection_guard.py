@@ -22,6 +22,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
 from src.core.config import settings
 from src.core.logger import get_logger
 
@@ -227,9 +229,6 @@ class AdverseSelectionGuard:
 
     async def _decision_loop(self) -> None:
         """Fast-polling loop that evaluates the cancel condition."""
-        # Need httpx for polygon poller
-        import httpx as _  # noqa: F401 — ensure available
-
         while self._running:
             await asyncio.sleep(self._poll_s)
             now = time.time()

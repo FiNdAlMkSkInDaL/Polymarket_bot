@@ -1,0 +1,223 @@
+"""
+Event-driven stop-loss engine — evaluates stop-loss conditions only when
+the Best Bid or Offer (BBO) changes on a tracked asset's order book.
+
+**Zero REST polling.**  The monitor subscribes to BBO-change callbacks
+from the local L2 or WS order book.  When a BBO delta arrives for an
+asset that has an open EXIT_PENDING position, the engine immediately
+evaluates the trailing / fixed stop-loss threshold and fires
+``force_stop_loss()`` if breached.
+
+This replaces the previous 500 ms REST-polling loop, eliminating
+HTTP 429 rate-limit risk entirely.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from src.core.config import settings
+from src.core.logger import get_logger
+
+if TYPE_CHECKING:
+    from src.data.ohlcv import OHLCVAggregator
+    from src.data.orderbook import OrderbookTracker
+    from src.monitoring.telegram import TelegramAlerter
+    from src.monitoring.trade_store import TradeStore
+    from src.trading.position_manager import PositionManager
+
+log = get_logger(__name__)
+
+
+class StopLossMonitor:
+    """Event-driven stop-loss monitor — zero polling.
+
+    Instead of a periodic REST poll, the monitor exposes
+    :meth:`on_bbo_update` which is invoked by BBO-change callbacks from
+    the order-book infrastructure (both ``L2OrderBook`` and
+    ``OrderbookTracker``).  Only positions whose ``no_asset_id`` matches
+    the changed asset are evaluated, giving O(1) lookup for markets
+    without open positions.
+
+    The monitor also supports an optional ``trailing_offset_cents``
+    parameter: if the mid-price rallies after entry, the stop-loss
+    ratchets upward (never back down), converting a fixed stop into a
+    trailing stop.
+    """
+
+    def __init__(
+        self,
+        position_manager: "PositionManager",
+        no_aggs: dict[str, "OHLCVAggregator"],
+        book_trackers: dict[str, "OrderbookTracker"],
+        trade_store: "TradeStore",
+        telegram: "TelegramAlerter",
+        *,
+        trailing_offset_cents: float | None = None,
+    ):
+        self._pm = position_manager
+        self._no_aggs = no_aggs
+        self._books = book_trackers
+        self._store = trade_store
+        self._telegram = telegram
+        self._trailing_offset = (
+            trailing_offset_cents
+            if trailing_offset_cents is not None
+            else settings.strategy.trailing_stop_offset_cents
+        )
+        self._stop_loss_cents = settings.strategy.stop_loss_cents
+        self._running = False
+        # Trailing high-water marks: pos.id → highest mid-price seen since entry
+        self._hwm: dict[str, float] = {}
+
+    def start(self) -> None:
+        """Mark the monitor as active (called once during bot startup)."""
+        if self._stop_loss_cents <= 0:
+            log.info("stop_loss_monitor_disabled", reason="stop_loss_cents=0")
+            return
+        self._running = True
+        log.info(
+            "stop_loss_monitor_started",
+            mode="event_driven",
+            trailing_offset=self._trailing_offset,
+        )
+
+    def stop(self) -> None:
+        self._running = False
+        log.info("stop_loss_monitor_stopped")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Event entry-point — called by BBO-change callbacks
+    # ═══════════════════════════════════════════════════════════════════════
+    async def on_bbo_update(self, asset_id: str) -> None:
+        """Called when the BBO changes for *asset_id*.
+
+        Only evaluates positions whose ``no_asset_id`` matches the
+        changed asset — typically 0 or 1 positions, so this is
+        extremely cheap when there are no open positions on the asset.
+        """
+        if not self._running:
+            return
+
+        from src.trading.position_manager import PositionState
+
+        # Fast-path: find EXIT_PENDING positions for this asset
+        positions_for_asset = [
+            p for p in self._pm.get_open_positions()
+            if p.no_asset_id == asset_id and p.state == PositionState.EXIT_PENDING
+        ]
+        if not positions_for_asset:
+            return
+
+        # Clean stale HWM entries
+        open_ids = {p.id for p in self._pm.get_open_positions()}
+        stale = [pid for pid in self._hwm if pid not in open_ids]
+        for pid in stale:
+            del self._hwm[pid]
+
+        for pos in positions_for_asset:
+            await self._evaluate_position(pos)
+
+    async def _evaluate_position(self, pos) -> None:
+        """Evaluate stop-loss for a single position."""
+        mid = self._get_mid_price(pos.no_asset_id)
+        if mid <= 0:
+            return
+
+        # Update high-water mark for trailing stop
+        hwm = self._hwm.get(pos.id, pos.entry_price)
+        if mid > hwm:
+            hwm = mid
+            self._hwm[pos.id] = hwm
+
+        # Determine effective stop-loss threshold
+        base_sl = (
+            pos.sl_trigger_cents
+            if pos.sl_trigger_cents > 0
+            else self._stop_loss_cents
+        )
+
+        if self._trailing_offset > 0 and hwm > pos.entry_price:
+            # Trailing stop: ratchet up the floor
+            trail_floor_price = hwm - self._trailing_offset / 100.0
+            trail_loss = (trail_floor_price - mid) * 100
+            entry_loss = (pos.entry_price - mid) * 100
+            unrealised_loss = max(trail_loss, entry_loss)
+        else:
+            unrealised_loss = (pos.entry_price - mid) * 100
+
+        if unrealised_loss >= base_sl:
+            await self._trigger_stop(pos, mid, base_sl)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Backward-compatible batch check (used by tests)
+    # ═══════════════════════════════════════════════════════════════════════
+    async def _check_once(self, stop_loss_cents: float) -> None:
+        """Evaluate all EXIT_PENDING positions.
+
+        Retained for test backward-compatibility.  The live path uses
+        :meth:`on_bbo_update` which is driven by BBO callbacks.
+        """
+        from src.trading.position_manager import PositionState
+
+        # Temporarily override the configured SL for this invocation
+        saved = self._stop_loss_cents
+        self._stop_loss_cents = stop_loss_cents
+        saved_running = self._running
+        self._running = True
+
+        try:
+            open_positions = self._pm.get_open_positions()
+
+            # Clean stale HWM entries
+            open_ids = {p.id for p in open_positions}
+            stale = [pid for pid in self._hwm if pid not in open_ids]
+            for pid in stale:
+                del self._hwm[pid]
+
+            for pos in open_positions:
+                if pos.state != PositionState.EXIT_PENDING:
+                    continue
+                await self._evaluate_position(pos)
+        finally:
+            self._stop_loss_cents = saved
+            self._running = saved_running
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Internals
+    # ═══════════════════════════════════════════════════════════════════════
+    def _get_mid_price(self, asset_id: str) -> float:
+        """Best source of current price: orderbook mid → last trade."""
+        book = self._books.get(asset_id)
+        if book and book.has_data:
+            snap = book.snapshot()
+            if snap.best_bid > 0 and snap.best_ask > 0:
+                return (snap.best_bid + snap.best_ask) / 2.0
+
+        agg = self._no_aggs.get(asset_id)
+        if agg and agg.current_price > 0:
+            return agg.current_price
+
+        return 0.0
+
+    async def _trigger_stop(self, pos, mid: float, threshold: float) -> None:
+        from src.trading.position_manager import PositionState
+
+        if pos.state != PositionState.EXIT_PENDING:
+            return  # may have been closed between check and trigger
+
+        log.warning(
+            "active_stop_loss_triggered",
+            pos_id=pos.id,
+            entry=pos.entry_price,
+            mid=mid,
+            threshold=threshold,
+            hwm=self._hwm.get(pos.id, 0.0),
+        )
+
+        await self._pm.force_stop_loss(pos)
+        await self._store.record(pos)
+        await self._telegram.notify_exit(
+            pos.id, pos.entry_price, pos.exit_price,
+            pos.pnl_cents, "stop_loss",
+        )

@@ -11,9 +11,28 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+# ── Deployment phases ──────────────────────────────────────────────────────
+class DeploymentEnv(str, Enum):
+    """Strict 3-phase deployment pipeline.
+
+    PAPER        — simulated fills, mocked wallet, data recorder forced ON.
+    PENNY_LIVE   — real CLOB + real wallet, hardcoded $1 max trade size.
+    PRODUCTION   — all guardrails lifted; defers to Kelly sizer.
+    """
+
+    PAPER = "PAPER"
+    PENNY_LIVE = "PENNY_LIVE"
+    PRODUCTION = "PRODUCTION"
+
+
+# Hardcoded — intentionally NOT configurable via env var.
+PENNY_LIVE_MAX_TRADE_USD: float = 1.0
 
 # ---------------------------------------------------------------------------
 # Locate .env — prefer tmpfs (VPS decrypted secrets), fall back to project root
@@ -33,12 +52,28 @@ def _env(key: str, default: str = "") -> str:
 
 def _env_float(key: str, default: float = 0.0) -> float:
     raw = os.getenv(key, "")
-    return float(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Invalid float for env var {key!r}: {raw!r}.  "
+            f"Expected a numeric value (e.g. '2.5')."
+        )
 
 
 def _env_int(key: str, default: int = 0) -> int:
     raw = os.getenv(key, "")
-    return int(raw) if raw else default
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Invalid integer for env var {key!r}: {raw!r}.  "
+            f"Expected an integer value (e.g. '10')."
+        )
 
 
 def _env_bool(key: str, default: bool = True) -> bool:
@@ -154,6 +189,28 @@ class StrategyParams:
     fee_max_pct: float = _env_float("FEE_MAX_PCT", 1.56)  # peak fee %
     fee_enabled_categories: str = _env("FEE_ENABLED_CATEGORIES", "crypto,sports")
 
+    # ── Pillar 10: Order Status Polling ─────────────────────────────────
+    order_status_poll_s: float = _env_float("ORDER_STATUS_POLL_S", 2.0)
+    order_status_max_retries: int = _env_int("ORDER_STATUS_MAX_RETRIES", 3)
+    # ── Pillar 11: Active Stop-Loss Engine ────────────────────────────────
+    stop_loss_poll_ms: int = _env_int("STOP_LOSS_POLL_MS", 500)
+    trailing_stop_offset_cents: float = _env_float("TRAILING_STOP_OFFSET_CENTS", 0.0)
+
+    # ── Pillar 12: Multi-Signal Framework ─────────────────────────────────
+    imbalance_threshold: float = _env_float("IMBALANCE_THRESHOLD", 2.0)
+    spread_compression_pct: float = _env_float("SPREAD_COMPRESSION_PCT", 0.5)
+    min_composite_signal_score: float = _env_float("MIN_COMPOSITE_SIGNAL_SCORE", 0.3)
+
+    # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
+    kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
+    kelly_max_pct: float = _env_float("KELLY_MAX_PCT", 10.0)
+    kelly_p_cap: float = _env_float("KELLY_P_CAP", 0.85)                      # max win probability estimate
+    kelly_default_uncertainty: float = _env_float("KELLY_DEFAULT_UNCERTAINTY", 0.5)  # fallback when signal metadata missing
+
+    # ── Uncertainty penalty weights for edge discounting ──────────────────
+    uncertainty_spread_weight: float = _env_float("UNCERTAINTY_SPREAD_WEIGHT", 0.6)
+    uncertainty_conf_weight: float = _env_float("UNCERTAINTY_CONF_WEIGHT", 0.4)
+
     # Ghost Liquidity Circuit Breaker
     ghost_depth_drop_threshold: float = _env_float("GHOST_DEPTH_DROP_THRESHOLD", 0.50)
     ghost_window_s: float = _env_float("GHOST_WINDOW_S", 2.0)
@@ -163,6 +220,14 @@ class StrategyParams:
     # Whale cluster detection
     whale_cluster_lookback_blocks: int = _env_int("WHALE_CLUSTER_LOOKBACK_BLOCKS", 10000)
     whale_cluster_refresh_hours: float = _env_float("WHALE_CLUSTER_REFRESH_HOURS", 6.0)
+
+    # ── Pillar 11: Real-Time L2 Order Book ─────────────────────────────────
+    l2_enabled: bool = _env_bool("L2_ENABLED", True)
+    l2_max_levels: int = _env_int("L2_MAX_LEVELS", 50)
+    l2_snapshot_timeout_s: float = _env_float("L2_SNAPSHOT_TIMEOUT_S", 10.0)
+    l2_delta_buffer_size: int = _env_int("L2_DELTA_BUFFER_SIZE", 500)
+    l2_seq_gap_max_retries: int = _env_int("L2_SEQ_GAP_MAX_RETRIES", 3)
+    l2_spread_score_top_n: int = _env_int("L2_SPREAD_SCORE_TOP_N", 3)
 
 
 @dataclass(frozen=True)
@@ -187,19 +252,63 @@ class Settings:
     telegram_bot_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
     telegram_chat_id: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID"))
 
-    # Mode
-    paper_mode: bool = field(default_factory=lambda: _env_bool("PAPER_MODE", True))
+    # ── Deployment phase (replaces simple paper_mode boolean) ──────────
+    deployment_env: DeploymentEnv = field(
+        default_factory=lambda: DeploymentEnv(_env("DEPLOYMENT_ENV", "PAPER"))
+    )
+    # Derived — kept for backward compatibility with executor / poller
+    paper_mode: bool = field(init=False, default=True)
+
+    # Data recording
+    record_data: bool = field(default_factory=lambda: _env_bool("RECORD_DATA", False))
+    record_data_dir: str = field(default_factory=lambda: _env("RECORD_DATA_DIR", "data"))
+
+    def __post_init__(self) -> None:
+        # Derive paper_mode from the canonical deployment_env.
+        # frozen=True prevents normal assignment; use object.__setattr__.
+        object.__setattr__(
+            self, "paper_mode", self.deployment_env == DeploymentEnv.PAPER
+        )
+        # Legacy PAPER_MODE env-var override: if someone explicitly sets
+        # PAPER_MODE=true *without* setting DEPLOYMENT_ENV, honour it.
+        raw_dep = os.getenv("DEPLOYMENT_ENV", "")
+        if not raw_dep and _env_bool("PAPER_MODE", True):
+            object.__setattr__(self, "deployment_env", DeploymentEnv.PAPER)
+            object.__setattr__(self, "paper_mode", True)
 
     # Strategy
     strategy: StrategyParams = field(default_factory=StrategyParams)
 
     # Polymarket CLOB endpoints
-    clob_http_url: str = "https://clob.polymarket.com"
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    clob_http_url: str = field(
+        default_factory=lambda: _env("CLOB_HTTP_URL", "https://clob.polymarket.com")
+    )
+    clob_ws_url: str = field(
+        default_factory=lambda: _env(
+            "CLOB_WS_URL",
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        )
+    )
+    clob_l2_ws_url: str = field(
+        default_factory=lambda: _env(
+            "CLOB_L2_WS_URL",
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        )
+    )
+    clob_book_url: str = field(
+        default_factory=lambda: _env(
+            "CLOB_BOOK_URL",
+            "https://clob.polymarket.com/book",
+        )
+    )
 
     # Whale monitoring
-    whale_poll_interval_seconds: int = 30
-    whale_lookback_seconds: int = 600  # 10 min window for confluence
+    whale_poll_interval_seconds: int = field(
+        default_factory=lambda: _env_int("WHALE_POLL_INTERVAL_S", 30)
+    )
+    whale_lookback_seconds: int = field(
+        default_factory=lambda: _env_int("WHALE_LOOKBACK_S", 600)
+    )  # 10 min window for confluence
 
     # Logging
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))
@@ -225,6 +334,26 @@ class Settings:
         return f"{self.__class__.__name__}({', '.join(parts)})"
 
     __str__ = __repr__
+
+    def validate_credentials(self) -> list[str]:
+        """Return a list of missing credential fields (empty = all OK).
+
+        Checks credentials required for any non-PAPER deployment phase
+        (PENNY_LIVE and PRODUCTION both need real CLOB credentials).
+        """
+        errors: list[str] = []
+        if self.deployment_env == DeploymentEnv.PAPER:
+            return errors  # no real credentials needed
+        required_live = [
+            ("polymarket_api_key", "POLYMARKET_API_KEY"),
+            ("polymarket_secret", "POLYMARKET_SECRET"),
+            ("polymarket_passphrase", "POLYMARKET_PASSPHRASE"),
+            ("eoa_private_key", "EOA_PRIVATE_KEY"),
+        ]
+        for attr, env_name in required_live:
+            if not getattr(self, attr, ""):
+                errors.append(f"{env_name} is required for {self.deployment_env.value} mode")
+        return errors
 
 
 # Singleton

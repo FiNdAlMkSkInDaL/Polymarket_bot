@@ -12,10 +12,11 @@ bid/ask spread, depth, and mid-price used by:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from src.core.logger import get_logger
 
@@ -36,6 +37,7 @@ class OrderbookSnapshot:
     timestamp: float = 0.0
     server_time: float = 0.0     # server-reported timestamp (epoch s)
     fresh: bool = True            # False when latency guard is BLOCKED
+    spread_score: float = 0.0    # live L2 spread score (0-100)
 
 
 @dataclass
@@ -54,12 +56,21 @@ class OrderbookTracker:
 
     _MAX_LEVELS = 10  # keep top-10 per side
 
-    def __init__(self, asset_id: str):
+    def __init__(
+        self,
+        asset_id: str,
+        *,
+        on_bbo_change: Callable[..., Any] | None = None,
+    ):
         self.asset_id = asset_id
         self._bids: list[_Level] = []  # sorted desc by price
         self._asks: list[_Level] = []  # sorted asc by price
         self._last_update: float = 0.0
         self._last_server_time: float = 0.0
+        self._on_bbo_change = on_bbo_change
+        # Previous BBO for change detection
+        self._prev_best_bid: float = 0.0
+        self._prev_best_ask: float = 0.0
         # Depth history ring buffer for Ghost Liquidity detection
         self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
 
@@ -111,6 +122,7 @@ class OrderbookTracker:
             except (TypeError, ValueError):
                 pass
         self._record_depth()
+        self._check_bbo_change()
 
     def on_book_snapshot(self, data: dict) -> None:
         """Process a full ``book`` snapshot (replaces current state)."""
@@ -141,6 +153,7 @@ class OrderbookTracker:
             except (TypeError, ValueError):
                 pass
         self._record_depth()
+        self._check_bbo_change()
 
     def snapshot(self, *, fresh: bool = True) -> OrderbookSnapshot:
         """Return current top-of-book summary.
@@ -200,6 +213,24 @@ class OrderbookTracker:
     @property
     def has_data(self) -> bool:
         return self._last_update > 0
+
+    # ── BBO change detection ─────────────────────────────────────────────
+    def _check_bbo_change(self) -> None:
+        """Fire ``on_bbo_change`` callback if the BBO has changed."""
+        bb = self._bids[0].price if self._bids else 0.0
+        ba = self._asks[0].price if self._asks else 0.0
+        if bb == self._prev_best_bid and ba == self._prev_best_ask:
+            return
+        self._prev_best_bid = bb
+        self._prev_best_ask = ba
+        if self._on_bbo_change is not None:
+            try:
+                snap = self.snapshot()
+                result = self._on_bbo_change(self.asset_id, snap)
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
+            except Exception:
+                pass
 
     # ── depth tracking for Ghost Liquidity detection ─────────────────────
     def _record_depth(self) -> None:
@@ -265,3 +296,84 @@ class OrderbookTracker:
         # Trim to max levels
         if len(levels) > self._MAX_LEVELS:
             del levels[self._MAX_LEVELS:]
+
+
+class L2OrderBookAdapter(OrderbookTracker):
+    """Adapter that wraps an ``L2OrderBook`` behind the ``OrderbookTracker``
+    interface so all existing consumers (heartbeat, sizer, chaser, ghost CB,
+    scorer, TP rescale, adverse selection, MTI classification) work without
+    modification.
+
+    Delegates all reads to the underlying ``L2OrderBook`` instance.  Write
+    methods (``on_price_change``, ``on_book_snapshot``) are no-ops since the
+    L2 book is populated by its own WebSocket pipeline.
+    """
+
+    def __init__(self, l2_book: Any) -> None:
+        # Do NOT call super().__init__() because we delegate everything
+        self._l2 = l2_book
+        self.asset_id = l2_book.asset_id
+
+    # ── Write ops are no-ops (L2 book is fed by L2WebSocket) ───────────
+    def on_price_change(self, data: dict) -> None:
+        """No-op: L2 book receives deltas via its own pipeline."""
+        pass
+
+    def on_book_snapshot(self, data: dict) -> None:
+        """No-op: L2 book receives snapshots via its own pipeline."""
+        pass
+
+    # ── Read ops delegate to L2OrderBook ───────────────────────────────
+    def snapshot(self, *, fresh: bool = True) -> OrderbookSnapshot:
+        l2_snap = self._l2.snapshot(fresh=fresh)
+        return OrderbookSnapshot(
+            asset_id=l2_snap.asset_id,
+            best_bid=l2_snap.best_bid,
+            best_ask=l2_snap.best_ask,
+            spread=l2_snap.spread,
+            bid_depth_usd=l2_snap.bid_depth_usd,
+            ask_depth_usd=l2_snap.ask_depth_usd,
+            mid_price=l2_snap.mid_price,
+            timestamp=l2_snap.timestamp,
+            server_time=l2_snap.server_time,
+            fresh=l2_snap.fresh,
+            spread_score=l2_snap.spread_score,
+        )
+
+    def levels(self, side: str, n: int = 5) -> list[_Level]:
+        l2_levels = self._l2.levels(side, n)
+        return [_Level(lv.price, lv.size) for lv in l2_levels]
+
+    @property
+    def spread_cents(self) -> float:
+        return self._l2.spread_cents
+
+    @property
+    def book_depth_ratio(self) -> float:
+        return self._l2.book_depth_ratio
+
+    @property
+    def has_data(self) -> bool:
+        return self._l2.has_data
+
+    @property
+    def _last_update(self) -> float:
+        return self._l2._last_update
+
+    @_last_update.setter
+    def _last_update(self, value: float) -> None:
+        pass  # read-only delegate
+
+    @property
+    def _last_server_time(self) -> float:
+        return self._l2._last_server_time
+
+    @_last_server_time.setter
+    def _last_server_time(self, value: float) -> None:
+        pass  # read-only delegate
+
+    def current_total_depth(self) -> float:
+        return self._l2.current_total_depth()
+
+    def depth_velocity(self, window_s: float = 2.0) -> float | None:
+        return self._l2.depth_velocity(window_s)

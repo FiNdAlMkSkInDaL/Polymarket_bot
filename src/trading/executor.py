@@ -9,7 +9,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 from src.core.config import settings
 from src.core.logger import get_logger
@@ -289,3 +289,188 @@ class OrderExecutor:
         for oid in to_remove:
             del self._orders[oid]
         return len(to_remove)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Order Status Poller — polls CLOB for live-order status updates
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Callback type: async fn(Order) called when a fill is detected
+FillCallback = Callable[[Order], Coroutine[Any, Any, None]]
+
+
+class OrderStatusPoller:
+    """Periodically polls the CLOB REST API for open-order status.
+
+    For every LIVE or PARTIALLY_FILLED :class:`Order` that has a
+    ``clob_order_id``, the poller fetches the latest status from
+    ``GET /order/{id}``.  When a fill (full or partial) is detected it
+    updates the local :class:`Order` object and invokes the registered
+    *on_fill* callback so that :class:`PositionManager` can transition
+    the owning position.
+
+    In **paper mode** the poller is a no-op — fills are simulated
+    locally by :meth:`OrderExecutor.check_paper_fill`.
+    """
+
+    # Mapping from CLOB status strings → internal OrderStatus
+    _STATUS_MAP: dict[str, OrderStatus] = {
+        "live": OrderStatus.LIVE,
+        "LIVE": OrderStatus.LIVE,
+        "open": OrderStatus.LIVE,
+        "OPEN": OrderStatus.LIVE,
+        "matched": OrderStatus.FILLED,
+        "MATCHED": OrderStatus.FILLED,
+        "filled": OrderStatus.FILLED,
+        "FILLED": OrderStatus.FILLED,
+        "cancelled": OrderStatus.CANCELLED,
+        "CANCELLED": OrderStatus.CANCELLED,
+        "canceled": OrderStatus.CANCELLED,
+        "CANCELED": OrderStatus.CANCELLED,
+        "expired": OrderStatus.EXPIRED,
+        "EXPIRED": OrderStatus.EXPIRED,
+    }
+
+    def __init__(
+        self,
+        executor: OrderExecutor,
+        *,
+        on_fill: FillCallback | None = None,
+        poll_interval_s: float | None = None,
+        max_retries: int | None = None,
+    ):
+        self._executor = executor
+        self._on_fill = on_fill
+        self._poll_s = poll_interval_s or settings.strategy.order_status_poll_s
+        self._max_retries = max_retries if max_retries is not None else settings.strategy.order_status_max_retries
+        self._running = False
+        self._consecutive_errors: dict[str, int] = {}  # clob_order_id → error count
+
+    # ── Public lifecycle ────────────────────────────────────────────────────
+    async def run(self) -> None:
+        """Long-running coroutine — poll until cancelled."""
+        if self._executor.paper_mode:
+            return  # paper mode: fills are simulated locally
+
+        self._running = True
+        log.info("order_status_poller_started", poll_s=self._poll_s)
+
+        while self._running:
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("order_status_poll_error", error=str(exc))
+            await asyncio.sleep(self._poll_s)
+
+        log.info("order_status_poller_stopped")
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ── Core polling logic ──────────────────────────────────────────────────
+    async def _poll_once(self) -> None:
+        """Fetch status for every open order with a clob_order_id."""
+        open_orders = [
+            o for o in self._executor.get_open_orders()
+            if o.clob_order_id
+        ]
+        if not open_orders:
+            return
+
+        clob = self._executor._get_clob_client()
+        if clob is None:
+            return
+
+        for order in open_orders:
+            try:
+                resp = await asyncio.to_thread(clob.get_order, order.clob_order_id)
+                if resp is None:
+                    self._record_error(order.clob_order_id)
+                    continue
+
+                self._consecutive_errors.pop(order.clob_order_id, None)
+                self._apply_update(order, resp)
+
+            except Exception as exc:
+                self._record_error(order.clob_order_id)
+                log.warning(
+                    "order_status_fetch_failed",
+                    clob_id=order.clob_order_id,
+                    error=str(exc),
+                )
+
+    def _record_error(self, clob_id: str) -> None:
+        count = self._consecutive_errors.get(clob_id, 0) + 1
+        self._consecutive_errors[clob_id] = count
+        if count >= self._max_retries:
+            log.warning(
+                "order_status_max_retries",
+                clob_id=clob_id,
+                retries=count,
+            )
+
+    def _apply_update(self, order: Order, resp: Any) -> None:
+        """Reconcile CLOB response with local order state."""
+        if isinstance(resp, dict):
+            raw_status = resp.get("status", "")
+            filled_size = float(resp.get("size_matched", 0) or resp.get("filled_size", 0) or 0)
+            avg_price = float(resp.get("average_price", 0) or resp.get("price", 0) or 0)
+        elif hasattr(resp, "status"):
+            raw_status = getattr(resp, "status", "")
+            filled_size = float(getattr(resp, "size_matched", 0) or getattr(resp, "filled_size", 0) or 0)
+            avg_price = float(getattr(resp, "average_price", 0) or getattr(resp, "price", 0) or 0)
+        else:
+            return
+
+        new_status = self._STATUS_MAP.get(str(raw_status), None)
+        if new_status is None:
+            log.debug("order_status_unknown", clob_id=order.clob_order_id, raw=raw_status)
+            return
+
+        # Detect partial fill growth
+        prev_filled = order.filled_size
+        if filled_size > prev_filled:
+            order.filled_size = filled_size
+            if avg_price > 0:
+                order.filled_avg_price = avg_price
+            order.updated_at = time.time()
+
+        # Detect terminal state transitions
+        if new_status != order.status:
+            old = order.status
+            order.status = new_status
+            order.updated_at = time.time()
+
+            log.info(
+                "order_status_updated",
+                order_id=order.order_id,
+                clob_id=order.clob_order_id,
+                old_status=old.value,
+                new_status=new_status.value,
+                filled_size=order.filled_size,
+            )
+
+            # Fire fill callback on FILLED transition
+            if new_status == OrderStatus.FILLED and self._on_fill:
+                asyncio.create_task(self._safe_callback(order))
+            elif (
+                new_status == OrderStatus.PARTIALLY_FILLED
+                and filled_size > prev_filled
+                and self._on_fill
+            ):
+                # Also notify on new partial fills
+                asyncio.create_task(self._safe_callback(order))
+
+    async def _safe_callback(self, order: Order) -> None:
+        """Invoke the fill callback with error isolation."""
+        try:
+            if self._on_fill:
+                await self._on_fill(order)
+        except Exception as exc:
+            log.error(
+                "fill_callback_error",
+                order_id=order.order_id,
+                error=str(exc),
+            )

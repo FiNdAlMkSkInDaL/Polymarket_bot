@@ -18,15 +18,28 @@ dependencies = [
     "aiosqlite>=0.20",
     "python-telegram-bot>=21.0",
     "click>=8.1",
+    "sortedcontainers>=2.4",
+    "optuna>=3.5",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
+data = [
+    "pandas>=2.1",
+    "pyarrow>=15.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "ruff>=0.3",
+    "pandas>=2.1",
+    "pyarrow>=15.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
 
 [project.scripts]
 polybot = "src.cli:main"

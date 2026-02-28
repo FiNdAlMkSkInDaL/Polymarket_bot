@@ -55,8 +55,8 @@ class PanicDetector:
         self.yes_agg = yes_aggregator
         self.no_agg = no_aggregator
 
-        self.z_thresh = zscore_threshold or settings.strategy.zscore_threshold
-        self.v_thresh = volume_ratio_threshold or settings.strategy.volume_ratio_threshold
+        self.z_thresh = zscore_threshold if zscore_threshold is not None else settings.strategy.zscore_threshold
+        self.v_thresh = volume_ratio_threshold if volume_ratio_threshold is not None else settings.strategy.volume_ratio_threshold
 
     # ── public ──────────────────────────────────────────────────────────────
     def evaluate(

@@ -19,7 +19,7 @@ from src.monitoring.trade_store import TradeStore
 
 # ── Ensure paper mode is always on during tests ──────────────────────────
 os.environ.setdefault("PAPER_MODE", "true")
-
+os.environ.setdefault("DEPLOYMENT_ENV", "PAPER")
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 @pytest.fixture

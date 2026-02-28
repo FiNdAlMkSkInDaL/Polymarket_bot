@@ -162,6 +162,10 @@ class BookHeartbeat:
         self._is_suspended = False
         self._kill_event.set()
 
+        # Reset the latency guard so it transitions back to HEALTHY
+        # immediately instead of waiting for N consecutive healthy ticks.
+        self._guard.reset()
+
         log.info("heartbeat_recovered")
 
         if self._telegram and hasattr(self._telegram, "send"):

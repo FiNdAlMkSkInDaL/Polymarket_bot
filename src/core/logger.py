@@ -7,6 +7,7 @@ Produces JSON lines to both stdout and a rotating file for post-hoc analysis.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
@@ -24,8 +25,13 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # File handler — JSON lines
-    file_handler = logging.FileHandler(log_path / "bot.jsonl", encoding="utf-8")
+    # Rotating file handler — 10 MB per file, 5 backups
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path / "bot.jsonl",
+        encoding="utf-8",
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+    )
     file_handler.setLevel(level)
 
     # Stdout handler

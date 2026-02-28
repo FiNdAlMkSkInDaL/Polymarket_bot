@@ -18,7 +18,6 @@ Resolution detection:  each refresh cycle polls Gamma for ``active``/
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -93,8 +92,6 @@ class MarketLifecycleManager:
         self.active: dict[str, ActiveMarket] = {}
         self.draining: dict[str, DrainingMarket] = {}
         self.emergency: dict[str, EmergencyDrainMarket] = {}
-
-        self._rate_sem = asyncio.Semaphore(settings.strategy.api_rate_limit_per_sec)
 
     # ────────────────────────── Bootstrap ──────────────────────────────────
 
@@ -186,10 +183,14 @@ class MarketLifecycleManager:
             # Build score with live data if available
             spread = 0.0
             mid_price = 0.5
+            live_spread_score = None
             book_tracker = orderbook_trackers.get(am.info.yes_token_id)
             if book_tracker and book_tracker.has_data:
                 spread = book_tracker.spread_cents
-                mid_price = book_tracker.snapshot().mid_price or 0.5
+                snap = book_tracker.snapshot()
+                mid_price = snap.mid_price or 0.5
+                if snap.spread_score > 0:
+                    live_spread_score = snap.spread_score
 
             tpm = trade_counts.get(am.info.yes_token_id, 0.0)
             has_whale = (
@@ -217,6 +218,7 @@ class MarketLifecycleManager:
                 has_whale_activity=has_whale,
                 taker_count=mkt_taker,
                 total_count=mkt_total,
+                live_spread_score=live_spread_score,
             )
             am.score = score
             am.info.score = score.total
@@ -468,10 +470,14 @@ class MarketLifecycleManager:
             # Re-score with any live data
             spread = 0.0
             mid_price = 0.5
+            live_spread_score = None
             bt = orderbook_trackers.get(om.info.yes_token_id)
             if bt and bt.has_data:
                 spread = bt.spread_cents
-                mid_price = bt.snapshot().mid_price or 0.5
+                snap = bt.snapshot()
+                mid_price = snap.mid_price or 0.5
+                if snap.spread_score > 0:
+                    live_spread_score = snap.spread_score
 
             tpm = trade_counts.get(om.info.yes_token_id, 0.0)
             has_whale = (
@@ -499,6 +505,7 @@ class MarketLifecycleManager:
                 has_whale_activity=has_whale,
                 taker_count=mkt_taker,
                 total_count=mkt_total,
+                live_spread_score=live_spread_score,
             )
 
             if score.total >= min_score:

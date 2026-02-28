@@ -22,13 +22,19 @@ from enum import Enum
 from typing import Any
 
 from src.core.config import settings
+from src.core.guard import DeploymentGuard
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
-from src.trading.sizer import SizingResult, compute_depth_aware_size
+from src.trading.sizer import (
+    KellyResult,
+    SizingResult,
+    compute_depth_aware_size,
+    compute_kelly_size,
+)
 from src.trading.take_profit import TakeProfitResult, compute_take_profit
 
 log = get_logger(__name__)
@@ -72,6 +78,7 @@ class Position:
 
     # Sizing metadata
     sizing: SizingResult | None = None
+    kelly_result: KellyResult | None = None
 
     # Fee tracking (basis points)
     entry_fee_bps: int = 0
@@ -109,9 +116,13 @@ class PositionManager:
         executor: OrderExecutor,
         *,
         max_open_positions: int | None = None,
+        trade_store: Any | None = None,
+        guard: DeploymentGuard | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
+        self._trade_store = trade_store
+        self._guard = guard
         self._positions: dict[str, Position] = {}
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
@@ -148,6 +159,7 @@ class PositionManager:
         days_to_resolution: int = 30,
         book_depth_ratio: float = 1.0,
         fee_enabled: bool = True,
+        signal_metadata: dict | None = None,
     ) -> Position | None:
         """Attempt to open a mean-reversion position on a panic signal.
 
@@ -278,11 +290,61 @@ class PositionManager:
                 capped=False,
             )
 
-        entry_size = sizing.size_shares
+        # ── Kelly criterion sizing (Pillar 3) ─────────────────────────────
+        kelly_result: KellyResult | None = None
+        win_rate = 0.0
+        avg_win_cents = 0.0
+        avg_loss_cents = 0.0
+        if self._trade_store is not None:
+            try:
+                stats = await self._trade_store.get_stats()
+                win_rate = stats.get("win_rate", 0.0)
+                avg_win_cents = stats.get("avg_win_cents", 0.0)
+                avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+            except Exception:
+                log.warning("trade_store_stats_unavailable")
+
+        # Normalise signal strength to 0.0–1.0 for Kelly sizer.
+        # zscore is typically 2–5+; map the excess above threshold to [0, 1].
+        z_threshold = strat.zscore_threshold
+        signal_score = min(1.0, max(0.0, (signal.zscore - z_threshold) / z_threshold)) if z_threshold > 0 else 0.5
+
+        kelly_result = compute_kelly_size(
+            signal_score=signal_score,
+            win_rate=win_rate,
+            avg_win_cents=avg_win_cents,
+            avg_loss_cents=avg_loss_cents,
+            bankroll_usd=self._wallet_balance_usd,
+            entry_price=entry_price,
+            max_trade_usd=max_trade,
+            book=no_book,
+            signal_metadata=signal_metadata,
+        )
+
+        # Reject if Kelly finds no edge
+        if kelly_result.method == "kelly_no_edge":
+            log.info(
+                "skip_entry_kelly_no_edge",
+                estimated_p=kelly_result.estimated_p,
+                adjusted_p=kelly_result.adjusted_p,
+                uncertainty=kelly_result.uncertainty_penalty,
+            )
+            return None
+
+        # Conservative sizing: min(depth-aware, kelly)
+        entry_size = min(sizing.size_shares, kelly_result.size_shares)
+
+        # ── Deployment guard: enforce phase-specific size cap ──────────────
+        if self._guard is not None:
+            entry_size = self._guard.get_allowed_trade_shares(
+                entry_size, entry_price
+            )
+
         if entry_size < 1:
             log.info(
                 "skip_entry_insufficient_size",
                 sizing_method=sizing.method,
+                kelly_method=kelly_result.method,
                 available_liq=sizing.available_liq_usd,
             )
             return None
@@ -349,8 +411,11 @@ class PositionManager:
             tp_result=tp,
             target_price=tp.target_price,
             sizing=sizing,
+            kelly_result=kelly_result,
             fee_enabled=fee_enabled,
             sl_trigger_cents=sl_trigger,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=exit_fee_bps,
         )
 
         self._positions[pos.id] = pos
@@ -484,7 +549,18 @@ class PositionManager:
                         size=pos.entry_size,
                     )
                     pos.exit_order = exit_order
-                    self.on_exit_filled(pos, reason="timeout")
+                    # In paper mode, check for an immediate fill;
+                    # in live mode the fill will be detected by the
+                    # order-status poller or the next check_timeouts cycle.
+                    if self.executor.paper_mode:
+                        self.on_exit_filled(pos, reason="timeout")
+                    else:
+                        pos.exit_reason = "timeout"
+                        log.info(
+                            "timeout_exit_placed",
+                            pos_id=pos.id,
+                            note="awaiting CLOB fill confirmation",
+                        )
 
     async def force_stop_loss(self, pos: Position) -> None:
         """Force-close a position via market sell due to stop-loss trigger."""
@@ -506,14 +582,24 @@ class PositionManager:
             size=pos.entry_size,
         )
         pos.exit_order = exit_order
-        self.on_exit_filled(pos, reason="stop_loss")
+        # In paper mode, close immediately; in live mode wait for CLOB
+        # fill confirmation from the order-status poller.
+        if self.executor.paper_mode:
+            self.on_exit_filled(pos, reason="stop_loss")
+        else:
+            pos.exit_reason = "stop_loss"
+            log.info(
+                "stop_loss_exit_placed",
+                pos_id=pos.id,
+                note="awaiting CLOB fill confirmation",
+            )
 
         log.warning(
             "stop_loss_triggered",
             pos_id=pos.id,
             entry=pos.entry_price,
-            exit=pos.exit_price,
-            pnl_cents=pos.pnl_cents,
+            exit=pos.exit_price if pos.state == PositionState.CLOSED else 0.0,
+            pnl_cents=pos.pnl_cents if pos.state == PositionState.CLOSED else 0.0,
         )
 
     # ── Cleanup ────────────────────────────────────────────────────────────

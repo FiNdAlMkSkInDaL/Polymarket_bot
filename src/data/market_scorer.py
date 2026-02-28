@@ -122,7 +122,7 @@ def score_price_range(mid_price: float) -> float:
 
 
 def score_trade_frequency(trades_per_minute: float) -> float:
-    """More trades → higher score.  0→0,  1→40,  5→80,  10+→100."""
+    """More trades → higher score.  0→0,  1→10,  5→50,  10+→100."""
     if trades_per_minute <= 0:
         return 0.0
     score = trades_per_minute * 10.0
@@ -135,20 +135,23 @@ def score_whale_interest(has_whale_activity: bool) -> float:
 
 
 def compute_mti_penalty(taker_count: int, total_count: int) -> float:
-    """Compute the Maker/Taker Imbalance penalty.
+    """Compute the Maker/Taker Imbalance penalty (graduated).
 
-    If > threshold% of trades are taker-initiated (aggressive), the market
-    is penalised — high taker ratios indicate toxic/informed flow.
+    Uses a linear ramp from 0 at ``mti_threshold`` to
+    ``mti_penalty_points`` at 100% taker ratio.  This avoids the
+    cliff-edge oscillation caused by a binary 0-or-max penalty.
 
-    Returns the penalty in points (0 or ``mti_penalty_points``).
+    Returns the penalty in points [0, ``mti_penalty_points``].
     """
     if total_count <= 0:
         return 0.0
     mti = taker_count / total_count
     threshold = settings.strategy.mti_threshold
-    if mti > threshold:
-        return settings.strategy.mti_penalty_points
-    return 0.0
+    if mti <= threshold:
+        return 0.0
+    max_penalty = settings.strategy.mti_penalty_points
+    # Linear ramp: 0 at threshold, max_penalty at 1.0
+    return max_penalty * (mti - threshold) / (1.0 - threshold)
 
 
 def compute_score(
@@ -162,19 +165,26 @@ def compute_score(
     has_whale_activity: bool = False,
     taker_count: int = 0,
     total_count: int = 0,
+    live_spread_score: float | None = None,
 ) -> ScoreBreakdown:
     """Compute the composite 0-100 quality score for a market.
 
     Returns a ScoreBreakdown with individual component scores and total.
     The MTI (Maker/Taker Imbalance) penalty is subtracted from the
     weighted sum when taker flow exceeds the configured threshold.
+
+    Parameters
+    ----------
+    live_spread_score:
+        When provided (from L2 order book), used directly as the spread
+        component instead of computing from ``spread_cents``.
     """
     penalty = compute_mti_penalty(taker_count, total_count)
 
     bd = ScoreBreakdown(
         volume=score_volume(daily_volume_usd),
         liquidity=score_liquidity(liquidity_usd),
-        spread=score_spread(spread_cents),
+        spread=live_spread_score if live_spread_score is not None else score_spread(spread_cents),
         time_to_resolve=score_time_to_resolution(end_date),
         price_range=score_price_range(mid_price),
         trade_freq=score_trade_frequency(trades_per_minute),

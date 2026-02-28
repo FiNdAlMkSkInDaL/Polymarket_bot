@@ -1,23 +1,29 @@
-"""
-Telegram alert bot — sends trade notifications and accepts a /kill command.
-"""
+"""Telegram alert bot — sends trade notifications and accepts a /kill command."""
 
 from __future__ import annotations
 
-import asyncio
+import time
+from collections import deque
 from typing import Any
+
+import httpx
 
 from src.core.config import settings
 from src.core.logger import get_logger
 
 log = get_logger(__name__)
 
+# Telegram rate limit: max 30 messages per minute
+_RATE_LIMIT_WINDOW_S = 60.0
+_RATE_LIMIT_MAX = 30
+
 
 class TelegramAlerter:
     """Lightweight async Telegram notification sender.
 
-    Uses httpx directly to avoid heavyweight telegram library at PoC stage.
-    Supports an optional /kill webhook (implemented in the orchestrator).
+    Uses a shared ``httpx.AsyncClient`` for connection pooling and
+    enforces a rate limit of 30 messages per minute to avoid Telegram
+    429 errors.
     """
 
     def __init__(
@@ -28,17 +34,41 @@ class TelegramAlerter:
         self.bot_token = bot_token or settings.telegram_bot_token
         self.chat_id = chat_id or settings.telegram_chat_id
         self._enabled = bool(self.bot_token and self.chat_id)
+        self._client: httpx.AsyncClient | None = None
+        self._send_times: deque[float] = deque(maxlen=_RATE_LIMIT_MAX)
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazily create and reuse a single httpx client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=10)
+        return self._client
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def send(self, message: str, parse_mode: str = "HTML") -> None:
         """Send a text message to the configured Telegram chat."""
         if not self._enabled:
             return
 
-        import httpx
+        # Rate limiting: drop if we've sent too many messages recently
+        now = time.monotonic()
+        while self._send_times and (now - self._send_times[0]) > _RATE_LIMIT_WINDOW_S:
+            self._send_times.popleft()
+        if len(self._send_times) >= _RATE_LIMIT_MAX:
+            log.warning("telegram_rate_limited", dropped_chars=len(message))
+            return
+
+        # Truncate to Telegram's 4096 char limit
+        if len(message) > 4096:
+            message = message[:4090] + "\n..."
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
@@ -48,10 +78,11 @@ class TelegramAlerter:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code != 200:
-                    log.warning("telegram_send_failed", status=resp.status_code)
+            client = self._get_client()
+            resp = await client.post(url, json=payload)
+            self._send_times.append(now)
+            if resp.status_code != 200:
+                log.warning("telegram_send_failed", status=resp.status_code)
         except Exception as exc:
             log.warning("telegram_send_error", error=str(exc))
 

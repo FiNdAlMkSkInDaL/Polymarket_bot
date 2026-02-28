@@ -86,3 +86,165 @@ class TestTradeStore:
         stats = await store.get_stats()
         assert stats["total_trades"] == 0
         await store.close()
+
+
+# ── State-persistence tests ─────────────────────────────────────────────────
+
+from src.trading.executor import Order, OrderSide, OrderStatus
+
+
+class TestStatePersistence:
+    @pytest.fixture
+    def store(self, tmp_path):
+        return TradeStore(tmp_path / "persist_test.db")
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_and_restore_orders(self, store):
+        await store.init()
+
+        orders = [
+            Order(
+                order_id="LIVE-1",
+                market_id="MKT_A",
+                asset_id="NO_A",
+                side=OrderSide.BUY,
+                price=0.45,
+                size=10.0,
+                status=OrderStatus.LIVE,
+                clob_order_id="CLOB-1",
+            ),
+            Order(
+                order_id="LIVE-2",
+                market_id="MKT_B",
+                asset_id="NO_B",
+                side=OrderSide.SELL,
+                price=0.60,
+                size=5.0,
+                status=OrderStatus.PARTIALLY_FILLED,
+                filled_size=2.0,
+                filled_avg_price=0.59,
+                clob_order_id="CLOB-2",
+            ),
+        ]
+
+        await store.checkpoint_orders(orders)
+        restored = await store.restore_orders()
+
+        assert len(restored) == 2
+        by_id = {r["order_id"]: r for r in restored}
+
+        o1 = by_id["LIVE-1"]
+        assert o1["market_id"] == "MKT_A"
+        assert o1["side"] == "BUY"
+        assert o1["price"] == 0.45
+        assert o1["clob_order_id"] == "CLOB-1"
+        assert o1["status"] == "LIVE"
+
+        o2 = by_id["LIVE-2"]
+        assert o2["filled_size"] == 2.0
+        assert o2["filled_avg_price"] == 0.59
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_and_restore_positions(self, store):
+        await store.init()
+
+        pos = _make_position("POS-1", 0.45, 0.55)
+        pos.state = PositionState.EXIT_PENDING  # simulate open position
+
+        await store.checkpoint_positions([pos])
+        restored = await store.restore_positions()
+
+        assert len(restored) == 1
+        p = restored[0]
+        assert p["id"] == "POS-1"
+        assert p["market_id"] == "MKT_TEST"
+        assert p["state"] == "EXIT_PENDING"
+        assert p["entry_price"] == 0.45
+        assert p["target_price"] == 0.55
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_replaces_previous_data(self, store):
+        await store.init()
+
+        orders_v1 = [
+            Order(
+                order_id="OLD-1", market_id="M", asset_id="A",
+                side=OrderSide.BUY, price=0.40, size=5.0,
+                status=OrderStatus.LIVE, clob_order_id="C-1",
+            ),
+        ]
+        await store.checkpoint_orders(orders_v1)
+
+        orders_v2 = [
+            Order(
+                order_id="NEW-1", market_id="M2", asset_id="A2",
+                side=OrderSide.SELL, price=0.60, size=3.0,
+                status=OrderStatus.LIVE, clob_order_id="C-2",
+            ),
+        ]
+        await store.checkpoint_orders(orders_v2)
+
+        restored = await store.restore_orders()
+        assert len(restored) == 1
+        assert restored[0]["order_id"] == "NEW-1"
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_clear_live_state(self, store):
+        await store.init()
+
+        orders = [
+            Order(
+                order_id="X-1", market_id="M", asset_id="A",
+                side=OrderSide.BUY, price=0.45, size=10.0,
+                status=OrderStatus.LIVE, clob_order_id="C-X",
+            ),
+        ]
+        pos = _make_position("POS-X", 0.45, 0.55)
+        pos.state = PositionState.ENTRY_PENDING
+
+        await store.checkpoint_orders(orders)
+        await store.checkpoint_positions([pos])
+
+        await store.clear_live_state()
+
+        assert len(await store.restore_orders()) == 0
+        assert len(await store.restore_positions()) == 0
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_restore_empty_tables(self, store):
+        await store.init()
+        assert await store.restore_orders() == []
+        assert await store.restore_positions() == []
+        await store.close()
+
+
+class TestTradeStorePragmas:
+    """Verify WAL-mode concurrency hardening pragmas are applied."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        return TradeStore(tmp_path / "pragma_test.db")
+
+    @pytest.mark.asyncio
+    async def test_wal_mode_enabled(self, store):
+        await store.init()
+        async with store._db.execute("PRAGMA journal_mode") as cur:
+            row = await cur.fetchone()
+            assert row[0].lower() == "wal"
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_busy_timeout_set(self, store):
+        await store.init()
+        async with store._db.execute("PRAGMA busy_timeout") as cur:
+            row = await cur.fetchone()
+            assert row[0] == 5000
+        await store.close()

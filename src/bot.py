@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-from src.core.config import settings
+from src.core.config import settings, DeploymentEnv
+from src.core.guard import DeploymentGuard
 from src.core.heartbeat import BookHeartbeat
 from src.core.latency_guard import LatencyGuard, LatencyState
 from src.core.logger import get_logger, setup_logging
@@ -28,17 +30,26 @@ from src.data.market_discovery import MarketInfo, fetch_active_markets
 from src.data.market_lifecycle import MarketLifecycleManager
 from src.data.market_scorer import compute_score
 from src.data.ohlcv import OHLCVAggregator
-from src.data.orderbook import OrderbookTracker
+from src.data.orderbook import L2OrderBookAdapter, OrderbookTracker
 from src.data.websocket_client import MarketWebSocket, TradeEvent
+from src.data.l2_book import L2OrderBook
+from src.data.l2_websocket import L2WebSocket
 from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
 from src.signals.adverse_selection_guard import AdverseSelectionGuard
 from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
-from src.trading.executor import OrderExecutor, OrderSide, OrderStatus
+from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
 from src.trading.position_manager import PositionManager, PositionState
+from src.trading.stop_loss import StopLossMonitor
 from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
+
+# Data recording (lazy import — only used when RECORD_DATA=true)
+try:
+    from src.backtest.data_recorder import MarketDataRecorder
+except ImportError:
+    MarketDataRecorder = None  # type: ignore[misc,assignment]
 
 log = get_logger(__name__)
 
@@ -46,14 +57,37 @@ log = get_logger(__name__)
 class TradingBot:
     """Top-level orchestrator for the mean-reversion market maker."""
 
-    def __init__(self, paper_mode: bool | None = None):
-        self.paper_mode = paper_mode if paper_mode is not None else settings.paper_mode
+    def __init__(
+        self,
+        paper_mode: bool | None = None,
+        *,
+        deployment_env: DeploymentEnv | None = None,
+        confirmed_production: bool = False,
+    ):
+        # Deployment env is the canonical source of truth.
+        # Legacy paper_mode kwarg is supported for backward compatibility.
+        if deployment_env is not None:
+            self.deployment_env = deployment_env
+        elif paper_mode is not None:
+            self.deployment_env = (
+                DeploymentEnv.PAPER if paper_mode else DeploymentEnv.PRODUCTION
+            )
+        else:
+            self.deployment_env = settings.deployment_env
+
+        self.guard = DeploymentGuard(
+            self.deployment_env,
+            confirmed_production=confirmed_production,
+        )
+        self.paper_mode = self.guard.is_paper
 
         # Components (initialised in start())
         self.executor = OrderExecutor(paper_mode=self.paper_mode)
-        self.positions = PositionManager(self.executor)
-        self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.trade_store = TradeStore()
+        self.positions = PositionManager(
+            self.executor, trade_store=self.trade_store, guard=self.guard,
+        )
+        self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
         self.lifecycle = MarketLifecycleManager()
         self.latency_guard = LatencyGuard()
@@ -69,6 +103,7 @@ class TradingBot:
         self._detectors: dict[str, PanicDetector] = {}    # keyed by condition_id
         self._market_map: dict[str, MarketInfo] = {}      # asset_id → MarketInfo
         self._book_trackers: dict[str, OrderbookTracker] = {}  # asset_id → tracker
+        self._l2_books: dict[str, L2OrderBook] = {}  # asset_id → L2 book (when L2 enabled)
         self._trade_counts: dict[str, float] = {}  # asset_id → trades/min
         self._taker_counts: dict[str, int] = {}    # asset_id → taker-initiated trades
         self._total_counts: dict[str, int] = {}    # asset_id → total classified trades
@@ -76,11 +111,18 @@ class TradingBot:
 
         # Lifecycle
         self._running = False
+        self._start_time: float = 0.0       # set in _run() for uptime tracking
         self._latest_z: float = 0.0        # tracks most recent panic Z-score
         self._trade_queue: asyncio.Queue[TradeEvent] = asyncio.Queue(maxsize=1000)
         self._book_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._ws: MarketWebSocket | None = None
+        self._l2_ws: L2WebSocket | None = None
         self._tasks: list[asyncio.Task] = []
+
+        # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
+        self._recorder = None
+        if self.guard.enforce_data_recording() and MarketDataRecorder is not None:
+            self._recorder = MarketDataRecorder(data_dir=settings.record_data_dir)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Lifecycle
@@ -88,8 +130,24 @@ class TradingBot:
     async def start(self) -> None:
         """Discover markets, wire components, and enter the main loop."""
         setup_logging(settings.log_dir)
-        mode_label = "PAPER" if self.paper_mode else "LIVE"
-        log.info("bot_starting", mode=mode_label)
+        mode_label = self.deployment_env.value
+        log.info(
+            "bot_starting",
+            mode=mode_label,
+            **self.guard.startup_summary(),
+        )
+
+        # Fail-fast if running with real capital without required credentials
+        if self.guard.is_live:
+            missing = settings.validate_credentials()
+            if missing:
+                for msg in missing:
+                    log.error("credential_missing", detail=msg)
+                raise SystemExit(
+                    f"Cannot start in {mode_label} mode — missing credentials: "
+                    f"{", ".join(missing)}"
+                )
+
         await self.telegram.send(f"🤖 Bot starting in <b>{mode_label}</b> mode")
 
         try:
@@ -105,6 +163,8 @@ class TradingBot:
 
     async def _run(self, mode_label: str) -> None:
         """Internal: initialise and run after startup message is sent."""
+        self._start_time = time.monotonic()
+
         # 1. Init trade store
         await self.trade_store.init()
 
@@ -143,15 +203,23 @@ class TradingBot:
         self.whale_monitor.set_market_map(whale_map)
 
         # 4. Set initial wallet balance
-        self.positions.set_wallet_balance(
-            50.0 if self.paper_mode else settings.strategy.max_trade_size_usd * 5
-        )
+        self.positions.set_wallet_balance(self.guard.get_wallet_balance())
 
         # 5. Launch concurrent tasks
         self._running = True
         self._ws = MarketWebSocket(
-            all_asset_ids, self._trade_queue, book_queue=self._book_queue
+            all_asset_ids, self._trade_queue, book_queue=self._book_queue,
+            recorder=self._recorder,
         )
+
+        # L2 WebSocket (Pillar 11) — dedicated connection for L2 book data
+        if settings.strategy.l2_enabled and self._l2_books:
+            # Register desync callbacks for all L2 books
+            for l2_book in self._l2_books.values():
+                l2_book._on_desync = self._on_l2_desync
+            self._l2_ws = L2WebSocket(self._l2_books, recorder=self._recorder)
+        else:
+            self._l2_ws = None
 
         # Adverse-selection guard (Pillar 5)
         self._adverse_guard = AdverseSelectionGuard(
@@ -169,6 +237,22 @@ class TradingBot:
             telegram=self.telegram,
         )
 
+        # Order status poller (Pillar 10) — live mode only
+        self._order_poller = OrderStatusPoller(
+            self.executor,
+            on_fill=self._on_clob_fill,
+        )
+
+        # Event-driven stop-loss monitor (Pillar 11) — no polling task
+        self._stop_loss_monitor = StopLossMonitor(
+            position_manager=self.positions,
+            no_aggs=self._no_aggs,
+            book_trackers=self._book_trackers,
+            trade_store=self.trade_store,
+            telegram=self.telegram,
+        )
+        self._stop_loss_monitor.start()  # mark active, no coroutine
+
         self._tasks = [
             asyncio.create_task(self._ws.start(), name="ws"),
             asyncio.create_task(self._process_trades(), name="trade_processor"),
@@ -182,15 +266,37 @@ class TradingBot:
             asyncio.create_task(self._adverse_guard.start(), name="adverse_sel"),
             asyncio.create_task(self._heartbeat.run(), name="heartbeat"),
             asyncio.create_task(self._ghost_liquidity_loop(), name="ghost_liquidity"),
+            asyncio.create_task(self._order_poller.run(), name="order_status_poller"),
+            asyncio.create_task(self._health_reporter(), name="health_reporter"),
         ]
+
+        # Launch data recorder if enabled
+        if self._recorder is not None:
+            self._tasks.append(
+                asyncio.create_task(self._recorder.run(), name="data_recorder")
+            )
+            log.info("data_recorder_enabled", data_dir=settings.record_data_dir)
+
+        # Launch L2 WebSocket task if enabled
+        if self._l2_ws is not None:
+            self._tasks.append(
+                asyncio.create_task(self._l2_ws.start(), name="l2_ws")
+            )
 
         # Handle graceful shutdown via SIGINT / SIGTERM
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
-            except NotImplementedError:
-                pass
+        else:
+            # On Windows, loop.add_signal_handler is not supported.
+            # Register via the signal module instead (handles Ctrl-C).
+            signal.signal(
+                signal.SIGINT,
+                lambda *_: asyncio.get_event_loop().call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(self.stop())
+                ),
+            )
 
         log.info("bot_running", markets=len(self._markets), mode=mode_label)
 
@@ -224,8 +330,23 @@ class TradingBot:
         self._detectors[m.condition_id] = detector
 
         # Orderbook trackers for both tokens
-        self._book_trackers[m.yes_token_id] = OrderbookTracker(m.yes_token_id)
-        self._book_trackers[m.no_token_id] = OrderbookTracker(m.no_token_id)
+        if settings.strategy.l2_enabled:
+            for token_id in (m.yes_token_id, m.no_token_id):
+                l2_book = L2OrderBook(
+                    token_id,
+                    on_bbo_change=self._on_l2_bbo_change,
+                )
+                self._l2_books[token_id] = l2_book
+                self._book_trackers[token_id] = L2OrderBookAdapter(l2_book)
+        else:
+            self._book_trackers[m.yes_token_id] = OrderbookTracker(
+                m.yes_token_id,
+                on_bbo_change=self._on_orderbook_bbo_change,
+            )
+            self._book_trackers[m.no_token_id] = OrderbookTracker(
+                m.no_token_id,
+                on_bbo_change=self._on_orderbook_bbo_change,
+            )
 
     def _unwire_market(self, m: MarketInfo) -> None:
         """Remove all state for an evicted market."""
@@ -236,6 +357,11 @@ class TradingBot:
         self._detectors.pop(m.condition_id, None)
         self._book_trackers.pop(m.yes_token_id, None)
         self._book_trackers.pop(m.no_token_id, None)
+        # Clean up L2 book instances
+        for token_id in (m.yes_token_id, m.no_token_id):
+            l2_book = self._l2_books.pop(token_id, None)
+            if l2_book is not None:
+                l2_book.reset()
         self._trade_counts.pop(m.yes_token_id, None)
         self._trade_counts.pop(m.no_token_id, None)
         self._markets = [x for x in self._markets if x.condition_id != m.condition_id]
@@ -259,6 +385,8 @@ class TradingBot:
 
         if self._ws:
             await self._ws.stop()
+        if self._l2_ws:
+            await self._l2_ws.stop()
 
         await self.whale_monitor.stop()
 
@@ -267,6 +395,10 @@ class TradingBot:
             await self._adverse_guard.stop()
         if hasattr(self, "_heartbeat"):
             self._heartbeat.stop()
+        if hasattr(self, "_order_poller"):
+            self._order_poller.stop()
+        if hasattr(self, "_stop_loss_monitor"):
+            self._stop_loss_monitor.stop()
 
         for task in self._tasks:
             task.cancel()
@@ -274,6 +406,7 @@ class TradingBot:
         stats = await self.trade_store.get_stats()
         log.info("final_stats", **stats)
         await self.telegram.notify_stats(stats)
+        await self.trade_store.clear_live_state()
         await self.trade_store.close()
 
         log.info("bot_stopped")
@@ -286,6 +419,29 @@ class TradingBot:
         log.warning("KILL_SWITCH_ACTIVATED")
         await self.telegram.notify_kill()
         await self.stop()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Pillar 10 — CLOB fill callback for order-status poller
+    # ═══════════════════════════════════════════════════════════════════════
+    async def _on_clob_fill(self, order: "Order") -> None:
+        """Called by :class:`OrderStatusPoller` when a LIVE order fills.
+
+        Routes the fill to the correct position lifecycle handler:
+        entry fill → :meth:`_handle_entry_fill`, exit fill → :meth:`_handle_exit_fill`.
+        """
+        from src.trading.executor import Order  # avoid circular at module-level
+
+        for pos in self.positions.get_open_positions():
+            if pos.entry_order and pos.entry_order.order_id == order.order_id:
+                if pos.state == PositionState.ENTRY_PENDING:
+                    await self._handle_entry_fill(pos)
+                return
+            if pos.exit_order and pos.exit_order.order_id == order.order_id:
+                if pos.state == PositionState.EXIT_PENDING:
+                    self._handle_exit_fill(pos)
+                return
+
+        log.debug("clob_fill_no_position", order_id=order.order_id)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Adaptive polling helper
@@ -383,6 +539,11 @@ class TradingBot:
         When the latency guard is BLOCKED, snapshots are tagged as
         ``fresh=False`` so downstream consumers (sizer, chaser) know
         the data may be stale.
+
+        When L2 is enabled, trackers backed by L2OrderBookAdapter are
+        fed directly by the L2WebSocket — ``on_price_change`` /
+        ``on_book_snapshot`` are no-ops on adapters.  This loop still
+        runs for any remaining non-L2 trackers and as a fallback.
         """
         while self._running:
             try:
@@ -402,10 +563,44 @@ class TradingBot:
             if not tracker:
                 continue
 
+            # L2-backed trackers are no-ops for these calls, but we
+            # still route for backward compat and non-L2 fallback.
             if event_type == "price_change":
                 tracker.on_price_change(msg)
             elif event_type == "book":
                 tracker.on_book_snapshot(msg)
+
+    # ── L2 callbacks ──────────────────────────────────────────────────────
+    async def _on_l2_bbo_change(self, asset_id: str, score: Any) -> None:
+        """Callback from L2OrderBook when the BBO changes.
+
+        Logs the live spread score for monitoring and drives the
+        event-driven stop-loss engine.  This fires on every BBO tick
+        so keep it lightweight.
+        """
+        log.debug(
+            "l2_bbo_update",
+            asset_id=asset_id,
+            spread_score=round(score.score, 1),
+            raw_spread_cents=round(score.raw_spread_cents, 2),
+        )
+        # Drive event-driven stop-loss evaluation
+        await self._stop_loss_monitor.on_bbo_update(asset_id)
+
+    def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
+        """Callback from basic OrderbookTracker when the BBO changes.
+
+        Schedules an async stop-loss evaluation for this asset.
+        """
+        asyncio.ensure_future(self._stop_loss_monitor.on_bbo_update(asset_id))
+
+    async def _on_l2_desync(self, asset_id: str) -> None:
+        """Callback from L2OrderBook on sequence gap detection.
+
+        Routes to the L2WebSocket for snapshot re-fetch.
+        """
+        if self._l2_ws is not None:
+            await self._l2_ws._on_book_desync(asset_id)
 
     async def _on_yes_bar_closed(self, yes_asset_id: str, bar: Any) -> None:
         """A 1-min YES bar just closed — evaluate the panic detector."""
@@ -848,31 +1043,14 @@ class TradingBot:
     #  Background loops
     # ═══════════════════════════════════════════════════════════════════════
     async def _timeout_loop(self) -> None:
-        """Every 10 seconds: check timeouts, stop-losses."""
-        stop_loss_cents = settings.strategy.stop_loss_cents
+        """Every 10 seconds: check timeouts and record closed positions.
 
+        Stop-loss checks have been moved to :class:`StopLossMonitor`
+        for faster (500ms) reaction time.
+        """
         while self._running:
             try:
                 await self.positions.check_timeouts()
-
-                # Stop-loss check: compare current NO price to entry_price
-                if stop_loss_cents > 0:
-                    for pos in self.positions.get_open_positions():
-                        if pos.state != PositionState.EXIT_PENDING:
-                            continue
-                        no_agg = self._no_aggs.get(pos.no_asset_id)
-                        if not no_agg or no_agg.current_price <= 0:
-                            continue
-                        unrealised_loss = (pos.entry_price - no_agg.current_price) * 100
-                        # Use fee-adaptive stop-loss trigger
-                        sl_threshold = pos.sl_trigger_cents if pos.sl_trigger_cents > 0 else stop_loss_cents
-                        if unrealised_loss >= sl_threshold:
-                            await self.positions.force_stop_loss(pos)
-                            await self.trade_store.record(pos)
-                            await self.telegram.notify_exit(
-                                pos.id, pos.entry_price, pos.exit_price,
-                                pos.pnl_cents, "stop_loss",
-                            )
 
                 # Record timeouts
                 for pos in self.positions.get_all_positions():
@@ -917,6 +1095,90 @@ class TradingBot:
             except Exception as exc:
                 log.error("stats_loop_error", error=str(exc))
 
+    async def _health_reporter(self) -> None:
+        """Every 60 seconds, write ``system_health.json`` to the log dir.
+
+        Tracks memory usage, WebSocket reconnect counts, SQLite lock
+        retries, latency guard state, and heartbeat status — critical
+        telemetry for the long-running data-harvesting soak test.
+        """
+        import json as _json
+        import os as _os
+        import tempfile
+        from pathlib import Path as _Path
+
+        health_dir = _Path(settings.log_dir)
+        health_dir.mkdir(parents=True, exist_ok=True)
+        health_path = health_dir / "system_health.json"
+
+        # Try to import psutil for memory tracking; degrade gracefully.
+        try:
+            import psutil  # type: ignore[import-untyped]
+            _process = psutil.Process(_os.getpid())
+        except ImportError:
+            _process = None
+
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                ws_reconnects = (
+                    getattr(self._ws, "reconnect_count", 0)
+                    if self._ws else 0
+                )
+                l2_reconnects = (
+                    getattr(self._l2_ws, "reconnect_count", 0)
+                    if self._l2_ws else 0
+                )
+                memory_bytes = (
+                    _process.memory_info().rss if _process else None
+                )
+                uptime_s = round(time.monotonic() - self._start_time, 1)
+
+                heartbeat_state = "unknown"
+                if hasattr(self, "_heartbeat"):
+                    heartbeat_state = (
+                        "suspended" if self._heartbeat._suspended else "alive"
+                    )
+                latency_state = self.latency_guard.state.value
+
+                health = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "deployment_env": self.deployment_env.value,
+                    "uptime_s": uptime_s,
+                    "memory_bytes": memory_bytes,
+                    "ws_reconnects": ws_reconnects,
+                    "l2_ws_reconnects": l2_reconnects,
+                    "db_lock_retries": self.trade_store.db_lock_retries,
+                    "latency_guard_state": latency_state,
+                    "heartbeat_state": heartbeat_state,
+                    "active_positions": len(self.positions.get_open_positions()),
+                    "active_markets": len(self.lifecycle.active),
+                    "observing_markets": len(self.lifecycle.observing),
+                }
+
+                # Atomic write: tmp → rename
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(health_dir), suffix=".tmp"
+                )
+                try:
+                    with _os.fdopen(fd, "w") as f:
+                        _json.dump(health, f, indent=2)
+                    _os.replace(tmp_path, str(health_path))
+                except Exception:
+                    # Clean up the temp file if rename fails
+                    try:
+                        _os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+
+                log.debug("health_report_written", path=str(health_path))
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("health_reporter_error", error=str(exc))
+
     async def _market_refresh_loop(self) -> None:
         """Periodically re-discover, re-score, promote/demote/evict."""
         interval = settings.strategy.market_refresh_minutes * 60
@@ -954,17 +1216,28 @@ class TradingBot:
                                 await self._ws.remove_assets(
                                     [m.yes_token_id, m.no_token_id]
                                 )
+                            if self._l2_ws:
+                                await self._l2_ws.remove_assets(
+                                    [m.yes_token_id, m.no_token_id]
+                                )
                             self._unwire_market(m)
                             break
 
                 # Wire + subscribe new markets
                 new_asset_ids: list[str] = []
+                new_l2_books: dict[str, L2OrderBook] = {}
                 for m in newly_added:
                     self._wire_market(m)
                     new_asset_ids.extend([m.yes_token_id, m.no_token_id])
+                    # Collect L2 books for dynamic subscription
+                    for token_id in (m.yes_token_id, m.no_token_id):
+                        if token_id in self._l2_books:
+                            new_l2_books[token_id] = self._l2_books[token_id]
 
                 if self._ws and new_asset_ids:
                     await self._ws.add_assets(new_asset_ids)
+                if self._l2_ws and new_l2_books:
+                    await self._l2_ws.add_assets(new_l2_books)
 
                 # Update _markets list with promoted markets
                 for cid, am in self.lifecycle.active.items():
@@ -996,7 +1269,8 @@ class TradingBot:
                 log.error("market_refresh_error", error=str(exc))
 
     async def _cleanup_loop(self) -> None:
-        """Every 5 minutes: clean up stale positions, orders, reset daily PnL."""
+        """Every 5 minutes: clean up stale positions, orders, reset daily PnL,
+        and checkpoint live state for crash recovery."""
         while self._running:
             await asyncio.sleep(300)
             try:
@@ -1012,6 +1286,14 @@ class TradingBot:
                 now = datetime.now(timezone.utc)
                 if now.hour == 0 and now.minute < 6:
                     self.positions.reset_daily_pnl()
+
+                # Checkpoint live state for crash recovery
+                await self.trade_store.checkpoint_orders(
+                    self.executor.get_open_orders()
+                )
+                await self.trade_store.checkpoint_positions(
+                    self.positions.get_open_positions()
+                )
 
             except asyncio.CancelledError:
                 break

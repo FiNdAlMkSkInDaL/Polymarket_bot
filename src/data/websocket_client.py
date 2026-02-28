@@ -54,8 +54,10 @@ class MarketWebSocket:
         book_queue: asyncio.Queue | None = None,
         ws_url: str | None = None,
         queue_maxsize: int = 1000,
+        recorder: Any | None = None,
     ):
         self.asset_ids = asset_ids
+        self._recorder = recorder  # Optional MarketDataRecorder
         # ── Fix 2: Bounded queue — drop oldest when full ───────────────────
         self.trade_queue = trade_queue
         self.book_queue: asyncio.Queue = book_queue or asyncio.Queue(maxsize=2000)
@@ -65,6 +67,9 @@ class MarketWebSocket:
         self._running = False
         self._last_message_time: float = 0.0
         self._silence_timeout = settings.strategy.ws_silence_timeout_s
+
+        # Cumulative reconnect counter (never reset — used by health reporter)
+        self.reconnect_count: int = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -83,6 +88,7 @@ class MarketWebSocket:
                 OSError,
             ) as exc:
                 attempt += 1
+                self.reconnect_count += 1
                 sleep_time = min(
                     self._BACKOFF_MAX,
                     self._BACKOFF_BASE * (2 ** attempt),
@@ -92,6 +98,7 @@ class MarketWebSocket:
                     error=str(exc),
                     retry_in=round(sleep_time, 2),
                     attempt=attempt,
+                    reconnect_count=self.reconnect_count,
                 )
                 await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
@@ -189,6 +196,9 @@ class MarketWebSocket:
 
     async def _handle_message(self, msg: dict | list) -> None:
         """Parse incoming WS messages and emit TradeEvents."""
+        if self._recorder and isinstance(msg, dict):
+            self._recorder.enqueue("trade", msg)
+
         # Polymarket may send batch messages as a JSON array
         if isinstance(msg, list):
             for sub in msg:
@@ -259,6 +269,18 @@ class MarketWebSocket:
                 raw_ts = time.time()
             # else: already seconds
 
+            # Determine taker status: if the trade data includes a
+            # 'taker_side' or 'aggressor' field use it; otherwise infer
+            # from the 'side' field — market sells hitting bids are taker.
+            is_taker = False
+            taker_side = (data.get("taker_side") or data.get("aggressor") or "").lower()
+            if taker_side in ("sell", "buy"):
+                is_taker = True
+            elif data.get("is_taker") is True:
+                is_taker = True
+            elif str(data.get("trade_type", "")).lower() == "taker":
+                is_taker = True
+
             return TradeEvent(
                 timestamp=raw_ts,
                 market_id=str(market_id),
@@ -267,6 +289,7 @@ class MarketWebSocket:
                 price=price,
                 size=size,
                 is_yes=is_yes,
+                is_taker=is_taker,
             )
         except (ValueError, TypeError) as exc:
             log.debug("trade_parse_error", error=str(exc), data=data)
