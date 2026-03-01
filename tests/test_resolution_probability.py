@@ -316,7 +316,13 @@ class TestGenericBayesianModel:
         assert model.name == "generic_bayesian"
 
     def test_higher_obs_weight_tracks_price(self) -> None:
-        """With higher observation weight, estimate follows market price more closely."""
+        """With higher observation weight, estimate follows market price closely.
+
+        With the adaptive prior (Beta anchored to market_price), both
+        low and high obs_weight models track the price.  The test
+        verifies that both produce estimates very close to market_price,
+        and higher weight has equal or higher concentration confidence.
+        """
         model_low = self._make_model(obs_weight=1.0)
         model_high = self._make_model(obs_weight=20.0)
         market = FakeMarketInfo(tags="politics")
@@ -325,8 +331,11 @@ class TestGenericBayesianModel:
         est_high = model_high.estimate(market, market_price=0.90, days_to_resolution=30)
 
         assert est_low is not None and est_high is not None
-        # Higher weight → closer to market price
-        assert abs(est_high.probability - 0.90) < abs(est_low.probability - 0.90)
+        # Both track market price closely with adaptive prior
+        assert abs(est_low.probability - 0.90) < 0.05
+        assert abs(est_high.probability - 0.90) < 0.05
+        # Higher obs_weight → higher concentration → higher confidence
+        assert est_high.confidence >= est_low.confidence
 
     def test_metadata_fields(self) -> None:
         model = self._make_model()
@@ -796,8 +805,22 @@ class TestGenericModelGate:
         assert 0 < cached.probability < 1
 
     def test_generic_enabled_allows_signal(self) -> None:
-        """When generic_enabled=True, generic model CAN fire signals."""
-        rpe = self._make_rpe(generic_enabled=True)
+        """When generic_enabled=True, generic model CAN fire signals.
+
+        With the adaptive prior anchored to market_price, the generic
+        model only diverges when prior_k and obs_weight interact with
+        an extreme market price.  We use a fixed legacy prior (k->0,
+        alpha0/beta0=2) to create genuine divergence for this test.
+        """
+        crypto = CryptoPriceModel(price_fn=lambda: None, vol_override=0.80)
+        generic = GenericBayesianModel(obs_weight=5.0, prior_k=0.0, alpha0=2.0, beta0=2.0)
+        rpe = ResolutionProbabilityEngine(
+            models=[crypto, generic],
+            confidence_threshold=0.01,
+            shadow_mode=False,
+            min_confidence=0.05,
+            generic_enabled=True,
+        )
         market = FakeMarketInfo(
             question="Will the Democrats win the 2028 election?",
             tags="politics",
@@ -805,8 +828,8 @@ class TestGenericModelGate:
         result = rpe.evaluate(
             market=market, market_price=0.90, days_to_resolution=10
         )
-        # With obs_weight=5 and price=0.90, posterior≈0.72, divergence≈0.18
-        # threshold is ~0.01 * (1 + 0.72) ≈ 0.017, so 0.18 > 0.017 → fires
+        # With fixed Beta(2,2) prior + obs_weight=5 and price=0.90,
+        # posterior≈0.72, divergence≈0.18 > threshold → fires
         assert result is not None
         assert result.metadata["model_name"] == "generic_bayesian"
 
@@ -1190,3 +1213,185 @@ class TestNearResolvedPriceGuard:
         mock_detector.evaluate.assert_called_once()
         mock_rpe.evaluate.assert_called_once()
         bot.lifecycle.drain_market.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Deliverable A — Adaptive Prior (price-aware Beta)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAdaptivePrior:
+    """Verify the adaptive Beta prior eliminates fake divergence on tail markets."""
+
+    def test_tail_market_no_fake_divergence(self) -> None:
+        """A market at 10¢ should NOT produce a model estimate near 28¢.
+
+        With the old fixed Beta(2,2) prior, GenericBayesianModel at
+        market_price=0.10 would estimate ~0.28.  With the adaptive prior
+        (k=4), it should track market price closely.
+        """
+        model = GenericBayesianModel(obs_weight=5.0)
+        market = FakeMarketInfo(tags="politics")
+        est = model.estimate(market, market_price=0.10, days_to_resolution=30)
+        assert est is not None
+        # Should be close to 0.10, not pulled toward 0.50
+        assert abs(est.probability - 0.10) < 0.05
+
+    def test_mid_price_still_tracks(self) -> None:
+        """Market at 0.50 should still estimate ~0.50."""
+        model = GenericBayesianModel(obs_weight=5.0)
+        market = FakeMarketInfo(tags="politics")
+        est = model.estimate(market, market_price=0.50, days_to_resolution=30)
+        assert est is not None
+        assert abs(est.probability - 0.50) < 0.05
+
+    def test_high_price_tracks(self) -> None:
+        """Market at 0.90 should estimate ~0.90."""
+        model = GenericBayesianModel(obs_weight=5.0)
+        market = FakeMarketInfo(tags="politics")
+        est = model.estimate(market, market_price=0.90, days_to_resolution=30)
+        assert est is not None
+        assert abs(est.probability - 0.90) < 0.05
+
+    def test_legacy_prior_with_k_zero(self) -> None:
+        """When prior_k=0, model falls back to fixed alpha0/beta0 behavior."""
+        model = GenericBayesianModel(
+            alpha0=2.0, beta0=2.0, obs_weight=5.0, prior_k=0.0,
+        )
+        market = FakeMarketInfo(tags="politics")
+        est = model.estimate(market, market_price=0.10, days_to_resolution=30)
+        assert est is not None
+        # With fixed Beta(2,2) + obs_weight=5 @ price=0.10:
+        # α_post = 2 + 5*0.10 = 2.5, β_post = 2 + 5*0.90 = 6.5
+        # mean = 2.5/9 ≈ 0.278  → pulled toward 0.5 (the bug)
+        assert est.probability > 0.20  # significantly above market price
+
+    def test_custom_prior_k(self) -> None:
+        """Custom prior_k changes the concentration."""
+        model_low = GenericBayesianModel(obs_weight=5.0, prior_k=1.0)
+        model_high = GenericBayesianModel(obs_weight=5.0, prior_k=20.0)
+        market = FakeMarketInfo(tags="politics")
+
+        est_low = model_low.estimate(market, market_price=0.30, days_to_resolution=30)
+        est_high = model_high.estimate(market, market_price=0.30, days_to_resolution=30)
+        assert est_low is not None and est_high is not None
+        # Both track 0.30 but with different concentration
+        assert abs(est_low.probability - 0.30) < 0.05
+        assert abs(est_high.probability - 0.30) < 0.05
+
+    def test_config_default_prior_k(self) -> None:
+        """Default rpe_prior_k config value is 4.0."""
+        from src.core.config import settings
+        assert settings.strategy.rpe_prior_k == 4.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Deliverable A — RPE Calibration Tracker
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRPECalibrationTracker:
+    """Ring-buffer calibration scoring for RPE signals."""
+
+    def _make_tracker(self) -> "RPECalibrationTracker":
+        from src.signals.resolution_probability import RPECalibrationTracker
+        return RPECalibrationTracker()
+
+    def test_record_and_count(self) -> None:
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 0.60, 0.50, "buy_yes", 1000.0, shadow=True)
+        tracker.record_signal("MKT_2", 0.30, 0.50, "buy_no", 1001.0, shadow=False)
+        assert tracker.total_signals == 2
+        assert tracker.shadow_signals == 1
+        assert tracker.live_signals == 1
+
+    def test_unresolved_metrics_are_none(self) -> None:
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 0.60, 0.50, "buy_yes", 1000.0)
+        assert tracker.compute_brier_score() is None
+        assert tracker.compute_log_loss() is None
+        assert tracker.compute_direction_accuracy() is None
+
+    def test_brier_score_perfect(self) -> None:
+        """Perfect predictions → Brier score = 0."""
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 1.0, 0.50, "buy_yes", 1000.0)
+        tracker.on_market_resolved("MKT_1", 1.0)
+        brier = tracker.compute_brier_score()
+        assert brier is not None
+        assert brier == pytest.approx(0.0, abs=1e-9)
+
+    def test_brier_score_worst(self) -> None:
+        """Worst predictions → Brier score = 1."""
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 0.0, 0.50, "buy_yes", 1000.0)
+        tracker.on_market_resolved("MKT_1", 1.0)
+        brier = tracker.compute_brier_score()
+        assert brier is not None
+        assert brier == pytest.approx(1.0, abs=1e-2)  # clamped model_prob
+
+    def test_log_loss_computes(self) -> None:
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 0.80, 0.50, "buy_yes", 1000.0)
+        tracker.on_market_resolved("MKT_1", 1.0)
+        ll = tracker.compute_log_loss()
+        assert ll is not None
+        assert ll > 0.0
+
+    def test_direction_accuracy(self) -> None:
+        tracker = self._make_tracker()
+        # Correct: buy_yes and resolves YES
+        tracker.record_signal("MKT_1", 0.70, 0.50, "buy_yes", 1000.0)
+        tracker.on_market_resolved("MKT_1", 1.0)
+        # Wrong: buy_yes but resolves NO
+        tracker.record_signal("MKT_2", 0.70, 0.50, "buy_yes", 1001.0)
+        tracker.on_market_resolved("MKT_2", 0.0)
+        acc = tracker.compute_direction_accuracy()
+        assert acc is not None
+        assert acc == pytest.approx(0.50)
+
+    def test_ring_buffer_eviction(self) -> None:
+        from src.signals.resolution_probability import RPECalibrationTracker
+        tracker = RPECalibrationTracker(max_entries=5)
+        for i in range(10):
+            tracker.record_signal(f"MKT_{i}", 0.50, 0.50, "buy_yes", float(i))
+        assert tracker.total_signals == 5
+
+    def test_calibration_summary(self) -> None:
+        tracker = self._make_tracker()
+        tracker.record_signal("MKT_1", 0.80, 0.50, "buy_yes", 1000.0, shadow=False)
+        tracker.on_market_resolved("MKT_1", 1.0)
+        summary = tracker.calibration_summary()
+        assert summary["total_signals"] == 1
+        assert summary["live_signals"] == 1
+        assert summary["resolved"] == 1
+        assert "brier_score" in summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Config additions (Deliverable G)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConfigAdditions:
+    """Verify new RPE config fields exist with correct defaults."""
+
+    def test_rpe_cooldown_seconds(self) -> None:
+        from src.core.config import settings
+        assert settings.strategy.rpe_cooldown_seconds == 300
+
+    def test_rpe_max_data_age_seconds(self) -> None:
+        from src.core.config import settings
+        assert settings.strategy.rpe_max_data_age_seconds == 30
+
+    def test_rpe_prior_k(self) -> None:
+        from src.core.config import settings
+        assert settings.strategy.rpe_prior_k == 4.0
+
+    def test_rpe_min_eqs(self) -> None:
+        from src.core.config import settings
+        assert settings.strategy.rpe_min_eqs == 40.0
+
+    def test_rpe_tail_veto_threshold(self) -> None:
+        from src.core.config import settings
+        assert settings.strategy.rpe_tail_veto_threshold == 0.10

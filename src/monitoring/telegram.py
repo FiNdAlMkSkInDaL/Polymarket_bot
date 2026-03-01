@@ -132,15 +132,52 @@ class TelegramAlerter:
         direction: str,
         confidence: float,
         shadow: bool,
+        question: str = "",
+        *,
+        calibration_footer: str = "",
     ) -> None:
         mode = "👻 SHADOW" if shadow else "🎯 LIVE"
         arrow = "⬇️" if direction == "buy_no" else "⬆️"
-        safe_id = _html.escape(market_id[:50])
+        safe_id = _html.escape(market_id)
+        question_line = f"<b>{_html.escape(question[:120])}</b>\n" if question else ""
+        footer = _html.escape(calibration_footer) if calibration_footer else ""
         await self.send(
             f"{mode} <b>RPE Signal</b> {arrow}\n"
-            f"Market: <code>{safe_id}</code>\n"
+            f"{question_line}"
+            f"ID: <code>{safe_id}</code>\n"
             f"Model: {model_prob:.3f}  |  Market: {market_price:.3f}\n"
             f"Direction: {direction}  |  Confidence: {confidence:.2f}"
+            f"{footer}"
+        )
+
+    async def notify_rpe_calibration_report(self, tracker: Any) -> None:
+        """Send a calibration dashboard for the RPE.
+
+        Parameters
+        ----------
+        tracker:
+            An ``RPECalibrationTracker`` instance.  Accepts ``Any`` to
+            avoid a circular import.
+        """
+        stats = tracker.calibration_summary()
+        total = stats.get("total_signals", 0)
+        live = stats.get("live_signals", 0)
+        shadow = stats.get("shadow_signals", 0)
+        resolved = stats.get("resolved", 0)
+        brier = stats.get("brier_score", "n/a")
+        logloss = stats.get("log_loss", "n/a")
+        accuracy = stats.get("direction_accuracy", "n/a")
+
+        if isinstance(accuracy, float):
+            accuracy = f"{accuracy:.1%}"
+
+        await self.send(
+            f"📊 <b>RPE Calibration Report</b>\n"
+            f"Total signals: {total} (live: {live}, shadow: {shadow})\n"
+            f"Resolved: {resolved}\n"
+            f"Brier score: {brier}\n"
+            f"Log-loss: {logloss}\n"
+            f"Direction accuracy: {accuracy}"
         )
 
     async def notify_pce_dashboard(self, data: dict) -> None:

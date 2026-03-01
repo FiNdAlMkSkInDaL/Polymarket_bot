@@ -48,6 +48,7 @@ import math
 import re
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
@@ -461,6 +462,12 @@ class GenericBayesianModel(ProbabilityModel):
     obs_weight:
         How many pseudo-observations the market price contributes.
         Default from ``settings.strategy.rpe_bayesian_obs_weight``.
+    prior_k:
+        Beta prior concentration parameter.  When provided, the prior
+        is anchored to market price: α₀ = k * p, β₀ = k * (1 - p).
+        This eliminates the persistent divergence on tail markets
+        caused by the old fixed Beta(2,2) prior pulling toward 50%.
+        Default from ``settings.strategy.rpe_prior_k``.
     """
 
     def __init__(
@@ -469,10 +476,12 @@ class GenericBayesianModel(ProbabilityModel):
         alpha0: float = 2.0,
         beta0: float = 2.0,
         obs_weight: float | None = None,
+        prior_k: float | None = None,
     ) -> None:
         self._alpha0 = alpha0
         self._beta0 = beta0
         self._obs_weight = obs_weight
+        self._prior_k = prior_k
 
     @property
     def _n(self) -> float:
@@ -480,6 +489,13 @@ class GenericBayesianModel(ProbabilityModel):
         if self._obs_weight is not None:
             return self._obs_weight
         return settings.strategy.rpe_bayesian_obs_weight
+
+    @property
+    def _k(self) -> float:
+        """Beta prior concentration (lazy — reads config at call time)."""
+        if self._prior_k is not None:
+            return self._prior_k
+        return settings.strategy.rpe_prior_k
 
     @property
     def name(self) -> str:
@@ -517,10 +533,27 @@ class GenericBayesianModel(ProbabilityModel):
 
         days = kwargs.get("days_to_resolution", 30)
         n = self._n
+        k = self._k
 
-        # Bayesian posterior
-        alpha_post = self._alpha0 + n * market_price
-        beta_post = self._beta0 + n * (1.0 - market_price)
+        # Adaptive prior: anchor α₀, β₀ to market price so the prior
+        # does not create artificial divergence on tail markets.
+        # When k=0, fall back to the legacy fixed alpha0/beta0 constructor args.
+        if k > 0:
+            alpha0 = k * market_price
+            beta0 = k * (1.0 - market_price)
+        else:
+            alpha0 = self._alpha0
+            beta0 = self._beta0
+
+        # Observations are market-price pseudo-counts.  Combined with the
+        # market-anchored prior this yields posterior = market_price (divergence
+        # = 0).  That is the CORRECT behaviour for a model with no independent
+        # external signal: "I have no information beyond the market price, so
+        # my best estimate IS the market price."  The GenericBayesianModel
+        # therefore never fires RPE signals on its own — alpha comes only from
+        # models with real external data (e.g. CryptoPriceModel with BTC spot).
+        alpha_post = alpha0 + n * market_price
+        beta_post = beta0 + n * (1.0 - market_price)
 
         # Posterior mean
         prob = alpha_post / (alpha_post + beta_post)
@@ -800,3 +833,164 @@ class ResolutionProbabilityEngine(SignalGenerator):
             },
             timestamp=time.time(),
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RPE Calibration Tracker
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _CalibrationEntry:
+    """Single RPE signal record for calibration scoring."""
+
+    market_id: str
+    model_prob: float
+    market_price: float
+    direction: str
+    timestamp: float
+    shadow: bool = True
+    resolution_price: float | None = None  # 0.0 or 1.0 once resolved
+
+
+class RPECalibrationTracker:
+    """Ring-buffer tracker that scores RPE signal calibration.
+
+    Records every fired RPE signal (shadow or live) and, once a market
+    resolves, computes Brier score, log-loss, and direction accuracy
+    across resolved entries.
+
+    Thread-safe via Python's GIL for single-writer patterns.
+
+    Parameters
+    ----------
+    max_entries:
+        Maximum entries in the ring buffer.  Oldest are evicted first.
+    """
+
+    def __init__(self, *, max_entries: int = 500) -> None:
+        self._entries: deque[_CalibrationEntry] = deque(maxlen=max_entries)
+        self._by_market: dict[str, list[_CalibrationEntry]] = {}
+
+    # ── Recording ──────────────────────────────────────────────────────
+
+    def record_signal(
+        self,
+        market_id: str,
+        model_prob: float,
+        market_price: float,
+        direction: str,
+        timestamp: float,
+        *,
+        shadow: bool = True,
+    ) -> None:
+        """Record a fired RPE signal for later calibration."""
+        entry = _CalibrationEntry(
+            market_id=market_id,
+            model_prob=model_prob,
+            market_price=market_price,
+            direction=direction,
+            timestamp=timestamp,
+            shadow=shadow,
+        )
+        self._entries.append(entry)
+        self._by_market.setdefault(market_id, []).append(entry)
+
+    def on_market_resolved(self, market_id: str, resolution_price: float) -> None:
+        """Mark all entries for *market_id* as resolved.
+
+        Parameters
+        ----------
+        resolution_price:
+            0.0 (NO wins) or 1.0 (YES wins).
+        """
+        for e in self._by_market.get(market_id, []):
+            e.resolution_price = resolution_price
+
+    # ── Scoring ────────────────────────────────────────────────────────
+
+    def _resolved(self) -> list[_CalibrationEntry]:
+        return [e for e in self._entries if e.resolution_price is not None]
+
+    @property
+    def total_signals(self) -> int:
+        return len(self._entries)
+
+    @property
+    def live_signals(self) -> int:
+        return sum(1 for e in self._entries if not e.shadow)
+
+    @property
+    def shadow_signals(self) -> int:
+        return sum(1 for e in self._entries if e.shadow)
+
+    @property
+    def resolved_count(self) -> int:
+        return len(self._resolved())
+
+    def compute_brier_score(self) -> float | None:
+        """Mean Brier score across resolved signals.  Lower is better.
+
+        Returns None if no resolved signals exist.
+        """
+        resolved = self._resolved()
+        if not resolved:
+            return None
+        total = 0.0
+        for e in resolved:
+            assert e.resolution_price is not None
+            total += (e.model_prob - e.resolution_price) ** 2
+        return total / len(resolved)
+
+    def compute_log_loss(self) -> float | None:
+        """Mean log-loss across resolved signals.  Lower is better.
+
+        Returns None if no resolved signals exist.
+        """
+        resolved = self._resolved()
+        if not resolved:
+            return None
+        eps = 1e-15
+        total = 0.0
+        for e in resolved:
+            assert e.resolution_price is not None
+            p = max(eps, min(1 - eps, e.model_prob))
+            y = e.resolution_price
+            total += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+        return total / len(resolved)
+
+    def compute_direction_accuracy(self) -> float | None:
+        """Fraction of resolved signals where model direction matched resolution.
+
+        Returns None if no resolved signals exist.
+        """
+        resolved = self._resolved()
+        if not resolved:
+            return None
+        correct = 0
+        for e in resolved:
+            assert e.resolution_price is not None
+            if e.direction == "buy_yes" and e.resolution_price == 1.0:
+                correct += 1
+            elif e.direction == "buy_no" and e.resolution_price == 0.0:
+                correct += 1
+        return correct / len(resolved)
+
+    def calibration_summary(self) -> dict[str, Any]:
+        """Return a summary dict suitable for logging / Telegram."""
+        resolved_n = self.resolved_count
+        summary: dict[str, Any] = {
+            "total_signals": self.total_signals,
+            "live_signals": self.live_signals,
+            "shadow_signals": self.shadow_signals,
+            "resolved": resolved_n,
+        }
+        if resolved_n > 0:
+            brier = self.compute_brier_score()
+            logloss = self.compute_log_loss()
+            accuracy = self.compute_direction_accuracy()
+            summary["brier_score"] = round(brier, 4) if brier is not None else None
+            summary["log_loss"] = round(logloss, 4) if logloss is not None else None
+            summary["direction_accuracy"] = (
+                round(accuracy, 4) if accuracy is not None else None
+            )
+        return summary

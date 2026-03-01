@@ -233,3 +233,63 @@ class TestMTIPenalty:
             total_count=100,  # MTI = 1.0
         )
         assert bd.total >= 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tail-market hard veto (Deliverable E)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTailMarketVeto:
+    """Markets near 0 or 1 must receive a hard zero score."""
+
+    def test_score_price_range_low_tail(self):
+        """mid_price below rpe_tail_veto_threshold → 0."""
+        assert score_price_range(0.05) == 0.0
+
+    def test_score_price_range_high_tail(self):
+        """mid_price above (1 - rpe_tail_veto_threshold) → 0."""
+        assert score_price_range(0.95) == 0.0
+
+    def test_score_price_range_at_threshold(self):
+        """mid_price exactly at threshold boundary → 0.0 (strict <)."""
+        from src.core.config import settings
+        threshold = settings.strategy.rpe_tail_veto_threshold
+        # Slightly below threshold → vetoed
+        assert score_price_range(threshold - 0.001) == 0.0
+        # Slightly above (1 - threshold) → vetoed
+        assert score_price_range(1.0 - threshold + 0.001) == 0.0
+
+    def test_score_price_range_mid_range_unaffected(self):
+        """Mid-range prices are NOT vetoed."""
+        assert score_price_range(0.50) == 100.0
+        assert score_price_range(0.30) == 100.0
+
+    def test_compute_score_low_tail_hard_zero(self):
+        """compute_score with tail-market mid_price → total = 0."""
+        bd = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            mid_price=0.03,
+        )
+        assert bd.total == 0.0
+        assert bd.price_range == 0.0
+
+    def test_compute_score_high_tail_hard_zero(self):
+        """compute_score with high-tail mid_price → total = 0."""
+        bd = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            mid_price=0.97,
+        )
+        assert bd.total == 0.0
+        assert bd.price_range == 0.0
+
+    def test_compute_score_mid_range_not_vetoed(self):
+        """compute_score with mid-range price retains a positive score."""
+        bd = compute_score(
+            daily_volume_usd=100_000,
+            liquidity_usd=50_000,
+            mid_price=0.50,
+        )
+        assert bd.total > 0.0
+        assert bd.price_range == 100.0

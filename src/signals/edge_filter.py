@@ -128,6 +128,7 @@ def compute_edge_score(
     volume_ratio_threshold: float | None = None,
     min_score: float | None = None,
     tick_size: float = 0.01,
+    model_confidence: float | None = None,
 ) -> EdgeAssessment:
     """Compute the Edge Quality Score for a proposed trade.
 
@@ -156,6 +157,11 @@ def compute_edge_score(
         Minimum EQS for viability.  Defaults to ``min_edge_score``.
     tick_size:
         Price grid resolution (0.01 for Polymarket).
+    model_confidence:
+        When provided (e.g. from RPE signals), scales the signal_quality
+        factor in place of the zscore/volume_ratio formula.  This allows
+        non-panic signals to pass through the EQS gate with appropriate
+        quality scoring based on model confidence.
 
     Returns
     -------
@@ -221,18 +227,22 @@ def compute_edge_score(
             tick_viab = min(1.0, discretised_net / (3.0 * tick_cents))
 
     # ── Factor 4: Signal quality ───────────────────────────────────────
-    z_excess = (
-        max(0.0, (zscore - z_thresh) / z_thresh)
-        if z_thresh > 0
-        else 0.0
-    )
-    v_excess = (
-        max(0.0, (volume_ratio - v_thresh) / v_thresh)
-        if v_thresh > 0
-        else 0.0
-    )
-    # Baseline 0.5 (just cleared PanicDetector), rises with excess
-    signal_q = min(1.0, 0.5 + 0.25 * z_excess + 0.25 * v_excess)
+    if model_confidence is not None:
+        # RPE / model-driven signal: confidence directly drives quality
+        signal_q = max(0.1, min(1.0, model_confidence))
+    else:
+        z_excess = (
+            max(0.0, (zscore - z_thresh) / z_thresh)
+            if z_thresh > 0
+            else 0.0
+        )
+        v_excess = (
+            max(0.0, (volume_ratio - v_thresh) / v_thresh)
+            if v_thresh > 0
+            else 0.0
+        )
+        # Baseline 0.5 (just cleared PanicDetector), rises with excess
+        signal_q = min(1.0, 0.5 + 0.25 * z_excess + 0.25 * v_excess)
     if whale_confluence:
         signal_q = min(1.0, signal_q + 0.15)
 

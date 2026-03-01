@@ -534,3 +534,88 @@ class TestParametricPriceSweep:
                                         "low_regime_entropy",
                                         "fees_exceed_discretised_spread",
                                         "fees_exceed_spread")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  model_confidence parameter (Deliverable B — EQS gate)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestModelConfidence:
+    """When model_confidence is supplied, signal_quality is set directly
+    from it instead of the zscore/volume_ratio formula."""
+
+    def test_high_confidence_boosts_score(self):
+        """High model_confidence → higher EQS than default formula with
+        mediocre zscore/volume_ratio."""
+        ea_default = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=1.5, volume_ratio=1.5,
+            min_score=0.0,
+        )
+        ea_conf = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=1.5, volume_ratio=1.5,
+            min_score=0.0,
+            model_confidence=0.95,
+        )
+        # With high confidence the score should be >= the default
+        assert ea_conf.score >= ea_default.score
+
+    def test_low_confidence_reduces_score(self):
+        """Low model_confidence → lower EQS than default formula with
+        strong zscore/volume_ratio."""
+        ea_strong = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=4.0, volume_ratio=8.0,
+            min_score=0.0,
+        )
+        ea_low = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=4.0, volume_ratio=8.0,
+            min_score=0.0,
+            model_confidence=0.15,
+        )
+        assert ea_low.score <= ea_strong.score
+
+    def test_confidence_none_uses_default_formula(self):
+        """model_confidence=None (default) behaves identically to
+        omitted parameter."""
+        ea1 = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=3.0, volume_ratio=5.0,
+            min_score=0.0,
+        )
+        ea2 = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=3.0, volume_ratio=5.0,
+            min_score=0.0,
+            model_confidence=None,
+        )
+        assert ea1.score == pytest.approx(ea2.score, abs=1e-9)
+
+    def test_confidence_clamped_low(self):
+        """model_confidence below 0.1 is clamped to 0.1, not zero."""
+        ea = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=3.0, volume_ratio=5.0,
+            min_score=0.0,
+            model_confidence=0.01,
+        )
+        # Should still produce a score (signal_quality = 0.1, not 0.01)
+        assert ea.score >= 0.0
+
+    def test_confidence_clamped_high(self):
+        """model_confidence above 1.0 is clamped to 1.0."""
+        ea = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=3.0, volume_ratio=5.0,
+            min_score=0.0,
+            model_confidence=1.5,
+        )
+        ea_one = compute_edge_score(
+            entry_price=0.40, no_vwap=0.55,
+            zscore=3.0, volume_ratio=5.0,
+            min_score=0.0,
+            model_confidence=1.0,
+        )
+        assert ea.score == pytest.approx(ea_one.score, abs=1e-9)

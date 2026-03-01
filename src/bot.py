@@ -42,6 +42,7 @@ from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.signals.resolution_probability import (
     CryptoPriceModel,
     GenericBayesianModel,
+    RPECalibrationTracker,
     ResolutionProbabilityEngine,
 )
 from src.signals.signal_framework import (
@@ -158,6 +159,12 @@ class TradingBot:
         )
         # Crypto retrigger state (Fix 2): last evaluated spot price
         self._rpe_last_spot: float | None = None
+
+        # RPE calibration tracker (Deliverable A)
+        self._rpe_calibration = RPECalibrationTracker()
+
+        # RPE per-market cooldown (Deliverable C)
+        self._rpe_last_signal: dict[str, float] = {}
 
         # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
         self._recorder = None
@@ -953,6 +960,21 @@ class TradingBot:
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
         if rpe and price_in_band:
+            # Deliverable D: Data freshness gate
+            yes_agg_rpe = self._yes_aggs.get(market_info.yes_token_id)
+            max_age = settings.strategy.rpe_max_data_age_seconds
+            if yes_agg_rpe and yes_agg_rpe.bars:
+                last_bar_ts = yes_agg_rpe.bars[-1].open_time
+                data_age = time.time() - last_bar_ts
+                if data_age > max_age:
+                    log.info(
+                        "rpe_stale_data",
+                        market=market_info.condition_id,
+                        data_age_s=round(data_age, 1),
+                        max_age_s=max_age,
+                    )
+                    return
+
             days = 30
             if market_info.end_date:
                 days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
@@ -1030,11 +1052,105 @@ class TradingBot:
         model_prob = meta.get("model_probability", 0.5)
         confidence = meta.get("confidence", 0.0)
         shadow = meta.get("shadow_mode", True)
+        strat = settings.strategy
 
         # Fix 3: Use actual market price, not the normalised divergence score
         display_price = current_price if current_price is not None else meta.get("market_price", signal.score)
 
-        # Always alert via Telegram (for calibration visibility in shadow mode)
+        # ── Deliverable C: Per-market cooldown ─────────────────────────
+        now = time.monotonic()
+        last_fire = self._rpe_last_signal.get(market.condition_id, 0.0)
+        if now - last_fire < strat.rpe_cooldown_seconds:
+            log.debug(
+                "rpe_cooldown_active",
+                market=market.condition_id,
+                seconds_remaining=round(strat.rpe_cooldown_seconds - (now - last_fire), 1),
+            )
+            return
+
+        # ── Deliverable B: EQS gate (all paths, before Telegram) ────────
+        # Determine entry price for EQS calculation
+        yes_agg = self._yes_aggs.get(market.yes_token_id)
+        no_agg = self._no_aggs.get(market.no_token_id)
+        if direction == "buy_no":
+            book = self._book_trackers.get(market.no_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                eqs_entry = snap.best_ask - 0.01 if snap.best_ask > 0 else 0.0
+            else:
+                eqs_entry = no_agg.current_price if no_agg else 0.0
+        else:
+            book = self._book_trackers.get(market.yes_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                eqs_entry = snap.best_ask - 0.01 if snap.best_ask > 0 else 0.0
+            else:
+                eqs_entry = yes_agg.current_price if yes_agg else 0.0
+
+        if eqs_entry > 0:
+            fee_cats = strat.fee_enabled_categories.lower().split(",")
+            market_tags = (getattr(market, 'tags', '') or '').lower()
+            fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+
+            edge = compute_edge_score(
+                entry_price=eqs_entry,
+                no_vwap=model_prob,
+                zscore=0.0,
+                volume_ratio=0.0,
+                whale_confluence=False,
+                fee_enabled=fee_enabled,
+                model_confidence=confidence,
+                min_score=strat.rpe_min_eqs,
+            )
+            log.debug(
+                "rpe_eqs_assessment",
+                market=market.condition_id,
+                eqs=edge.score,
+                viable=edge.viable,
+                regime=edge.regime_quality,
+                fee_eff=edge.fee_efficiency,
+                signal_q=edge.signal_quality,
+                reason=edge.rejection_reason,
+            )
+            if not edge.viable:
+                log.info(
+                    "rpe_eqs_rejected",
+                    market=market.condition_id,
+                    score=edge.score,
+                    min_required=strat.rpe_min_eqs,
+                    reason=edge.rejection_reason,
+                    direction=direction,
+                    confidence=round(confidence, 3),
+                )
+                # Stamp the cooldown even on rejection — the market condition
+                # is unlikely to change within the cooldown window, and this
+                # prevents the same EQS rejection from filling the logs every
+                # evaluation cycle.
+                self._rpe_last_signal[market.condition_id] = now
+                return
+
+        # ── Record cooldown timestamp (after EQS passes) ─────────────
+        self._rpe_last_signal[market.condition_id] = now
+
+        # ── Record in calibration tracker (Deliverable A) ────────────
+        self._rpe_calibration.record_signal(
+            market_id=market.condition_id,
+            model_prob=model_prob,
+            market_price=display_price,
+            direction=direction,
+            timestamp=time.time(),
+            shadow=shadow,
+        )
+
+        # ── Telegram notification (with calibration footer) ───────────
+        cal_footer = ""
+        cal_stats = self._rpe_calibration.calibration_summary()
+        if cal_stats.get("resolved", 0) >= 20:
+            brier = cal_stats.get("brier_score", "n/a")
+            logloss = cal_stats.get("log_loss", "n/a")
+            acc = cal_stats.get("direction_accuracy", "n/a")
+            cal_footer = f"\nCalibration (N={cal_stats['resolved']}): Brier={brier} LL={logloss} Acc={acc}"
+
         await self.telegram.notify_rpe_signal(
             market_id=market.condition_id,
             model_prob=model_prob,
@@ -1042,6 +1158,8 @@ class TradingBot:
             direction=direction,
             confidence=confidence,
             shadow=shadow,
+            question=market.question,
+            calibration_footer=cal_footer,
         )
 
         # Record in data recorder for backtesting
@@ -1078,8 +1196,6 @@ class TradingBot:
             return
 
         # Gate 2: Require >= 10 OHLCV bars of history for meaningful data
-        yes_agg = self._yes_aggs.get(market.yes_token_id)
-        no_agg = self._no_aggs.get(market.no_token_id)
         bar_count = max(
             len(yes_agg.bars) if yes_agg else 0,
             len(no_agg.bars) if no_agg else 0,
@@ -1093,10 +1209,22 @@ class TradingBot:
             )
             return
 
+        # ── Deliverable C: Position deduplication ────────────────────
+        positioned = self._positioned_asset_ids()
+        if market.yes_token_id in positioned or market.no_token_id in positioned:
+            log.info(
+                "rpe_already_positioned",
+                market=market.condition_id,
+                yes_token=market.yes_token_id,
+                no_token=market.no_token_id,
+            )
+            return
+
         # Live mode — open a position
-        fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
-        market_tags = (getattr(market, 'tags', '') or '').lower()
-        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+        if not fee_enabled:
+            fee_cats_local = strat.fee_enabled_categories.lower().split(",")
+            market_tags_local = (getattr(market, 'tags', '') or '').lower()
+            fee_enabled = any(cat.strip() in market_tags_local for cat in fee_cats_local) if market_tags_local else True
 
         # Determine entry price from the appropriate book
         if direction == "buy_no":
@@ -1115,25 +1243,6 @@ class TradingBot:
                 entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
 
         if entry_price <= 0:
-            return
-
-        # Gate 3: Edge quality filter — RPE entries must pass compute_edge_score
-        divergence_z = abs(model_prob - entry_price) / max(1.0 - confidence, 0.05)
-        edge = compute_edge_score(
-            entry_price=entry_price,
-            no_vwap=model_prob,
-            zscore=divergence_z,
-            volume_ratio=1.0,
-            whale_confluence=False,
-            fee_enabled=fee_enabled,
-        )
-        if not edge.viable:
-            log.info(
-                "rpe_live_edge_rejected",
-                market=market.condition_id,
-                score=edge.score,
-                reason=edge.rejection_reason,
-            )
             return
 
         pos = await self.positions.open_rpe_position(
@@ -1218,6 +1327,20 @@ class TradingBot:
                         < settings.strategy.max_tradeable_price
                     ):
                         continue
+
+                    # Deliverable D: Data freshness gate (retrigger path)
+                    max_age = settings.strategy.rpe_max_data_age_seconds
+                    if yes_agg and yes_agg.bars:
+                        data_age = time.time() - yes_agg.bars[-1].open_time
+                        if data_age > max_age:
+                            log.info(
+                                "rpe_stale_data",
+                                market=m.condition_id,
+                                data_age_s=round(data_age, 1),
+                                max_age_s=max_age,
+                                path="retrigger",
+                            )
+                            continue
 
                     days = 30
                     if m.end_date:

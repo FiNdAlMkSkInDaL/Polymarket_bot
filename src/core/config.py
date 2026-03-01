@@ -306,6 +306,13 @@ class StrategyParams:
     rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", True)
     rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
 
+    # RPE cooldown / freshness / calibration (Pillar 14 overhaul)
+    rpe_cooldown_seconds: int = _env_int("RPE_COOLDOWN_SECONDS", 300)
+    rpe_max_data_age_seconds: int = _env_int("RPE_MAX_DATA_AGE_SECONDS", 30)
+    rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
+    rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 40.0)
+    rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)
+
     # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────
     pce_shadow_mode: bool = _env_bool("PCE_SHADOW_MODE", True)
     pce_max_portfolio_var_usd: float = _env_float("PCE_MAX_PORTFOLIO_VAR_USD", 50.0)

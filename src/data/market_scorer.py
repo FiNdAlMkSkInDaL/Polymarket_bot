@@ -110,9 +110,16 @@ def score_time_to_resolution(end_date: datetime | None) -> float:
 
 
 def score_price_range(mid_price: float) -> float:
-    """YES mid-price ∈ [0.15, 0.85] → good edge.  Near 0 or 1 → no edge."""
+    """YES mid-price ∈ [0.15, 0.85] → good edge.  Near 0 or 1 → no edge.
+
+    Markets with mid_price < tail_veto_threshold or > (1 - tail_veto_threshold)
+    return 0.0 as a hard zero to prevent promotion of near-resolved markets.
+    """
     if mid_price <= 0 or mid_price >= 1.0:
         return 50.0  # no data yet
+    tail_veto = settings.strategy.rpe_tail_veto_threshold
+    if mid_price < tail_veto or mid_price > (1.0 - tail_veto):
+        return 0.0
     if 0.15 <= mid_price <= 0.85:
         return 100.0
     if mid_price < 0.15:
@@ -203,5 +210,11 @@ def compute_score(
     )
 
     bd.total = max(0.0, min(100.0, weighted_sum - penalty))
+
+    # Hard tail-market veto: prevent promotion regardless of other scores
+    tail_veto = settings.strategy.rpe_tail_veto_threshold
+    if 0 < mid_price < tail_veto or (1.0 - tail_veto) < mid_price < 1.0:
+        bd.total = 0.0
+        bd.price_range = 0.0
 
     return bd
