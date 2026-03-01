@@ -63,7 +63,8 @@ class Position:
     # Entry
     entry_order: Order | None = None
     entry_price: float = 0.0
-    entry_size: float = 0.0
+    entry_size: float = 0.0          # intended (pre-fill) size
+    filled_size: float = 0.0          # actual shares acquired (set on fill)
     entry_time: float = 0.0
 
     # Exit
@@ -73,6 +74,11 @@ class Position:
     exit_price: float = 0.0
     exit_time: float = 0.0
     exit_reason: str = ""
+
+    # Bidirectional support (RPE)
+    trade_asset_id: str = ""   # actual token traded (YES or NO); fallback to no_asset_id
+    trade_side: str = "NO"     # "YES" or "NO" — which outcome token we bought
+    yes_asset_id: str = ""     # YES token id (for RPE YES-side entries)
 
     # Signal metadata
     signal: PanicSignal | None = None
@@ -98,6 +104,11 @@ class Position:
 
     created_at: float = field(default_factory=time.time)
 
+    @property
+    def effective_size(self) -> float:
+        """Shares to use for exit orders / PnL — filled_size if set, else entry_size."""
+        return self.filled_size if self.filled_size > 0 else self.entry_size
+
 
 class PositionManager:
     """Orchestrates the full lifecycle of mean-reversion trades.
@@ -119,11 +130,13 @@ class PositionManager:
         max_open_positions: int | None = None,
         trade_store: Any | None = None,
         guard: DeploymentGuard | None = None,
+        pce: Any | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
         self._trade_store = trade_store
         self._guard = guard
+        self._pce = pce  # PortfolioCorrelationEngine (Pillar 15)
         self._positions: dict[str, Position] = {}
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
@@ -148,6 +161,142 @@ class PositionManager:
         self._daily_pnl_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._circuit_breaker_tripped = False
         log.info("daily_pnl_reset")
+
+    # ── Shared risk gates ──────────────────────────────────────────────────
+    def _check_risk_gates(
+        self, market_id: str, event_id: str = "", *, trade_direction: str = "NO"
+    ) -> tuple[bool, float]:
+        """Run all risk gates shared between panic and RPE entries.
+
+        Returns (passed: bool, max_trade_usd: float).  When passed
+        is False, the caller must abort.  max_trade_usd is the
+        capital-allocation cap for this entry attempt.
+        """
+        strat = settings.strategy
+
+        # ── Circuit breaker check ──────────────────────────────────────────
+        if self._circuit_breaker_tripped:
+            log.warning("circuit_breaker_active", reason="daily_loss_or_drawdown")
+            return False, 0.0
+
+        # ── Daily loss check ───────────────────────────────────────────────
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_pnl_date != today:
+            self.reset_daily_pnl()
+
+        daily_loss_limit_cents = strat.daily_loss_limit_usd * 100
+        if self._daily_pnl_cents <= -daily_loss_limit_cents:
+            self._circuit_breaker_tripped = True
+            log.warning(
+                "daily_loss_limit_hit",
+                daily_pnl=round(self._daily_pnl_cents, 2),
+                limit=daily_loss_limit_cents,
+            )
+            return False, 0.0
+
+        # ── Max drawdown check ─────────────────────────────────────────────
+        if self._max_drawdown_cents >= strat.max_drawdown_cents:
+            self._circuit_breaker_tripped = True
+            log.warning(
+                "max_drawdown_hit",
+                drawdown=round(self._max_drawdown_cents, 2),
+                limit=strat.max_drawdown_cents,
+            )
+            return False, 0.0
+
+        # ── Risk gate: max open positions ──────────────────────────────────
+        open_positions = self.get_open_positions()
+        if len(open_positions) >= self.max_open:
+            log.warning("max_positions_reached", open=len(open_positions))
+            return False, 0.0
+
+        # ── Risk gate: per-market concentration ────────────────────────────
+        market_count = sum(
+            1 for p in open_positions if p.market_id == market_id
+        )
+        if market_count >= strat.max_positions_per_market:
+            log.warning(
+                "per_market_limit",
+                market=market_id,
+                count=market_count,
+                limit=strat.max_positions_per_market,
+            )
+            return False, 0.0
+
+        # ── Risk gate: per-event concentration ─────────────────────────────
+        if event_id:
+            event_count = sum(
+                1 for p in open_positions if p.event_id == event_id
+            )
+            if event_count >= strat.max_positions_per_event:
+                log.warning(
+                    "per_event_limit",
+                    event_id=event_id,
+                    count=event_count,
+                    limit=strat.max_positions_per_event,
+                )
+                return False, 0.0
+
+        # ── Risk gate: total exposure ──────────────────────────────────────
+        total_exposure = sum(
+            p.entry_price * p.entry_size for p in open_positions
+        )
+        max_exposure = self._wallet_balance_usd * strat.max_total_exposure_pct / 100.0
+        if total_exposure >= max_exposure and max_exposure > 0:
+            log.warning(
+                "exposure_limit",
+                exposure=round(total_exposure, 2),
+                limit=round(max_exposure, 2),
+            )
+            return False, 0.0
+
+        # ── Risk gate: capital allocation ──────────────────────────────────
+        max_trade = min(
+            strat.max_trade_size_usd,
+            self._wallet_balance_usd * strat.max_wallet_risk_pct / 100.0,
+        )
+        if max_trade <= 0:
+            log.warning("insufficient_balance", balance=self._wallet_balance_usd)
+            return False, 0.0
+
+        # ── Risk gate: Portfolio Correlation Engine (PCE) VaR ──────────────
+        if self._pce is not None:
+            if self._pce.var_soft_cap:
+                # Soft cap: skip check_var_gate(); compute_var_sizing_cap
+                # already evaluates VaR internally (avoids redundant O(N²))
+                sizing_result = self._pce.compute_var_sizing_cap(
+                    open_positions=open_positions,
+                    proposed_market_id=market_id,
+                    proposed_size_usd=max_trade,
+                    proposed_direction=trade_direction,
+                )
+                if sizing_result.cap_usd < 1.0:
+                    log.warning(
+                        "pce_var_gate_blocked",
+                        market=market_id,
+                        portfolio_var=sizing_result.current_var,
+                        threshold=self._pce.max_portfolio_var_usd,
+                    )
+                    return False, 0.0
+                max_trade = min(max_trade, sizing_result.cap_usd)
+            else:
+                # Hard block mode: binary accept/reject
+                allowed, var_result = self._pce.check_var_gate(
+                    open_positions=open_positions,
+                    proposed_market_id=market_id,
+                    proposed_size_usd=max_trade,
+                    proposed_direction=trade_direction,
+                )
+                if not allowed:
+                    log.warning(
+                        "pce_var_gate_blocked",
+                        market=market_id,
+                        portfolio_var=var_result.portfolio_var_usd,
+                        threshold=self._pce.max_portfolio_var_usd,
+                    )
+                    return False, 0.0
+
+        return True, max_trade
 
     # ── Open a new position on signal ──────────────────────────────────────
     async def open_position(
@@ -176,89 +325,8 @@ class PositionManager:
         """
         strat = settings.strategy
 
-        # ── Circuit breaker check ──────────────────────────────────────────
-        if self._circuit_breaker_tripped:
-            log.warning("circuit_breaker_active", reason="daily_loss_or_drawdown")
-            return None
-
-        # ── Daily loss check ───────────────────────────────────────────────
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self._daily_pnl_date != today:
-            self.reset_daily_pnl()
-
-        daily_loss_limit_cents = strat.daily_loss_limit_usd * 100
-        if self._daily_pnl_cents <= -daily_loss_limit_cents:
-            self._circuit_breaker_tripped = True
-            log.warning(
-                "daily_loss_limit_hit",
-                daily_pnl=round(self._daily_pnl_cents, 2),
-                limit=daily_loss_limit_cents,
-            )
-            return None
-
-        # ── Max drawdown check ─────────────────────────────────────────────
-        if self._max_drawdown_cents >= strat.max_drawdown_cents:
-            self._circuit_breaker_tripped = True
-            log.warning(
-                "max_drawdown_hit",
-                drawdown=round(self._max_drawdown_cents, 2),
-                limit=strat.max_drawdown_cents,
-            )
-            return None
-
-        # ── Risk gate: max open positions ──────────────────────────────────
-        open_positions = self.get_open_positions()
-        if len(open_positions) >= self.max_open:
-            log.warning("max_positions_reached", open=len(open_positions))
-            return None
-
-        # ── Risk gate: per-market concentration ────────────────────────────
-        market_count = sum(
-            1 for p in open_positions if p.market_id == signal.market_id
-        )
-        if market_count >= strat.max_positions_per_market:
-            log.warning(
-                "per_market_limit",
-                market=signal.market_id,
-                count=market_count,
-                limit=strat.max_positions_per_market,
-            )
-            return None
-
-        # ── Risk gate: per-event concentration ─────────────────────────────
-        if event_id:
-            event_count = sum(
-                1 for p in open_positions if p.event_id == event_id
-            )
-            if event_count >= strat.max_positions_per_event:
-                log.warning(
-                    "per_event_limit",
-                    event_id=event_id,
-                    count=event_count,
-                    limit=strat.max_positions_per_event,
-                )
-                return None
-
-        # ── Risk gate: total exposure ──────────────────────────────────────
-        total_exposure = sum(
-            p.entry_price * p.entry_size for p in open_positions
-        )
-        max_exposure = self._wallet_balance_usd * strat.max_total_exposure_pct / 100.0
-        if total_exposure >= max_exposure and max_exposure > 0:
-            log.warning(
-                "exposure_limit",
-                exposure=round(total_exposure, 2),
-                limit=round(max_exposure, 2),
-            )
-            return None
-
-        # ── Risk gate: capital allocation ──────────────────────────────────
-        max_trade = min(
-            strat.max_trade_size_usd,
-            self._wallet_balance_usd * strat.max_wallet_risk_pct / 100.0,
-        )
-        if max_trade <= 0:
-            log.warning("insufficient_balance", balance=self._wallet_balance_usd)
+        passed, max_trade = self._check_risk_gates(signal.market_id, event_id)
+        if not passed:
             return None
 
         # Entry price: undercut the best ask by 1¢ to ensure maker
@@ -349,6 +417,19 @@ class PositionManager:
 
         # Conservative sizing: min(depth-aware, kelly)
         entry_size = min(sizing.size_shares, kelly_result.size_shares)
+
+        # ── PCE concentration haircut (Pillar 15) ─────────────────────────
+        if self._pce is not None:
+            pce_haircut = self._pce.compute_concentration_haircut(
+                signal.market_id, self.get_open_positions()
+            )
+            if pce_haircut < 1.0:
+                entry_size = max(1.0, round(entry_size * pce_haircut, 2))
+                log.info(
+                    "pce_size_haircut_applied",
+                    haircut=round(pce_haircut, 4),
+                    new_size=entry_size,
+                )
 
         # ── Deployment guard: enforce phase-specific size cap ──────────────
         if self._guard is not None:
@@ -452,19 +533,308 @@ class PositionManager:
 
         return pos
 
+    # ── Open RPE position (bidirectional) ──────────────────────────────────
+    async def open_rpe_position(
+        self,
+        *,
+        market_id: str,
+        yes_asset_id: str,
+        no_asset_id: str,
+        direction: str,
+        model_probability: float,
+        confidence: float,
+        entry_price: float,
+        event_id: str = "",
+        days_to_resolution: int = 30,
+        fee_enabled: bool = True,
+        book: OrderbookTracker | None = None,
+        signal_metadata: dict | None = None,
+    ) -> Position | None:
+        """Open a position driven by the Resolution Probability Engine.
+
+        This is a parallel entry method to ``open_position()`` — it
+        shares all risk gates but supports bidirectional trades
+        (buy YES or buy NO) and uses RPE-specific edge evaluation.
+
+        Design decision — **parallel method vs extending open_position()**:
+            The two alphas (panic mean-reversion and RPE model-based) are
+            structurally independent.  Extending ``open_position()`` to
+            handle both would introduce conditional branches in a proven
+            code path.  A separate method isolates RPE logic while
+            sharing risk infrastructure via ``_check_risk_gates()``.
+
+        Parameters
+        ----------
+        direction:
+            ``"buy_yes"`` or ``"buy_no"`` — which outcome token to buy.
+        model_probability:
+            The RPE's estimated YES resolution probability.
+        confidence:
+            Model confidence (0–1), used as ``1 - uncertainty_penalty``
+            for Kelly sizing.
+        entry_price:
+            Price to place the limit BUY order at.
+        """
+        strat = settings.strategy
+
+        # Shadow mode: log but do not trade
+        if strat.rpe_shadow_mode:
+            log.info(
+                "rpe_shadow_entry_skipped",
+                market=market_id,
+                direction=direction,
+                model_prob=round(model_probability, 4),
+                confidence=round(confidence, 3),
+                entry_price=entry_price,
+            )
+            return None
+
+        # Determine trade direction before risk gates for PCE directional awareness
+        trade_direction = "YES" if direction == "buy_yes" else "NO"
+
+        passed, max_trade = self._check_risk_gates(
+            market_id, event_id, trade_direction=trade_direction,
+        )
+        if not passed:
+            return None
+
+        if entry_price <= 0 or entry_price >= 1:
+            log.warning("rpe_entry_price_invalid", price=entry_price)
+            return None
+
+        # Determine which token to trade
+        if direction == "buy_yes":
+            trade_asset = yes_asset_id
+            trade_side = "YES"
+        else:
+            trade_asset = no_asset_id
+            trade_side = "NO"
+
+        # ── Edge quality gate ──────────────────────────────────────────
+        # Map RPE divergence to the EQS framework.  The divergence
+        # divided by (1 - confidence) produces a z-score-like metric.
+        # Volume ratio is set to 1.0 (RPE is not volume-triggered).
+        divergence_z = abs(model_probability - entry_price) / max(
+            1.0 - confidence, 0.05
+        )
+        edge = compute_edge_score(
+            entry_price=entry_price,
+            no_vwap=model_probability,  # model estimate as "fair value"
+            zscore=divergence_z,
+            volume_ratio=1.0,
+            whale_confluence=False,
+            fee_enabled=fee_enabled,
+        )
+        if not edge.viable:
+            log.info(
+                "rpe_edge_rejected",
+                market=market_id,
+                reason=edge.rejection_reason,
+                score=edge.score,
+            )
+            return None
+
+        # ── Depth-aware sizing ─────────────────────────────────────────
+        if book is not None:
+            sizing = compute_depth_aware_size(
+                book=book,
+                entry_price=entry_price,
+                max_trade_usd=max_trade,
+                side="BUY",
+            )
+        else:
+            fallback_usd = max_trade * 0.50
+            shares = round(fallback_usd / entry_price, 2)
+            if shares < 1:
+                shares = 0.0
+                fallback_usd = 0.0
+            sizing = SizingResult(
+                size_usd=fallback_usd,
+                size_shares=shares,
+                available_liq_usd=0.0,
+                method="fallback_no_book",
+                capped=False,
+            )
+
+        # ── Kelly sizing ───────────────────────────────────────────────
+        # RPE confidence flows directly as uncertainty_penalty
+        rpe_metadata = dict(signal_metadata or {})
+        rpe_metadata.setdefault("uncertainty_penalty", 1.0 - confidence)
+
+        win_rate = 0.0
+        avg_win_cents = 0.0
+        avg_loss_cents = 0.0
+        if self._trade_store is not None:
+            try:
+                stats = await self._trade_store.get_stats()
+                win_rate = stats.get("win_rate", 0.0)
+                avg_win_cents = stats.get("avg_win_cents", 0.0)
+                avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+            except Exception:
+                log.warning("trade_store_stats_unavailable")
+
+        signal_score = min(1.0, divergence_z / 3.0)
+
+        kelly_result = compute_kelly_size(
+            signal_score=signal_score,
+            win_rate=win_rate,
+            avg_win_cents=avg_win_cents,
+            avg_loss_cents=avg_loss_cents,
+            bankroll_usd=self._wallet_balance_usd,
+            entry_price=entry_price,
+            max_trade_usd=max_trade,
+            book=book,
+            signal_metadata=rpe_metadata,
+        )
+
+        if kelly_result.method == "kelly_no_edge":
+            log.info(
+                "rpe_skip_kelly_no_edge",
+                estimated_p=kelly_result.estimated_p,
+                adjusted_p=kelly_result.adjusted_p,
+                uncertainty=kelly_result.uncertainty_penalty,
+            )
+            return None
+
+        entry_size = min(sizing.size_shares, kelly_result.size_shares)
+
+        # ── PCE concentration haircut (Pillar 15) ─────────────────────
+        if self._pce is not None:
+            pce_haircut = self._pce.compute_concentration_haircut(
+                market_id, self.get_open_positions()
+            )
+            if pce_haircut < 1.0:
+                entry_size = max(1.0, round(entry_size * pce_haircut, 2))
+                log.info(
+                    "rpe_pce_size_haircut_applied",
+                    haircut=round(pce_haircut, 4),
+                    new_size=entry_size,
+                )
+
+        if self._guard is not None:
+            entry_size = self._guard.get_allowed_trade_shares(
+                entry_size, entry_price
+            )
+
+        if entry_size < 1:
+            log.info("rpe_skip_insufficient_size")
+            return None
+
+        # ── Take-profit target ─────────────────────────────────────────
+        # Mean-reversion toward model estimate: price should converge
+        # to model_probability.
+        alpha = strat.alpha_default
+        target_price = round(
+            entry_price + alpha * (model_probability - entry_price), 2
+        )
+        # When buying NO (market overpriced), model_prob < market_price,
+        # so we bought at 1-market_price on the NO side.  The target
+        # needs to be above entry for a profitable exit.
+        if direction == "buy_no":
+            # NO token price ≈ 1 - YES price.  We enter at entry_price
+            # (NO best ask - 1¢), target is higher (NO reverts up).
+            no_entry = entry_price
+            no_fair = 1.0 - model_probability
+            target_price = round(
+                no_entry + alpha * (no_fair - no_entry), 2
+            )
+            target_price = max(target_price, no_entry + 0.01)
+        else:
+            # YES side: entry at entry_price, target toward model estimate
+            target_price = round(
+                entry_price + alpha * (model_probability - entry_price), 2
+            )
+            target_price = max(target_price, entry_price + 0.01)
+
+        # Fee-adaptive stop-loss
+        sl_trigger = compute_adaptive_stop_loss_cents(
+            sl_base_cents=strat.stop_loss_cents,
+            entry_price=entry_price,
+            fee_enabled=fee_enabled,
+        )
+
+        from src.trading.fees import get_fee_rate
+        entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
+        entry_fee_bps = round(entry_fee_frac * 10000)
+
+        # Place entry order
+        pos_id = f"RPE-{self._next_id}"
+        self._next_id += 1
+
+        order = await self.executor.place_limit_order(
+            market_id=market_id,
+            asset_id=trade_asset,
+            side=OrderSide.BUY,
+            price=entry_price,
+            size=entry_size,
+        )
+
+        pos = Position(
+            id=pos_id,
+            market_id=market_id,
+            no_asset_id=no_asset_id,
+            yes_asset_id=yes_asset_id,
+            trade_asset_id=trade_asset,
+            trade_side=trade_side,
+            event_id=event_id,
+            state=PositionState.ENTRY_PENDING,
+            entry_order=order,
+            entry_price=entry_price,
+            entry_size=entry_size,
+            entry_time=time.time(),
+            target_price=target_price,
+            sizing=sizing,
+            kelly_result=kelly_result,
+            fee_enabled=fee_enabled,
+            sl_trigger_cents=sl_trigger,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=0,
+        )
+
+        self._positions[pos.id] = pos
+
+        log.info(
+            "rpe_position_opened",
+            pos_id=pos.id,
+            market=market_id,
+            direction=direction,
+            trade_side=trade_side,
+            entry=entry_price,
+            size=entry_size,
+            target=target_price,
+            model_prob=round(model_probability, 4),
+            confidence=round(confidence, 3),
+            sl_trigger=sl_trigger,
+        )
+
+        return pos
+
     # ── Handle entry fill ──────────────────────────────────────────────────
     async def on_entry_filled(self, pos: Position) -> None:
         """Called when the entry buy order is filled.  Places the exit sell."""
         pos.state = PositionState.ENTRY_FILLED
         pos.entry_price = pos.entry_order.filled_avg_price or pos.entry_price
 
-        # Place exit limit sell at the computed target
+        # Reconcile actual fill quantity.  The chaser or paper-fill may
+        # have set filled_size already; if not, infer from the order.
+        if pos.filled_size <= 0:
+            if pos.entry_order and pos.entry_order.filled_size > 0:
+                pos.filled_size = pos.entry_order.filled_size
+            else:
+                pos.filled_size = pos.entry_size
+
+        # Use trade_asset_id for exit — supports both YES and NO side entries.
+        # Fallback to no_asset_id preserves backward compatibility for
+        # existing panic-detector positions created before RPE was added.
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+
+        # Place exit limit sell at the computed target, sized to *actual* fill
         exit_order = await self.executor.place_limit_order(
             market_id=pos.market_id,
-            asset_id=pos.no_asset_id,
+            asset_id=exit_asset,
             side=OrderSide.SELL,
             price=pos.target_price,
-            size=pos.entry_size,
+            size=pos.effective_size,
         )
 
         pos.exit_order = exit_order
@@ -474,7 +844,8 @@ class PositionManager:
             "exit_order_placed",
             pos_id=pos.id,
             target=pos.target_price,
-            size=pos.entry_size,
+            size=pos.effective_size,
+            trade_side=pos.trade_side,
         )
 
     # ── Handle exit fill ───────────────────────────────────────────────────
@@ -487,11 +858,11 @@ class PositionManager:
         pos.exit_time = time.time()
         pos.exit_reason = reason
 
-        # Net-of-fee PnL using dynamic fee curve
+        # Net-of-fee PnL using actual fill size
         pos.pnl_cents = compute_net_pnl_cents(
             entry_price=pos.entry_price,
             exit_price=pos.exit_price,
-            size=pos.entry_size,
+            size=pos.effective_size,
             fee_enabled=pos.fee_enabled,
         )
 
@@ -569,12 +940,13 @@ class PositionManager:
 
                     # Place a market sell (IOC at best bid — simulated by
                     # placing at a very low price in paper mode)
+                    exit_asset = pos.trade_asset_id or pos.no_asset_id
                     exit_order = await self.executor.place_limit_order(
                         market_id=pos.market_id,
-                        asset_id=pos.no_asset_id,
+                        asset_id=exit_asset,
                         side=OrderSide.SELL,
                         price=0.01,  # effectively market sell
-                        size=pos.entry_size,
+                        size=pos.effective_size,
                     )
                     pos.exit_order = exit_order
                     # In paper mode, check for an immediate fill;
@@ -602,12 +974,13 @@ class PositionManager:
         if pos.exit_order:
             await self.executor.cancel_order(pos.exit_order)
 
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
         exit_order = await self.executor.place_limit_order(
             market_id=pos.market_id,
-            asset_id=pos.no_asset_id,
+            asset_id=exit_asset,
             side=OrderSide.SELL,
             price=0.01,
-            size=pos.entry_size,
+            size=pos.effective_size,
         )
         pos.exit_order = exit_order
         # In paper mode, close immediately; in live mode wait for CLOB

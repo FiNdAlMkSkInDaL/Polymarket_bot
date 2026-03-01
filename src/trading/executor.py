@@ -140,6 +140,8 @@ class OrderExecutor:
                 from py_clob_client.clob_types import OrderArgs
                 from py_clob_client.order_builder.constants import BUY, SELL
 
+                from py_clob_client.clob_types import OrderType
+
                 order_args = OrderArgs(
                     price=price,
                     size=size,
@@ -149,7 +151,15 @@ class OrderExecutor:
                 # Attach fee rate to the signed payload when taking liquidity
                 if fee_rate_bps > 0:
                     order_args.fee_rate_bps = fee_rate_bps
-                resp = await asyncio.to_thread(clob.create_and_post_order, order_args)
+
+                # Two-step create+post so post_only reaches the wire.
+                # ClobClient.create_and_post_order doesn't forward
+                # post_only; ClobClient.post_order does.
+                signed = await asyncio.to_thread(clob.create_order, order_args)
+                resp = await asyncio.to_thread(
+                    clob.post_order, signed, OrderType.GTC, post_only,
+                )
+
                 clob_id = ""
                 if isinstance(resp, dict):
                     # Detect POST_ONLY rejection

@@ -160,16 +160,67 @@ class StrategyParams:
     latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
     # ── Pillar 5: Anti-Adverse-Selection ("Fast-Kill") ─────────────────────
+    #
+    # Intrinsic detection engine — four intra-Polymarket signals detect
+    # toxic flow using data the bot already collects.  A kill fires when
+    # ANY two of the four signals trigger simultaneously (2-of-4 rule),
+    # reducing false positives from idiosyncratic market noise.
+    #
+    # Core lifecycle knobs (preserved from v1):
     adverse_sel_enabled: bool = _env_bool("ADVERSE_SEL_ENABLED", True)
-    adverse_sel_tick_threshold: int = _env_int("ADVERSE_SEL_TICK_THRESHOLD", 5000)
-    adverse_sel_book_stale_ms: int = _env_int("ADVERSE_SEL_BOOK_STALE_MS", 30000)
     adverse_sel_cooldown_s: float = _env_float("ADVERSE_SEL_COOLDOWN_S", 2.0)
     adverse_sel_poll_ms: int = _env_int("ADVERSE_SEL_POLL_MS", 50)
-    adverse_sel_polygon_head_lag_ms: int = _env_int("ADVERSE_SEL_POLYGON_HEAD_LAG_MS", 3000)
-    binance_ws_url: str = _env(
-        "BINANCE_WS_URL", "wss://stream.binance.com:9443/ws/btcusdc@trade"
-    )
 
+    # Polygon head-lag threshold (used by PolygonHeadLagChecker in heartbeat.py)
+    adverse_sel_polygon_head_lag_ms: int = _env_int("ADVERSE_SEL_POLYGON_HEAD_LAG_MS", 3000)
+
+    # Signal 1 — Cross-market flow coherence
+    # When taker-initiated trades dominate 3+ independent markets within
+    # a 5-second window, it indicates a platform-wide information event
+    # (news drop, API leak).  Idiosyncratic noise cannot produce
+    # simultaneous directional flow across unrelated markets.
+    adverse_sel_mti_threshold: float = _env_float("ADVERSE_SEL_MTI_THRESHOLD", 0.85)
+    adverse_sel_mti_min_markets: int = _env_int("ADVERSE_SEL_MTI_MIN_MARKETS", 3)
+    adverse_sel_mti_window_s: float = _env_float("ADVERSE_SEL_MTI_WINDOW_S", 5.0)
+
+    # Signal 2 — Book depth evaporation
+    # When informed traders arrive, market makers pull quotes before the
+    # price moves.  A 60% depth drop within 2 seconds within 5¢ of mid
+    # is the classic signature.  Differs from ghost liquidity (which
+    # detects fake depth without corresponding trades) — this detects
+    # genuine quote withdrawal by real market makers.
+    adverse_sel_depth_drop_pct: float = _env_float("ADVERSE_SEL_DEPTH_DROP_PCT", 0.60)
+    adverse_sel_depth_window_s: float = _env_float("ADVERSE_SEL_DEPTH_WINDOW_S", 2.0)
+    adverse_sel_depth_near_mid_cents: float = _env_float("ADVERSE_SEL_DEPTH_NEAR_MID_CENTS", 5.0)
+
+    # Signal 3 — Spread blow-out
+    # When the bid-ask spread on a positioned market widens to 3× its
+    # 5-minute rolling average, market makers are widening defensively
+    # in response to perceived information asymmetry.  The 5-minute
+    # window normalizes for time-of-day spread variation.
+    adverse_sel_spread_blowout_mult: float = _env_float("ADVERSE_SEL_SPREAD_BLOWOUT_MULT", 3.0)
+    adverse_sel_spread_avg_window_s: float = _env_float("ADVERSE_SEL_SPREAD_AVG_WINDOW_S", 300.0)
+
+    # Signal 4 — Velocity anomaly on positioned assets
+    # A 5× spike in trade arrival rate over a 10-minute baseline on a
+    # market where the bot holds a position indicates a burst of
+    # informed activity.  Under Poisson arrival, a 5× spike has
+    # p < 0.001 unless event-driven.
+    adverse_sel_velocity_mult: float = _env_float("ADVERSE_SEL_VELOCITY_MULT", 5.0)
+    adverse_sel_velocity_window_s: float = _env_float("ADVERSE_SEL_VELOCITY_WINDOW_S", 600.0)
+    # Adaptive multiplier boost for high-frequency markets.
+    # Markets with a long-term baseline above this rate (trades/min)
+    # use velocity_mult * high_freq_mult_boost instead of velocity_mult,
+    # preventing false positives on naturally active markets.
+    adverse_sel_high_freq_baseline: float = _env_float("ADVERSE_SEL_HIGH_FREQ_BASELINE", 20.0)
+    adverse_sel_high_freq_mult_boost: float = _env_float("ADVERSE_SEL_HIGH_FREQ_MULT_BOOST", 1.5)
+
+    # Kill outcome retrospective analysis.
+    # After each fast-kill, wait outcome_delay_s then re-read mid-prices
+    # and classify the kill as TP (price moved adversely ≥ threshold) or
+    # FP (it didn’t).  Results are logged and persisted to JSONL.
+    adverse_sel_outcome_delay_s: float = _env_float("ADVERSE_SEL_OUTCOME_DELAY_S", 60.0)
+    adverse_sel_tp_threshold_cents: float = _env_float("ADVERSE_SEL_TP_THRESHOLD_CENTS", 3.0)
     # ── Pillar 6: Dynamic Fee-Curve Integration ────────────────────────────
     fee_cache_ttl_s: int = _env_int("FEE_CACHE_TTL_S", 300)
     fee_default_bps: int = _env_int("FEE_DEFAULT_BPS", 200)
@@ -181,7 +232,8 @@ class StrategyParams:
 
     # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
-    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 1500)
+    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 2500)
+    heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 2)
     ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 5.0)
 
     # ── Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) ───────────
@@ -232,6 +284,35 @@ class StrategyParams:
     l2_delta_buffer_size: int = _env_int("L2_DELTA_BUFFER_SIZE", 500)
     l2_seq_gap_max_retries: int = _env_int("L2_SEQ_GAP_MAX_RETRIES", 3)
     l2_spread_score_top_n: int = _env_int("L2_SPREAD_SCORE_TOP_N", 3)
+
+    # ── Pillar 14: Resolution Probability Engine (RPE) ─────────────────────
+    rpe_shadow_mode: bool = _env_bool("RPE_SHADOW_MODE", True)
+    rpe_confidence_threshold: float = _env_float("RPE_CONFIDENCE_THRESHOLD", 0.08)
+    rpe_weight: float = _env_float("RPE_WEIGHT", 0.5)
+    rpe_crypto_vol_default: float = _env_float("RPE_CRYPTO_VOL_DEFAULT", 0.80)  # 80% annualised
+    rpe_bayesian_obs_weight: float = _env_float("RPE_BAYESIAN_OBS_WEIGHT", 5.0)
+    rpe_min_confidence: float = _env_float("RPE_MIN_CONFIDENCE", 0.15)
+    rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", False)
+    rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
+
+    # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────
+    pce_shadow_mode: bool = _env_bool("PCE_SHADOW_MODE", True)
+    pce_max_portfolio_var_usd: float = _env_float("PCE_MAX_PORTFOLIO_VAR_USD", 50.0)
+    pce_correlation_haircut_threshold: float = _env_float("PCE_CORRELATION_HAIRCUT_THRESHOLD", 0.50)
+    pce_structural_same_event_corr: float = _env_float("PCE_STRUCTURAL_SAME_EVENT_CORR", 0.85)
+    pce_structural_same_tag_corr: float = _env_float("PCE_STRUCTURAL_SAME_TAG_CORR", 0.30)
+    pce_structural_baseline_corr: float = _env_float("PCE_STRUCTURAL_BASELINE_CORR", 0.05)
+    pce_structural_prior_weight: int = _env_int("PCE_STRUCTURAL_PRIOR_WEIGHT", 10)
+    pce_min_overlap_bars: int = _env_int("PCE_MIN_OVERLAP_BARS", 30)
+    pce_staleness_halflife_hours: float = _env_float("PCE_STALENESS_HALFLIFE_HOURS", 24.0)
+    pce_var_confidence_z: float = _env_float("PCE_VAR_CONFIDENCE_Z", 1.645)
+    pce_correlation_refresh_minutes: float = _env_float("PCE_CORRELATION_REFRESH_MINUTES", 30.0)
+    pce_holding_period_minutes: int = _env_int("PCE_HOLDING_PERIOD_MINUTES", 120)
+    pce_var_soft_cap: bool = _env_bool("PCE_VAR_SOFT_CAP", True)
+    pce_var_bisect_iterations: int = _env_int("PCE_VAR_BISECT_ITERATIONS", 10)
+    pce_near_extreme_threshold: float = _env_float("PCE_NEAR_EXTREME_THRESHOLD", 0.85)
+    pce_near_extreme_overlap_multiplier: int = _env_int("PCE_NEAR_EXTREME_OVERLAP_MULTIPLIER", 3)
+    pce_backtest_enabled: bool = _env_bool("PCE_BACKTEST_ENABLED", False)
 
 
 @dataclass(frozen=True)

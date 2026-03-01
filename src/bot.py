@@ -23,7 +23,7 @@ from typing import Any
 
 from src.core.config import settings, DeploymentEnv
 from src.core.guard import DeploymentGuard
-from src.core.heartbeat import BookHeartbeat
+from src.core.heartbeat import BookHeartbeat, PolygonHeadLagChecker
 from src.core.latency_guard import LatencyGuard, LatencyState
 from src.core.logger import get_logger, setup_logging
 from src.data.market_discovery import MarketInfo, fetch_active_markets
@@ -38,10 +38,17 @@ from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
 from src.signals.adverse_selection_guard import AdverseSelectionGuard
 from src.signals.panic_detector import PanicDetector, PanicSignal
+from src.signals.resolution_probability import (
+    CryptoPriceModel,
+    GenericBayesianModel,
+    ResolutionProbabilityEngine,
+)
+from src.signals.signal_framework import SignalResult
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
 from src.trading.position_manager import PositionManager, PositionState
+from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
 from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 
@@ -84,8 +91,16 @@ class TradingBot:
         # Components (initialised in start())
         self.executor = OrderExecutor(paper_mode=self.paper_mode)
         self.trade_store = TradeStore()
+
+        # Portfolio Correlation Engine (Pillar 15)
+        self.pce = PortfolioCorrelationEngine(
+            data_dir=settings.record_data_dir,
+        )
+        self.pce.load_state()
+
         self.positions = PositionManager(
             self.executor, trade_store=self.trade_store, guard=self.guard,
+            pce=self.pce,
         )
         self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
@@ -118,6 +133,21 @@ class TradingBot:
         self._ws: MarketWebSocket | None = None
         self._l2_ws: L2WebSocket | None = None
         self._tasks: list[asyncio.Task] = []
+
+        # Singleton RPE (Pillar 14) — shared across all markets.
+        # The CryptoPriceModel and GenericBayesianModel are stateless
+        # per call; the per-market estimate cache inside the RPE already
+        # keys by market_id, so one instance suffices.
+        self._rpe = ResolutionProbabilityEngine(
+            models=[
+                CryptoPriceModel(
+                    price_fn=lambda: self._get_crypto_spot(),
+                ),
+                GenericBayesianModel(),
+            ],
+        )
+        # Crypto retrigger state (Fix 2): last evaluated spot price
+        self._rpe_last_spot: float | None = None
 
         # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
         self._recorder = None
@@ -205,6 +235,23 @@ class TradingBot:
         # 4. Set initial wallet balance
         self.positions.set_wallet_balance(self.guard.get_wallet_balance())
 
+        # 4b. Validate fee model against CLOB REST endpoint (live only).
+        #     Sample up to 3 active markets to cross-check the local
+        #     parabolic formula against the exchange's actual fee curve.
+        if self.guard.is_live and self._markets:
+            from src.trading.fee_cache import validate_fee_model
+            probe_markets = self._markets[:3]
+            probe_tokens = [m.no_token_id for m in probe_markets]
+            # Use 0.50 mid-price as the worst-case probe (peak fee)
+            probe_prices = [0.50] * len(probe_tokens)
+            fee_ok = await validate_fee_model(probe_tokens, probe_prices)
+            if not fee_ok:
+                await self.telegram.send(
+                    "⚠️ <b>Fee model divergence detected</b>\n"
+                    "Local fee formula disagrees with CLOB endpoint.\n"
+                    "Review logs — bot continues with local model."
+                )
+
         # 5. Launch concurrent tasks
         self._running = True
         self._ws = MarketWebSocket(
@@ -226,6 +273,21 @@ class TradingBot:
             executor=self.executor,
             book_trackers=self._book_trackers,
             fast_kill_event=self._fast_kill_event,
+            taker_counts=self._taker_counts,
+            total_counts=self._total_counts,
+            trade_counts=self._trade_counts,
+            get_position_assets=self._positioned_asset_ids,
+            telegram=self.telegram,
+        )
+
+        # Polygon head-lag checker (moved from adverse-selection guard)
+        polygon_checker = (
+            PolygonHeadLagChecker(
+                rpc_url=settings.polygon_rpc_url,
+                lag_threshold_ms=settings.strategy.adverse_sel_polygon_head_lag_ms,
+            )
+            if settings.polygon_rpc_url
+            else None
         )
 
         # Book heartbeat (Pillar 8)
@@ -237,6 +299,7 @@ class TradingBot:
             ws_transport=self._l2_ws,
             get_position_assets=self._positioned_asset_ids,
             telegram=self.telegram,
+            polygon_checker=polygon_checker,
         )
 
         # Order status poller (Pillar 10) — live mode only
@@ -270,6 +333,8 @@ class TradingBot:
             asyncio.create_task(self._ghost_liquidity_loop(), name="ghost_liquidity"),
             asyncio.create_task(self._order_poller.run(), name="order_status_poller"),
             asyncio.create_task(self._health_reporter(), name="health_reporter"),
+            asyncio.create_task(self._rpe_crypto_retrigger_loop(), name="rpe_retrigger"),
+            asyncio.create_task(self._pce_refresh_loop(), name="pce_refresh"),
         ]
 
         # Launch data recorder if enabled
@@ -331,6 +396,16 @@ class TradingBot:
         )
         self._detectors[m.condition_id] = detector
 
+        # RPE: Resolution Probability Engine (Pillar 14)
+        # Wiring is handled by the singleton self._rpe;
+        # no per-market instance needed.
+
+        # PCE: register market for correlation tracking (Pillar 15)
+        self.pce.register_market(
+            m.condition_id, m.event_id, getattr(m, 'tags', '') or '',
+            yes_agg,
+        )
+
         # Orderbook trackers for both tokens
         if settings.strategy.l2_enabled:
             for token_id in (m.yes_token_id, m.no_token_id):
@@ -357,6 +432,8 @@ class TradingBot:
         self._yes_aggs.pop(m.yes_token_id, None)
         self._no_aggs.pop(m.no_token_id, None)
         self._detectors.pop(m.condition_id, None)
+        self._rpe.clear_market(m.condition_id)
+        self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
         self._book_trackers.pop(m.no_token_id, None)
         # Clean up L2 book instances
@@ -366,17 +443,43 @@ class TradingBot:
                 l2_book.reset()
         self._trade_counts.pop(m.yes_token_id, None)
         self._trade_counts.pop(m.no_token_id, None)
+        self._taker_counts.pop(m.yes_token_id, None)
+        self._taker_counts.pop(m.no_token_id, None)
+        self._total_counts.pop(m.yes_token_id, None)
+        self._total_counts.pop(m.no_token_id, None)
+        self._recent_trade_volume.pop(m.condition_id, None)
         self._markets = [x for x in self._markets if x.condition_id != m.condition_id]
 
     def _positioned_asset_ids(self) -> set[str]:
         """Return asset IDs that currently have open positions.
 
         Used by the heartbeat to decide which books need fresh data.
+        Includes trade_asset_id (YES or NO token) for bidirectional
+        RPE positions.
         """
-        return {
-            pos.no_asset_id
-            for pos in self.positions.get_open_positions()
-        }
+        ids: set[str] = set()
+        for pos in self.positions.get_open_positions():
+            ids.add(pos.trade_asset_id or pos.no_asset_id)
+            ids.add(pos.no_asset_id)
+        return ids
+
+    def _get_crypto_spot(self) -> float | None:
+        """Return latest BTC spot price from the adverse-selection guard.
+
+        Returns None when the guard hasn't started or has no ticks.
+        Used as the ``price_fn`` for the shared CryptoPriceModel.
+        """
+        guard = getattr(self, "_adverse_guard", None)
+        if guard is None:
+            return None
+        # AdverseSelectionGuard doesn't expose get_latest_price();
+        # it doesn't maintain external Binance ticks.  The RPE crypto
+        # model will return None (no hallucination) until a real
+        # external price source is wired.
+        fn = getattr(guard, "get_latest_price", None)
+        if fn is not None:
+            return fn()
+        return None
 
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
@@ -656,6 +759,25 @@ class TradingBot:
             self.lifecycle.record_signal(market_info.condition_id)
             await self._on_panic_signal(sig, no_agg, market_info)
 
+        # ── RPE evaluation (Pillar 14) ───────────────────────────────────
+        rpe = self._rpe
+        if rpe:
+            days = 30
+            if market_info.end_date:
+                days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
+            yes_price = bar.close if hasattr(bar, 'close') else 0.0
+            if 0 < yes_price < 1:
+                try:
+                    rpe_signal = rpe.evaluate(
+                        market=market_info,
+                        market_price=yes_price,
+                        days_to_resolution=days,
+                    )
+                    if rpe_signal:
+                        await self._on_rpe_signal(rpe_signal, market_info, days)
+                except Exception:
+                    log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
+
     async def _on_panic_signal(
         self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo
     ) -> None:
@@ -705,6 +827,170 @@ class TradingBot:
                 "🛑 <b>Circuit breaker tripped</b> — pausing new positions."
             )
 
+    async def _on_rpe_signal(
+        self, signal: SignalResult, market: MarketInfo, days_to_resolution: int
+    ) -> None:
+        """Handle an RPE divergence signal — may be shadow or live."""
+        meta = signal.metadata
+        direction = meta.get("direction", "buy_no")
+        model_prob = meta.get("model_probability", 0.5)
+        confidence = meta.get("confidence", 0.0)
+        shadow = meta.get("shadow_mode", True)
+
+        # Always alert via Telegram (for calibration visibility in shadow mode)
+        await self.telegram.notify_rpe_signal(
+            market_id=market.condition_id,
+            model_prob=model_prob,
+            market_price=signal.score,  # score is normalised; use metadata
+            direction=direction,
+            confidence=confidence,
+            shadow=shadow,
+        )
+
+        # Record in data recorder for backtesting
+        if self._recorder is not None:
+            self._recorder.enqueue("rpe_signal", {
+                "market": market.condition_id,
+                "asset_id": market.yes_token_id,
+                "model_probability": model_prob,
+                "confidence": confidence,
+                "direction": direction,
+                "shadow": shadow,
+                "model_metadata": meta.get("model_metadata", {}),
+            })
+
+        if shadow:
+            log.info(
+                "rpe_shadow_signal",
+                market=market.condition_id,
+                model_prob=round(model_prob, 4),
+                confidence=round(confidence, 3),
+                direction=direction,
+            )
+            return
+
+        # Live mode — open a position
+        fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
+        market_tags = (getattr(market, 'tags', '') or '').lower()
+        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+
+        # Determine entry price from the appropriate book
+        if direction == "buy_no":
+            book = self._book_trackers.get(market.no_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                no_agg = self._no_aggs.get(market.no_token_id)
+                entry_price = round(no_agg.current_price, 2) if no_agg else 0.0
+        else:
+            book = self._book_trackers.get(market.yes_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                yes_agg = self._yes_aggs.get(market.yes_token_id)
+                entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
+
+        if entry_price <= 0:
+            return
+
+        pos = await self.positions.open_rpe_position(
+            market_id=market.condition_id,
+            yes_asset_id=market.yes_token_id,
+            no_asset_id=market.no_token_id,
+            direction=direction,
+            model_probability=model_prob,
+            confidence=confidence,
+            entry_price=entry_price,
+            event_id=market.event_id,
+            days_to_resolution=days_to_resolution,
+            fee_enabled=fee_enabled,
+            book=book,
+            signal_metadata=meta,
+        )
+
+        if pos:
+            if book and book.has_data:
+                chaser_task = asyncio.create_task(
+                    self._entry_chaser_flow(pos, book),
+                    name=f"chaser_entry_{pos.id}",
+                )
+                pos.entry_chaser_task = chaser_task
+
+    async def _rpe_crypto_retrigger_loop(self) -> None:
+        """Periodically check if BTC spot has moved enough to re-evaluate RPE.
+
+        Runs every 5 seconds.  When the spot price changes by more than
+        ``rpe_crypto_retrigger_cents`` since the last evaluation, re-runs
+        the RPE for all active crypto-tagged markets.  This catches
+        mispricings that appear between 1-minute bar closes.
+
+        Does NOT open a new WebSocket — reuses the same ``price_fn``
+        that the CryptoPriceModel already reads from.
+        """
+        interval_s = 5.0
+        while self._running:
+            await asyncio.sleep(interval_s)
+            try:
+                spot = self._get_crypto_spot()
+                if spot is None:
+                    continue
+
+                threshold = settings.strategy.rpe_crypto_retrigger_cents
+                last = self._rpe_last_spot
+                if last is not None and abs(spot - last) < threshold:
+                    continue
+
+                # Spot moved enough — re-evaluate crypto markets
+                self._rpe_last_spot = spot
+                for m in list(self._markets):
+                    if not self.lifecycle.is_tradeable(m.condition_id):
+                        continue
+                    # Quick check: is this a crypto market?
+                    tags = (getattr(m, "tags", "") or "").lower()
+                    question_lower = m.question.lower()
+                    is_crypto = (
+                        "crypto" in tags
+                        or any(
+                            kw in question_lower
+                            for kw in ("bitcoin", "btc", "ethereum", "eth")
+                        )
+                    )
+                    if not is_crypto:
+                        continue
+
+                    # Use latest YES price from aggregator or book
+                    yes_agg = self._yes_aggs.get(m.yes_token_id)
+                    yes_book = self._book_trackers.get(m.yes_token_id)
+                    if yes_book and yes_book.has_data:
+                        snap = yes_book.snapshot()
+                        yes_price = snap.mid_price if snap.mid_price > 0 else (
+                            yes_agg.current_price if yes_agg else 0.0
+                        )
+                    else:
+                        yes_price = yes_agg.current_price if yes_agg else 0.0
+
+                    if not (0 < yes_price < 1):
+                        continue
+
+                    days = 30
+                    if m.end_date:
+                        days = max(1, (m.end_date - datetime.now(timezone.utc)).days)
+
+                    rpe_signal = self._rpe.evaluate(
+                        market=m,
+                        market_price=yes_price,
+                        days_to_resolution=days,
+                    )
+                    if rpe_signal:
+                        await self._on_rpe_signal(rpe_signal, m, days)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("rpe_retrigger_error", exc_info=True)
+
     def _check_paper_fills(self, event: TradeEvent) -> None:
         """Check if any paper orders should fill based on this trade."""
         filled_orders = self.executor.check_paper_fill(event.asset_id, event.price)
@@ -729,10 +1015,13 @@ class TradingBot:
             pos.target_price,
         )
         # Launch exit chaser (Pillar 1)
-        no_book = self._book_trackers.get(pos.no_asset_id)
-        if no_book and no_book.has_data:
+        # Use trade_asset_id to route to the correct book —
+        # panic positions trade NO, RPE positions may trade YES or NO.
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        exit_book = self._book_trackers.get(exit_asset)
+        if exit_book and exit_book.has_data:
             exit_task = asyncio.create_task(
-                self._exit_chaser_flow(pos, no_book),
+                self._exit_chaser_flow(pos, exit_book),
                 name=f"chaser_exit_{pos.id}",
             )
             pos.exit_chaser_task = exit_task
@@ -757,12 +1046,14 @@ class TradingBot:
         If the chaser fills, triggers the entry-fill handler.
         If abandoned, cancels the position.
         """
+        # Resolve the correct asset_id — RPE positions may trade YES.
+        entry_asset = pos.trade_asset_id or pos.no_asset_id
         try:
             chaser = OrderChaser(
                 executor=self.executor,
                 book=no_book,
                 market_id=pos.market_id,
-                asset_id=pos.no_asset_id,
+                asset_id=entry_asset,
                 side=OrderSide.BUY,
                 target_size=pos.entry_size,
                 anchor_price=pos.entry_price,
@@ -774,8 +1065,18 @@ class TradingBot:
             result = await chaser.run()
 
             if chaser.state == ChaserState.FILLED and result:
-                pos.entry_order = result
-                await self._handle_entry_fill(pos)
+                # Guard: don't resurrect a position that was cancelled
+                # while the chaser was running (e.g. ghost liquidity eviction)
+                if pos.state == PositionState.CANCELLED:
+                    log.warning(
+                        "entry_chaser_filled_but_cancelled",
+                        pos_id=pos.id,
+                    )
+                else:
+                    pos.entry_order = result
+                    # Propagate actual fill quantity from chaser
+                    pos.filled_size = chaser.filled_size
+                    await self._handle_entry_fill(pos)
             elif chaser.state == ChaserState.ABANDONED:
                 # Cancel the original order placed by PositionManager
                 if pos.entry_order:
@@ -795,14 +1096,16 @@ class TradingBot:
         If abandoned, logs but does NOT force-close — the timeout loop
         will handle it via an IOC market sell.
         """
+        # Resolve the correct asset_id — RPE positions may trade YES.
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
         try:
             chaser = OrderChaser(
                 executor=self.executor,
                 book=no_book,
                 market_id=pos.market_id,
-                asset_id=pos.no_asset_id,
+                asset_id=exit_asset,
                 side=OrderSide.SELL,
-                target_size=pos.entry_size,
+                target_size=pos.effective_size,
                 anchor_price=pos.target_price,
                 latency_guard=self.latency_guard,
                 fee_rate_bps=pos.exit_fee_bps,
@@ -847,7 +1150,8 @@ class TradingBot:
                     if not pos.exit_order:
                         continue
 
-                    no_agg = self._no_aggs.get(pos.no_asset_id)
+                    asset_id = pos.trade_asset_id or pos.no_asset_id
+                    no_agg = self._no_aggs.get(asset_id)
                     if not no_agg or no_agg.rolling_vwap <= 0:
                         continue
 
@@ -858,12 +1162,12 @@ class TradingBot:
                     dynamic_spread = compute_dynamic_spread(sigma_30)
 
                     # Recompute take-profit with fresh market state
-                    no_book = self._book_trackers.get(pos.no_asset_id)
+                    no_book = self._book_trackers.get(asset_id)
                     depth_ratio = 1.0
                     if no_book and no_book.has_data:
                         depth_ratio = no_book.book_depth_ratio
 
-                    whale = self.whale_monitor.has_confluence(pos.no_asset_id)
+                    whale = self.whale_monitor.has_confluence(asset_id)
 
                     new_tp = compute_take_profit(
                         entry_price=pos.entry_price,
@@ -879,8 +1183,9 @@ class TradingBot:
                     # Tighten if calm: if current BBO is already profitable
                     # and σ is low, lock the scalp
                     current_best_bid = 0.0
-                    if no_book and no_book.has_data:
-                        snap = no_book.snapshot()
+                    tp_book = self._book_trackers.get(asset_id)
+                    if tp_book and tp_book.has_data:
+                        snap = tp_book.snapshot()
                         current_best_bid = snap.best_bid
 
                     new_target = new_tp.target_price
@@ -914,20 +1219,20 @@ class TradingBot:
                         await self.executor.cancel_order(pos.exit_order)
 
                     # Place new exit order (or restart chaser)
-                    no_book = self._book_trackers.get(pos.no_asset_id)
-                    if no_book and no_book.has_data:
+                    exit_book = self._book_trackers.get(asset_id)
+                    if exit_book and exit_book.has_data:
                         exit_task = asyncio.create_task(
-                            self._exit_chaser_flow(pos, no_book),
+                            self._exit_chaser_flow(pos, exit_book),
                             name=f"chaser_exit_rescale_{pos.id}",
                         )
                         pos.exit_chaser_task = exit_task
                     else:
                         exit_order = await self.executor.place_limit_order(
                             market_id=pos.market_id,
-                            asset_id=pos.no_asset_id,
+                            asset_id=asset_id,
                             side=OrderSide.SELL,
                             price=pos.target_price,
-                            size=pos.entry_size,
+                            size=pos.effective_size,
                             fee_rate_bps=pos.exit_fee_bps,
                         )
                         pos.exit_order = exit_order
@@ -1064,14 +1369,19 @@ class TradingBot:
             try:
                 await self.positions.check_timeouts()
 
-                # Record timeouts
+                # Record timeouts (only once — mark as recorded)
                 for pos in self.positions.get_all_positions():
-                    if pos.state == PositionState.CLOSED and pos.exit_reason == "timeout":
+                    if (
+                        pos.state == PositionState.CLOSED
+                        and pos.exit_reason == "timeout"
+                        and not getattr(pos, "_recorded", False)
+                    ):
                         await self.trade_store.record(pos)
                         await self.telegram.notify_exit(
                             pos.id, pos.entry_price, pos.exit_price,
                             pos.pnl_cents, pos.exit_reason,
                         )
+                        pos._recorded = True  # type: ignore[attr-defined]
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -1289,6 +1599,30 @@ class TradingBot:
             except Exception as exc:
                 log.error("market_refresh_error", error=str(exc))
 
+    async def _pce_refresh_loop(self) -> None:
+        """Periodically recompute correlations, persist, and send dashboard."""
+        interval = settings.strategy.pce_correlation_refresh_minutes * 60
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                self.pce.refresh_correlations()
+                self.pce.save_state()
+
+                # Send Telegram dashboard
+                open_positions = self.positions.get_open_positions()
+                dashboard = self.pce.get_dashboard_data(open_positions)
+                await self.telegram.notify_pce_dashboard(dashboard)
+
+                log.info(
+                    "pce_dashboard_sent",
+                    portfolio_var=dashboard.get("portfolio_var", 0.0),
+                    pairs_tracked=dashboard.get("total_pairs_tracked", 0),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("pce_refresh_error", error=str(exc))
+
     async def _cleanup_loop(self) -> None:
         """Every 5 minutes: clean up stale positions, orders, reset daily PnL,
         and checkpoint live state for crash recovery."""
@@ -1303,10 +1637,14 @@ class TradingBot:
                 if removed_orders:
                     log.info("orders_cleaned", count=removed_orders)
 
-                # Check for midnight UTC → reset daily PnL
+                # Check for midnight UTC → reset daily PnL (exactly once)
                 now = datetime.now(timezone.utc)
-                if now.hour == 0 and now.minute < 6:
+                today = now.date()
+                if not hasattr(self, "_last_pnl_reset_date"):
+                    self._last_pnl_reset_date = today
+                if today != self._last_pnl_reset_date:
                     self.positions.reset_daily_pnl()
+                    self._last_pnl_reset_date = today
 
                 # Checkpoint live state for crash recovery
                 await self.trade_store.checkpoint_orders(

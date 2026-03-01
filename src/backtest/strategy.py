@@ -25,6 +25,7 @@ from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar
 from src.data.websocket_client import TradeEvent
 from src.trading.executor import OrderSide
+from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 
 if TYPE_CHECKING:
     from src.backtest.data_loader import MarketEvent
@@ -97,6 +98,16 @@ class StrategyABC(ABC):
         """
         pass
 
+    def on_external_price(
+        self, asset_id: str, price: float, timestamp: float
+    ) -> None:
+        """Called when an external price observation is replayed.
+
+        Used by the RPE's crypto model to receive Binance BTC prices
+        during backtest replay.  Default implementation is a no-op.
+        """
+        pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Bot Replay Adapter — production parity
@@ -157,16 +168,44 @@ class BotReplayAdapter(StrategyABC):
         self._positions: list[dict] = []   # all opened positions
         self._open_positions: dict[str, dict] = {}  # order_id → position context
 
+        # External price history for RPE crypto model replay
+        self._external_prices: list[tuple[float, float]] = []  # (ts, price)
+
+        # PCE backtest integration (Pillar 15 Issue 4)
+        self._pce: PortfolioCorrelationEngine | None = None
+        self._pce_rejections: int = 0
+        if self._params.pce_backtest_enabled:
+            self._pce = PortfolioCorrelationEngine(
+                shadow_mode=True,  # always shadow in backtest
+                max_portfolio_var_usd=self._params.pce_max_portfolio_var_usd,
+                haircut_threshold=self._params.pce_correlation_haircut_threshold,
+                structural_prior_weight=self._params.pce_structural_prior_weight,
+                min_overlap_bars=self._params.pce_min_overlap_bars,
+                holding_period_minutes=self._params.pce_holding_period_minutes,
+                var_soft_cap=self._params.pce_var_soft_cap,
+                var_bisect_iterations=self._params.pce_var_bisect_iterations,
+            )
+
     def on_init(self) -> None:
         """Initialise aggregators and detectors."""
         self._yes_agg = OHLCVAggregator(self._yes_asset_id)
         self._no_agg = OHLCVAggregator(self._no_asset_id)
+
+        # Register market with PCE if enabled
+        if self._pce is not None and self._yes_agg is not None:
+            self._pce.register_market(
+                market_id=self._market_id,
+                event_id=self._market_id,  # same in backtest
+                tags="backtest",
+                aggregator=self._yes_agg,
+            )
 
         log.info(
             "bot_replay_adapter_init",
             market_id=self._market_id,
             yes=self._yes_asset_id,
             no=self._no_asset_id,
+            pce_enabled=self._pce is not None,
         )
 
     def on_book_update(self, asset_id: str, snapshot: dict) -> None:
@@ -247,6 +286,82 @@ class BotReplayAdapter(StrategyABC):
         if size < 1:
             return
 
+        # PCE VaR gate: check if adding this position keeps VaR within limits
+        if self._pce is not None:
+            # Refresh correlations on each entry attempt (cheap in backtest)
+            self._pce.refresh_correlations()
+
+            # Build synthetic open_positions list for PCE
+            pce_positions = self._build_pce_positions()
+
+            if self._pce.var_soft_cap:
+                sizing_result = self._pce.compute_var_sizing_cap(
+                    open_positions=pce_positions,
+                    proposed_market_id=self._market_id,
+                    proposed_size_usd=trade_usd,
+                    proposed_direction="NO",
+                )
+                # Record PCE snapshot for telemetry
+                if self.engine is not None and hasattr(self.engine, 'telemetry'):
+                    _avg_corr = 0.0
+                    if pce_positions:
+                        _corrs = [
+                            self._pce.corr_matrix.get(self._market_id, p.market_id)
+                            for p in pce_positions if p.market_id != self._market_id
+                        ]
+                        _avg_corr = sum(_corrs) / len(_corrs) if _corrs else 0.0
+                    self.engine.telemetry.record_pce_snapshot(
+                        timestamp=bar.open_time,
+                        portfolio_var=sizing_result.current_var,
+                        avg_correlation=_avg_corr,
+                        n_positions=len(pce_positions),
+                    )
+                if sizing_result.cap_usd < 1.0:
+                    self._pce_rejections += 1
+                    log.debug("adapter_pce_var_blocked", market=self._market_id)
+                    return
+                trade_usd = min(trade_usd, sizing_result.cap_usd)
+                size = trade_usd / best_ask if best_ask > 0 else 0
+                if size < 1:
+                    return
+            else:
+                allowed, _var_result = self._pce.check_var_gate(
+                    open_positions=pce_positions,
+                    proposed_market_id=self._market_id,
+                    proposed_size_usd=trade_usd,
+                    proposed_direction="NO",
+                )
+                # Record PCE snapshot for telemetry
+                if self.engine is not None and hasattr(self.engine, 'telemetry'):
+                    _avg_corr = 0.0
+                    if pce_positions:
+                        _corrs = [
+                            self._pce.corr_matrix.get(self._market_id, p.market_id)
+                            for p in pce_positions if p.market_id != self._market_id
+                        ]
+                        _avg_corr = sum(_corrs) / len(_corrs) if _corrs else 0.0
+                    self.engine.telemetry.record_pce_snapshot(
+                        timestamp=bar.open_time,
+                        portfolio_var=_var_result.portfolio_var_usd,
+                        avg_correlation=_avg_corr,
+                        n_positions=len(pce_positions),
+                    )
+                if not allowed:
+                    self._pce_rejections += 1
+                    log.debug("adapter_pce_var_blocked", market=self._market_id)
+                    return
+
+            # Apply concentration haircut
+            haircut = self._pce.compute_concentration_haircut(
+                proposed_market_id=self._market_id,
+                open_positions=pce_positions,
+            )
+            if haircut < 1.0:
+                trade_usd *= haircut
+                size = trade_usd / best_ask if best_ask > 0 else 0
+                if size < 1:
+                    return
+
         order = self.engine.submit_order(
             side=OrderSide.BUY,
             price=best_ask,
@@ -273,6 +388,29 @@ class BotReplayAdapter(StrategyABC):
             zscore=round(zscore, 2),
             target=round(target_price, 4),
         )
+
+    def _build_pce_positions(self) -> list:
+        """Build a list of lightweight position objects for PCE API.
+
+        PCE expects objects with ``.market_id``, ``.entry_price``, and
+        ``.entry_size`` attributes.  We use a simple namespace class.
+        """
+        class _Pos:
+            def __init__(self, market_id: str, entry_price: float, entry_size: float, trade_side: str = "NO"):
+                self.market_id = market_id
+                self.entry_price = entry_price
+                self.entry_size = entry_size
+                self.trade_side = trade_side
+
+        positions: list[_Pos] = []
+        for pos in self._open_positions.values():
+            fill = pos["entry_fill"]
+            positions.append(_Pos(
+                market_id=self._market_id,
+                entry_price=fill.price,
+                entry_size=fill.size,
+            ))
+        return positions
 
     def on_fill(self, fill: "Fill") -> None:
         """Route fills to entry or exit position handling."""
@@ -343,12 +481,36 @@ class BotReplayAdapter(StrategyABC):
                 pnl_net=round(pnl_net, 4),
             )
 
+    def on_external_price(
+        self, asset_id: str, price: float, timestamp: float
+    ) -> None:
+        """Store replayed external prices for RPE crypto model.
+
+        In backtesting, the RPE's ``CryptoPriceModel`` reads the
+        latest price from ``self._external_prices`` via a closure,
+        replicating the live bot's Binance WS feed.
+        """
+        if price > 0:
+            self._external_prices.append((timestamp, price))
+            # Keep only last 500 entries (matches live deque maxlen)
+            if len(self._external_prices) > 500:
+                self._external_prices = self._external_prices[-500:]
+
     def on_end(self) -> None:
         """Log summary of adapter performance."""
+        # Push PCE rejection count to telemetry
+        if self._pce is not None and self.engine is not None and hasattr(self.engine, 'telemetry'):
+            self.engine.telemetry.set_pce_rejections(self._pce_rejections)
+
+        # Unregister from PCE
+        if self._pce is not None:
+            self._pce.unregister_market(self._market_id)
+
         total_pnl = sum(p["pnl_net"] for p in self._positions)
         log.info(
             "adapter_summary",
             total_positions=len(self._positions),
             open_remaining=len(self._open_positions),
             total_pnl_net=round(total_pnl, 4),
+            pce_enabled=self._pce is not None,
         )

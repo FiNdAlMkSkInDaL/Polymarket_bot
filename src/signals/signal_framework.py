@@ -85,7 +85,7 @@ class OrderbookImbalanceSignal(SignalGenerator):
         min_depth_usd: float = 50.0,
     ):
         self.market_id = market_id
-        self.threshold = imbalance_threshold or settings.strategy.imbalance_threshold
+        self.threshold = imbalance_threshold if imbalance_threshold is not None else settings.strategy.imbalance_threshold
         self.min_depth_usd = min_depth_usd
 
     @property
@@ -153,7 +153,7 @@ class SpreadCompressionSignal(SignalGenerator):
         min_history: int = 10,
     ):
         self.market_id = market_id
-        self.compression_pct = compression_pct or settings.strategy.spread_compression_pct
+        self.compression_pct = compression_pct if compression_pct is not None else settings.strategy.spread_compression_pct
         self.min_history = min_history
         self._spread_history: deque[float] = deque(maxlen=120)
 

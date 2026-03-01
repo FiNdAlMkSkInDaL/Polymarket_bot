@@ -45,9 +45,9 @@ class LatencyGuard:
         recovery_count: int | None = None,
     ):
         strat = settings.strategy
-        self._block_ms: int = block_ms or strat.latency_block_ms
-        self._warn_ms: int = warn_ms or strat.latency_warn_ms
-        self._recovery_n: int = recovery_count or strat.latency_recovery_count
+        self._block_ms: int = block_ms if block_ms is not None else strat.latency_block_ms
+        self._warn_ms: int = warn_ms if warn_ms is not None else strat.latency_warn_ms
+        self._recovery_n: int = recovery_count if recovery_count is not None else strat.latency_recovery_count
 
         # Clock-skew offset (seconds): server_time - local_time
         self._clock_offset: float = 0.0

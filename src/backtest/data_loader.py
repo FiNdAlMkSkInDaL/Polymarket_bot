@@ -34,7 +34,7 @@ log = get_logger(__name__)
 
 
 # ── Event type literals ────────────────────────────────────────────────────
-EventType = Literal["l2_delta", "l2_snapshot", "trade"]
+EventType = Literal["l2_delta", "l2_snapshot", "trade", "external_price"]
 
 # Map the recorder's source tags → canonical event types
 _SOURCE_MAP: dict[str, EventType] = {
@@ -44,6 +44,8 @@ _SOURCE_MAP: dict[str, EventType] = {
     "book_snapshot": "l2_snapshot",
     "snapshot": "l2_snapshot",
     "trade": "trade",
+    "external_price": "external_price",
+    "rpe_signal": "external_price",
 }
 
 # Reverse map: Parquet msg_type → canonical EventType
@@ -51,6 +53,7 @@ _PARQUET_MSG_MAP: dict[str, EventType] = {
     "delta": "l2_delta",
     "snapshot": "l2_snapshot",
     "trade": "trade",
+    "external_price": "external_price",
     # Also accept canonical values directly
     "l2_delta": "l2_delta",
     "l2_snapshot": "l2_snapshot",

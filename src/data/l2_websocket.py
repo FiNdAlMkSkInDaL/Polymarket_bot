@@ -310,6 +310,9 @@ class L2WebSocket:
             asset_id=asset_id,
             max_retries=max_retries,
         )
+        # Transition out of BUFFERING so the next delta or reconnect
+        # can trigger a fresh recovery instead of staying zombie.
+        book.reset()
 
     async def _on_book_desync(self, asset_id: str) -> None:
         """Callback invoked by L2OrderBook when a sequence gap is detected."""

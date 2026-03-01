@@ -249,6 +249,9 @@ class MarketWebSocket:
             size = float(data.get("size") or data.get("amount", 0))
             if price <= 0 or size <= 0:
                 return None
+            # Guard against NaN values which would corrupt OHLCV aggregation
+            if price != price or size != size:  # NaN check
+                return None
 
             asset_id = data.get("asset_id") or parent.get("asset_id", "")
             market_id = data.get("market") or data.get("condition_id") or parent.get("market", "")

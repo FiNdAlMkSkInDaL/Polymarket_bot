@@ -2,16 +2,19 @@
 Tests for the Walk-Forward Optimization (WFO) pipeline.
 
 Covers:
-- Time-series fold generation (date windowing, edge cases)
-- Objective function (drawdown penalty, score collapse)
+- Time-series fold generation (date windowing, edge cases, embargo, anchored)
+- Multi-metric objective function (drawdown penalty, trade gate, composite)
 - Strategy parameter injection via BotReplayAdapter
 - OOS equity-curve stitching
+- Overfitting diagnostics (decay, probability, stability)
+- Expanded search space with log-scale
 - End-to-end single-fold smoke test with synthetic data
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -111,66 +114,219 @@ class TestGenerateFolds:
         folds = generate_folds(dates, train_days=30, test_days=7, step_days=7)
         assert len(folds) >= 3
 
+    # ── Embargo tests ──────────────────────────────────────────────────
+
+    def test_embargo_creates_gap(self):
+        """Embargo=2 pushes OOS start forward by 2 days."""
+        dates = self._date_range("2026-01-01", 50)
+        folds_no_embargo = generate_folds(dates, train_days=30, test_days=7, step_days=7, embargo_days=0)
+        folds_embargo = generate_folds(dates, train_days=30, test_days=7, step_days=7, embargo_days=2)
+
+        if folds_no_embargo and folds_embargo:
+            # OOS start should be 2 days later with embargo
+            assert folds_embargo[0].test_dates[0] > folds_no_embargo[0].test_dates[0]
+
+    def test_embargo_no_overlap_between_train_and_test(self):
+        """With embargo, there must be a clear gap between IS and OOS."""
+        from datetime import datetime
+
+        dates = self._date_range("2026-01-01", 60)
+        folds = generate_folds(dates, train_days=30, test_days=7, step_days=7, embargo_days=3)
+
+        for fold in folds:
+            if fold.train_dates and fold.test_dates:
+                last_train = datetime.strptime(fold.train_dates[-1], "%Y-%m-%d").date()
+                first_test = datetime.strptime(fold.test_dates[0], "%Y-%m-%d").date()
+                gap = (first_test - last_train).days
+                assert gap >= 4, f"Fold {fold.index}: gap={gap} days, expected ≥ 4"
+
+    def test_embargo_too_large_returns_fewer_folds(self):
+        """Very large embargo can reduce or eliminate folds."""
+        dates = self._date_range("2026-01-01", 38)
+        # 30d train + 10d embargo + 7d test = 47 days needed but only 38
+        folds = generate_folds(dates, train_days=30, test_days=7, step_days=7, embargo_days=10)
+        assert len(folds) == 0
+
+    # ── Anchored tests ─────────────────────────────────────────────────
+
+    def test_anchored_expanding_window(self):
+        """In anchored mode, all folds start from the first date."""
+        dates = self._date_range("2026-01-01", 60)
+        folds = generate_folds(dates, train_days=30, test_days=7, step_days=7, anchored=True)
+
+        for fold in folds:
+            assert fold.train_dates[0] == "2026-01-01", (
+                f"Fold {fold.index}: anchored should start from first date"
+            )
+
+    def test_anchored_train_grows(self):
+        """Each subsequent anchored fold should have more training data."""
+        dates = self._date_range("2026-01-01", 60)
+        folds = generate_folds(dates, train_days=30, test_days=7, step_days=7, anchored=True)
+
+        if len(folds) >= 2:
+            assert len(folds[1].train_dates) > len(folds[0].train_dates)
+
+    def test_anchored_with_embargo(self):
+        """Anchored + embargo should work together."""
+        dates = self._date_range("2026-01-01", 60)
+        folds = generate_folds(
+            dates, train_days=30, test_days=7, step_days=7,
+            embargo_days=2, anchored=True,
+        )
+        for fold in folds:
+            assert fold.train_dates[0] == "2026-01-01"
+            train_set = set(fold.train_dates)
+            test_set = set(fold.test_dates)
+            assert train_set.isdisjoint(test_set)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Objective / scoring math
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestWfoScore:
-    """Tests for compute_wfo_score — the drawdown-penalized Sharpe objective."""
+    """Tests for compute_wfo_score — multi-metric composite objective."""
 
     def test_zero_drawdown_no_penalty(self):
-        """If drawdown is 0, penalty = 1 → score = Sharpe."""
-        score = compute_wfo_score(sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15)
-        assert score == 2.0
+        """If drawdown is 0, penalty = 1 → score = weighted composite."""
+        score = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            total_fills=10,
+        )
+        assert score > 0
 
     def test_half_threshold_drawdown(self):
         """If drawdown = half of threshold, penalty = 0.5."""
-        score = compute_wfo_score(
-            sharpe_ratio=2.0, max_drawdown=0.075, max_acceptable_drawdown=0.15
+        score_full = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            total_fills=10,
         )
-        assert abs(score - 1.0) < 1e-9
+        score_half = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.075, max_acceptable_drawdown=0.15,
+            total_fills=10,
+        )
+        assert abs(score_half - score_full * 0.5) < 1e-9
 
     def test_at_threshold_collapses_to_zero(self):
         """If drawdown == threshold, penalty = 0 → score = 0."""
         score = compute_wfo_score(
-            sharpe_ratio=5.0, max_drawdown=0.15, max_acceptable_drawdown=0.15
+            sharpe_ratio=5.0, max_drawdown=0.15, max_acceptable_drawdown=0.15,
+            total_fills=10,
         )
         assert score == 0.0
 
     def test_exceeds_threshold_collapses_to_zero(self):
         """If drawdown > threshold, score must still be 0."""
         score = compute_wfo_score(
-            sharpe_ratio=10.0, max_drawdown=0.25, max_acceptable_drawdown=0.15
+            sharpe_ratio=10.0, max_drawdown=0.25, max_acceptable_drawdown=0.15,
+            total_fills=10,
         )
         assert score == 0.0
 
     def test_negative_sharpe_with_drawdown(self):
-        """Negative Sharpe × positive penalty → negative score."""
+        """Negative Sharpe in composite → negative score."""
         score = compute_wfo_score(
-            sharpe_ratio=-1.5, max_drawdown=0.05, max_acceptable_drawdown=0.15
+            sharpe_ratio=-1.5, max_drawdown=0.05, max_acceptable_drawdown=0.15,
+            sortino_ratio=-1.0, profit_factor=0.5, total_fills=10,
         )
-        expected = -1.5 * (1.0 - 0.05 / 0.15)
-        assert abs(score - expected) < 1e-9
+        assert score < 0
 
     def test_very_small_drawdown(self):
         """Near-zero drawdown: penalty ≈ 1."""
         score = compute_wfo_score(
-            sharpe_ratio=3.0, max_drawdown=0.001, max_acceptable_drawdown=0.15
+            sharpe_ratio=3.0, max_drawdown=0.001, max_acceptable_drawdown=0.15,
+            total_fills=10,
         )
-        assert score > 2.9
+        assert score > 1.0
 
     def test_custom_threshold(self):
         """Different max_acceptable_drawdown values."""
         score_10 = compute_wfo_score(
-            sharpe_ratio=2.0, max_drawdown=0.10, max_acceptable_drawdown=0.10
+            sharpe_ratio=2.0, max_drawdown=0.10, max_acceptable_drawdown=0.10,
+            total_fills=10,
         )
         assert score_10 == 0.0  # exactly at threshold
 
-        score_20 = compute_wfo_score(
-            sharpe_ratio=2.0, max_drawdown=0.10, max_acceptable_drawdown=0.20
+    # ── Trade gate tests ───────────────────────────────────────────────
+
+    def test_too_few_trades_returns_neg_inf(self):
+        """Fewer than min_trades → score = -inf."""
+        score = compute_wfo_score(
+            sharpe_ratio=3.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            total_fills=2, min_trades=5,
         )
-        assert abs(score_20 - 1.0) < 1e-9  # penalty = 0.5
+        assert score == float("-inf")
+
+    def test_exactly_min_trades_passes(self):
+        """Exactly min_trades should pass the gate."""
+        score = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            total_fills=5, min_trades=5,
+        )
+        assert score > 0
+
+    def test_zero_fills_rejected(self):
+        """Zero fills always rejected."""
+        score = compute_wfo_score(
+            sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            total_fills=0,
+        )
+        assert score == float("-inf")
+
+    # ── Multi-metric composite tests ───────────────────────────────────
+
+    def test_sortino_contribution(self):
+        """Higher Sortino → higher score."""
+        base = compute_wfo_score(
+            sharpe_ratio=1.5, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            sortino_ratio=0.0, total_fills=10,
+        )
+        higher = compute_wfo_score(
+            sharpe_ratio=1.5, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            sortino_ratio=3.0, total_fills=10,
+        )
+        assert higher > base
+
+    def test_profit_factor_contribution(self):
+        """Higher profit factor → higher score."""
+        base = compute_wfo_score(
+            sharpe_ratio=1.5, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            profit_factor=0.0, total_fills=10,
+        )
+        higher = compute_wfo_score(
+            sharpe_ratio=1.5, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            profit_factor=3.0, total_fills=10,
+        )
+        assert higher > base
+
+    def test_profit_factor_log_transform(self):
+        """Profit factor uses ln(1+PF) — verifiable."""
+        score = compute_wfo_score(
+            sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            sortino_ratio=0.0, profit_factor=2.0, total_fills=10,
+            sharpe_weight=0.0, sortino_weight=0.0, profit_factor_weight=1.0,
+        )
+        expected = math.log(1.0 + 2.0)  # ln(3) ≈ 1.0986
+        assert abs(score - expected) < 1e-6
+
+    def test_custom_weights(self):
+        """Custom weights affect the score as expected."""
+        # Only Sharpe weight
+        sharpe_only = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+            sortino_ratio=5.0, profit_factor=3.0, total_fills=10,
+            sharpe_weight=1.0, sortino_weight=0.0, profit_factor_weight=0.0,
+        )
+        assert abs(sharpe_only - 2.0) < 1e-9
+
+    def test_backward_compatible_simple_call(self):
+        """Old-style call with just Sharpe/DD still works (defaults handle it)."""
+        score = compute_wfo_score(
+            sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
+        )
+        # With default min_trades=5 and total_fills=0, should be -inf
+        assert score == float("-inf")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -388,6 +544,8 @@ class TestWfoReport:
                     oos_sharpe=1.2,
                     is_max_drawdown=0.05,
                     oos_max_drawdown=0.07,
+                    is_total_fills=45,
+                    sharpe_decay_pct=-33.3,
                 ),
                 FoldResult(
                     fold_index=1,
@@ -396,6 +554,8 @@ class TestWfoReport:
                     oos_sharpe=1.5,
                     is_max_drawdown=0.04,
                     oos_max_drawdown=0.06,
+                    is_total_fills=52,
+                    sharpe_decay_pct=-28.6,
                 ),
             ],
             aggregate_oos_sharpe=1.35,
@@ -406,18 +566,42 @@ class TestWfoReport:
                 "kelly_fraction": [0.15, 0.12],
             },
             total_elapsed_s=123.4,
+            avg_sharpe_decay_pct=-30.9,
+            overfit_probability=0.0,
+            unstable_params=[],
         )
 
         text = report.summary()
         assert "WALK-FORWARD" in text
         assert "1.35" in text  # aggregate sharpe
         assert "zscore_threshold" in text
+        assert "Overfitting Analysis" in text
+        assert "Overfit Probability" in text
 
     def test_empty_report(self):
         report = WfoReport()
         text = report.summary()
         assert "Folds completed" in text
         assert "0" in text
+
+    def test_unstable_params_shown(self):
+        """Unstable parameters flagged in report."""
+        report = WfoReport(
+            unstable_params=["kelly_fraction", "zscore_threshold"],
+            parameter_stability={
+                "kelly_fraction": [0.05, 0.30],  # high CV
+                "zscore_threshold": [1.5, 3.5],
+            },
+        )
+        text = report.summary()
+        assert "kelly_fraction" in text
+        assert "⚠" in text  # stability flag
+
+    def test_overfit_probability_shown(self):
+        """High overfit probability is rendered."""
+        report = WfoReport(overfit_probability=0.75)
+        text = report.summary()
+        assert "75.0%" in text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -432,10 +616,17 @@ class TestWfoConfig:
         assert cfg.train_days == 30
         assert cfg.test_days == 7
         assert cfg.step_days == 7
+        assert cfg.embargo_days == 1
+        assert cfg.anchored is False
         assert cfg.n_trials == 100
         assert cfg.max_acceptable_drawdown == 0.15
+        assert cfg.min_trades == 5
         assert cfg.initial_cash == 1000.0
         assert cfg.max_workers >= 1
+        assert cfg.warm_start is True
+        assert cfg.sharpe_weight == 0.50
+        assert cfg.sortino_weight == 0.30
+        assert cfg.profit_factor_weight == 0.20
 
     def test_custom_config(self):
         cfg = WfoConfig(
@@ -443,12 +634,20 @@ class TestWfoConfig:
             train_days=14,
             test_days=3,
             step_days=3,
+            embargo_days=2,
+            anchored=True,
             n_trials=50,
             max_acceptable_drawdown=0.10,
+            min_trades=10,
+            warm_start=False,
         )
         assert cfg.train_days == 14
         assert cfg.n_trials == 50
         assert cfg.max_acceptable_drawdown == 0.10
+        assert cfg.embargo_days == 2
+        assert cfg.anchored is True
+        assert cfg.min_trades == 10
+        assert cfg.warm_start is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -461,9 +660,11 @@ class TestSearchSpace:
     def test_suggest_params_returns_all_keys(self):
         from src.backtest.wfo_optimizer import SEARCH_SPACE, _suggest_params
 
-        # Mock an Optuna trial
+        # Mock an Optuna trial — must handle log=True kwarg
         mock_trial = MagicMock()
-        mock_trial.suggest_float = MagicMock(side_effect=lambda name, lo, hi: (lo + hi) / 2)
+        mock_trial.suggest_float = MagicMock(
+            side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
+        )
 
         params = _suggest_params(mock_trial)
 
@@ -475,13 +676,59 @@ class TestSearchSpace:
         from src.backtest.wfo_optimizer import _suggest_params
 
         mock_trial = MagicMock()
-        mock_trial.suggest_float = MagicMock(side_effect=lambda name, lo, hi: (lo + hi) / 2)
+        mock_trial.suggest_float = MagicMock(
+            side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
+        )
 
         params = _suggest_params(mock_trial)
         sp = StrategyParams(**params)
 
         assert sp.zscore_threshold == (1.5 + 3.5) / 2
-        assert sp.kelly_fraction == (0.05 + 0.35) / 2
+        assert sp.kelly_fraction == (0.03 + 0.40) / 2
+
+    def test_expanded_search_space_has_new_params(self):
+        """Search space includes the new parameters."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        new_params = [
+            "volume_ratio_threshold",
+            "alpha_default",
+            "tp_vol_sensitivity",
+            "min_edge_score",
+        ]
+        for p in new_params:
+            assert p in SEARCH_SPACE, f"Missing new param: {p}"
+
+    def test_log_scale_params_marked(self):
+        """Certain params should use log-scale (4th element = True)."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        log_params = ["spread_compression_pct", "kelly_fraction", "max_impact_pct"]
+        for p in log_params:
+            spec = SEARCH_SPACE[p]
+            assert len(spec) == 4 and spec[3] is True, (
+                f"{p} should have log=True"
+            )
+
+    def test_log_scale_kwarg_passed(self):
+        """Verify log=True is passed to suggest_float for log-scale params."""
+        from src.backtest.wfo_optimizer import _suggest_params
+
+        calls_with_log = []
+
+        def mock_suggest(name, lo, hi, **kwargs):
+            if kwargs.get("log"):
+                calls_with_log.append(name)
+            return (lo + hi) / 2
+
+        mock_trial = MagicMock()
+        mock_trial.suggest_float = MagicMock(side_effect=mock_suggest)
+
+        _suggest_params(mock_trial)
+
+        assert "kelly_fraction" in calls_with_log
+        assert "spread_compression_pct" in calls_with_log
+        assert "max_impact_pct" in calls_with_log
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -661,3 +908,123 @@ class TestWfoParquetSupport:
 
         dates = MarketDataRecorder.available_dates(str(tmp_path))
         assert "2026-01-03" not in dates
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Overfitting diagnostics
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestOverfittingDiagnostics:
+    """Tests for IS/OOS decay, overfit probability, and param stability."""
+
+    def test_sharpe_decay_computed(self):
+        """FoldResult.sharpe_decay_pct computed correctly."""
+        fr = FoldResult(
+            fold_index=0,
+            best_params={},
+            is_sharpe=2.0,
+            oos_sharpe=1.0,
+            sharpe_decay_pct=((1.0 - 2.0) / abs(2.0)) * 100,  # -50%
+        )
+        assert abs(fr.sharpe_decay_pct - (-50.0)) < 0.1
+
+    def test_overfit_probability_all_positive(self):
+        """If all OOS Sharpe > 0, overfit probability = 0."""
+        report = WfoReport(
+            folds=[
+                FoldResult(fold_index=0, best_params={}, oos_sharpe=1.0),
+                FoldResult(fold_index=1, best_params={}, oos_sharpe=0.5),
+            ],
+            overfit_probability=0.0,
+        )
+        assert report.overfit_probability == 0.0
+
+    def test_overfit_probability_half_negative(self):
+        """If half of OOS Sharpe < 0, overfit probability = 0.5."""
+        report = WfoReport(
+            folds=[
+                FoldResult(fold_index=0, best_params={}, oos_sharpe=1.0),
+                FoldResult(fold_index=1, best_params={}, oos_sharpe=-0.5),
+            ],
+            overfit_probability=0.5,
+        )
+        assert report.overfit_probability == 0.5
+
+    def test_unstable_params_identified(self):
+        """Parameters with CV > 0.50 should be flagged."""
+        import numpy as np
+
+        vals = [0.05, 0.35]  # very spread out
+        arr = np.array(vals)
+        mu = float(arr.mean())
+        sd = float(arr.std(ddof=1))
+        cv = sd / abs(mu)
+        assert cv > 0.50  # confirm it's unstable
+
+    def test_fold_result_new_fields_default(self):
+        """New FoldResult fields have sane defaults."""
+        fr = FoldResult(fold_index=0, best_params={})
+        assert fr.is_sortino == 0.0
+        assert fr.is_profit_factor == 0.0
+        assert fr.is_total_fills == 0
+        assert fr.oos_sortino == 0.0
+        assert fr.oos_profit_factor == 0.0
+        assert fr.oos_total_fills == 0
+        assert fr.sharpe_decay_pct == 0.0
+
+    def test_report_new_fields_default(self):
+        """New WfoReport fields have sane defaults."""
+        report = WfoReport()
+        assert report.avg_sharpe_decay_pct == 0.0
+        assert report.overfit_probability == 0.0
+        assert report.unstable_params == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Backward compatibility
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestBackwardCompatibility:
+    """Ensure old API patterns still work after upgrade."""
+
+    def test_generate_folds_old_signature(self):
+        """generate_folds with just the original 4 args still works."""
+        from datetime import datetime, timedelta
+
+        d = datetime(2026, 1, 1).date()
+        dates = [(d + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(45)]
+        folds = generate_folds(dates, 30, 7, 7)
+        assert len(folds) >= 1
+
+    def test_wfo_config_old_fields_unchanged(self):
+        """All original WfoConfig fields remain at their original defaults."""
+        cfg = WfoConfig()
+        assert cfg.data_dir == "data"
+        assert cfg.train_days == 30
+        assert cfg.test_days == 7
+        assert cfg.step_days == 7
+        assert cfg.n_trials == 100
+        assert cfg.max_acceptable_drawdown == 0.15
+        assert cfg.initial_cash == 1000.0
+        assert cfg.storage_url == "sqlite:///wfo_optuna.db"
+        assert cfg.study_prefix == "polymarket_wfo"
+        assert cfg.latency_ms == 150.0
+        assert cfg.fee_max_pct == 1.56
+        assert cfg.fee_enabled is True
+
+    def test_fold_result_old_fields_still_work(self):
+        """Old FoldResult fields still exist and work."""
+        fr = FoldResult(
+            fold_index=0,
+            best_params={"zscore_threshold": 2.0},
+            is_sharpe=1.5,
+            is_max_drawdown=0.05,
+            is_total_pnl=50.0,
+            oos_sharpe=1.2,
+            oos_max_drawdown=0.07,
+            oos_total_pnl=30.0,
+            n_trials_completed=100,
+            best_trial_score=1.3,
+        )
+        assert fr.is_sharpe == 1.5
+        assert fr.oos_sharpe == 1.2

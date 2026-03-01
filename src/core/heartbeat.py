@@ -7,10 +7,16 @@ Architecture
 The monitor operates on two independent layers:
 
 1. **Transport layer** — checks ``L2WebSocket._last_message_time``,
-   which is updated on every incoming WS frame (deltas, snapshots,
-   pong replies — anything).  This is the *definitive* signal for
-   "is the connection alive?"  It is immune to low-activity markets
-   that may go seconds without a book change.
+   which is updated on every incoming WS data frame (deltas,
+   snapshots).  WS control frames (pong) do *not* update this
+   timestamp, so during quiet markets the gap can naturally reach
+   ~2 s without indicating a dead connection.
+
+   To avoid false-positive flapping, suspension requires
+   ``heartbeat_stale_count`` **consecutive** stale checks (default 2)
+   before acting.  A single transient gap is tolerated; the 5-second
+   ``ws_silence_timeout_s`` watchdog provides the hard safety net for
+   truly dead connections.
 
 2. **Position layer** — for assets with **open positions only**,
    checks per-book ``_last_update`` to ensure the specific books
@@ -18,9 +24,10 @@ The monitor operates on two independent layers:
    without positions are ignored — they are irrelevant to execution
    safety.
 
-Suspension occurs when either layer is stale for ``stale_ms``.
-Recovery requires the transport layer to be healthy (the WS must be
-alive), at which point individual books will naturally re-sync.
+Suspension occurs when either layer is stale for ``stale_ms``
+(transport requires consecutive confirmation).  Recovery requires
+the transport layer to be healthy (the WS must be alive), at which
+point individual books will naturally re-sync.
 
 Usage::
 
@@ -40,6 +47,8 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Callable
+
+import httpx
 
 from src.core.config import settings
 from src.core.logger import get_logger
@@ -84,6 +93,11 @@ class BookHeartbeat:
         position layer.
     telegram:
         Optional ``TelegramAlerter`` for notifications.
+    polygon_checker:
+        Optional ``PolygonHeadLagChecker`` for Polygon RPC health.
+        When provided, the heartbeat monitors blockchain head lag as
+        a general health signal (affects settlement, not price
+        discovery).  Suspend if lag exceeds threshold.
     """
 
     def __init__(
@@ -96,6 +110,7 @@ class BookHeartbeat:
         ws_transport: Any | None = None,
         get_position_assets: Callable[[], set[str]] | None = None,
         telegram: object | None = None,
+        polygon_checker: "PolygonHeadLagChecker | None" = None,
     ):
         strat = settings.strategy
         self._books = book_trackers
@@ -105,12 +120,15 @@ class BookHeartbeat:
         self._telegram = telegram
         self._ws_transport = ws_transport
         self._get_position_assets = get_position_assets or _no_positions
+        self._polygon_checker = polygon_checker
 
         self._check_interval_s = strat.heartbeat_check_ms / 1000.0
         self._stale_ms = strat.heartbeat_stale_ms
+        self._stale_count_threshold = strat.heartbeat_stale_count
         self._running = False
         self._is_suspended = False
         self._suspend_reason: str = ""
+        self._transport_stale_streak: int = 0
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -141,16 +159,27 @@ class BookHeartbeat:
         transport_gap_ms = self._transport_gap_ms(now)
         if transport_gap_ms is not None:
             if transport_gap_ms > self._stale_ms:
-                if not self._is_suspended:
-                    await self._suspend(
-                        transport_gap_ms,
-                        reason="ws_transport_dead",
-                        detail="no WS message received",
-                    )
+                self._transport_stale_streak += 1
+                if self._transport_stale_streak >= self._stale_count_threshold:
+                    if not self._is_suspended:
+                        await self._suspend(
+                            transport_gap_ms,
+                            reason="ws_transport_dead",
+                            detail="no WS message received",
+                        )
+                    return
+                # Sub-threshold streak — tolerate transient gap
+                log.debug(
+                    "heartbeat_transient_gap",
+                    gap_ms=round(transport_gap_ms, 1),
+                    streak=self._transport_stale_streak,
+                    threshold=self._stale_count_threshold,
+                )
                 return
             else:
-                # Transport is healthy — if we were suspended for a
-                # transport reason, resume immediately.
+                # Transport is healthy — reset streak counter.
+                self._transport_stale_streak = 0
+                # If we were suspended for a transport reason, resume.
                 if self._is_suspended and self._suspend_reason == "ws_transport_dead":
                     await self._resume()
                     return
@@ -185,6 +214,29 @@ class BookHeartbeat:
                         detail=stalest_asset[:16],
                     )
                 return
+
+        # ── Layer 2.5: Polygon head-lag health ─────────────────────────
+        #
+        # If a PolygonHeadLagChecker is wired, check blockchain head lag.
+        # Excessive lag indicates Polygon is stalled, which affects
+        # settlement.  This is a general health signal, not an adverse
+        # selection signal — it belongs in the heartbeat, not the guard.
+        if self._polygon_checker is not None:
+            try:
+                is_healthy, lag_ms = await self._polygon_checker.check()
+                if not is_healthy:
+                    if not self._is_suspended:
+                        await self._suspend(
+                            lag_ms,
+                            reason="polygon_head_lag",
+                            detail=f"lag {lag_ms:.0f}ms",
+                        )
+                    return
+                elif self._is_suspended and self._suspend_reason == "polygon_head_lag":
+                    await self._resume()
+                    return
+            except Exception as exc:
+                log.debug("polygon_check_error", error=str(exc))
 
         # ── Layer 3: Fallback — legacy per-tracker scan ───────────────
         #
@@ -291,3 +343,84 @@ class BookHeartbeat:
     @property
     def is_suspended(self) -> bool:
         return self._is_suspended
+
+
+class PolygonHeadLagChecker:
+    """Standalone Polygon RPC head-lag health check.
+
+    Polls ``eth_blockNumber`` + ``eth_getBlockByNumber`` to estimate
+    how far the chain head is behind wall-clock time.  This is useful
+    as a general system health signal (settlement may be delayed) but
+    is **not** an adverse-selection signal — it does not predict price
+    movements on the CLOB.
+
+    Previously lived inside ``AdverseSelectionGuard`` as a kill
+    condition; now resides in the heartbeat module where it is checked
+    as part of the tiered health monitor.
+
+    Parameters
+    ----------
+    rpc_url:
+        Polygon JSON-RPC endpoint URL.
+    lag_threshold_ms:
+        Maximum acceptable head lag in milliseconds.  If the latest
+        block timestamp is older than this, the check reports unhealthy.
+    """
+
+    def __init__(self, rpc_url: str, lag_threshold_ms: float = 3000.0):
+        self._rpc_url = rpc_url
+        self._lag_threshold_ms = lag_threshold_ms
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=3.0)
+        return self._client
+
+    async def check(self) -> tuple[bool, float]:
+        """Perform one head-lag check.
+
+        Returns
+        -------
+        (is_healthy, lag_ms)
+            ``is_healthy`` is ``True`` when lag is within threshold.
+        """
+        if not self._rpc_url:
+            return True, 0.0
+
+        client = self._get_client()
+
+        # Get latest block number
+        resp = await client.post(
+            self._rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_blockNumber",
+                "params": [],
+                "id": 1,
+            },
+        )
+        block_hex = resp.json().get("result", "0x0")
+        block_num = int(block_hex, 16)
+
+        # Get block timestamp
+        resp2 = await client.post(
+            self._rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [hex(block_num), False],
+                "id": 2,
+            },
+        )
+        block_data = resp2.json().get("result", {})
+        block_ts = int(block_data.get("timestamp", "0x0"), 16)
+        lag_ms = abs(time.time() - block_ts) * 1000
+
+        return lag_ms <= self._lag_threshold_ms, lag_ms
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None

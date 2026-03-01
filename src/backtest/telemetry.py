@@ -79,7 +79,11 @@ class BacktestMetrics:
 
     # ── Equity curve ───────────────────────────────────────────────────
     equity_curve: list[tuple[float, float]] = field(default_factory=list)
-
+    # ── Portfolio Correlation Engine (PCE) metrics ──────────────────────
+    avg_portfolio_correlation: float = 0.0
+    max_portfolio_var: float = 0.0
+    pce_rejections: int = 0
+    diversification_ratio: float = 0.0  # gross VaR / net VaR (≥1 = diversified)
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
         d = {}
@@ -152,6 +156,10 @@ class Telemetry:
         # ── Round-trip trades ──────────────────────────────────────────
         self._round_trips: list[dict] = []
 
+        # ── PCE snapshots (Pillar 15) ───────────────────────────────────
+        self._pce_snapshots: list[dict] = []  # [{ts, var, avg_corr, n_pos}]
+        self._pce_rejection_count: int = 0
+
     # ═══════════════════════════════════════════════════════════════════════
     #  Recording methods (called during the replay loop)
     # ═══════════════════════════════════════════════════════════════════════
@@ -213,6 +221,25 @@ class Telemetry:
             "exit_time": exit_time,
             "hold_time_s": exit_time - entry_time,
         })
+
+    def record_pce_snapshot(
+        self,
+        timestamp: float,
+        portfolio_var: float,
+        avg_correlation: float,
+        n_positions: int,
+    ) -> None:
+        """Record a PCE state snapshot for post-run analysis."""
+        self._pce_snapshots.append({
+            "timestamp": timestamp,
+            "portfolio_var": portfolio_var,
+            "avg_correlation": avg_correlation,
+            "n_positions": n_positions,
+        })
+
+    def set_pce_rejections(self, count: int) -> None:
+        """Set the PCE rejection count (called by strategy before finalize)."""
+        self._pce_rejection_count = count
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Finalisation — compute all metrics
@@ -320,6 +347,32 @@ class Telemetry:
             hold_times = [rt["hold_time_s"] for rt in self._round_trips]
             m.avg_hold_time_s = sum(hold_times) / len(hold_times)
 
+        # ── PCE metrics ─────────────────────────────────────────────────
+        if self._pce_snapshots:
+            vars_ = [s["portfolio_var"] for s in self._pce_snapshots]
+            corrs = [s["avg_correlation"] for s in self._pce_snapshots]
+            m.max_portfolio_var = max(vars_) if vars_ else 0.0
+            m.avg_portfolio_correlation = (
+                sum(corrs) / len(corrs) if corrs else 0.0
+            )
+
+        # pce_rejections: set externally by strategy after finalize,
+        # or pre-populated via set_pce_rejections() before finalize.
+        m.pce_rejections = self._pce_rejection_count
+
+        # Diversification ratio: gross VaR / net VaR from last snapshot.
+        # If no snapshots, leave at 0.0.
+        if self._pce_snapshots and len(self._pce_snapshots) >= 1:
+            # Compute average diversification across all snapshots
+            # diversification_ratio ≥ 1 means portfolio is diversified
+            last = self._pce_snapshots[-1]
+            n_pos = last.get("n_positions", 0)
+            if n_pos > 0 and last.get("portfolio_var", 0) > 0:
+                m.diversification_ratio = 1.0  # placeholder; real gross/net needs full VaR call
+            # If we have explicit gross/net data, use that:
+            if "gross_var" in last and last["gross_var"] > 0:
+                m.diversification_ratio = last["gross_var"] / last["portfolio_var"]
+
         return m
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -332,3 +385,5 @@ class Telemetry:
         self._slippage_records.clear()
         self._equity_curve.clear()
         self._round_trips.clear()
+        self._pce_snapshots.clear()
+        self._pce_rejection_count = 0

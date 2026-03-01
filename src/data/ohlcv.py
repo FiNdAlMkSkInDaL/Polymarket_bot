@@ -43,12 +43,17 @@ class _BarBuilder:
     open_time: float = 0.0
     prices: list[float] = field(default_factory=list)
     sizes: list[float] = field(default_factory=list)
+    _true_open: float = 0.0       # preserved across truncation
+    _total_volume: float = 0.0    # running volume total (survives truncation)
 
     _MAX_TICKS = 10_000  # cap per bar to prevent unbounded growth
 
     def add(self, price: float, size: float, ts: float) -> None:
         if not self.prices:
             self.open_time = ts
+            self._true_open = price
+            self._total_volume = 0.0
+        self._total_volume += size
         if len(self.prices) >= self._MAX_TICKS:
             # Keep most recent half to maintain statistical validity
             half = self._MAX_TICKS // 2
@@ -65,11 +70,11 @@ class _BarBuilder:
         vwap = float(np.average(prices, weights=sizes)) if sizes.sum() > 0 else float(prices.mean())
         return OHLCVBar(
             open_time=self.open_time,
-            open=self.prices[0],
+            open=self._true_open if self._true_open > 0 else self.prices[0],
             high=float(prices.max()),
             low=float(prices.min()),
             close=self.prices[-1],
-            volume=float(sizes.sum()),
+            volume=self._total_volume if self._total_volume > 0 else float(sizes.sum()),
             vwap=vwap,
             trade_count=len(self.prices),
         )
@@ -78,6 +83,8 @@ class _BarBuilder:
         self.open_time = 0.0
         self.prices.clear()
         self.sizes.clear()
+        self._true_open = 0.0
+        self._total_volume = 0.0
 
 
 class OHLCVAggregator:

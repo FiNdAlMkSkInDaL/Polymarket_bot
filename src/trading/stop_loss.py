@@ -101,9 +101,11 @@ class StopLossMonitor:
             return
 
         # Fast-path: find EXIT_PENDING positions for this asset
+        # Match on trade_asset_id (supports both YES and NO side entries)
         positions_for_asset = [
             p for p in self._pm.get_open_positions()
-            if p.no_asset_id == asset_id and p.state == PositionState.EXIT_PENDING
+            if ((p.trade_asset_id or p.no_asset_id) == asset_id or p.no_asset_id == asset_id)
+            and p.state == PositionState.EXIT_PENDING
         ]
         if not positions_for_asset:
             return
@@ -119,7 +121,8 @@ class StopLossMonitor:
 
     async def _evaluate_position(self, pos) -> None:
         """Evaluate stop-loss for a single position."""
-        mid = self._get_mid_price(pos.no_asset_id)
+        eval_asset = pos.trade_asset_id or pos.no_asset_id
+        mid = self._get_mid_price(eval_asset)
         if mid <= 0:
             return
 

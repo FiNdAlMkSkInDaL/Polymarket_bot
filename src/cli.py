@@ -45,10 +45,16 @@ def _startup_banner(env: DeploymentEnv, confirm: bool) -> None:
 
     from src.core.config import settings, PENNY_LIVE_MAX_TRADE_USD
 
-    # Build wallet address display (masked middle)
+    # Build wallet address display — NEVER show private key material
     wallet_key = settings.eoa_private_key
-    if wallet_key and len(wallet_key) > 10:
-        wallet_display = wallet_key[:6] + "…" + wallet_key[-4:]
+    if wallet_key:
+        try:
+            from eth_account import Account
+            acct = Account.from_key(wallet_key)
+            addr = acct.address
+            wallet_display = addr[:6] + "\u2026" + addr[-4:]
+        except Exception:
+            wallet_display = "(key set, address derivation failed)"
     else:
         wallet_display = "(not set)"
 

@@ -267,6 +267,8 @@ class BacktestEngine:
             self._process_book_event(event)
         elif event.event_type == "trade":
             self._process_trade_event(event)
+        elif event.event_type == "external_price":
+            self._process_external_price_event(event)
 
     def _process_book_event(self, event: MarketEvent) -> None:
         """Handle an L2 delta or snapshot."""
@@ -328,6 +330,19 @@ class BacktestEngine:
 
         # Notify strategy
         self.strategy.on_trade(event.asset_id, trade_event)
+
+    def _process_external_price_event(self, event: MarketEvent) -> None:
+        """Handle an external price observation (e.g. Binance BTC price).
+
+        These events are recorded by the live bot's data recorder and
+        replayed here so that the RPE's crypto model has access to the
+        same external prices it would see in production.
+        """
+        data = event.data
+        price = float(data.get("price", data.get("model_probability", 0)))
+        self.strategy.on_external_price(
+            event.asset_id, price, event.timestamp
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Fill processing

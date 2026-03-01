@@ -129,7 +129,11 @@ class TradeStore:
 
     async def close(self) -> None:
         if self._db:
-            await self._db.close()
+            try:
+                await self._db.close()
+            except Exception:
+                pass
+            self._db = None
 
     # ── Record a closed position ────────────────────────────────────────────
     async def record(self, pos: Position) -> None:
@@ -428,6 +432,11 @@ class TradeStore:
         """Wipe persisted live-state tables (call after clean shutdown)."""
         if not self._db:
             return
-        await self._db.execute("DELETE FROM live_orders")
-        await self._db.execute("DELETE FROM live_positions")
-        await self._db.commit()
+        await self._db.execute("BEGIN")
+        try:
+            await self._db.execute("DELETE FROM live_orders")
+            await self._db.execute("DELETE FROM live_positions")
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise

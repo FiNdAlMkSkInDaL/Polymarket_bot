@@ -171,3 +171,65 @@ class FeeCache:
                 fallback_bps=self._default_bps,
             )
             return self._default_bps
+
+
+# ── Startup validation ─────────────────────────────────────────────────────
+
+async def validate_fee_model(
+    token_ids: list[str],
+    mid_prices: list[float],
+    *,
+    tolerance_bps: int = 5,
+    base_url: str | None = None,
+) -> bool:
+    """Compare the local fee formula against the CLOB REST endpoint.
+
+    Probes up to ``len(token_ids)`` tokens.  For each, fetches the
+    exchange's fee rate and compares it to our parabolic model
+    ``Fee(p) = f_max · 4·p·(1-p)``.  If any diverge by more than
+    *tolerance_bps*, a warning is logged and the function returns
+    ``False``.
+
+    Returns ``True`` (model validated) or ``False`` (divergence found
+    or endpoint unreachable).  Never raises — safe to call on startup.
+    """
+    from src.trading.fees import get_fee_rate as local_fee_rate
+
+    if not token_ids:
+        return True
+
+    cache = FeeCache(base_url=base_url)
+    ok = True
+
+    for token_id, mid in zip(token_ids, mid_prices):
+        try:
+            remote_bps = await cache.get_fee_rate(token_id)
+            local_bps = round(local_fee_rate(mid) * 10_000)
+            delta = abs(remote_bps - local_bps)
+            if delta > tolerance_bps:
+                log.warning(
+                    "fee_model_divergence",
+                    token_id=token_id[:16],
+                    mid_price=round(mid, 4),
+                    local_bps=local_bps,
+                    remote_bps=remote_bps,
+                    delta_bps=delta,
+                    tolerance_bps=tolerance_bps,
+                )
+                ok = False
+            else:
+                log.info(
+                    "fee_model_validated",
+                    token_id=token_id[:16],
+                    local_bps=local_bps,
+                    remote_bps=remote_bps,
+                )
+        except Exception as exc:
+            log.warning(
+                "fee_model_validation_error",
+                token_id=token_id[:16],
+                error=str(exc),
+            )
+            ok = False
+
+    return ok

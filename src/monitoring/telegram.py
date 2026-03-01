@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as _html
 import time
 from collections import deque
 from typing import Any
@@ -88,18 +89,20 @@ class TelegramAlerter:
 
     # ── Convenience methods ─────────────────────────────────────────────────
     async def notify_signal(self, market: str, zscore: float, v_ratio: float) -> None:
+        safe = _html.escape(market[:60])
         await self.send(
             f"🔔 <b>Panic Signal</b>\n"
-            f"Market: <code>{market[:60]}</code>\n"
+            f"Market: <code>{safe}</code>\n"
             f"Z-score: {zscore:.2f}  |  Vol ratio: {v_ratio:.1f}×"
         )
 
     async def notify_entry(
         self, pos_id: str, market: str, price: float, size: float, target: float
     ) -> None:
+        safe = _html.escape(market[:40])
         await self.send(
             f"📥 <b>Entry Filled</b>\n"
-            f"Pos: {pos_id}  |  {market[:40]}\n"
+            f"Pos: {pos_id}  |  {safe}\n"
             f"Buy NO @ {price:.2f}¢  ×{size:.1f}\n"
             f"Target: {target:.2f}¢"
         )
@@ -120,6 +123,53 @@ class TelegramAlerter:
         for k, v in stats.items():
             lines.append(f"  {k}: {v}")
         await self.send("\n".join(lines))
+
+    async def notify_rpe_signal(
+        self,
+        market_id: str,
+        model_prob: float,
+        market_price: float,
+        direction: str,
+        confidence: float,
+        shadow: bool,
+    ) -> None:
+        mode = "👻 SHADOW" if shadow else "🎯 LIVE"
+        arrow = "⬇️" if direction == "buy_no" else "⬆️"
+        safe_id = _html.escape(market_id[:50])
+        await self.send(
+            f"{mode} <b>RPE Signal</b> {arrow}\n"
+            f"Market: <code>{safe_id}</code>\n"
+            f"Model: {model_prob:.3f}  |  Market: {market_price:.3f}\n"
+            f"Direction: {direction}  |  Confidence: {confidence:.2f}"
+        )
+
+    async def notify_pce_dashboard(self, data: dict) -> None:
+        """Send PCE correlation dashboard summary."""
+        var_val = data.get("portfolio_var", 0.0)
+        threshold = data.get("threshold", 15.0)
+        pairs = data.get("top_correlated_pairs", [])
+        n_pos = data.get("open_positions", 0)
+        gross = data.get("gross_exposure", 0.0)
+        net = data.get("net_exposure", 0.0)
+        shadow = data.get("shadow_mode", True)
+        mode = "👻 SHADOW" if shadow else "🎯 LIVE"
+
+        pair_lines = ""
+        for i, p in enumerate(pairs[:3], 1):
+            a = _html.escape(p.get("market_a", "")[:40])
+            b = _html.escape(p.get("market_b", "")[:40])
+            c = p.get("correlation", 0.0)
+            pair_lines += f"  {i}. <code>{a}</code>\n     ↔ <code>{b}</code>: {c:.3f}\n"
+
+        if not pair_lines:
+            pair_lines = "  (no pairs tracked)\n"
+
+        await self.send(
+            f"🔗 {mode} <b>PCE Dashboard</b>\n"
+            f"Portfolio VaR: ${var_val:.2f} / ${threshold:.2f}\n"
+            f"Top correlated:\n{pair_lines}"
+            f"Positions: {n_pos}  |  Gross: ${gross:.2f}  |  Net: ${net:.2f}"
+        )
 
     async def notify_kill(self) -> None:
         await self.send("🛑 <b>KILL SWITCH ACTIVATED</b> — all orders cancelled, bot stopping.")

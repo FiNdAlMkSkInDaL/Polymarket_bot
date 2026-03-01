@@ -522,6 +522,7 @@ class TestFullPipelineSequential:
             train_days=1,
             test_days=1,
             step_days=1,
+            embargo_days=0,
             n_trials=2,
             max_workers=1,
             max_acceptable_drawdown=0.50,

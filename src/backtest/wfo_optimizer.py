@@ -1,27 +1,36 @@
 """
-Walk-Forward Optimization (WFO) pipeline — Step 20 of the Upgrade Plan.
+Walk-Forward Optimization (WFO) pipeline — enterprise-grade.
 
-Systematically optimises strategy parameters on rolling In-Sample (IS)
-windows and evaluates them on Out-of-Sample (OOS) windows using Optuna
-with a risk-adjusted objective function.
+Systematically optimises strategy parameters on rolling (or anchored)
+In-Sample (IS) windows and evaluates them on embargo-purged Out-of-Sample
+(OOS) windows using Optuna with a multi-metric composite objective.
 
 Architecture
 ────────────
-    1. **Time-Series CV** — rolling (train=30 d, test=7 d, step=7 d).
-    2. **Optuna Study per fold** — TPE sampler over 6-parameter search
-       space, coordinated via SQLite storage and ``ProcessPoolExecutor``.
-    3. **Objective** — Sharpe × drawdown penalty; collapses to 0 when
-       ``max_drawdown ≥ MAX_ACCEPTABLE_DRAWDOWN``.
-    4. **OOS Stitching** — best-IS params are replayed on OOS data;
+    1. **Time-Series CV** — rolling *or* anchored (expanding IS window).
+       Configurable embargo gap between IS and OOS to prevent data
+       leakage at the boundary.
+    2. **Optuna Study per fold** — TPE sampler with ``MedianPruner``,
+       warm-started from the previous fold's best parameters.
+       Coordinated via SQLite storage and ``ProcessPoolExecutor``.
+    3. **Multi-metric objective** — composite of Sharpe, Sortino,
+       profit-factor, and drawdown penalty.  Minimum trade-count gate
+       rejects inactive parameter sets.  Log-scale suggestion for
+       spread-like parameters.
+    4. **Overfitting detection** — IS/OOS Sharpe decay penalty per fold,
+       aggregate probability-of-overfitting estimate, and parameter
+       stability enforcement (high CV → flagged).
+    5. **OOS Stitching** — best-IS params are replayed on OOS data;
        equity curves are concatenated into the "True Backtest".
 
 Public API
 ──────────
-    WfoConfig        – pipeline configuration
-    WfoReport        – aggregated results (folds + stitched OOS curve)
-    FoldResult       – per-fold IS/OOS metrics + best params
-    run_wfo()        – entry point (blocking, uses ProcessPoolExecutor)
-    generate_folds() – time-series cross-validation window generator
+    WfoConfig         – pipeline configuration
+    WfoReport         – aggregated results (folds + stitched OOS curve)
+    FoldResult        – per-fold IS/OOS metrics + best params
+    run_wfo()         – entry point (blocking, uses ProcessPoolExecutor)
+    generate_folds()  – time-series cross-validation window generator
+    compute_wfo_score – multi-metric composite objective function
 """
 
 from __future__ import annotations
@@ -66,6 +75,14 @@ class WfoConfig:
         Length of each Out-of-Sample testing window in days.
     step_days:
         How many days to step forward between folds.
+    embargo_days:
+        Gap in calendar days between IS and OOS windows.  Prevents
+        autocorrelation leakage at the IS/OOS boundary.  Set to 0
+        for backward-compatible behaviour.
+    anchored:
+        If True, use an expanding (anchored) IS window that always
+        starts from the first available date.  If False (default),
+        use a rolling window of fixed ``train_days`` width.
     n_trials:
         Total Optuna trials per fold (split across workers).
     max_workers:
@@ -73,6 +90,9 @@ class WfoConfig:
     max_acceptable_drawdown:
         Drawdown threshold (fraction) above which the objective score
         collapses to zero.
+    min_trades:
+        Minimum number of fills required for a valid trial.  Trials
+        with fewer fills are rejected (score = -inf).
     initial_cash:
         Starting cash balance for each backtest run.
     storage_url:
@@ -85,6 +105,15 @@ class WfoConfig:
         Maximum Polymarket fee rate %.
     fee_enabled:
         Whether dynamic fees are active.
+    warm_start:
+        If True, seed each fold's Optuna study with the previous
+        fold's best parameters as an initial trial (enqueue_trial).
+    sortino_weight:
+        Weight for Sortino ratio in the composite objective [0, 1].
+    profit_factor_weight:
+        Weight for profit factor in the composite objective [0, 1].
+    sharpe_weight:
+        Weight for Sharpe ratio in the composite objective [0, 1].
     """
 
     data_dir: str = "data"
@@ -95,10 +124,13 @@ class WfoConfig:
     train_days: int = 30
     test_days: int = 7
     step_days: int = 7
+    embargo_days: int = 1
+    anchored: bool = False
 
     n_trials: int = 100
     max_workers: int = field(default_factory=lambda: max((os.cpu_count() or 2) - 1, 1))
     max_acceptable_drawdown: float = 0.15
+    min_trades: int = 5
 
     initial_cash: float = 1000.0
     storage_url: str = "sqlite:///wfo_optuna.db"
@@ -107,6 +139,13 @@ class WfoConfig:
     latency_ms: float = 150.0
     fee_max_pct: float = 1.56
     fee_enabled: bool = True
+
+    warm_start: bool = True
+
+    # Composite objective weights (must sum to 1.0)
+    sharpe_weight: float = 0.50
+    sortino_weight: float = 0.30
+    profit_factor_weight: float = 0.20
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -134,15 +173,22 @@ class FoldResult:
     is_sharpe: float = 0.0
     is_max_drawdown: float = 0.0
     is_total_pnl: float = 0.0
+    is_sortino: float = 0.0
+    is_profit_factor: float = 0.0
+    is_total_fills: int = 0
     oos_sharpe: float = 0.0
     oos_max_drawdown: float = 0.0
     oos_total_pnl: float = 0.0
+    oos_sortino: float = 0.0
+    oos_profit_factor: float = 0.0
+    oos_total_fills: int = 0
     is_equity_curve: list[tuple[float, float]] = field(default_factory=list)
     oos_equity_curve: list[tuple[float, float]] = field(default_factory=list)
     n_trials_completed: int = 0
     best_trial_score: float = 0.0
     train_dates: list[str] = field(default_factory=list)
     test_dates: list[str] = field(default_factory=list)
+    sharpe_decay_pct: float = 0.0  # (OOS-IS)/|IS| × 100
 
 
 @dataclass
@@ -157,6 +203,11 @@ class WfoReport:
     parameter_stability: dict[str, list[float]] = field(default_factory=dict)
     total_elapsed_s: float = 0.0
 
+    # ── Overfitting diagnostics ────────────────────────────────────────
+    avg_sharpe_decay_pct: float = 0.0      # mean IS→OOS Sharpe decay %
+    overfit_probability: float = 0.0       # fraction of folds where OOS < 0
+    unstable_params: list[str] = field(default_factory=list)  # params with CV > 0.50
+
     def summary(self) -> str:
         """Human-readable WFO report with IS-vs-OOS comparison."""
         lines = [
@@ -168,24 +219,21 @@ class WfoReport:
             f"  Folds completed:     {len(self.folds)}",
             f"  Total elapsed:       {self.total_elapsed_s:.1f}s",
             "",
-            "  ┌────────┬──────────────┬──────────────┬──────────────┬──────────────┐",
-            "  │  Fold  │  IS Sharpe   │  OOS Sharpe  │   IS MaxDD   │  OOS MaxDD   │",
-            "  ├────────┼──────────────┼──────────────┼──────────────┼──────────────┤",
+            "  ┌────────┬──────────┬──────────┬──────────┬──────────┬──────────┬────────────┐",
+            "  │  Fold  │ IS Sharpe│OOS Sharpe│  IS MaxDD│ OOS MaxDD│ IS Fills │ Decay%     │",
+            "  ├────────┼──────────┼──────────┼──────────┼──────────┼──────────┼────────────┤",
         ]
 
         for fr in self.folds:
-            decay = ""
-            if fr.is_sharpe != 0:
-                pct = ((fr.oos_sharpe - fr.is_sharpe) / abs(fr.is_sharpe)) * 100
-                decay = f" ({pct:+.0f}%)"
+            decay_str = f"{fr.sharpe_decay_pct:+.0f}%" if abs(fr.is_sharpe) > 1e-6 else "N/A"
             lines.append(
-                f"  │  {fr.fold_index:>4}  │  {fr.is_sharpe:>+10.2f}  "
-                f"│  {fr.oos_sharpe:>+10.2f}  │  {fr.is_max_drawdown:>10.2%}  "
-                f"│  {fr.oos_max_drawdown:>10.2%}  │{decay}"
+                f"  │  {fr.fold_index:>4}  │ {fr.is_sharpe:>+8.2f}│ {fr.oos_sharpe:>+8.2f}"
+                f"│ {fr.is_max_drawdown:>8.2%}│ {fr.oos_max_drawdown:>8.2%}"
+                f"│ {fr.is_total_fills:>8}│ {decay_str:>10} │"
             )
 
         lines.append(
-            "  └────────┴──────────────┴──────────────┴──────────────┴──────────────┘"
+            "  └────────┴──────────┴──────────┴──────────┴──────────┴──────────┴────────────┘"
         )
 
         lines.extend([
@@ -198,6 +246,17 @@ class WfoReport:
             "",
         ])
 
+        # ── Overfitting analysis ──────────────────────────────────────
+        lines.append("  Overfitting Analysis")
+        lines.append("  ────────────────────")
+        lines.append(f"    Avg IS→OOS Sharpe Decay:  {self.avg_sharpe_decay_pct:+.1f}%")
+        lines.append(f"    Overfit Probability:       {self.overfit_probability:.1%}")
+        if self.unstable_params:
+            lines.append(f"    Unstable Parameters:       {', '.join(self.unstable_params)}")
+        else:
+            lines.append("    Unstable Parameters:       (none — all stable)")
+        lines.append("")
+
         # Parameter stability
         if self.parameter_stability:
             lines.append("  Parameter Stability Across Folds")
@@ -207,8 +266,9 @@ class WfoReport:
                     arr = np.array(vals)
                     mu, sd = float(arr.mean()), float(arr.std(ddof=1))
                     cv = sd / abs(mu) if abs(mu) > 1e-9 else float("inf")
+                    flag = " ⚠" if cv > 0.50 else ""
                     lines.append(
-                        f"    {pname:<30s}  mean={mu:.4f}  std={sd:.4f}  CV={cv:.2f}"
+                        f"    {pname:<30s}  mean={mu:.4f}  std={sd:.4f}  CV={cv:.2f}{flag}"
                     )
                 else:
                     lines.append(f"    {pname:<30s}  value={vals[0]:.4f}")
@@ -223,23 +283,54 @@ class WfoReport:
 # ═══════════════════════════════════════════════════════════════════════════
 
 #: Names and ranges for the Optuna search space.
-#: Each entry: (suggest_method, low, high)
-SEARCH_SPACE: dict[str, tuple[str, float, float]] = {
+#: Each entry: (suggest_method, low, high[, log])
+#: Log-scale for parameters where relative magnitude matters more than
+#: absolute distance (e.g. kelly_fraction, spread_compression_pct).
+SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
+    # Core signal parameters
     "zscore_threshold": ("suggest_float", 1.5, 3.5),
-    "spread_compression_pct": ("suggest_float", 0.05, 0.25),
+    "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
+    "volume_ratio_threshold": ("suggest_float", 2.0, 6.0),
+    # Risk management
     "stop_loss_cents": ("suggest_float", 2.0, 12.0),
-    "trailing_stop_offset_cents": ("suggest_float", 1.0, 5.0),
-    "kelly_fraction": ("suggest_float", 0.05, 0.35),
-    "max_impact_pct": ("suggest_float", 0.05, 0.25),
+    "trailing_stop_offset_cents": ("suggest_float", 0.5, 6.0),
+    "kelly_fraction": ("suggest_float", 0.03, 0.40, True),             # log-scale
+    "max_impact_pct": ("suggest_float", 0.03, 0.30, True),             # log-scale
+    # Take-profit
+    "alpha_default": ("suggest_float", 0.25, 0.75),
+    "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
+    # Edge quality
+    "min_edge_score": ("suggest_float", 20.0, 60.0),
+    # RPE (Pillar 14)
+    "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
+    "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),
+    "rpe_crypto_vol_default": ("suggest_float", 0.50, 1.20),
+    # PCE (Pillar 15)
+    "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
+    "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),
+    "pce_structural_prior_weight": ("suggest_int", 5, 30),
+    "pce_holding_period_minutes": ("suggest_int", 30, 360),
 }
 
 
 def _suggest_params(trial: Any) -> dict[str, float]:
-    """Sample hyperparameters from the Optuna trial."""
+    """Sample hyperparameters from the Optuna trial.
+
+    Supports optional 4th element ``log=True`` for log-uniform sampling.
+    """
     params: dict[str, float] = {}
-    for name, (method, lo, hi) in SEARCH_SPACE.items():
-        fn = getattr(trial, method)
-        params[name] = fn(name, lo, hi)
+    for name, spec in SEARCH_SPACE.items():
+        method = spec[0]
+        lo, hi = spec[1], spec[2]
+        log_scale = spec[3] if len(spec) > 3 else False  # type: ignore[arg-type]
+        if method == "suggest_int":
+            params[name] = trial.suggest_int(name, int(lo), int(hi))
+        else:
+            fn = getattr(trial, method)
+            if log_scale:
+                params[name] = fn(name, lo, hi, log=True)
+            else:
+                params[name] = fn(name, lo, hi)
     return params
 
 
@@ -252,8 +343,10 @@ def generate_folds(
     train_days: int = 30,
     test_days: int = 7,
     step_days: int = 7,
+    embargo_days: int = 0,
+    anchored: bool = False,
 ) -> list[Fold]:
-    """Generate rolling IS/OOS folds from a sorted list of YYYY-MM-DD date strings.
+    """Generate rolling (or anchored) IS/OOS folds from sorted date strings.
 
     Parameters
     ----------
@@ -265,6 +358,13 @@ def generate_folds(
         Number of calendar days in each testing window.
     step_days:
         Number of calendar days to step forward between folds.
+    embargo_days:
+        Gap between IS end and OOS start (prevents boundary leakage).
+        The embargo period is excluded from both IS and OOS.
+    anchored:
+        If True, IS window always starts from ``available_dates[0]``
+        (expanding train window).  ``train_days`` is still the *minimum*
+        IS width — the first fold won't fire until IS ≥ train_days.
 
     Returns
     -------
@@ -285,8 +385,16 @@ def generate_folds(
     train_start = first_date
 
     while True:
+        # In anchored mode, IS always starts from first_date
+        if anchored:
+            effective_train_start = first_date
+        else:
+            effective_train_start = train_start
+
         train_end = train_start + timedelta(days=train_days - 1)
-        test_start = train_end + timedelta(days=1)
+
+        # Embargo gap between IS and OOS
+        test_start = train_end + timedelta(days=1 + embargo_days)
         test_end = test_start + timedelta(days=test_days - 1)
 
         # Stop if test window exceeds available data
@@ -296,7 +404,7 @@ def generate_folds(
         # Collect dates that actually have data within each window
         train_dates = [
             d for d in available_dates
-            if train_start <= datetime.strptime(d, "%Y-%m-%d").date() <= train_end
+            if effective_train_start <= datetime.strptime(d, "%Y-%m-%d").date() <= train_end
         ]
         test_dates = [
             d for d in available_dates
@@ -416,19 +524,52 @@ def compute_wfo_score(
     sharpe_ratio: float,
     max_drawdown: float,
     max_acceptable_drawdown: float,
+    *,
+    sortino_ratio: float = 0.0,
+    profit_factor: float = 0.0,
+    total_fills: int = 0,
+    min_trades: int = 5,
+    sharpe_weight: float = 0.50,
+    sortino_weight: float = 0.30,
+    profit_factor_weight: float = 0.20,
 ) -> float:
-    """Risk-adjusted objective: Sharpe × drawdown penalty.
+    """Multi-metric composite objective with drawdown penalty and trade gate.
 
     .. math::
 
-        \\text{Score} = \\text{Sharpe} \\times \\max\\!\\left(0,\\;
+        \\text{Composite} = w_S \\cdot \\text{Sharpe} +
+                            w_{So} \\cdot \\text{Sortino} +
+                            w_{PF} \\cdot \\ln(1 + \\text{PF})
+
+        \\text{Score} = \\text{Composite} \\times \\max\\!\\left(0,\\;
         1 - \\frac{\\text{MaxDD}}{\\text{MaxAcceptableDD}}\\right)
 
+    Returns ``-inf`` when ``total_fills < min_trades`` (inactivity gate).
     If ``max_drawdown >= max_acceptable_drawdown`` the score collapses
     to 0, forcing Optuna to discard catastrophic parameter sets.
+
+    ``profit_factor`` is transformed via ``ln(1 + PF)`` to normalise
+    its scale relative to Sharpe/Sortino (PF > 2 is excellent, PF=1
+    is breakeven).
     """
-    penalty = max(0.0, 1.0 - (max_drawdown / max_acceptable_drawdown))
-    return sharpe_ratio * penalty
+    # Gate: reject parameter sets that produce too few trades
+    if total_fills < min_trades:
+        return float("-inf")
+
+    # Drawdown penalty: linear collapse from 1 → 0
+    dd_penalty = max(0.0, 1.0 - (max_drawdown / max_acceptable_drawdown))
+
+    # Normalised profit factor via log transform
+    pf_score = math.log(1.0 + max(profit_factor, 0.0))
+
+    # Weighted composite
+    composite = (
+        sharpe_weight * sharpe_ratio
+        + sortino_weight * sortino_ratio
+        + profit_factor_weight * pf_score
+    )
+
+    return composite * dd_penalty
 
 
 def _objective(
@@ -456,16 +597,34 @@ def _objective(
         return float("-inf")
 
     sharpe = metrics.get("sharpe_ratio", 0.0)
+    sortino = metrics.get("sortino_ratio", 0.0)
     mdd = metrics.get("max_drawdown", 0.0)
-    score = compute_wfo_score(sharpe, mdd, wfo_cfg.max_acceptable_drawdown)
+    pf = metrics.get("profit_factor", 0.0)
+    fills = metrics.get("total_fills", 0)
+
+    score = compute_wfo_score(
+        sharpe_ratio=sharpe,
+        max_drawdown=mdd,
+        max_acceptable_drawdown=wfo_cfg.max_acceptable_drawdown,
+        sortino_ratio=sortino,
+        profit_factor=pf,
+        total_fills=fills,
+        min_trades=wfo_cfg.min_trades,
+        sharpe_weight=wfo_cfg.sharpe_weight,
+        sortino_weight=wfo_cfg.sortino_weight,
+        profit_factor_weight=wfo_cfg.profit_factor_weight,
+    )
 
     # Log trial outcome
     log.info(
         "wfo_trial",
         trial=trial.number,
-        score=round(score, 4),
+        score=round(score, 4) if score != float("-inf") else "-inf",
         sharpe=round(sharpe, 4),
+        sortino=round(sortino, 4),
         max_dd=round(mdd, 4),
+        pf=round(pf, 2),
+        fills=fills,
         params=suggested,
     )
 
@@ -580,13 +739,17 @@ def _compute_stitched_metrics(
 def run_wfo(cfg: WfoConfig) -> WfoReport:
     """Execute the full Walk-Forward Optimization pipeline.
 
-    1. Enumerate available dates and generate rolling IS/OOS folds.
+    1. Enumerate available dates and generate rolling/anchored IS/OOS folds
+       with configurable embargo gap.
     2. For each fold:
-       a. Create an Optuna study and run parallel trials on IS data.
-       b. Extract the best parameters.
-       c. Replay IS + OOS with best params for metrics & equity curves.
+       a. Create an Optuna study (with MedianPruner) and optionally
+          warm-start from the previous fold's best parameters.
+       b. Run parallel trials on IS data.
+       c. Extract the best parameters.
+       d. Replay IS + OOS with best params for metrics & equity curves.
     3. Stitch OOS curves and compute aggregate metrics.
-    4. Return a ``WfoReport``.
+    4. Compute overfitting diagnostics (decay, probability, stability).
+    5. Return a ``WfoReport``.
     """
     import optuna
 
@@ -610,13 +773,15 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         train_days=cfg.train_days,
         test_days=cfg.test_days,
         step_days=cfg.step_days,
+        embargo_days=cfg.embargo_days,
+        anchored=cfg.anchored,
     )
 
     if not folds:
         raise ValueError(
             f"Cannot generate any folds from {len(available)} available dates "
             f"with train={cfg.train_days}d / test={cfg.test_days}d / "
-            f"step={cfg.step_days}d."
+            f"step={cfg.step_days}d / embargo={cfg.embargo_days}d."
         )
 
     log.info("wfo_folds_generated", n_folds=len(folds))
@@ -630,18 +795,26 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         "train_days": cfg.train_days,
         "test_days": cfg.test_days,
         "step_days": cfg.step_days,
+        "embargo_days": cfg.embargo_days,
+        "anchored": cfg.anchored,
         "n_trials": cfg.n_trials,
         "max_workers": cfg.max_workers,
         "max_acceptable_drawdown": cfg.max_acceptable_drawdown,
+        "min_trades": cfg.min_trades,
         "initial_cash": cfg.initial_cash,
         "storage_url": cfg.storage_url,
         "study_prefix": cfg.study_prefix,
         "latency_ms": cfg.latency_ms,
         "fee_max_pct": cfg.fee_max_pct,
         "fee_enabled": cfg.fee_enabled,
+        "warm_start": cfg.warm_start,
+        "sharpe_weight": cfg.sharpe_weight,
+        "sortino_weight": cfg.sortino_weight,
+        "profit_factor_weight": cfg.profit_factor_weight,
     }
 
     fold_results: list[FoldResult] = []
+    prev_best_params: dict[str, float] | None = None
 
     for fold in folds:
         log.info(
@@ -653,13 +826,30 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
         study_name = f"{cfg.study_prefix}_fold_{fold.index}"
 
-        # Create a fresh study for this fold
+        # Create a fresh study with MedianPruner for early stopping
         study = optuna.create_study(
             study_name=study_name,
             storage=cfg.storage_url,
             direction="maximize",
             load_if_exists=True,
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=0,
+            ),
         )
+
+        # ── Warm-start: seed with previous fold's best params ─────────
+        if cfg.warm_start and prev_best_params is not None:
+            try:
+                study.enqueue_trial(prev_best_params)
+                log.info(
+                    "wfo_warm_start",
+                    fold=fold.index,
+                    seed_params=prev_best_params,
+                )
+            except Exception:
+                # If enqueue fails (e.g. param name mismatch), proceed
+                log.warning("wfo_warm_start_failed", fold=fold.index)
 
         # ── Parallel trial execution ──────────────────────────────────
         trials_per_worker = max(1, math.ceil(cfg.n_trials / cfg.max_workers))
@@ -696,6 +886,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
         best_params = study.best_params
         best_score = study.best_value
+        prev_best_params = dict(best_params)  # for warm-start
 
         log.info(
             "wfo_fold_best",
@@ -745,13 +936,25 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             fr.is_sharpe = is_metrics.get("sharpe_ratio", 0.0)
             fr.is_max_drawdown = is_metrics.get("max_drawdown", 0.0)
             fr.is_total_pnl = is_metrics.get("total_pnl", 0.0)
+            fr.is_sortino = is_metrics.get("sortino_ratio", 0.0)
+            fr.is_profit_factor = is_metrics.get("profit_factor", 0.0)
+            fr.is_total_fills = is_metrics.get("total_fills", 0)
             fr.is_equity_curve = is_metrics.get("equity_curve", [])
 
         if oos_metrics:
             fr.oos_sharpe = oos_metrics.get("sharpe_ratio", 0.0)
             fr.oos_max_drawdown = oos_metrics.get("max_drawdown", 0.0)
             fr.oos_total_pnl = oos_metrics.get("total_pnl", 0.0)
+            fr.oos_sortino = oos_metrics.get("sortino_ratio", 0.0)
+            fr.oos_profit_factor = oos_metrics.get("profit_factor", 0.0)
+            fr.oos_total_fills = oos_metrics.get("total_fills", 0)
             fr.oos_equity_curve = oos_metrics.get("equity_curve", [])
+
+        # Compute IS→OOS Sharpe decay
+        if abs(fr.is_sharpe) > 1e-6:
+            fr.sharpe_decay_pct = ((fr.oos_sharpe - fr.is_sharpe) / abs(fr.is_sharpe)) * 100
+        else:
+            fr.sharpe_decay_pct = 0.0
 
         fold_results.append(fr)
 
@@ -760,11 +963,8 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             fold=fold.index,
             is_sharpe=round(fr.is_sharpe, 4),
             oos_sharpe=round(fr.oos_sharpe, 4),
-            decay_pct=(
-                round(((fr.oos_sharpe - fr.is_sharpe) / abs(fr.is_sharpe)) * 100, 1)
-                if abs(fr.is_sharpe) > 1e-6
-                else None
-            ),
+            decay_pct=round(fr.sharpe_decay_pct, 1),
+            is_fills=fr.is_total_fills,
         )
 
     # ── Stitch OOS equity curves ──────────────────────────────────────
@@ -777,6 +977,26 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         for pname, pval in fr.best_params.items():
             stability.setdefault(pname, []).append(pval)
 
+    # ── Overfitting diagnostics ───────────────────────────────────────
+    sharpe_decays = [fr.sharpe_decay_pct for fr in fold_results if abs(fr.is_sharpe) > 1e-6]
+    avg_decay = float(np.mean(sharpe_decays)) if sharpe_decays else 0.0
+
+    # Probability of overfitting: fraction of folds where OOS Sharpe < 0
+    n_overfit = sum(1 for fr in fold_results if fr.oos_sharpe < 0)
+    overfit_prob = n_overfit / len(fold_results) if fold_results else 0.0
+
+    # Unstable parameters: CV > 0.50
+    unstable: list[str] = []
+    _STABILITY_CV_THRESHOLD = 0.50
+    for pname, vals in stability.items():
+        if len(vals) > 1:
+            arr = np.array(vals)
+            mu = float(arr.mean())
+            sd = float(arr.std(ddof=1))
+            cv = sd / abs(mu) if abs(mu) > 1e-9 else float("inf")
+            if cv > _STABILITY_CV_THRESHOLD:
+                unstable.append(pname)
+
     elapsed = time.monotonic() - t0
 
     report = WfoReport(
@@ -787,6 +1007,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         aggregate_oos_total_pnl=agg_pnl,
         parameter_stability=stability,
         total_elapsed_s=elapsed,
+        avg_sharpe_decay_pct=avg_decay,
+        overfit_probability=overfit_prob,
+        unstable_params=unstable,
     )
 
     log.info(
@@ -795,6 +1018,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         oos_sharpe=round(agg_sharpe, 4),
         oos_max_dd=round(agg_dd, 4),
         oos_pnl=round(agg_pnl, 4),
+        avg_decay_pct=round(avg_decay, 1),
+        overfit_prob=round(overfit_prob, 2),
+        unstable_params=unstable,
         elapsed_s=round(elapsed, 1),
     )
 

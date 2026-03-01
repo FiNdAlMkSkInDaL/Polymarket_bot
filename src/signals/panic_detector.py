@@ -106,7 +106,13 @@ class PanicDetector:
 
         # NO must actually be discounted vs its VWAP
         no_vwap = self.no_agg.rolling_vwap
-        if no_best_ask >= no_vwap and no_vwap > 0:
+        if no_vwap <= 0:
+            log.debug(
+                "spike_check_fail_no_vwap_missing",
+                market=self.market_id,
+            )
+            return None
+        if no_best_ask >= no_vwap:
             log.debug(
                 "spike_check_fail_no_not_discounted",
                 market=self.market_id,
