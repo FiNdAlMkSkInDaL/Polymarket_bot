@@ -797,6 +797,17 @@ class TradingBot:
         yes_price = yes_agg.current_price if yes_agg else 0.50
         yes_vwap = yes_agg.rolling_vwap if yes_agg else 0.50
 
+        # ── Price band guard (consistent with _on_yes_bar_closed) ──────
+        strat_band = settings.strategy
+        if yes_price <= strat_band.min_tradeable_price or yes_price >= strat_band.max_tradeable_price:
+            return
+        if yes_price >= 0.97 or yes_price <= 0.03:
+            self.lifecycle.drain_market(market_info.condition_id, reason="near_resolved_price")
+            return
+        if not market_info.accepting_orders:
+            self.lifecycle.drain_market(market_info.condition_id, reason="not_accepting_orders")
+            return
+
         # Build synthetic signal with moderate values
         synthetic_sig = PanicSignal(
             market_id=market_info.condition_id,
@@ -888,6 +899,11 @@ class TradingBot:
         if not self.lifecycle.is_tradeable(market_info.condition_id):
             return
 
+        # ── Fix 4: Real-time drain if market stopped accepting orders ──
+        if not market_info.accepting_orders:
+            self.lifecycle.drain_market(market_info.condition_id, reason="not_accepting_orders")
+            return
+
         # Signal cooldown check
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
             return
@@ -911,33 +927,45 @@ class TradingBot:
         if no_best_ask <= 0:
             return
 
+        # ── Derive YES close price for price-band checks ───────────────
+        yes_price = bar.close if hasattr(bar, 'close') else 0.0
+
+        # ── Fix 2: Near-resolved price auto-drain ──────────────────────
+        if yes_price >= 0.97 or yes_price <= 0.03:
+            self.lifecycle.drain_market(market_info.condition_id, reason="near_resolved_price")
+            return
+
+        # ── Fix 1: Tradeable price band guard ──────────────────────────
+        min_price = settings.strategy.min_tradeable_price
+        max_price = settings.strategy.max_tradeable_price
+        price_in_band = min_price < yes_price < max_price
+
         # Whale confluence check
         whale = self.whale_monitor.has_confluence(market_info.no_token_id)
 
-        sig = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
-        if sig:
-            self._latest_z = sig.zscore
-            self.lifecycle.record_signal(market_info.condition_id)
-            await self._on_panic_signal(sig, no_agg, market_info)
+        if price_in_band:
+            sig = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
+            if sig:
+                self._latest_z = sig.zscore
+                self.lifecycle.record_signal(market_info.condition_id)
+                await self._on_panic_signal(sig, no_agg, market_info)
 
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
-        if rpe:
+        if rpe and price_in_band:
             days = 30
             if market_info.end_date:
                 days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
-            yes_price = bar.close if hasattr(bar, 'close') else 0.0
-            if 0 < yes_price < 1:
-                try:
-                    rpe_signal = rpe.evaluate(
-                        market=market_info,
-                        market_price=yes_price,
-                        days_to_resolution=days,
-                    )
-                    if rpe_signal:
-                        await self._on_rpe_signal(rpe_signal, market_info, days)
-                except Exception:
-                    log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
+            try:
+                rpe_signal = rpe.evaluate(
+                    market=market_info,
+                    market_price=yes_price,
+                    days_to_resolution=days,
+                )
+                if rpe_signal:
+                    await self._on_rpe_signal(rpe_signal, market_info, days, current_price=yes_price)
+            except Exception:
+                log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
 
     async def _on_panic_signal(
         self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo
@@ -989,7 +1017,12 @@ class TradingBot:
             )
 
     async def _on_rpe_signal(
-        self, signal: SignalResult, market: MarketInfo, days_to_resolution: int
+        self,
+        signal: SignalResult,
+        market: MarketInfo,
+        days_to_resolution: int,
+        *,
+        current_price: float | None = None,
     ) -> None:
         """Handle an RPE divergence signal — may be shadow or live."""
         meta = signal.metadata
@@ -998,11 +1031,14 @@ class TradingBot:
         confidence = meta.get("confidence", 0.0)
         shadow = meta.get("shadow_mode", True)
 
+        # Fix 3: Use actual market price, not the normalised divergence score
+        display_price = current_price if current_price is not None else meta.get("market_price", signal.score)
+
         # Always alert via Telegram (for calibration visibility in shadow mode)
         await self.telegram.notify_rpe_signal(
             market_id=market.condition_id,
             model_prob=model_prob,
-            market_price=signal.score,  # score is normalised; use metadata
+            market_price=display_price,
             direction=direction,
             confidence=confidence,
             shadow=shadow,
@@ -1176,7 +1212,11 @@ class TradingBot:
                     else:
                         yes_price = yes_agg.current_price if yes_agg else 0.0
 
-                    if not (0 < yes_price < 1):
+                    if not (
+                        settings.strategy.min_tradeable_price
+                        < yes_price
+                        < settings.strategy.max_tradeable_price
+                    ):
                         continue
 
                     days = 30
@@ -1189,7 +1229,7 @@ class TradingBot:
                         days_to_resolution=days,
                     )
                     if rpe_signal:
-                        await self._on_rpe_signal(rpe_signal, m, days)
+                        await self._on_rpe_signal(rpe_signal, m, days, current_price=yes_price)
 
             except asyncio.CancelledError:
                 raise

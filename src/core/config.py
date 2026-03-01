@@ -89,6 +89,11 @@ class StrategyParams:
     (e.g.  ZSCORE_THRESHOLD=2.5  in .env).
     """
 
+    # Tradeable price band — markets outside this range are too close
+    # to resolution for mean-reversion alpha to exist.
+    min_tradeable_price: float = _env_float("MIN_TRADEABLE_PRICE", 0.05)
+    max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
+
     # Panic spike detector
     zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.2)
     volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.5)

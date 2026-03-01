@@ -1035,3 +1035,158 @@ class TestSingletonRPE:
         # Should not raise on a condition_id that was never cached
         rpe.clear_market("nonexistent")
         assert rpe.get_estimate("nonexistent") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Near-Resolved Price Guard — bot-level integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestNearResolvedPriceGuard:
+    """Verify that _on_yes_bar_closed blocks signals on near-resolved markets."""
+
+    def test_near_resolved_price_skips_signals_and_drains(self) -> None:
+        """When yes_price=0.98, rpe.evaluate and detector.evaluate must NOT be
+        called, and drain_market must be called with reason='near_resolved_price'.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from src.bot import TradingBot
+
+        bot = TradingBot(paper_mode=True)
+
+        # ── Fake market info ──
+        market = FakeMarketInfo(
+            condition_id="NEAR_RESOLVED",
+            yes_token_id="YES_NR",
+            no_token_id="NO_NR",
+            accepting_orders=True,
+        )
+
+        # ── Wire the market into the bot's internal maps ──
+        bot._market_map["YES_NR"] = market
+
+        # Lifecycle stubs
+        bot.lifecycle.is_tradeable = MagicMock(return_value=True)
+        bot.lifecycle.is_cooled_down = MagicMock(return_value=True)
+        bot.lifecycle.drain_market = MagicMock()
+
+        # Detector and RPE — should never be called
+        mock_detector = MagicMock()
+        mock_detector.evaluate = MagicMock(return_value=None)
+        bot._detectors["NEAR_RESOLVED"] = mock_detector
+
+        mock_rpe = MagicMock()
+        mock_rpe.evaluate = MagicMock(return_value=None)
+        bot._rpe = mock_rpe
+
+        # Provide a NO aggregator so the method doesn't bail early
+        mock_no_agg = MagicMock()
+        mock_no_agg.current_price = 0.02
+        bot._no_aggs["NO_NR"] = mock_no_agg
+
+        # Whale monitor stub
+        bot.whale_monitor = MagicMock()
+        bot.whale_monitor.has_confluence = MagicMock(return_value=False)
+
+        # ── Build a bar with close=0.98 (near resolved) ──
+        bar = MagicMock()
+        bar.close = 0.98
+
+        # Run the handler
+        asyncio.get_event_loop().run_until_complete(
+            bot._on_yes_bar_closed("YES_NR", bar)
+        )
+
+        # Assertions
+        mock_detector.evaluate.assert_not_called()
+        mock_rpe.evaluate.assert_not_called()
+        bot.lifecycle.drain_market.assert_called_once_with(
+            "NEAR_RESOLVED", reason="near_resolved_price"
+        )
+
+    def test_accepting_orders_false_drains(self) -> None:
+        """When accepting_orders is False, drain with reason='not_accepting_orders'."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.bot import TradingBot
+
+        bot = TradingBot(paper_mode=True)
+
+        market = FakeMarketInfo(
+            condition_id="CLOSED_MKT",
+            yes_token_id="YES_CL",
+            no_token_id="NO_CL",
+            accepting_orders=False,  # market no longer accepting orders
+        )
+
+        bot._market_map["YES_CL"] = market
+        bot.lifecycle.is_tradeable = MagicMock(return_value=True)
+        bot.lifecycle.drain_market = MagicMock()
+
+        mock_detector = MagicMock()
+        bot._detectors["CLOSED_MKT"] = mock_detector
+
+        mock_rpe = MagicMock()
+        bot._rpe = mock_rpe
+
+        bar = MagicMock()
+        bar.close = 0.55
+
+        asyncio.get_event_loop().run_until_complete(
+            bot._on_yes_bar_closed("YES_CL", bar)
+        )
+
+        # Should drain immediately, no signal evaluation
+        bot.lifecycle.drain_market.assert_called_once_with(
+            "CLOSED_MKT", reason="not_accepting_orders"
+        )
+        mock_detector.evaluate.assert_not_called()
+        mock_rpe.evaluate.assert_not_called()
+
+    def test_price_in_band_allows_evaluation(self) -> None:
+        """When yes_price=0.50 (within band), detector and RPE should be called."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.bot import TradingBot
+
+        bot = TradingBot(paper_mode=True)
+
+        market = FakeMarketInfo(
+            condition_id="NORMAL_MKT",
+            yes_token_id="YES_OK",
+            no_token_id="NO_OK",
+            accepting_orders=True,
+        )
+
+        bot._market_map["YES_OK"] = market
+        bot.lifecycle.is_tradeable = MagicMock(return_value=True)
+        bot.lifecycle.is_cooled_down = MagicMock(return_value=True)
+        bot.lifecycle.drain_market = MagicMock()
+        bot.lifecycle.record_signal = MagicMock()
+
+        mock_detector = MagicMock()
+        mock_detector.evaluate = MagicMock(return_value=None)
+        bot._detectors["NORMAL_MKT"] = mock_detector
+
+        mock_rpe = MagicMock()
+        mock_rpe.evaluate = MagicMock(return_value=None)
+        bot._rpe = mock_rpe
+
+        mock_no_agg = MagicMock()
+        mock_no_agg.current_price = 0.50
+        bot._no_aggs["NO_OK"] = mock_no_agg
+
+        bot.whale_monitor = MagicMock()
+        bot.whale_monitor.has_confluence = MagicMock(return_value=False)
+
+        bar = MagicMock()
+        bar.close = 0.50
+
+        asyncio.get_event_loop().run_until_complete(
+            bot._on_yes_bar_closed("YES_OK", bar)
+        )
+
+        # Both signals should be evaluated when price is normal
+        mock_detector.evaluate.assert_called_once()
+        mock_rpe.evaluate.assert_called_once()
+        bot.lifecycle.drain_market.assert_not_called()
