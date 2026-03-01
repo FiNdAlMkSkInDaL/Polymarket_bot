@@ -197,6 +197,7 @@ def compute_kelly_size(
     kelly_fraction_mult: float | None = None,
     max_kelly_pct: float | None = None,
     signal_metadata: dict | None = None,
+    total_trades: int = 0,
 ) -> KellyResult:
     """Compute position size using fractional Kelly criterion with
     **edge discounting** and **probability capping**.
@@ -246,6 +247,58 @@ def compute_kelly_size(
     k_mult = kelly_fraction_mult if kelly_fraction_mult is not None else strat.kelly_fraction
     max_pct = max_kelly_pct if max_kelly_pct is not None else strat.kelly_max_pct
     p_cap = strat.kelly_p_cap
+
+    # ── Cold-start bypass ───────────────────────────────────────────────
+    # When total_trades < MIN_KELLY_TRADES, the Kelly formula has
+    # insufficient data to compute a meaningful edge.  Use a fixed
+    # conservative fraction of max_trade_usd and skip the edge check
+    # to avoid a death spiral where bad early stats permanently block
+    # trading.
+    min_kelly_trades = strat.min_kelly_trades
+    if total_trades < min_kelly_trades:
+        cold_start_frac = 0.30  # 30% of max_trade_usd
+        cold_usd = max_trade_usd * cold_start_frac
+
+        # Depth cap if book available
+        if book is not None and book.has_data:
+            depth_result = compute_depth_aware_size(
+                book=book,
+                entry_price=entry_price,
+                max_trade_usd=cold_usd,
+                side="BUY",
+            )
+            if depth_result.size_usd > 0:
+                cold_usd = depth_result.size_usd
+
+        if entry_price <= 0:
+            shares = 0.0
+        else:
+            shares = round(cold_usd / entry_price, 2)
+
+        if shares < 1:
+            cold_usd = 0.0
+            shares = 0.0
+
+        log.info(
+            "kelly_cold_start",
+            total_trades=total_trades,
+            min_required=min_kelly_trades,
+            size_usd=round(cold_usd, 2),
+            shares=shares,
+        )
+
+        return KellyResult(
+            kelly_fraction=0.0,
+            adj_fraction=0.0,
+            size_usd=round(cold_usd, 4),
+            size_shares=shares,
+            method="kelly_cold_start",
+            edge=0.0,
+            win_prob=0.0,
+            estimated_p=0.0,
+            adjusted_p=0.0,
+            uncertainty_penalty=0.0,
+        )
 
     # ── Estimate win probability ────────────────────────────────────────
     base_wr = win_rate if win_rate > 0 else 0.55

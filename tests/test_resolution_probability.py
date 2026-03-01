@@ -831,10 +831,10 @@ class TestGenericModelGate:
         assert result is not None
         assert result.metadata["model_name"] == "crypto_lognormal"
 
-    def test_default_generic_enabled_is_false(self) -> None:
-        """Default config has rpe_generic_enabled=False."""
+    def test_default_generic_enabled_is_true(self) -> None:
+        """Default config has rpe_generic_enabled=True (activated with RPE)."""
         from src.core.config import settings
-        assert settings.strategy.rpe_generic_enabled is False
+        assert settings.strategy.rpe_generic_enabled is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

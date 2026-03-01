@@ -68,7 +68,7 @@ class PanicDetector:
         """Check a newly closed YES bar.  Returns a signal or None."""
 
         # Need enough history to compute stats
-        if len(self.yes_agg.bars) < 5:
+        if len(self.yes_agg.bars) < 3:
             return None
 
         vwap = self.yes_agg.rolling_vwap
@@ -112,7 +112,7 @@ class PanicDetector:
                 market=self.market_id,
             )
             return None
-        if no_best_ask >= no_vwap:
+        if no_best_ask >= no_vwap * 1.02:
             log.debug(
                 "spike_check_fail_no_not_discounted",
                 market=self.market_id,

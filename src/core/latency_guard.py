@@ -58,6 +58,10 @@ class LatencyGuard:
         self._consecutive_healthy: int = 0
         self._last_delta_ms: float = 0.0
 
+        # Grace period: after reset(), skip blocking for a short window
+        # to prevent the heartbeat and latency guard from fighting.
+        self._grace_until: float = 0.0
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -101,6 +105,12 @@ class LatencyGuard:
         if not self._calibrated:
             # Auto-calibrate on first check if not done explicitly.
             self.calibrate(server_ts)
+
+        # Grace period after reset — return HEALTHY to prevent
+        # immediate re-blocking when heartbeat just resumed.
+        if time.time() < self._grace_until:
+            self._last_delta_ms = 0.0
+            return LatencyState.HEALTHY
 
         adjusted_local = time.time() + self._clock_offset
         delta_ms = abs(adjusted_local - server_ts) * 1000.0
@@ -164,8 +174,14 @@ class LatencyGuard:
         self._consecutive_healthy = 0
 
     def reset(self) -> None:
-        """Reset to initial state (e.g. on WS reconnect)."""
+        """Reset to initial state (e.g. on WS reconnect).
+
+        Sets a 2-second grace period during which check() returns
+        HEALTHY unconditionally, preventing the latency guard from
+        immediately re-blocking after heartbeat recovery.
+        """
         self._state = LatencyState.HEALTHY
         self._consecutive_healthy = 0
         self._calibrated = False
         self._clock_offset = 0.0
+        self._grace_until = time.time() + 2.0

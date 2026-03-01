@@ -13,8 +13,8 @@ The monitor operates on two independent layers:
    ~2 s without indicating a dead connection.
 
    To avoid false-positive flapping, suspension requires
-   ``heartbeat_stale_count`` **consecutive** stale checks (default 2)
-   before acting.  A single transient gap is tolerated; the 5-second
+   ``heartbeat_stale_count`` **consecutive** stale checks (default 3)
+   before acting.  Transient gaps are tolerated; the 10-second
    ``ws_silence_timeout_s`` watchdog provides the hard safety net for
    truly dead connections.
 
@@ -130,6 +130,15 @@ class BookHeartbeat:
         self._suspend_reason: str = ""
         self._transport_stale_streak: int = 0
 
+        # Deferred order cancellation — only cancel after sustained stale
+        self._suspend_start_time: float = 0.0
+        self._orders_cancelled: bool = False
+        self._cancel_after_s: float = 10.0  # seconds of sustained stale before cancel
+
+        # Notification throttling — min 60s between heartbeat Telegram alerts
+        self._last_heartbeat_alert_time: float = 0.0
+        self._heartbeat_alert_interval_s: float = 60.0
+
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -167,6 +176,8 @@ class BookHeartbeat:
                             reason="ws_transport_dead",
                             detail="no WS message received",
                         )
+                    else:
+                        await self._escalate_cancel_if_needed()
                     return
                 # Sub-threshold streak — tolerate transient gap
                 log.debug(
@@ -213,6 +224,8 @@ class BookHeartbeat:
                         reason="position_book_stale",
                         detail=stalest_asset[:16],
                     )
+                else:
+                    await self._escalate_cancel_if_needed()
                 return
 
         # ── Layer 2.5: Polygon head-lag health ─────────────────────────
@@ -231,6 +244,8 @@ class BookHeartbeat:
                             reason="polygon_head_lag",
                             detail=f"lag {lag_ms:.0f}ms",
                         )
+                    else:
+                        await self._escalate_cancel_if_needed()
                     return
                 elif self._is_suspended and self._suspend_reason == "polygon_head_lag":
                     await self._resume()
@@ -251,6 +266,8 @@ class BookHeartbeat:
                         reason="legacy_stale",
                         detail="freshest tracker",
                     )
+                else:
+                    await self._escalate_cancel_if_needed()
                 return
 
         # ── All layers healthy — resume if suspended ──────────────────
@@ -288,10 +305,55 @@ class BookHeartbeat:
 
     # ── Suspend / Resume ───────────────────────────────────────────────────
 
+    async def _escalate_cancel_if_needed(self) -> None:
+        """Cancel resting orders after sustained suspension (>10s).
+
+        On first suspension we only block new activity — resting limit
+        orders are safe during brief stale periods.  Only cancel them
+        when the connection is genuinely dead.
+        """
+        if self._orders_cancelled or self._suspend_start_time <= 0:
+            return
+        elapsed = time.time() - self._suspend_start_time
+        if elapsed > self._cancel_after_s:
+            count = await self._executor.cancel_all()
+            self._orders_cancelled = True
+            log.warning(
+                "heartbeat_escalate_cancel",
+                elapsed_s=round(elapsed, 1),
+                orders_cancelled=count,
+            )
+            # Throttled escalation notification
+            await self._send_heartbeat_alert(
+                f"⚠️ <b>Heartbeat ESCALATED</b> — cancelled {count} orders "
+                f"after {elapsed:.0f}s sustained stale."
+            )
+
+    async def _send_heartbeat_alert(self, message: str) -> None:
+        """Send a Telegram alert, throttled to once per 60 seconds."""
+        if not (self._telegram and hasattr(self._telegram, "send")):
+            return
+        now = time.time()
+        if now - self._last_heartbeat_alert_time < self._heartbeat_alert_interval_s:
+            return
+        try:
+            await self._telegram.send(message)
+            self._last_heartbeat_alert_time = now
+        except Exception:
+            pass
+
     async def _suspend(self, gap_ms: float, *, reason: str, detail: str) -> None:
-        """Suspend all execution due to stale data."""
+        """Suspend new execution due to stale data.
+
+        On first suspension we block the latency guard and pause chasers
+        but do NOT cancel resting orders — they are passive limit orders
+        that are safe during brief stale periods.  Orders are only
+        cancelled after sustained suspension (see _escalate_cancel_if_needed).
+        """
         self._is_suspended = True
         self._suspend_reason = reason
+        self._suspend_start_time = time.time()
+        self._orders_cancelled = False
 
         # Force the latency guard into BLOCKED state
         self._guard.force_block("heartbeat_stale")
@@ -299,33 +361,27 @@ class BookHeartbeat:
         # Pause chasers
         self._kill_event.clear()
 
-        # Pull all resting quotes
-        count = await self._executor.cancel_all()
-
         log.warning(
             "heartbeat_stale_detected",
             max_gap_ms=round(gap_ms, 1),
             threshold_ms=self._stale_ms,
             reason=reason,
             detail=detail,
-            orders_cancelled=count,
         )
 
-        if self._telegram and hasattr(self._telegram, "send"):
-            try:
-                await self._telegram.send(
-                    f"💓 <b>Heartbeat STALE</b> — execution suspended.\n"
-                    f"Reason: {reason}\n"
-                    f"Gap: {gap_ms:.0f}ms (threshold: {self._stale_ms}ms)\n"
-                    f"Cancelled {count} resting orders."
-                )
-            except Exception:
-                pass
+        await self._send_heartbeat_alert(
+            f"💓 <b>Heartbeat STALE</b> — execution suspended.\n"
+            f"Reason: {reason}\n"
+            f"Gap: {gap_ms:.0f}ms (threshold: {self._stale_ms}ms)\n"
+            f"Resting orders preserved (cancel after {self._cancel_after_s:.0f}s)."
+        )
 
     async def _resume(self) -> None:
         """Resume execution after fresh data arrives."""
         self._is_suspended = False
         self._suspend_reason = ""
+        self._suspend_start_time = 0.0
+        self._orders_cancelled = False
         self._kill_event.set()
 
         # Reset the latency guard so it transitions back to HEALTHY
@@ -334,11 +390,7 @@ class BookHeartbeat:
 
         log.info("heartbeat_recovered")
 
-        if self._telegram and hasattr(self._telegram, "send"):
-            try:
-                await self._telegram.send("💚 <b>Heartbeat recovered</b> — execution resumed.")
-            except Exception:
-                pass
+        await self._send_heartbeat_alert("💚 <b>Heartbeat recovered</b> — execution resumed.")
 
     @property
     def is_suspended(self) -> bool:

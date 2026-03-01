@@ -37,13 +37,19 @@ from src.data.l2_websocket import L2WebSocket
 from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
 from src.signals.adverse_selection_guard import AdverseSelectionGuard
+from src.signals.edge_filter import compute_edge_score
 from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.signals.resolution_probability import (
     CryptoPriceModel,
     GenericBayesianModel,
     ResolutionProbabilityEngine,
 )
-from src.signals.signal_framework import SignalResult
+from src.signals.signal_framework import (
+    CompositeSignalEvaluator,
+    OrderbookImbalanceSignal,
+    SignalResult,
+    SpreadCompressionSignal,
+)
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
@@ -124,6 +130,10 @@ class TradingBot:
         self._total_counts: dict[str, int] = {}    # asset_id → total classified trades
         self._recent_trade_volume: dict[str, list[tuple[float, float]]] = {}  # cond_id → [(ts, size)]
 
+        # Spread-based signal evaluators (Problem 3)
+        self._spread_evaluators: dict[str, CompositeSignalEvaluator] = {}  # condition_id → evaluator
+        self._spread_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
+
         # Lifecycle
         self._running = False
         self._start_time: float = 0.0       # set in _run() for uptime tracking
@@ -161,10 +171,23 @@ class TradingBot:
         """Discover markets, wire components, and enter the main loop."""
         setup_logging(settings.log_dir)
         mode_label = self.deployment_env.value
+        strat = settings.strategy
         log.info(
             "bot_starting",
             mode=mode_label,
             **self.guard.startup_summary(),
+            zscore_threshold=strat.zscore_threshold,
+            volume_ratio_threshold=strat.volume_ratio_threshold,
+            min_edge_score=strat.min_edge_score,
+            signal_cooldown_min=strat.signal_cooldown_minutes,
+            heartbeat_stale_ms=strat.heartbeat_stale_ms,
+            heartbeat_stale_count=strat.heartbeat_stale_count,
+            ws_silence_timeout=strat.ws_silence_timeout_s,
+            min_kelly_trades=strat.min_kelly_trades,
+            spread_signal_enabled=strat.spread_signal_enabled,
+            rpe_shadow_mode=strat.rpe_shadow_mode,
+            rpe_generic_enabled=strat.rpe_generic_enabled,
+            kelly_fraction=strat.kelly_fraction,
         )
 
         # Fail-fast if running with real capital without required credentials
@@ -396,6 +419,16 @@ class TradingBot:
         )
         self._detectors[m.condition_id] = detector
 
+        # Spread-based composite signal evaluator (Problem 3)
+        if settings.strategy.spread_signal_enabled:
+            imbalance_sig = OrderbookImbalanceSignal(m.condition_id)
+            spread_comp_sig = SpreadCompressionSignal(m.condition_id)
+            evaluator = CompositeSignalEvaluator(
+                generators=[(imbalance_sig, 0.6), (spread_comp_sig, 0.4)],
+                min_composite_score=settings.strategy.min_composite_signal_score,
+            )
+            self._spread_evaluators[m.condition_id] = evaluator
+
         # RPE: Resolution Probability Engine (Pillar 14)
         # Wiring is handled by the singleton self._rpe;
         # no per-market instance needed.
@@ -432,6 +465,8 @@ class TradingBot:
         self._yes_aggs.pop(m.yes_token_id, None)
         self._no_aggs.pop(m.no_token_id, None)
         self._detectors.pop(m.condition_id, None)
+        self._spread_evaluators.pop(m.condition_id, None)
+        self._spread_cooldowns.pop(m.condition_id, None)
         self._rpe.clear_market(m.condition_id)
         self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
@@ -690,8 +725,8 @@ class TradingBot:
         """Callback from L2OrderBook when the BBO changes.
 
         Logs the live spread score for monitoring and drives the
-        event-driven stop-loss engine.  This fires on every BBO tick
-        so keep it lightweight.
+        event-driven stop-loss engine.  Also evaluates the spread-based
+        signal path (Problem 3) on NO-token BBO ticks.
         """
         log.debug(
             "l2_bbo_update",
@@ -701,6 +736,132 @@ class TradingBot:
         )
         # Drive event-driven stop-loss evaluation
         await self._stop_loss_monitor.on_bbo_update(asset_id)
+
+        # ── Spread-based signal evaluation (Problem 3) ─────────────────
+        if not settings.strategy.spread_signal_enabled:
+            return
+
+        market_info = self._market_map.get(asset_id)
+        if not market_info:
+            return
+
+        # Only evaluate on NO-token BBO changes
+        if asset_id != market_info.no_token_id:
+            return
+
+        # Only trade active-tier markets
+        if not self.lifecycle.is_tradeable(market_info.condition_id):
+            return
+
+        # Signal cooldown check (lifecycle cooldown)
+        if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            return
+
+        # Per-signal-source cooldown: 60 seconds between spread signals
+        now = time.time()
+        last_fire = self._spread_cooldowns.get(market_info.condition_id, 0.0)
+        if now - last_fire < 60.0:
+            return
+
+        # Check minimum spread
+        strat = settings.strategy
+        if score.raw_spread_cents < strat.min_spread_cents:
+            return
+
+        no_book = self._book_trackers.get(market_info.no_token_id)
+        if not no_book or not no_book.has_data:
+            return
+
+        evaluator = self._spread_evaluators.get(market_info.condition_id)
+        if not evaluator:
+            return
+
+        actionable, composite_score, fired = evaluator.is_actionable(
+            no_book=no_book,
+        )
+
+        if not actionable:
+            return
+
+        # Generate a synthetic PanicSignal to enter the standard flow
+        no_agg = self._no_aggs.get(market_info.no_token_id)
+        if not no_agg:
+            return
+
+        snap = no_book.snapshot()
+        no_best_ask = snap.best_ask if snap.best_ask > 0 else no_agg.current_price
+        if no_best_ask <= 0:
+            return
+
+        yes_agg = self._yes_aggs.get(market_info.yes_token_id)
+        yes_price = yes_agg.current_price if yes_agg else 0.50
+        yes_vwap = yes_agg.rolling_vwap if yes_agg else 0.50
+
+        # Build synthetic signal with moderate values
+        synthetic_sig = PanicSignal(
+            market_id=market_info.condition_id,
+            yes_asset_id=market_info.yes_token_id,
+            no_asset_id=market_info.no_token_id,
+            yes_price=yes_price,
+            yes_vwap=yes_vwap,
+            zscore=strat.zscore_threshold * 1.2,  # just above threshold
+            volume_ratio=strat.volume_ratio_threshold * 1.1,
+            no_best_ask=no_best_ask,
+            whale_confluence=False,
+        )
+
+        # Build signal metadata with uncertainty from evaluator +
+        # a sizing multiplier of 50% (lower conviction)
+        spread_metadata: dict[str, Any] = {}
+        if fired:
+            spread_metadata = dict(fired[0].metadata)
+        spread_metadata["signal_source"] = "spread_opportunity"
+        spread_metadata["spread_sizing_mult"] = 0.50
+
+        self._spread_cooldowns[market_info.condition_id] = now
+
+        log.info(
+            "spread_signal_fired",
+            market=market_info.condition_id,
+            composite_score=round(composite_score, 3),
+            signal_source="spread_opportunity",
+            raw_spread_cents=round(score.raw_spread_cents, 2),
+        )
+
+        self.lifecycle.record_signal(market_info.condition_id)
+
+        # Compute days to resolution
+        days = 30
+        if market_info.end_date:
+            days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
+
+        # Get real book depth ratio if available
+        book_depth = 1.0
+        if no_book and no_book.has_data:
+            book_depth = no_book.book_depth_ratio
+
+        # Determine fee category
+        fee_cats = strat.fee_enabled_categories.lower().split(",")
+        market_tags = (getattr(market_info, 'tags', '') or '').lower()
+        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+
+        pos = await self.positions.open_position(
+            synthetic_sig,
+            no_agg,
+            no_book=no_book,
+            event_id=market_info.event_id,
+            days_to_resolution=days,
+            book_depth_ratio=book_depth,
+            fee_enabled=fee_enabled,
+            signal_metadata=spread_metadata,
+        )
+        if pos:
+            if no_book and no_book.has_data:
+                chaser_task = asyncio.create_task(
+                    self._entry_chaser_flow(pos, no_book),
+                    name=f"chaser_entry_{pos.id}",
+                )
+                pos.entry_chaser_task = chaser_task
 
     def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
         """Callback from basic OrderbookTracker when the BBO changes.
@@ -869,6 +1030,33 @@ class TradingBot:
             )
             return
 
+        # ── Live-mode safety gates (conservative RPE activation) ───────
+        # Gate 1: Require higher confidence than the base threshold
+        if confidence < 0.15:
+            log.info(
+                "rpe_live_confidence_too_low",
+                market=market.condition_id,
+                confidence=round(confidence, 3),
+                min_required=0.15,
+            )
+            return
+
+        # Gate 2: Require >= 10 OHLCV bars of history for meaningful data
+        yes_agg = self._yes_aggs.get(market.yes_token_id)
+        no_agg = self._no_aggs.get(market.no_token_id)
+        bar_count = max(
+            len(yes_agg.bars) if yes_agg else 0,
+            len(no_agg.bars) if no_agg else 0,
+        )
+        if bar_count < 10:
+            log.info(
+                "rpe_live_insufficient_bars",
+                market=market.condition_id,
+                bar_count=bar_count,
+                min_required=10,
+            )
+            return
+
         # Live mode — open a position
         fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
         market_tags = (getattr(market, 'tags', '') or '').lower()
@@ -881,7 +1069,6 @@ class TradingBot:
                 snap = book.snapshot()
                 entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
             else:
-                no_agg = self._no_aggs.get(market.no_token_id)
                 entry_price = round(no_agg.current_price, 2) if no_agg else 0.0
         else:
             book = self._book_trackers.get(market.yes_token_id)
@@ -889,10 +1076,28 @@ class TradingBot:
                 snap = book.snapshot()
                 entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
             else:
-                yes_agg = self._yes_aggs.get(market.yes_token_id)
                 entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
 
         if entry_price <= 0:
+            return
+
+        # Gate 3: Edge quality filter — RPE entries must pass compute_edge_score
+        divergence_z = abs(model_prob - entry_price) / max(1.0 - confidence, 0.05)
+        edge = compute_edge_score(
+            entry_price=entry_price,
+            no_vwap=model_prob,
+            zscore=divergence_z,
+            volume_ratio=1.0,
+            whale_confluence=False,
+            fee_enabled=fee_enabled,
+        )
+        if not edge.viable:
+            log.info(
+                "rpe_live_edge_rejected",
+                market=market.condition_id,
+                score=edge.score,
+                reason=edge.rejection_reason,
+            )
             return
 
         pos = await self.positions.open_rpe_position(

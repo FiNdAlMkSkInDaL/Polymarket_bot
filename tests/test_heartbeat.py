@@ -79,8 +79,8 @@ class TestTransportLayer:
         guard, event, executor = components
         now = time.time()
 
-        # Transport: no message for 5 seconds
-        transport = _make_transport(now - 5.0)
+        # Transport: no message for 6 seconds (> 5000ms threshold)
+        transport = _make_transport(now - 6.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -88,11 +88,15 @@ class TestTransportLayer:
             ws_transport=transport,
         )
 
-        # First check: gap detected but under consecutive threshold — no suspend
+        # First check: gap detected but under consecutive threshold (need 3)
         await hb._check()
         assert hb.is_suspended is False
 
-        # Second check: consecutive threshold met — now suspend
+        # Second check: still under threshold
+        await hb._check()
+        assert hb.is_suspended is False
+
+        # Third check: consecutive threshold met — now suspend
         await hb._check()
         assert hb.is_suspended is True
         assert guard.is_blocked() is True
@@ -104,7 +108,7 @@ class TestTransportLayer:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 5.0)
+        transport = _make_transport(now - 6.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -112,7 +116,8 @@ class TestTransportLayer:
             ws_transport=transport,
         )
 
-        # Need 2 consecutive stale checks to trigger suspension
+        # Need 3 consecutive stale checks to trigger suspension
+        await hb._check()
         await hb._check()
         await hb._check()
         assert hb.is_suspended is True
@@ -189,7 +194,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 5.0)
+        transport = _make_transport(now - 6.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -207,7 +212,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 5.0)
+        transport = _make_transport(now - 6.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -231,7 +236,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 5.0)
+        transport = _make_transport(now - 6.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -249,14 +254,14 @@ class TestConsecutiveStaleCount:
         assert hb._transport_stale_streak == 0
 
         # Stale check again — streak starts from 1 again
-        transport._last_message_time = time.time() - 5.0
+        transport._last_message_time = time.time() - 6.0
         await hb._check()
         assert hb._transport_stale_streak == 1
-        assert hb.is_suspended is False  # only 1, need 2
+        assert hb.is_suspended is False  # only 1, need 3
 
     @pytest.mark.asyncio
     async def test_quiet_market_gap_no_suspend(self, components):
-        """Natural quiet-market gap (1.9s) below 2500ms threshold → no suspend."""
+        """Natural quiet-market gap (1.9s) below 5000ms threshold → no suspend."""
         guard, event, executor = components
         now = time.time()
 
@@ -334,13 +339,13 @@ class TestPositionLayer:
     @pytest.mark.asyncio
     async def test_position_on_stale_book_suspends(self, components):
         """Open position on a book that hasn't updated for 3× threshold → suspend.
-        Default threshold is 2500ms, so position threshold is 7500ms."""
+        Default threshold is 5000ms, so position threshold is 15000ms."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)  # WS is healthy
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 8.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 16.0),
         }
 
         hb = BookHeartbeat(
@@ -354,13 +359,13 @@ class TestPositionLayer:
 
     @pytest.mark.asyncio
     async def test_position_within_3x_threshold_no_suspend(self, components):
-        """Position book stale by 5s (< 3× 2.5s = 7.5s) → NOT suspended."""
+        """Position book stale by 10s (< 3× 5s = 15s) → NOT suspended."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 5.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 10.0),
         }
 
         hb = BookHeartbeat(
@@ -394,7 +399,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 5.0),
+            "A": _make_tracker("A", last_update=now - 6.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -423,7 +428,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 5.0),
+            "A": _make_tracker("A", last_update=now - 6.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -442,7 +447,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 5.0, server_time=now - 5.0),
+            "A": _make_tracker("A", last_update=now - 6.0, server_time=now - 6.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -489,8 +494,9 @@ class TestGeneralBehaviour:
         assert hb.is_suspended is False
 
     @pytest.mark.asyncio
-    async def test_cancel_all_called_on_suspend(self, components):
-        """Suspension should cancel all resting orders."""
+    async def test_suspend_does_not_cancel_immediately(self, components):
+        """First suspension should NOT cancel resting orders — they are
+        passive limit orders safe during brief stale periods."""
         guard, event, executor = components
         now = time.time()
 
@@ -499,12 +505,41 @@ class TestGeneralBehaviour:
             side=MagicMock(), price=0.5, size=10.0,
         )
 
-        trackers = {"A": _make_tracker("A", last_update=now - 5.0)}
+        trackers = {"A": _make_tracker("A", last_update=now - 6.0)}
         hb = BookHeartbeat(trackers, guard, event, executor)
 
         # Legacy fallback (no transport) suspends on first check
         await hb._check()
         assert hb.is_suspended is True
+        # Orders should still be alive — NOT cancelled on first suspend
+        assert len(executor.get_open_orders()) == 1
+        assert hb._orders_cancelled is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_sustained_stale(self, components):
+        """Orders should be cancelled after sustained suspension (>10s)."""
+        guard, event, executor = components
+        now = time.time()
+
+        await executor.place_limit_order(
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=MagicMock(), price=0.5, size=10.0,
+        )
+
+        trackers = {"A": _make_tracker("A", last_update=now - 6.0)}
+        hb = BookHeartbeat(trackers, guard, event, executor)
+
+        # First check suspends
+        await hb._check()
+        assert hb.is_suspended is True
+        assert hb._orders_cancelled is False
+
+        # Simulate 11 seconds of sustained suspension
+        hb._suspend_start_time = time.time() - 11.0
+
+        # Next check should escalate and cancel orders
+        await hb._check()
+        assert hb._orders_cancelled is True
 
     def test_stop(self, components):
         guard, event, executor = components

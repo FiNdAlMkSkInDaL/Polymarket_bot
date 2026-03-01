@@ -379,12 +379,14 @@ class PositionManager:
         win_rate = 0.0
         avg_win_cents = 0.0
         avg_loss_cents = 0.0
+        total_trades = 0
         if self._trade_store is not None:
             try:
                 stats = await self._trade_store.get_stats()
                 win_rate = stats.get("win_rate", 0.0)
                 avg_win_cents = stats.get("avg_win_cents", 0.0)
                 avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+                total_trades = stats.get("total_trades", 0)
             except Exception:
                 log.warning("trade_store_stats_unavailable")
 
@@ -403,9 +405,10 @@ class PositionManager:
             max_trade_usd=max_trade,
             book=no_book,
             signal_metadata=signal_metadata,
+            total_trades=total_trades,
         )
 
-        # Reject if Kelly finds no edge
+        # Reject if Kelly finds no edge (cold-start is allowed through)
         if kelly_result.method == "kelly_no_edge":
             log.info(
                 "skip_entry_kelly_no_edge",
@@ -417,6 +420,19 @@ class PositionManager:
 
         # Conservative sizing: min(depth-aware, kelly)
         entry_size = min(sizing.size_shares, kelly_result.size_shares)
+
+        # ── Spread signal sizing multiplier ────────────────────────────────
+        # Spread-opportunity entries are lower conviction; apply the
+        # explicit sizing multiplier set by the spread signal source.
+        meta = signal_metadata or {}
+        spread_mult = float(meta.get("spread_sizing_mult", 1.0))
+        if spread_mult < 1.0:
+            entry_size = max(1.0, round(entry_size * spread_mult, 2))
+            log.info(
+                "spread_sizing_mult_applied",
+                multiplier=spread_mult,
+                new_size=entry_size,
+            )
 
         # ── PCE concentration haircut (Pillar 15) ─────────────────────────
         if self._pce is not None:
@@ -664,16 +680,21 @@ class PositionManager:
         win_rate = 0.0
         avg_win_cents = 0.0
         avg_loss_cents = 0.0
+        total_trades_rpe = 0
         if self._trade_store is not None:
             try:
                 stats = await self._trade_store.get_stats()
                 win_rate = stats.get("win_rate", 0.0)
                 avg_win_cents = stats.get("avg_win_cents", 0.0)
                 avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+                total_trades_rpe = stats.get("total_trades", 0)
             except Exception:
                 log.warning("trade_store_stats_unavailable")
 
         signal_score = min(1.0, divergence_z / 3.0)
+
+        # Half Kelly for RPE entries — lower conviction than panic signals
+        rpe_kelly_fraction = (strat.kelly_fraction * 0.5)
 
         kelly_result = compute_kelly_size(
             signal_score=signal_score,
@@ -684,7 +705,9 @@ class PositionManager:
             entry_price=entry_price,
             max_trade_usd=max_trade,
             book=book,
+            kelly_fraction_mult=rpe_kelly_fraction,
             signal_metadata=rpe_metadata,
+            total_trades=total_trades_rpe,
         )
 
         if kelly_result.method == "kelly_no_edge":

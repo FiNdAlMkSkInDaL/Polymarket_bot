@@ -90,8 +90,8 @@ class StrategyParams:
     """
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 2.0)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 3.0)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.2)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.5)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Take-profit
@@ -102,7 +102,7 @@ class StrategyParams:
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
-    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 40.0)
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 25.0)
 
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 5.0)
@@ -136,7 +136,7 @@ class StrategyParams:
     daily_loss_limit_usd: float = _env_float("DAILY_LOSS_LIMIT_USD", 25.0)
     max_drawdown_cents: float = _env_float("MAX_DRAWDOWN_CENTS", 2500.0)
     stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 8.0)
-    signal_cooldown_minutes: int = _env_int("SIGNAL_COOLDOWN_MINUTES", 15)
+    signal_cooldown_minutes: int = _env_int("SIGNAL_COOLDOWN_MINUTES", 2)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
     # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
@@ -232,9 +232,9 @@ class StrategyParams:
 
     # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
-    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 2500)
-    heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 2)
-    ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 5.0)
+    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 5000)
+    heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 3)
+    ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 10.0)
 
     # ── Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) ───────────
     # MTI — Maker/Taker Imbalance penalty
@@ -256,6 +256,12 @@ class StrategyParams:
     imbalance_threshold: float = _env_float("IMBALANCE_THRESHOLD", 2.0)
     spread_compression_pct: float = _env_float("SPREAD_COMPRESSION_PCT", 0.5)
     min_composite_signal_score: float = _env_float("MIN_COMPOSITE_SIGNAL_SCORE", 0.3)
+
+    # ── Kelly cold-start ──────────────────────────────────────────────────
+    min_kelly_trades: int = _env_int("MIN_KELLY_TRADES", 20)
+
+    # ── Spread-based signal source ────────────────────────────────────────
+    spread_signal_enabled: bool = _env_bool("SPREAD_SIGNAL_ENABLED", True)
 
     # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
@@ -286,13 +292,13 @@ class StrategyParams:
     l2_spread_score_top_n: int = _env_int("L2_SPREAD_SCORE_TOP_N", 3)
 
     # ── Pillar 14: Resolution Probability Engine (RPE) ─────────────────────
-    rpe_shadow_mode: bool = _env_bool("RPE_SHADOW_MODE", True)
+    rpe_shadow_mode: bool = _env_bool("RPE_SHADOW_MODE", False)
     rpe_confidence_threshold: float = _env_float("RPE_CONFIDENCE_THRESHOLD", 0.08)
     rpe_weight: float = _env_float("RPE_WEIGHT", 0.5)
     rpe_crypto_vol_default: float = _env_float("RPE_CRYPTO_VOL_DEFAULT", 0.80)  # 80% annualised
     rpe_bayesian_obs_weight: float = _env_float("RPE_BAYESIAN_OBS_WEIGHT", 5.0)
     rpe_min_confidence: float = _env_float("RPE_MIN_CONFIDENCE", 0.15)
-    rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", False)
+    rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", True)
     rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
 
     # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────
