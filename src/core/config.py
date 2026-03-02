@@ -95,7 +95,7 @@ class StrategyParams:
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.2)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 2.0)
     volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.5)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
@@ -107,7 +107,10 @@ class StrategyParams:
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
-    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 25.0)
+    # Raised from 25→35 to reduce low-quality trade throughput while
+    # keeping the threshold below the docstring-recommended 40 to avoid
+    # starving the paper-trade pipeline during soak testing.
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 35.0)
 
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 5.0)
@@ -240,6 +243,10 @@ class StrategyParams:
     heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 5000)
     heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 3)
     ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 10.0)
+    # L2 uses a separate, longer timeout because low-volume markets
+    # can go minutes without book changes.  Ping/pong keeps the TCP
+    # socket alive; application-level silence is expected.
+    l2_silence_timeout_s: float = _env_float("L2_SILENCE_TIMEOUT_S", 120.0)
 
     # ── Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) ───────────
     # MTI — Maker/Taker Imbalance penalty
@@ -281,8 +288,19 @@ class StrategyParams:
     # Ghost Liquidity Circuit Breaker
     ghost_depth_drop_threshold: float = _env_float("GHOST_DEPTH_DROP_THRESHOLD", 0.50)
     ghost_window_s: float = _env_float("GHOST_WINDOW_S", 2.0)
-    ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 30.0)
+    ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 60.0)
     ghost_check_interval_ms: int = _env_int("GHOST_CHECK_INTERVAL_MS", 500)
+
+    # Paper-mode fill slippage.  In paper mode, fills are simulated by
+    # crossing the limit price.  This adds a configurable adverse
+    # slippage (in cents) to avoid overstating performance.  Set to 0
+    # for the legacy behaviour (fill at exact limit price).
+    paper_slippage_cents: float = _env_float("PAPER_SLIPPAGE_CENTS", 0.5)
+
+    # Minimum ask-side depth (USD) required when discovering markets.
+    # Markets with less than this on the ask side are too illiquid to
+    # enter without excessive impact.
+    min_ask_depth_usd: float = _env_float("MIN_ASK_DEPTH_USD", 100.0)
 
     # Whale cluster detection
     whale_cluster_lookback_blocks: int = _env_int("WHALE_CLUSTER_LOOKBACK_BLOCKS", 10000)
@@ -295,20 +313,41 @@ class StrategyParams:
     l2_delta_buffer_size: int = _env_int("L2_DELTA_BUFFER_SIZE", 500)
     l2_seq_gap_max_retries: int = _env_int("L2_SEQ_GAP_MAX_RETRIES", 3)
     l2_spread_score_top_n: int = _env_int("L2_SPREAD_SCORE_TOP_N", 3)
+    # Maximum acceptable seq-gap rate for an L2 book.  Books that exceed
+    # this rate (after ≥50 deltas) are flagged unreliable and excluded
+    # from signal evaluation until they stabilise.
+    l2_max_seq_gap_rate: float = _env_float("L2_MAX_SEQ_GAP_RATE", 0.02)
 
     # ── Pillar 14: Resolution Probability Engine (RPE) ─────────────────────
+    #
+    # RPE_SHADOW_MODE (default False → live mode):
+    #   When True, RPE signals are evaluated, logged, recorded in the
+    #   calibration tracker, and sent to Telegram (prefixed "SHADOW"),
+    #   but NO positions are opened.  Use this to collect calibration
+    #   data (Brier score, log-loss, direction accuracy) before going
+    #   live.  Set to False to enable real/paper position opening.
     rpe_shadow_mode: bool = _env_bool("RPE_SHADOW_MODE", False)
     rpe_confidence_threshold: float = _env_float("RPE_CONFIDENCE_THRESHOLD", 0.08)
     rpe_weight: float = _env_float("RPE_WEIGHT", 0.5)
     rpe_crypto_vol_default: float = _env_float("RPE_CRYPTO_VOL_DEFAULT", 0.80)  # 80% annualised
     rpe_bayesian_obs_weight: float = _env_float("RPE_BAYESIAN_OBS_WEIGHT", 5.0)
     rpe_min_confidence: float = _env_float("RPE_MIN_CONFIDENCE", 0.15)
-    rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", True)
+    # GenericBayesianModel uses a Beta(2,2)-derived prior that shrinks
+    # every market toward 0.50.  This creates false divergence on any
+    # market not priced at 0.50.  Disabled by default; enable ONLY after
+    # RPECalibrationTracker shows direction_accuracy > 55% on ≥30
+    # resolved signals.
+    rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", False)
     rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
 
     # RPE cooldown / freshness / calibration (Pillar 14 overhaul)
     rpe_cooldown_seconds: int = _env_int("RPE_COOLDOWN_SECONDS", 300)
-    rpe_max_data_age_seconds: int = _env_int("RPE_MAX_DATA_AGE_SECONDS", 30)
+    rpe_max_data_age_seconds: int = _env_int("RPE_MAX_DATA_AGE_SECONDS", 300)
+    # Dedicated stale-market eviction threshold (seconds without any
+    # trade).  Markets exceeding this are evicted or drained.  Separate
+    # from rpe_max_data_age_seconds so the two concerns can be tuned
+    # independently.
+    stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 480.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 40.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)

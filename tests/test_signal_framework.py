@@ -20,11 +20,27 @@ from src.signals.signal_framework import (
 
 
 class FakeSnap:
-    def __init__(self, bids=None, asks=None, best_bid=0.0, best_ask=0.0):
+    def __init__(self, bids=None, asks=None, best_bid=0.0, best_ask=0.0,
+                 bid_depth_usd=None, ask_depth_usd=None):
         self.bids = bids or []
         self.asks = asks or []
         self.best_bid = best_bid
         self.best_ask = best_ask
+        # Allow explicit override; default = price × size (matches L2Snapshot)
+        self._bid_depth_usd = bid_depth_usd
+        self._ask_depth_usd = ask_depth_usd
+
+    @property
+    def bid_depth_usd(self) -> float:
+        if self._bid_depth_usd is not None:
+            return self._bid_depth_usd
+        return sum(price * size for price, size in self.bids)
+
+    @property
+    def ask_depth_usd(self) -> float:
+        if self._ask_depth_usd is not None:
+            return self._ask_depth_usd
+        return sum(price * size for price, size in self.asks)
 
 
 class FakeBook:
@@ -126,6 +142,8 @@ class TestOrderbookImbalance:
         snap = FakeSnap(
             bids=[(0.44, 80)],
             asks=[(0.46, 20)],
+            bid_depth_usd=80.0,
+            ask_depth_usd=20.0,
         )
         book = FakeBook(snap)
 

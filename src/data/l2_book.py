@@ -109,6 +109,14 @@ class L2OrderBook:
         self._state: BookState = BookState.EMPTY
         self._desync_count: int = 0
 
+        # Cumulative desync counter — never reset; used for seq_gap_rate.
+        self._desync_total: int = 0
+
+        # Local delta counter — incremented for every successfully applied
+        # delta regardless of whether the protocol includes a sequence
+        # number.  Exposed via ``delta_count`` for health monitoring.
+        self._delta_count: int = 0
+
         # ── Delta buffer (used during BUFFERING state) ────────────────
         self._delta_buffer: deque[dict] = deque(
             maxlen=settings.strategy.l2_delta_buffer_size
@@ -131,6 +139,21 @@ class L2OrderBook:
         # ── Snapshot fetch lock (prevents concurrent fetches) ─────────
         self._snapshot_lock = asyncio.Lock()
 
+    # ── Task error logging ────────────────────────────────────────────
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """Done-callback for fire-and-forget tasks to surface exceptions."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                "l2_callback_task_error",
+                task_name=task.get_name(),
+                error=repr(exc),
+                exc_info=exc,
+            )
+
     # ═══════════════════════════════════════════════════════════════════════
     #  State machine
     # ═══════════════════════════════════════════════════════════════════════
@@ -141,6 +164,43 @@ class L2OrderBook:
     @property
     def seq(self) -> int:
         return self._seq
+
+    @property
+    def delta_count(self) -> int:
+        """Total deltas applied since last snapshot (monotonically increasing)."""
+        return self._delta_count
+
+    @property
+    def desync_total(self) -> int:
+        """Cumulative desync count since book creation (never reset)."""
+        return self._desync_total
+
+    @property
+    def desync_count(self) -> int:
+        """Current desync count (reset on each successful snapshot)."""
+        return self._desync_count
+
+    @property
+    def seq_gap_rate(self) -> float:
+        """Fraction of deltas that caused desyncs (desync_total / delta_count)."""
+        if self._delta_count <= 0:
+            return 0.0
+        return self._desync_total / self._delta_count
+
+    @property
+    def is_reliable(self) -> bool:
+        """Whether this book can be trusted for signal evaluation.
+
+        Returns True if either:
+          (a) fewer than 50 deltas have been applied (too early to judge), OR
+          (b) ``seq_gap_rate`` is below ``l2_max_seq_gap_rate`` (default 2%).
+
+        A chronically desyncing book (e.g. > 2% gap rate after 50+ deltas)
+        should NOT feed the panic detector, RPE, or sizer.
+        """
+        if self._delta_count < 50:
+            return True  # not enough samples to judge
+        return self.seq_gap_rate < settings.strategy.l2_max_seq_gap_rate
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Snapshot loading (called by L2WebSocket on connect/desync)
@@ -155,6 +215,8 @@ class L2OrderBook:
     async def load_snapshot(
         self,
         snapshot_data: dict,
+        *,
+        trigger: str = "unknown",
     ) -> bool:
         """Apply a REST snapshot and replay any buffered deltas.
 
@@ -163,6 +225,10 @@ class L2OrderBook:
         snapshot_data:
             Dict with keys ``bids``, ``asks`` (lists of ``{price, size}``),
             and optionally ``seq`` / ``sequence`` / ``timestamp``.
+        trigger:
+            Why the snapshot was loaded.  One of ``"initial"``,
+            ``"desync_recovery"``, ``"periodic_server_snapshot"``,
+            or ``"unknown"``.
 
         Returns
         -------
@@ -170,9 +236,9 @@ class L2OrderBook:
             True if the snapshot was loaded and book is now SYNCED.
         """
         async with self._snapshot_lock:
-            return self._apply_snapshot(snapshot_data)
+            return self._apply_snapshot(snapshot_data, trigger=trigger)
 
-    def _apply_snapshot(self, data: dict) -> bool:
+    def _apply_snapshot(self, data: dict, *, trigger: str = "unknown") -> bool:
         """Internal: replace book state from snapshot dict."""
         bids_raw = data.get("bids") or []
         asks_raw = data.get("asks") or []
@@ -233,17 +299,33 @@ class L2OrderBook:
         self._delta_buffer.clear()
         self._state = BookState.SYNCED
         self._desync_count = 0
+        self._delta_count = replayed  # reset local counter to replayed count
+
+        # Clear depth history so a resync doesn't produce an artificial
+        # depth-change spike that triggers false ghost-liquidity alerts.
+        self._depth_history.clear()
 
         # Update BBO + spread score (also records depth if BBO changed)
         self._update_bbo_and_score()
 
+        # Compute seq gap rate: fraction of desyncs relative to deltas processed.
+        # A high value (e.g. > 0.01) indicates unreliable sequencing.
+        seq_gap_rate = (
+            self._desync_total / max(1, self._delta_count)
+            if self._delta_count > 0
+            else 0.0
+        )
+
         log.info(
             "l2_synced",
             asset_id=self.asset_id,
+            trigger=trigger,
             seq=self._seq,
+            delta_count=self._delta_count,
             bids=len(self._bids),
             asks=len(self._asks),
             replayed=replayed,
+            seq_gap_rate=round(seq_gap_rate, 6),
         )
         return True
 
@@ -306,6 +388,7 @@ class L2OrderBook:
 
         # ── Apply the delta ───────────────────────────────────────────
         self._apply_delta_changes(data)
+        self._delta_count += 1
         now = time.time()
         self._last_update = now
         self._extract_server_time(data)
@@ -353,6 +436,7 @@ class L2OrderBook:
         """Move to DESYNCED state, wipe the book, signal for re-snapshot."""
         self._state = BookState.DESYNCED
         self._desync_count += 1
+        self._desync_total += 1
         self._bids.clear()
         self._asks.clear()
         self._spread_score = SpreadScore()
@@ -369,9 +453,14 @@ class L2OrderBook:
             try:
                 result = self._on_desync(self.asset_id)
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    task = asyncio.ensure_future(result)
+                    task.add_done_callback(self._log_task_exception)
             except Exception:
-                pass
+                log.error(
+                    "desync_callback_dispatch_error",
+                    asset_id=self.asset_id,
+                    exc_info=True,
+                )
 
     # ═══════════════════════════════════════════════════════════════════════
     #  BBO tracking & spread score
@@ -428,9 +517,14 @@ class L2OrderBook:
             try:
                 result = self._on_bbo_change(self.asset_id, self._spread_score)
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    task = asyncio.ensure_future(result)
+                    task.add_done_callback(self._log_task_exception)
             except Exception:
-                pass
+                log.error(
+                    "bbo_callback_dispatch_error",
+                    asset_id=self.asset_id,
+                    exc_info=True,
+                )
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Public API — compatible with OrderbookTracker
@@ -548,8 +642,16 @@ class L2OrderBook:
         return round(bid_d + ask_d, 2)
 
     def depth_velocity(self, window_s: float = 2.0) -> float | None:
-        """Compute fractional depth change over *window_s* seconds."""
-        if len(self._depth_history) < 2:
+        """Compute fractional depth change over *window_s* seconds.
+
+        Returns None if there are fewer than 4 depth samples (prevents
+        false readings on freshly-synced or very thin books).
+        """
+        if len(self._depth_history) < 4:
+            return None
+
+        # Only evaluate when book is SYNCED to avoid resync artifacts
+        if self._state != BookState.SYNCED:
             return None
 
         now = time.time()
@@ -602,6 +704,7 @@ class L2OrderBook:
         self._last_server_time = 0.0
         self._depth_history.clear()
         self._desync_count = 0
+        self._delta_count = 0
 
 
 # ── REST snapshot fetcher ──────────────────────────────────────────────────

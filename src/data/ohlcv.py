@@ -116,10 +116,15 @@ class OHLCVAggregator:
         self.rolling_volatility_30m: float = 0.0  # 30-min window for TP rescaling
         self.avg_bar_volume: float = 0.0
 
+        # Most recent trade timestamp — used for data freshness checks.
+        # Unlike bar open_time, this is updated on EVERY trade.
+        self.last_trade_time: float = 0.0
+
     # ── public API ──────────────────────────────────────────────────────────
     def on_trade(self, event: TradeEvent) -> OHLCVBar | None:
         """Ingest a trade tick.  Returns a completed bar if one just closed."""
         now = event.timestamp
+        self.last_trade_time = now
 
         # Initialise bar window on first trade
         if self._bar_start == 0.0:
@@ -134,6 +139,31 @@ class OHLCVAggregator:
 
         self._builder.add(event.price, event.size, now)
         return None
+
+    def flush_stale_bar(self, now: float | None = None) -> OHLCVBar | None:
+        """Close the current bar if it has been open longer than BAR_INTERVAL.
+
+        Call this periodically (e.g. every 30s) to ensure bars close even
+        when no trades arrive.  On low-volume markets this prevents VWAP
+        and σ from becoming frozen indefinitely.  Returns the closed bar,
+        or ``None`` if the bar is still within its interval or empty.
+        """
+        if now is None:
+            now = time.time()
+        if self._bar_start <= 0:
+            return None
+        if not self._builder.prices:
+            # No ticks accumulated — nothing to close.  Advance the
+            # bar window so the next trade starts a fresh interval.
+            if now - self._bar_start >= BAR_INTERVAL:
+                self._bar_start = now
+            return None
+        if now - self._bar_start < BAR_INTERVAL:
+            return None
+
+        closed = self._close_bar()
+        self._bar_start = now
+        return closed
 
     @property
     def current_price(self) -> float:

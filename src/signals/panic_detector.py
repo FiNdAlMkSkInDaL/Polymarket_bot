@@ -67,8 +67,9 @@ class PanicDetector:
     ) -> PanicSignal | None:
         """Check a newly closed YES bar.  Returns a signal or None."""
 
-        # Need enough history to compute stats
-        if len(self.yes_agg.bars) < 3:
+        # Need enough history to compute meaningful stats.
+        # With < 5 bars, rolling VWAP/σ are dominated by noise.
+        if len(self.yes_agg.bars) < 5:
             return None
 
         vwap = self.yes_agg.rolling_vwap
@@ -87,12 +88,26 @@ class PanicDetector:
 
         # ── Gate conditions ────────────────────────────────────────────────
         if zscore < self.z_thresh:
-            log.debug(
-                "spike_check_fail_zscore",
-                market=self.market_id,
-                zscore=round(zscore, 3),
-                threshold=self.z_thresh,
-            )
+            # Near-miss diagnostic: log when z-score is within 25% of
+            # threshold to help calibrate whether the threshold is too
+            # high for actual market volatility.
+            miss_delta = self.z_thresh - zscore
+            if miss_delta <= self.z_thresh * 0.25:
+                log.info(
+                    "zscore_near_miss",
+                    market=self.market_id,
+                    zscore=round(zscore, 3),
+                    threshold=self.z_thresh,
+                    gap=round(miss_delta, 3),
+                    v_ratio=round(v_ratio, 2),
+                )
+            else:
+                log.debug(
+                    "spike_check_fail_zscore",
+                    market=self.market_id,
+                    zscore=round(zscore, 3),
+                    threshold=self.z_thresh,
+                )
             return None
 
         if v_ratio < self.v_thresh:

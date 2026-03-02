@@ -300,7 +300,7 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     "alpha_default": ("suggest_float", 0.25, 0.75),
     "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
     # Edge quality
-    "min_edge_score": ("suggest_float", 20.0, 60.0),
+    "min_edge_score": ("suggest_float", 30.0, 60.0),
     # RPE (Pillar 14)
     "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
     "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),

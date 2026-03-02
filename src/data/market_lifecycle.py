@@ -441,6 +441,66 @@ class MarketLifecycleManager:
         """Is this market in emergency drain?"""
         return condition_id in self.emergency
 
+    # ────────────────────── Stale-trade eviction ──────────────────────────
+
+    def check_stale_markets(
+        self,
+        yes_aggs: dict[str, "OHLCVAggregator"],
+        open_position_markets: set[str],
+        *,
+        stale_threshold_s: float = 900.0,
+    ) -> list[str]:
+        """Evict active markets with no trades for ``stale_threshold_s`` seconds.
+
+        Markets with open positions are drained instead of evicted so the
+        position manager can close them gracefully.
+
+        Parameters
+        ----------
+        yes_aggs:
+            Mapping of ``yes_token_id → OHLCVAggregator``.
+        open_position_markets:
+            Set of ``condition_id``s that have open positions.
+        stale_threshold_s:
+            Duration without trades before a market is considered dead.
+            Default 900s (15 minutes).
+
+        Returns
+        -------
+        list[str]
+            Condition IDs that were evicted or moved to draining.
+        """
+        evicted: list[str] = []
+        now = time.time()
+
+        for cid in list(self.active):
+            am = self.active[cid]
+            agg = yes_aggs.get(am.info.yes_token_id)
+            if not agg:
+                continue
+
+            # If we have never received a trade at all, use discovery time
+            last = agg.last_trade_time
+            if last <= 0:
+                continue  # no trades yet — too early to judge
+
+            age = now - last
+            if age > stale_threshold_s:
+                log.info(
+                    "stale_trade_eviction",
+                    condition_id=cid,
+                    last_trade_age_s=round(age, 1),
+                    threshold_s=stale_threshold_s,
+                    question=am.info.question[:60],
+                )
+                if cid in open_position_markets:
+                    self._move_to_draining(cid, reason="stale_trades")
+                else:
+                    self._evict(cid)
+                evicted.append(cid)
+
+        return evicted
+
     # ────────────────────────── Internals ──────────────────────────────────
 
     def _promote_ready(

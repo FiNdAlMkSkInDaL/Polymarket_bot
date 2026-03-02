@@ -24,6 +24,20 @@ from src.data.types import Level as _Level
 log = get_logger(__name__)
 
 
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Done-callback for fire-and-forget tasks to surface exceptions."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(
+            "orderbook_callback_task_error",
+            task_name=task.get_name(),
+            error=repr(exc),
+            exc_info=exc,
+        )
+
+
 @dataclass
 class OrderbookSnapshot:
     """Point-in-time L2 orderbook summary for one asset."""
@@ -232,9 +246,14 @@ class OrderbookTracker:
                 snap = self.snapshot()
                 result = self._on_bbo_change(self.asset_id, snap)
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    task = asyncio.ensure_future(result)
+                    task.add_done_callback(_log_task_exception)
             except Exception:
-                pass
+                log.error(
+                    "bbo_callback_dispatch_error",
+                    asset_id=self.asset_id,
+                    exc_info=True,
+                )
 
     # ── depth tracking for Ghost Liquidity detection ─────────────────────
     def _record_depth(self) -> None:

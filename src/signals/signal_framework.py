@@ -99,8 +99,8 @@ class OrderbookImbalanceSignal(SignalGenerator):
             return None
 
         snap = no_book.snapshot()
-        bid_depth = sum(qty for _, qty in snap.bids[:10]) if snap.bids else 0.0
-        ask_depth = sum(qty for _, qty in snap.asks[:10]) if snap.asks else 0.0
+        bid_depth = snap.bid_depth_usd
+        ask_depth = snap.ask_depth_usd
 
         if ask_depth <= 0 or bid_depth <= 0:
             return None

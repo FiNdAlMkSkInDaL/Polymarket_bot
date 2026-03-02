@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -356,3 +356,53 @@ class TestGhostLiquidity:
         tracked = lm.get_all_tracked()
         tracked_cids = [mi.condition_id for mi in tracked]
         assert "CID_TRK" in tracked_cids
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stale eviction boundary tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestStaleEvictionBoundary:
+    """Verify that stale_market_eviction_s (480s) correctly gates eviction."""
+
+    def _make_agg(self, last_trade_time: float) -> MagicMock:
+        agg = MagicMock()
+        agg.last_trade_time = last_trade_time
+        return agg
+
+    def test_over_threshold_evicted(self):
+        """Market with last trade 490s ago → evicted at 480s threshold."""
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_STALE1")
+        lm.active["CID_STALE1"] = ActiveMarket(info=m, low_score_cycles=0)
+
+        now = time.time()
+        agg = self._make_agg(last_trade_time=now - 490)
+        yes_aggs = {m.yes_token_id: agg}
+
+        evicted = lm.check_stale_markets(
+            yes_aggs=yes_aggs,
+            open_position_markets=set(),
+            stale_threshold_s=480.0,
+        )
+        assert "CID_STALE1" in evicted
+        assert "CID_STALE1" not in lm.active
+
+    def test_under_threshold_not_evicted(self):
+        """Market with last trade 470s ago → NOT evicted at 480s threshold."""
+        lm = MarketLifecycleManager()
+        m = _high_score_market("CID_FRESH1")
+        lm.active["CID_FRESH1"] = ActiveMarket(info=m, low_score_cycles=0)
+
+        now = time.time()
+        agg = self._make_agg(last_trade_time=now - 470)
+        yes_aggs = {m.yes_token_id: agg}
+
+        evicted = lm.check_stale_markets(
+            yes_aggs=yes_aggs,
+            open_position_markets=set(),
+            stale_threshold_s=480.0,
+        )
+        assert evicted == []
+        assert "CID_FRESH1" in lm.active

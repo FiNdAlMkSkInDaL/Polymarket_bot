@@ -235,9 +235,17 @@ class OrderExecutor:
 
     # ── Paper-mode fill simulation ──────────────────────────────────────────
     def check_paper_fill(self, asset_id: str, market_price: float) -> list[Order]:
-        """Simulate fills for paper orders when the market crosses."""
+        """Simulate fills for paper orders when the market crosses.
+
+        Applies configurable adverse slippage (``paper_slippage_cents``)
+        to avoid overstating paper-mode performance.  Buy orders fill at
+        ``limit + slippage`` and sell orders at ``limit - slippage``,
+        clamped to [0.01, 0.99].
+        """
         if not self.paper_mode:
             return []
+
+        slippage = settings.strategy.paper_slippage_cents / 100.0  # cents → dollars
 
         filled: list[Order] = []
         for order in self._orders.values():
@@ -253,15 +261,23 @@ class OrderExecutor:
                 should_fill = True
 
             if should_fill:
+                # Apply adverse slippage
+                if order.side == OrderSide.BUY:
+                    fill_price = min(0.99, order.price + slippage)
+                else:
+                    fill_price = max(0.01, order.price - slippage)
+
                 order.status = OrderStatus.FILLED
                 order.filled_size = order.size
-                order.filled_avg_price = order.price
+                order.filled_avg_price = fill_price
                 order.updated_at = time.time()
                 log.info(
                     "paper_fill",
                     order_id=order.order_id,
                     side=order.side.value,
-                    price=order.price,
+                    limit_price=order.price,
+                    fill_price=round(fill_price, 4),
+                    slippage_cents=round(slippage * 100, 1),
                     size=order.size,
                 )
                 filled.append(order)

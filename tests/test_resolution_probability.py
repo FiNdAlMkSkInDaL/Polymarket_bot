@@ -854,10 +854,10 @@ class TestGenericModelGate:
         assert result is not None
         assert result.metadata["model_name"] == "crypto_lognormal"
 
-    def test_default_generic_enabled_is_true(self) -> None:
-        """Default config has rpe_generic_enabled=True (activated with RPE)."""
+    def test_default_generic_enabled_is_false(self) -> None:
+        """Default config has rpe_generic_enabled=False (safe until calibrated)."""
         from src.core.config import settings
-        assert settings.strategy.rpe_generic_enabled is True
+        assert settings.strategy.rpe_generic_enabled is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1382,7 +1382,7 @@ class TestConfigAdditions:
 
     def test_rpe_max_data_age_seconds(self) -> None:
         from src.core.config import settings
-        assert settings.strategy.rpe_max_data_age_seconds == 30
+        assert settings.strategy.rpe_max_data_age_seconds == 300
 
     def test_rpe_prior_k(self) -> None:
         from src.core.config import settings

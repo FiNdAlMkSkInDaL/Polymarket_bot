@@ -710,6 +710,17 @@ class TestSearchSpace:
                 f"{p} should have log=True"
             )
 
+    def test_min_edge_score_lower_bound(self):
+        """Lower bound of min_edge_score must be >= 30 to prevent regression."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        spec = SEARCH_SPACE["min_edge_score"]
+        lower_bound = spec[1]
+        assert lower_bound >= 30.0, (
+            f"min_edge_score lower bound {lower_bound} is below 30.0 — "
+            "risk of WFO recommending a value that undoes quality-gate tightening"
+        )
+
     def test_log_scale_kwarg_passed(self):
         """Verify log=True is passed to suggest_float for log-scale params."""
         from src.backtest.wfo_optimizer import _suggest_params

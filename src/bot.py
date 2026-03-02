@@ -32,7 +32,7 @@ from src.data.market_scorer import compute_score
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import L2OrderBookAdapter, OrderbookTracker
 from src.data.websocket_client import MarketWebSocket, TradeEvent
-from src.data.l2_book import L2OrderBook
+from src.data.l2_book import BookState, L2OrderBook
 from src.data.l2_websocket import L2WebSocket
 from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
@@ -66,6 +66,38 @@ except ImportError:
     MarketDataRecorder = None  # type: ignore[misc,assignment]
 
 log = get_logger(__name__)
+
+
+def _safe_task_done_callback(task: asyncio.Task) -> None:
+    """Callback attached to fire-and-forget tasks to log unhandled exceptions.
+
+    Without this, exceptions in tasks created via ``asyncio.ensure_future``
+    or ``asyncio.create_task`` are silently dropped until the task is GC'd,
+    producing the infamous *"Task exception was never retrieved"* message.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(
+            "unhandled_task_exception",
+            task_name=task.get_name(),
+            error=repr(exc),
+            exc_info=exc,
+        )
+
+
+def _safe_fire_and_forget(coro, *, name: str | None = None) -> asyncio.Task:
+    """Schedule a coroutine as a fire-and-forget task with error logging.
+
+    Replaces bare ``asyncio.ensure_future`` calls throughout the bot to
+    ensure that exceptions are always captured and logged.
+    """
+    task = asyncio.ensure_future(coro)
+    if name:
+        task.set_name(name)
+    task.add_done_callback(_safe_task_done_callback)
+    return task
 
 
 class TradingBot:
@@ -365,6 +397,8 @@ class TradingBot:
             asyncio.create_task(self._health_reporter(), name="health_reporter"),
             asyncio.create_task(self._rpe_crypto_retrigger_loop(), name="rpe_retrigger"),
             asyncio.create_task(self._pce_refresh_loop(), name="pce_refresh"),
+            asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
+            asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
 
         # Launch data recorder if enabled
@@ -380,8 +414,11 @@ class TradingBot:
                 asyncio.create_task(self._l2_ws.start(), name="l2_ws")
             )
 
-        # Handle graceful shutdown via SIGINT / SIGTERM
+        # ── Global asyncio exception handler (last line of defence) ─────
         loop = asyncio.get_running_loop()
+        loop.set_exception_handler(self._asyncio_exception_handler)
+
+        # Handle graceful shutdown via SIGINT / SIGTERM
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
@@ -402,6 +439,25 @@ class TradingBot:
             await asyncio.gather(*self._tasks, return_exceptions=False)
         except asyncio.CancelledError:
             pass
+
+    # ── Global asyncio exception handler ────────────────────────────────────
+    def _asyncio_exception_handler(self, loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        """Catch-all for unhandled exceptions in asyncio tasks/callbacks.
+
+        Prevents the silent *"Task exception was never retrieved"* problem
+        by logging with full context instead of relying on GC finalisation.
+        """
+        exc = context.get("exception")
+        msg = context.get("message", "Unhandled exception in event loop")
+        task = context.get("future")
+        task_name = task.get_name() if task and hasattr(task, "get_name") else str(task)
+        log.error(
+            "asyncio_unhandled_exception",
+            message=msg,
+            task=task_name,
+            error=repr(exc) if exc else "unknown",
+            exc_info=exc,
+        )
 
     # ── Market wiring / unwiring ───────────────────────────────────────────
     def _wire_market(self, m: MarketInfo) -> None:
@@ -734,7 +790,23 @@ class TradingBot:
         Logs the live spread score for monitoring and drives the
         event-driven stop-loss engine.  Also evaluates the spread-based
         signal path (Problem 3) on NO-token BBO ticks.
+
+        Fully exception-guarded: any failure is logged and contained
+        so that a single bad tick cannot kill the callback pipeline.
         """
+        try:
+            await self._on_l2_bbo_change_inner(asset_id, score)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error(
+                "l2_bbo_callback_error",
+                asset_id=asset_id,
+                exc_info=True,
+            )
+
+    async def _on_l2_bbo_change_inner(self, asset_id: str, score: Any) -> None:
+        """Inner implementation — called by the guarded wrapper."""
         log.debug(
             "l2_bbo_update",
             asset_id=asset_id,
@@ -879,6 +951,7 @@ class TradingBot:
                     self._entry_chaser_flow(pos, no_book),
                     name=f"chaser_entry_{pos.id}",
                 )
+                chaser_task.add_done_callback(_safe_task_done_callback)
                 pos.entry_chaser_task = chaser_task
 
     def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
@@ -886,15 +959,24 @@ class TradingBot:
 
         Schedules an async stop-loss evaluation for this asset.
         """
-        asyncio.ensure_future(self._stop_loss_monitor.on_bbo_update(asset_id))
+        _safe_fire_and_forget(
+            self._stop_loss_monitor.on_bbo_update(asset_id),
+            name=f"stop_loss_bbo_{asset_id[:12]}",
+        )
 
     async def _on_l2_desync(self, asset_id: str) -> None:
         """Callback from L2OrderBook on sequence gap detection.
 
         Routes to the L2WebSocket for snapshot re-fetch.
+        Exception-guarded so a desync error cannot kill the callback.
         """
-        if self._l2_ws is not None:
-            await self._l2_ws._on_book_desync(asset_id)
+        try:
+            if self._l2_ws is not None:
+                await self._l2_ws._on_book_desync(asset_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("l2_desync_callback_error", asset_id=asset_id, exc_info=True)
 
     async def _on_yes_bar_closed(self, yes_asset_id: str, bar: Any) -> None:
         """A 1-min YES bar just closed — evaluate the panic detector."""
@@ -913,6 +995,19 @@ class TradingBot:
 
         # Signal cooldown check
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            return
+
+        # ── L2 book reliability gate ───────────────────────────────
+        # Chronically desyncing books produce unreliable BBO/depth data.
+        # Skip signal evaluation but do NOT evict — let recovery continue.
+        l2_yes = self._l2_books.get(market_info.yes_token_id)
+        if l2_yes is not None and not l2_yes.is_reliable:
+            log.info(
+                "l2_book_unreliable",
+                asset_id=market_info.yes_token_id,
+                seq_gap_rate=round(l2_yes.seq_gap_rate, 4),
+                delta_count=l2_yes.delta_count,
+            )
             return
 
         detector = self._detectors.get(market_info.condition_id)
@@ -961,11 +1056,21 @@ class TradingBot:
         rpe = self._rpe
         if rpe and price_in_band:
             # Deliverable D: Data freshness gate
+            # Use last_trade_time (updated on every trade) instead of
+            # bars[-1].open_time (only updated when a bar closes).
+            # This prevents false stale-data rejections between bars
+            # on healthy markets with moderate trade frequency.
             yes_agg_rpe = self._yes_aggs.get(market_info.yes_token_id)
             max_age = settings.strategy.rpe_max_data_age_seconds
-            if yes_agg_rpe and yes_agg_rpe.bars:
-                last_bar_ts = yes_agg_rpe.bars[-1].open_time
-                data_age = time.time() - last_bar_ts
+            if yes_agg_rpe:
+                if yes_agg_rpe.last_trade_time <= 0:
+                    # No trades received at all — genuinely stale
+                    log.info(
+                        "rpe_no_trade_data",
+                        market=market_info.condition_id,
+                    )
+                    return
+                data_age = time.time() - yes_agg_rpe.last_trade_time
                 if data_age > max_age:
                     log.info(
                         "rpe_stale_data",
@@ -1008,6 +1113,18 @@ class TradingBot:
         if no_book and no_book.has_data:
             book_depth = no_book.book_depth_ratio
 
+            # ── Minimum ask-depth gate ─────────────────────────────────
+            snap = no_book.snapshot()
+            min_depth = settings.strategy.min_ask_depth_usd
+            if snap.ask_depth_usd < min_depth:
+                log.info(
+                    "panic_rejected_thin_asks",
+                    market=market.condition_id,
+                    ask_depth_usd=round(snap.ask_depth_usd, 2),
+                    min_required=min_depth,
+                )
+                return
+
         # Fetch fee rates for this token
         # Determine if market is fee-enabled based on category
         fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
@@ -1030,6 +1147,7 @@ class TradingBot:
                     self._entry_chaser_flow(pos, no_book),
                     name=f"chaser_entry_{pos.id}",
                 )
+                chaser_task.add_done_callback(_safe_task_done_callback)
                 pos.entry_chaser_task = chaser_task
             # else: order already placed directly by PositionManager
 
@@ -1046,7 +1164,25 @@ class TradingBot:
         *,
         current_price: float | None = None,
     ) -> None:
-        """Handle an RPE divergence signal — may be shadow or live."""
+        """Handle an RPE divergence signal — may be shadow or live.
+
+        Shadow mode control flow
+        ────────────────────────
+        RPE shadow mode is controlled by the ``RPE_SHADOW_MODE`` env var
+        (default ``False`` → **live** mode).  When ``rpe_shadow_mode=True``:
+
+        1. The RPE still evaluates markets normally and fires signals.
+        2. Signals pass through EQS filtering and cooldown checks.
+        3. Signals are recorded in ``RPECalibrationTracker`` with
+           ``shadow=True`` for offline Brier/log-loss scoring.
+        4. A Telegram notification is sent (prefixed "👻 SHADOW").
+        5. **No position is opened** — the method returns early at the
+           ``if shadow: return`` gate below the notification block.
+
+        This allows the operator to collect calibration data on RPE
+        accuracy without risking real (or paper) capital, then switch
+        to live by setting ``RPE_SHADOW_MODE=false``.
+        """
         meta = signal.metadata
         direction = meta.get("direction", "buy_no")
         model_prob = meta.get("model_probability", 0.5)
@@ -1245,6 +1381,20 @@ class TradingBot:
         if entry_price <= 0:
             return
 
+        # ── Minimum ask-depth gate (RPE path) ────────────────────────
+        if book and book.has_data:
+            snap_depth = book.snapshot()
+            min_depth = settings.strategy.min_ask_depth_usd
+            if snap_depth.ask_depth_usd < min_depth:
+                log.info(
+                    "rpe_rejected_thin_asks",
+                    market=market.condition_id,
+                    ask_depth_usd=round(snap_depth.ask_depth_usd, 2),
+                    min_required=min_depth,
+                    direction=direction,
+                )
+                return
+
         pos = await self.positions.open_rpe_position(
             market_id=market.condition_id,
             yes_asset_id=market.yes_token_id,
@@ -1266,6 +1416,7 @@ class TradingBot:
                     self._entry_chaser_flow(pos, book),
                     name=f"chaser_entry_{pos.id}",
                 )
+                chaser_task.add_done_callback(_safe_task_done_callback)
                 pos.entry_chaser_task = chaser_task
 
     async def _rpe_crypto_retrigger_loop(self) -> None:
@@ -1328,10 +1479,25 @@ class TradingBot:
                     ):
                         continue
 
+                    # L2 book reliability gate (retrigger path)
+                    l2_yes = self._l2_books.get(m.yes_token_id)
+                    if l2_yes is not None and not l2_yes.is_reliable:
+                        log.info(
+                            "l2_book_unreliable",
+                            asset_id=m.yes_token_id,
+                            seq_gap_rate=round(l2_yes.seq_gap_rate, 4),
+                            delta_count=l2_yes.delta_count,
+                            path="retrigger",
+                        )
+                        continue
+
                     # Deliverable D: Data freshness gate (retrigger path)
+                    # Use last_trade_time for accurate freshness.
                     max_age = settings.strategy.rpe_max_data_age_seconds
-                    if yes_agg and yes_agg.bars:
-                        data_age = time.time() - yes_agg.bars[-1].open_time
+                    if yes_agg:
+                        if yes_agg.last_trade_time <= 0:
+                            continue
+                        data_age = time.time() - yes_agg.last_trade_time
                         if data_age > max_age:
                             log.info(
                                 "rpe_stale_data",
@@ -1367,43 +1533,64 @@ class TradingBot:
             for pos in self.positions.get_open_positions():
                 if pos.entry_order and pos.entry_order.order_id == order.order_id:
                     # Entry filled — schedule exit placement
-                    asyncio.create_task(self._handle_entry_fill(pos))
+                    _safe_fire_and_forget(
+                        self._handle_entry_fill(pos),
+                        name=f"entry_fill_{pos.id}",
+                    )
                 elif pos.exit_order and pos.exit_order.order_id == order.order_id:
                     # Exit filled — close position
                     self._handle_exit_fill(pos)
 
     async def _handle_entry_fill(self, pos: Any) -> None:
-        """Entry order filled — compute target and place exit."""
-        await self.positions.on_entry_filled(pos)
-        await self.telegram.notify_entry(
-            pos.id,
-            pos.market_id,
-            pos.entry_price,
-            pos.entry_size,
-            pos.target_price,
-        )
-        # Launch exit chaser (Pillar 1)
-        # Use trade_asset_id to route to the correct book —
-        # panic positions trade NO, RPE positions may trade YES or NO.
-        exit_asset = pos.trade_asset_id or pos.no_asset_id
-        exit_book = self._book_trackers.get(exit_asset)
-        if exit_book and exit_book.has_data:
-            exit_task = asyncio.create_task(
-                self._exit_chaser_flow(pos, exit_book),
-                name=f"chaser_exit_{pos.id}",
+        """Entry order filled — compute target and place exit.
+
+        Exception-guarded: failures are logged but do not propagate
+        (the task was launched via fire-and-forget).
+        """
+        try:
+            await self.positions.on_entry_filled(pos)
+            await self.telegram.notify_entry(
+                pos.id,
+                pos.market_id,
+                pos.entry_price,
+                pos.entry_size,
+                pos.target_price,
             )
-            pos.exit_chaser_task = exit_task
+            # Launch exit chaser (Pillar 1)
+            # Use trade_asset_id to route to the correct book —
+            # panic positions trade NO, RPE positions may trade YES or NO.
+            exit_asset = pos.trade_asset_id or pos.no_asset_id
+            exit_book = self._book_trackers.get(exit_asset)
+            if exit_book and exit_book.has_data:
+                exit_task = asyncio.create_task(
+                    self._exit_chaser_flow(pos, exit_book),
+                    name=f"chaser_exit_{pos.id}",
+                )
+                exit_task.add_done_callback(_safe_task_done_callback)
+                pos.exit_chaser_task = exit_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("handle_entry_fill_error", pos_id=pos.id, exc_info=True)
 
     def _handle_exit_fill(self, pos: Any) -> None:
         """Exit order filled — close position and record."""
         self.positions.on_exit_filled(pos, reason="target")
-        asyncio.create_task(self._record_and_notify_exit(pos))
+        _safe_fire_and_forget(
+            self._record_and_notify_exit(pos),
+            name=f"record_exit_{pos.id}",
+        )
 
     async def _record_and_notify_exit(self, pos: Any) -> None:
-        await self.trade_store.record(pos)
-        await self.telegram.notify_exit(
-            pos.id, pos.entry_price, pos.exit_price, pos.pnl_cents, pos.exit_reason
-        )
+        try:
+            await self.trade_store.record(pos)
+            await self.telegram.notify_exit(
+                pos.id, pos.entry_price, pos.exit_price, pos.pnl_cents, pos.exit_reason
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("record_notify_exit_error", pos_id=pos.id, exc_info=True)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Pillar 1 — Passive-aggressive chaser flows
@@ -1593,6 +1780,7 @@ class TradingBot:
                             self._exit_chaser_flow(pos, exit_book),
                             name=f"chaser_exit_rescale_{pos.id}",
                         )
+                        exit_task.add_done_callback(_safe_task_done_callback)
                         pos.exit_chaser_task = exit_task
                     else:
                         exit_order = await self.executor.place_limit_order(
@@ -1644,10 +1832,21 @@ class TradingBot:
         """Fast loop (500ms): detect ghost liquidity and trigger emergency drain.
 
         Ghost = depth drops > 50% in < 2s WITHOUT matching trade volume.
+
+        Safety guards to prevent false positives:
+        - Require book in SYNCED state (no resync artifacts)
+        - Require minimum absolute depth ($50) before evaluating
+        - Per-market cooldown of 60s between ghost triggers
+        - Depth velocity requires >=4 history samples
         """
         interval_s = settings.strategy.ghost_check_interval_ms / 1000.0
         ghost_window = settings.strategy.ghost_window_s
         ghost_threshold = -settings.strategy.ghost_depth_drop_threshold  # e.g. -0.50
+        # Minimum absolute depth to evaluate ghost detection (very thin
+        # books naturally fluctuate dramatically)
+        min_depth_for_ghost = 50.0  # $50 USD
+        ghost_cooldown_s = 60.0  # seconds between ghost triggers per market
+        ghost_cooldowns: dict[str, float] = {}  # cid -> last trigger time
 
         while self._running:
             try:
@@ -1659,10 +1858,21 @@ class TradingBot:
                     if not am:
                         continue
 
+                    # Per-market cooldown
+                    last_ghost = ghost_cooldowns.get(cid, 0.0)
+                    if time.time() - last_ghost < ghost_cooldown_s:
+                        continue
+
                     # Check both YES and NO book trackers
                     for token_id in (am.info.yes_token_id, am.info.no_token_id):
                         tracker = self._book_trackers.get(token_id)
                         if not tracker or not tracker.has_data:
+                            continue
+
+                        # Require minimum absolute depth to avoid false
+                        # positives on naturally thin books
+                        current_depth = tracker.current_total_depth()
+                        if current_depth < min_depth_for_ghost:
                             continue
 
                         dv = tracker.depth_velocity(ghost_window)
@@ -1683,6 +1893,7 @@ class TradingBot:
                             else:
                                 baseline_pre = baseline / (1.0 + dv)
 
+                            ghost_cooldowns[cid] = time.time()
                             self.lifecycle.emergency_drain(cid, baseline_pre)
 
                             # Force-exit any open positions in this market
@@ -1699,8 +1910,14 @@ class TradingBot:
                             log.warning(
                                 "ghost_liquidity_detected",
                                 condition_id=cid,
+                                token_id=token_id,
                                 depth_velocity=round(dv, 3),
                                 baseline_depth=round(baseline_pre, 2),
+                                l2_state=(
+                                    self._l2_books[token_id].state.value
+                                    if token_id in self._l2_books
+                                    else "n/a"
+                                ),
                             )
                             await self.telegram.send(
                                 f"👻 <b>Ghost Liquidity</b> detected!\n"
@@ -1756,6 +1973,37 @@ class TradingBot:
                 log.error("timeout_loop_error", error=str(exc))
             await asyncio.sleep(10)
 
+    async def _stale_bar_flush_loop(self) -> None:
+        """Every 30 seconds, flush stale OHLCV bars on all aggregators.
+
+        On low-volume markets, minutes can pass without a single trade.
+        Without this loop, bars only close when the next trade arrives,
+        causing rolling VWAP and σ to freeze — which in turn makes the
+        panic detector and RPE evaluate against stale statistics.
+
+        This loop calls ``flush_stale_bar()`` on every aggregator,
+        closing any bar that has been open longer than BAR_INTERVAL
+        even if no new trade has arrived.
+        """
+        while self._running:
+            await asyncio.sleep(30)
+            try:
+                now = time.time()
+                for yes_agg in self._yes_aggs.values():
+                    bar = yes_agg.flush_stale_bar(now)
+                    if bar:
+                        # Drive the same signal evaluation as a normal bar close
+                        asset_id = yes_agg.asset_id
+                        latency_state = self.latency_guard.check(now)
+                        if latency_state != LatencyState.BLOCKED:
+                            await self._on_yes_bar_closed(asset_id, bar)
+                for no_agg in self._no_aggs.values():
+                    no_agg.flush_stale_bar(now)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("stale_bar_flush_error", error=str(exc))
+
     async def _stats_loop(self) -> None:
         """Every 15 minutes, log and broadcast aggregate stats."""
         while self._running:
@@ -1780,10 +2028,56 @@ class TradingBot:
                         await self.telegram.send(
                             "🟢 <b>Paper-trading criteria MET</b> — ready for live deployment!"
                         )
+
+                # ── RPE calibration gate check ────────────────────────
+                cal_stats = self._rpe_calibration.calibration_summary()
+                resolved_n = cal_stats.get("resolved", 0)
+
+                if settings.strategy.rpe_generic_enabled and resolved_n < 30:
+                    log.warning(
+                        "rpe_generic_insufficient_calibration",
+                        resolved=resolved_n,
+                        required=30,
+                    )
+
+                if (
+                    self.paper_mode
+                    and resolved_n >= 30
+                    and cal_stats.get("direction_accuracy", 0) >= 0.55
+                ):
+                    await self.telegram.send(
+                        "🎯 <b>Generic RPE calibrated</b>\n"
+                        f"Direction accuracy: {cal_stats['direction_accuracy']:.1%} "
+                        f"on {resolved_n} resolved signals.\n"
+                        "Consider enabling <code>RPE_GENERIC_ENABLED=true</code>."
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("stats_loop_error", error=str(exc))
+
+    async def _paper_summary_loop(self) -> None:
+        """Every 30 minutes, send a formatted paper trade summary to Telegram.
+
+        Gives the operator immediate visibility into paper performance
+        without having to inspect the DB or raw log entries.
+        """
+        interval = 1800  # 30 minutes
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                stats = await self.trade_store.get_stats()
+                uptime_h = (time.monotonic() - self._start_time) / 3600.0
+                await self.telegram.notify_paper_summary(stats, uptime_h)
+                log.info(
+                    "paper_summary_sent",
+                    total_trades=stats.get("total_trades", 0),
+                    uptime_h=round(uptime_h, 1),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("paper_summary_error", error=str(exc))
 
     async def _health_reporter(self) -> None:
         """Every 60 seconds, write ``system_health.json`` to the log dir.
@@ -1846,6 +2140,28 @@ class TradingBot:
                     "active_markets": len(self.lifecycle.active),
                     "observing_markets": len(self.lifecycle.observing),
                 }
+
+                # Aggregate L2 book health metrics across all tracked books
+                l2_total_deltas = 0
+                l2_total_desyncs = 0
+                l2_synced_count = 0
+                for book in self._l2_books.values():
+                    l2_total_deltas += book.delta_count
+                    l2_total_desyncs += book.desync_total
+                    if book.state == BookState.SYNCED:
+                        l2_synced_count += 1
+
+                health["l2_total_deltas"] = l2_total_deltas
+                health["l2_total_desyncs"] = l2_total_desyncs
+                health["l2_synced_books"] = l2_synced_count
+                health["l2_total_books"] = len(self._l2_books)
+                health["l2_seq_gap_rate"] = round(
+                    l2_total_desyncs / max(1, l2_total_deltas), 6
+                )
+                health["l2_unreliable_books"] = sum(
+                    1 for book in self._l2_books.values()
+                    if not book.is_reliable
+                )
 
                 # Atomic write: offload blocking file I/O to a thread
                 await asyncio.to_thread(
@@ -1937,6 +2253,49 @@ class TradingBot:
                     await self._ws.add_assets(new_asset_ids)
                 if self._l2_ws and new_l2_books:
                     await self._l2_ws.add_assets(new_l2_books)
+
+                # ── Stale trade eviction ──────────────────────────────
+                stale_evicted = self.lifecycle.check_stale_markets(
+                    yes_aggs=self._yes_aggs,
+                    open_position_markets=open_markets,
+                    stale_threshold_s=settings.strategy.stale_market_eviction_s,
+                )
+                for cid in stale_evicted:
+                    for m in list(self._markets):
+                        if m.condition_id == cid:
+                            if self._ws:
+                                await self._ws.remove_assets(
+                                    [m.yes_token_id, m.no_token_id]
+                                )
+                            if self._l2_ws:
+                                await self._l2_ws.remove_assets(
+                                    [m.yes_token_id, m.no_token_id]
+                                )
+                            self._unwire_market(m)
+                            break
+
+                # ── Per-market health log ─────────────────────────────
+                for cid, am in self.lifecycle.active.items():
+                    tid = am.info.yes_token_id
+                    agg = self._yes_aggs.get(tid)
+                    bt = self._book_trackers.get(tid)
+                    tpm = self._trade_counts.get(tid, 0.0)
+                    last_trade_age = (
+                        round(time.time() - agg.last_trade_time, 1)
+                        if agg and agg.last_trade_time > 0
+                        else -1
+                    )
+                    bars = len(agg.bars) if agg else 0
+                    spread = bt.spread_cents if bt and bt.has_data else -1
+                    log.info(
+                        "market_health",
+                        condition_id=cid,
+                        score=round(am.score.total, 1),
+                        trades_per_min=round(tpm, 2),
+                        last_trade_age_s=last_trade_age,
+                        bars=bars,
+                        spread_cents=spread,
+                    )
 
                 # Update _markets list with promoted markets
                 for cid, am in self.lifecycle.active.items():

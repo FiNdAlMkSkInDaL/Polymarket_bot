@@ -1219,3 +1219,43 @@ class TestServerTime:
 
         snap = book.snapshot()
         assert snap.server_time < 1e12
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P — is_reliable property
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestIsReliable:
+    """Verify ``is_reliable`` correctly gates on seq_gap_rate threshold."""
+
+    def _book_with_counters(
+        self, delta_count: int, desync_total: int
+    ) -> L2OrderBook:
+        book = L2OrderBook("ASSET_R", max_levels=50)
+        book._delta_count = delta_count
+        book._desync_total = desync_total
+        return book
+
+    def test_high_gap_rate_unreliable(self) -> None:
+        """100 deltas + 3 desyncs → 3% > 2% threshold → unreliable."""
+        book = self._book_with_counters(delta_count=100, desync_total=3)
+        assert book.seq_gap_rate == pytest.approx(0.03, abs=1e-6)
+        assert book.is_reliable is False
+
+    def test_too_few_deltas_always_reliable(self) -> None:
+        """< 50 deltas → not enough data to judge, treat as reliable."""
+        book = self._book_with_counters(delta_count=10, desync_total=0)
+        assert book.is_reliable is True
+
+    def test_moderate_gap_rate_reliable(self) -> None:
+        """40 deltas + 1 desync → under 50 threshold, always reliable."""
+        book = self._book_with_counters(delta_count=40, desync_total=1)
+        assert book.is_reliable is True
+
+    def test_exact_threshold_boundary(self) -> None:
+        """100 deltas + 2 desyncs → exactly 2% = threshold → reliable (strict <)."""
+        book = self._book_with_counters(delta_count=100, desync_total=2)
+        assert book.seq_gap_rate == pytest.approx(0.02, abs=1e-6)
+        # is_reliable uses strict < so exactly at threshold is NOT reliable
+        assert book.is_reliable is False

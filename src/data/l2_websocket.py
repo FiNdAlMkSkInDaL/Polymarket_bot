@@ -39,6 +39,21 @@ from src.data.l2_book import BookState, L2OrderBook, fetch_l2_snapshot
 
 log = get_logger(__name__)
 
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Done-callback for fire-and-forget tasks to surface exceptions."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(
+            "l2ws_task_error",
+            task_name=task.get_name(),
+            error=repr(exc),
+            exc_info=exc,
+        )
+
+
 # Pre-allocated event-type sets used in the hot message dispatch path.
 _DELTA_EVENTS = frozenset(("price_change", "book_delta", "delta"))
 _SNAPSHOT_EVENTS = frozenset(("book", "snapshot", "book_snapshot"))
@@ -72,7 +87,7 @@ class L2WebSocket:
         self._ws: Any = None
         self._running = False
         self._last_message_time: float = 0.0
-        self._silence_timeout = settings.strategy.ws_silence_timeout_s
+        self._silence_timeout = settings.strategy.l2_silence_timeout_s
         self._snapshot_tasks: dict[str, asyncio.Task] = {}
 
         # Cumulative reconnect counter (never reset — used by health reporter)
@@ -101,9 +116,23 @@ class L2WebSocket:
                     self._BACKOFF_MAX,
                     self._BACKOFF_BASE * (2 ** attempt),
                 ) + random.uniform(0, 1)
+
+                # Classify the disconnection reason for diagnostics
+                if isinstance(exc, websockets.exceptions.ConnectionClosed):
+                    reconnect_reason = "ws_close"
+                elif isinstance(exc, websockets.exceptions.InvalidStatus):
+                    reconnect_reason = "invalid_status"
+                elif isinstance(exc, ConnectionError):
+                    reconnect_reason = "connection_error"
+                elif isinstance(exc, OSError):
+                    reconnect_reason = "os_error"
+                else:
+                    reconnect_reason = "unknown"
+
                 log.warning(
                     "l2_ws_disconnected",
                     error=str(exc),
+                    reconnect_reason=reconnect_reason,
                     retry_in=round(sleep_time, 2),
                     attempt=attempt,
                     reconnect_count=self.reconnect_count,
@@ -191,9 +220,15 @@ class L2WebSocket:
                 for aid in asset_ids:
                     log.info("l2_ws_subscribed", asset_id=aid, channel="book")
 
-            # Trigger snapshot fetch for all assets
+            # Only snapshot assets that aren't already SYNCED.
+            # On first connect everything is EMPTY so all get snapshots.
+            # On reconnect, SYNCED books stay SYNCED and just receive
+            # new deltas — only DESYNCED / EMPTY / BUFFERING books need
+            # a fresh snapshot.
             for aid in asset_ids:
-                self._schedule_snapshot(aid)
+                book = self._books.get(aid)
+                if book is None or book.state != BookState.SYNCED:
+                    self._schedule_snapshot(aid)
 
             # Silence watchdog
             silence_task = asyncio.create_task(
@@ -253,26 +288,40 @@ class L2WebSocket:
             # Some WS implementations push full snapshots inline
             # Treat as snapshot data
             try:
-                result = book.load_snapshot(msg)
+                result = book.load_snapshot(
+                    msg, trigger="periodic_server_snapshot",
+                )
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    task = asyncio.ensure_future(result)
+                    task.add_done_callback(_log_task_exception)
             except Exception:
-                pass
+                log.error(
+                    "l2ws_snapshot_dispatch_error",
+                    asset_id=asset_id,
+                    exc_info=True,
+                )
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Snapshot orchestration
     # ═══════════════════════════════════════════════════════════════════════
-    def _schedule_snapshot(self, asset_id: str) -> None:
+    def _schedule_snapshot(
+        self, asset_id: str, *, trigger: str = "initial",
+    ) -> None:
         """Schedule an async REST snapshot fetch for an asset."""
         # Cancel any in-flight fetch for this asset
         existing = self._snapshot_tasks.pop(asset_id, None)
         if existing and not existing.done():
             existing.cancel()
 
-        task = asyncio.ensure_future(self._fetch_and_apply_snapshot(asset_id))
+        task = asyncio.ensure_future(
+            self._fetch_and_apply_snapshot(asset_id, trigger=trigger)
+        )
+        task.add_done_callback(_log_task_exception)
         self._snapshot_tasks[asset_id] = task
 
-    async def _fetch_and_apply_snapshot(self, asset_id: str) -> None:
+    async def _fetch_and_apply_snapshot(
+        self, asset_id: str, *, trigger: str = "initial",
+    ) -> None:
         """Fetch a REST snapshot and apply it to the book."""
         book = self._books.get(asset_id)
         if not book:
@@ -294,7 +343,7 @@ class L2WebSocket:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
-            success = await book.load_snapshot(data)
+            success = await book.load_snapshot(data, trigger=trigger)
             if success:
                 return
 
@@ -317,4 +366,4 @@ class L2WebSocket:
     async def _on_book_desync(self, asset_id: str) -> None:
         """Callback invoked by L2OrderBook when a sequence gap is detected."""
         log.warning("l2_desync_recovery_triggered", asset_id=asset_id)
-        self._schedule_snapshot(asset_id)
+        self._schedule_snapshot(asset_id, trigger="desync_recovery")

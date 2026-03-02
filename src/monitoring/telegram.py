@@ -208,5 +208,36 @@ class TelegramAlerter:
             f"Positions: {n_pos}  |  Gross: ${gross:.2f}  |  Net: ${net:.2f}"
         )
 
+    async def notify_paper_summary(self, stats: dict, uptime_h: float) -> None:
+        """Send a formatted paper trade performance summary.
+
+        Parameters
+        ----------
+        stats:
+            Dict from ``TradeStore.get_stats()`` with keys like
+            ``total_trades``, ``win_rate``, ``avg_pnl``, ``total_pnl``,
+            ``best_trade``, ``worst_trade``.
+        uptime_h:
+            Bot uptime in hours — provides context for trade frequency.
+        """
+        total = stats.get("total_trades", 0)
+        win_rate = stats.get("win_rate", 0.0)
+        avg_pnl = stats.get("avg_pnl", 0.0)
+        total_pnl = stats.get("total_pnl", 0.0)
+        best = stats.get("best_trade", 0.0)
+        worst = stats.get("worst_trade", 0.0)
+
+        emoji = "📈" if total_pnl >= 0 else "📉"
+        tph = total / max(0.01, uptime_h)
+
+        await self.send(
+            f"{emoji} <b>Paper Trade Summary</b>\n"
+            f"Trades: {total}  ({tph:.1f}/hr)\n"
+            f"Win rate: {win_rate:.1%}\n"
+            f"Avg PnL: {avg_pnl:+.2f}¢  |  Total: {total_pnl:+.2f}¢\n"
+            f"Best: {best:+.2f}¢  |  Worst: {worst:+.2f}¢\n"
+            f"Uptime: {uptime_h:.1f}h"
+        )
+
     async def notify_kill(self) -> None:
         await self.send("🛑 <b>KILL SWITCH ACTIVATED</b> — all orders cancelled, bot stopping.")
