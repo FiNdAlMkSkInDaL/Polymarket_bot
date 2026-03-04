@@ -129,6 +129,7 @@ def compute_edge_score(
     min_score: float | None = None,
     tick_size: float = 0.01,
     model_confidence: float | None = None,
+    current_ewma_vol: float | None = None,
 ) -> EdgeAssessment:
     """Compute the Edge Quality Score for a proposed trade.
 
@@ -162,6 +163,11 @@ def compute_edge_score(
         factor in place of the zscore/volume_ratio formula.  This allows
         non-panic signals to pass through the EQS gate with appropriate
         quality scoring based on model confidence.
+    current_ewma_vol:
+        Current EWMA σ from the OHLCVAggregator.  When provided and
+        ``eqs_vol_adaptive`` is enabled, the EQS threshold is scaled:
+        high-vol → lower threshold (better mean-reversion opportunities),
+        low-vol → higher threshold (avoid trading noise).
 
     Returns
     -------
@@ -181,6 +187,25 @@ def compute_edge_score(
         else strat.volume_ratio_threshold
     )
     threshold = min_score if min_score is not None else strat.min_edge_score
+
+    # ── Regime-adaptive threshold (OE-6) ───────────────────────────────
+    # Scale threshold by ±eqs_vol_scale_range based on EWMA σ vs ref.
+    # High vol → lower threshold (mean-reversion α is higher).
+    # Low vol → higher threshold (noise dominates, be pickier).
+    if (
+        current_ewma_vol is not None
+        and current_ewma_vol > 0
+        and strat.eqs_vol_adaptive
+    ):
+        vol_ref = strat.eqs_vol_ref
+        scale_range = strat.eqs_vol_scale_range
+        if vol_ref > 0:
+            ratio = current_ewma_vol / vol_ref
+            # ratio < 1 → low vol → positive adjustment → higher threshold
+            # ratio > 1 → high vol → negative adjustment → lower threshold
+            # Clamped to ±scale_range.
+            adjustment = max(-scale_range, min(scale_range, 1.0 - ratio))
+            threshold = threshold * (1.0 + adjustment)
 
     tick_cents = tick_size * 100.0  # 1.0
 
@@ -249,8 +274,10 @@ def compute_edge_score(
         # Baseline 0.5 (just cleared PanicDetector), rises with excess.
         # Z-score excess has diminishing returns above 2× threshold
         # (extreme z-scores often indicate information, not noise).
-        z_contribution = min(z_excess, 2.0) * 0.25 / max(z_excess, 1.0) if z_excess > 0 else 0.0
-        z_contribution = min(0.35, 0.25 * z_excess) if z_excess <= 2.0 else 0.35 + 0.05 * min(z_excess - 2.0, 2.0)
+        # Log-concave z-score contribution: saturates smoothly but
+        # continues to differentiate between z=4 and z=9, rewarding
+        # extreme signals with proportionally larger sizing.
+        z_contribution = 0.35 * (1.0 - math.exp(-0.5 * z_excess)) if z_excess > 0 else 0.0
         signal_q = min(1.0, 0.5 + z_contribution + 0.20 * min(v_excess, 2.0))
     if whale_confluence:
         signal_q = min(1.0, signal_q + 0.15)

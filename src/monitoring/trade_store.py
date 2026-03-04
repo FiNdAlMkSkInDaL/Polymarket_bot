@@ -223,7 +223,27 @@ class TradeStore:
             "timeout_exits": timeout_exits,
             "avg_hold_seconds": round(sum(holds) / len(holds), 1) if holds else 0,
             "expectancy_cents": round(total_pnl / total, 2) if total else 0,
+            "decayed_win_rate": round(self._compute_decayed_wr(pnls), 4),
         }
+
+    @staticmethod
+    def _compute_decayed_wr(
+        pnls: list[float], alpha: float = 0.10
+    ) -> float:
+        """Exponentially-decayed win rate.
+
+        ŵ_t = α · 1[win_t] + (1-α) · ŵ_{t-1}
+
+        Recent trades are weighted more heavily, so the sizer reacts
+        to deteriorating or improving performance within ~10 trades
+        instead of being anchored to the all-time aggregate.
+        """
+        if not pnls:
+            return 0.0
+        wr = 0.5  # seed
+        for p in pnls:
+            wr = alpha * (1.0 if p > 0 else 0.0) + (1.0 - alpha) * wr
+        return wr
 
     async def passes_go_live_criteria(self) -> tuple[bool, dict]:
         """Check whether paper-trading results meet go-live thresholds.
@@ -258,6 +278,25 @@ class TradeStore:
                 return False, stats
 
         return True, stats
+
+    async def get_rolling_expectancy(self, window: int = 10) -> float:
+        """Compute average PnL of the last *window* closed trades.
+
+        Used by the adaptive cold-start Kelly sizer to detect negative
+        expectancy and throttle sizing.
+
+        Returns 0.0 if fewer than *window* trades are available.
+        """
+        await self._ensure_db()
+        cursor = await self._db.execute(
+            "SELECT pnl_cents FROM trades WHERE state = ? "
+            "ORDER BY exit_time DESC LIMIT ?",
+            (PositionState.CLOSED.value, window),
+        )
+        rows = await cursor.fetchall()
+        if len(rows) < window:
+            return 0.0
+        return sum(r[0] for r in rows) / len(rows)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  State Persistence — checkpoint / restore for crash recovery

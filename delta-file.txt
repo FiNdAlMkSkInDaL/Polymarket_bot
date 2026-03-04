@@ -1,0 +1,153 @@
+//CHANGES MADE ON MARCH 2ND:
+
+feat(config): update strategy parameters for improved performance
+
+Increased zscore_threshold from 1.2 to 2.0 to enhance panic spike detection.
+
+Raised min_edge_score from 25.0 to 35.0 to reduce low-quality trade throughput.
+
+Added l2_silence_timeout_s parameter set to 120.0 for low-volume markets.
+
+Extended ghost_recovery_s from 30.0 to 60.0 for better ghost liquidity handling.
+
+Introduced paper_slippage_cents to simulate adverse slippage in paper mode.
+
+Added min_ask_depth_usd to ensure sufficient liquidity when discovering markets.
+
+Updated rpe_generic_enabled to False by default for safer calibration.
+
+Increased rpe_max_data_age_seconds from 30 to 300 for better data freshness.
+
+Introduced stale_market_eviction_s to manage stale markets effectively.
+
+feat(l2_book): enhance reliability metrics and error handling
+
+Added cumulative desync counter and delta counter for better tracking.
+
+Implemented is_reliable property to assess book reliability based on seq_gap_rate.
+
+Improved error logging for task exceptions in L2OrderBook.
+
+feat(l2_websocket): refine snapshot handling and error diagnostics
+
+Adjusted snapshot fetching logic to only request for non-SYNCED books.
+
+Enhanced error logging for snapshot dispatch errors.
+
+feat(market_lifecycle): implement stale market eviction logic
+
+Added check_stale_markets method to evict or drain markets with no trades for a specified duration.
+feat(ohlcv): ensure timely bar closure on low-volume markets
+
+Introduced flush_stale_bar method to close bars that exceed their interval without trades.
+
+// TODAYS CHANGES:
+feat(config): adjust strategy parameters for improved performance and signal efficiency
+
+feat(bot): enhance trading logic with book tracker integration and urgent chaser handling
+
+fix(edge_filter): implement fee efficiency floor to prevent zeroing of EQS score
+
+fix(panic_detector): update discount factor logic for better market condition handling
+
+test: update tests to reflect changes in strategy parameters and ensure accuracy
+
+Enhance signal processing and trading logic
+
+Refactor AdverseSelectionGuard to prefer allocation-free depth calculation when available, improving performance.
+
+Update edge scoring logic in EdgeFilter to better account for diminishing returns on z-scores.
+
+Introduce intra-bar momentum confirmation in PanicDetector to enhance panic signal accuracy.
+
+Implement trend regime guard in PanicDetector to suppress signals during sustained uptrends, preventing false positives.
+
+Optimize SpreadCompressionSignal to use a running sum for average spread calculation, improving efficiency.
+
+Enhance WhaleMonitor with deduplication of transaction hashes for efficient processing.
+
+Maintain open order count in OrderExecutor for better tracking of live orders.
+
+Improve FeeCache with per-token locks for concurrent fetches and a persistent HTTP client for efficiency.
+
+Optimize VaRCalculator to reuse pre-built covariance matrices, reducing computational overhead.
+
+Adjust position sizing logic in PositionManager to incorporate precomputed depth results for better accuracy.
+
+Update StopLossMonitor to prevent premature trailing stops by introducing a breakeven activation threshold.
+
+Revise take profit logic to increase alpha during high volatility, allowing for larger reversion captures.
+
+Add comprehensive tests for new features and adjustments, ensuring robustness and correctness in signal evaluation and trading strategies.
+
+// MARCH 4TH CHANGES (Alpha Evolution + Backtest Validation):
+
+feat(config): tighten strategy parameters to cut fee drag and marginal entries
+
+Raised min_spread_cents from 2.0 to 4.0 — requires meaningful spread before entry.
+
+Raised min_edge_score from 20.0 to 50.0 — filters ~93% of low-conviction signals.
+
+Changed no_discount_factor from 1.005 to 0.98 — requires NO ask to be genuinely discounted vs VWAP before panic entry.
+
+feat(edge_filter): replace linear z-score scaling with log-concave contribution
+
+Updated z_contribution formula to 0.35 * (1.0 - exp(-0.5 * z_excess)) for diminishing returns.
+Extreme z-scores (possible information arrivals) no longer receive disproportionate EQS bonuses.
+
+feat(trading/position_manager): add minimum viable edge gate and asyncio lock
+
+Added spread viability check: entry requires tp.spread_cents >= 2*slippage + entry_fee + exit_fee + margin.
+Wrapped parallel entry submissions in asyncio.Lock() to prevent per-event limit breaches.
+
+feat(trading/sizer): implement adaptive cold-start Kelly blend and negative-EV throttle
+
+During cold start, Kelly fraction blended with 50% fixed fraction using blend_weight = max(0, (min_kelly_trades - total_trades) / min_kelly_trades).
+Added 75% size reduction when rolling expectancy is negative (negative-EV throttle).
+
+feat(trading/sizer): add dollar-risk cap on position size from stop-loss distance
+
+max_shares capped at max_loss_per_trade_cents / (entry_price * 100) to limit stop-loss exposure.
+
+feat(monitoring/trade_store): add get_rolling_expectancy method
+
+New method queries last N closed trades for average net PnL. Used by sizer for negative-EV throttle gate.
+
+fix(backtest/data_loader): correctly route production tick events by payload type
+
+Updated _parse_record to check payload.event_type before using source tag.
+last_trade_price payload events now routed as "trade" (were incorrectly kept as "l2_delta").
+book/snapshot payload events now promoted to "l2_snapshot" regardless of source tag.
+
+feat(backtest/strategy): rewrite BotReplayAdapter with real PanicDetector for live parity
+
+Previously used a simplified z-score check missing 6 gates the live bot enforces.
+Now instantiates a real PanicDetector in on_init() sharing the YES/NO OHLCVAggregators.
+_on_yes_bar_closed() now enforces: near-resolved price guard (YES>=0.97 / <=0.03), tradeable price band, signal cooldown, PanicDetector (z-score + volume ratio + intra-bar retracement discount + NO discount factor + trend guard), spread gate (min_spread_cents), and EQS gate (min_edge_score).
+Added _last_signal_time and _cooldown_seconds fields for per-market signal cooldown tracking.
+Fixed volume_ratio reference from non-existent rolling_volume to avg_bar_volume.
+Fixed target_price calculation to use sig.yes_vwap and sig.no_best_ask from the detector signal.
+
+feat(backtest): add production tick data backtest comparison script
+
+New scripts/backtest_comparison.py replays 3 days of VPS tick data (2026-03-01..03) across top 5 markets.
+Runs PRE (old) vs POST (new) config through the full BotReplayAdapter pipeline.
+Reports side-by-side table with PnL, drawdown, fills, win rate, and risk-adjusted PnL/MaxDD ratio.
+Backtest result: POST reduces drawdown 98% (19.5% -> 0.4%) and filters 84% of marginal entries, while maintaining positive PnL.
+
+data: add market_map.json with 31 actionable markets mapped from VPS tick data
+
+data/market_map.json maps each actionable market (NO price in [0.05, 0.50]) to
+YES/NO numeric asset token IDs, extracted from 3 days of production JSONL tick files.
+
+test: add 23 new tests covering all alpha evolution features (tests/test_alpha_evolution.py)
+
+TestMinViableEdgeGate — 3 tests for spread viability check in PositionManager.
+TestPositionManagerLock — 2 tests for asyncio.Lock concurrent entry protection.
+TestDollarRiskCap — 3 tests for max_shares dollar-risk cap from stop distance.
+TestColdStartKellyBlend — 4 tests for adaptive blend weight and negative-EV throttle.
+TestNoDiscountFactor — 3 tests for tighter no_discount_factor=0.98.
+TestMinEdgeScore — 3 tests for raised min_edge_score=50.
+TestLogConcaveZScore — 3 tests for log-concave z-score contribution.
+TestRollingExpectancy — 2 tests for get_rolling_expectancy in TradeStore.
+Total regression: 1150 tests passing (1127 original + 23 new).

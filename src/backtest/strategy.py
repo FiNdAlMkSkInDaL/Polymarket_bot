@@ -24,6 +24,8 @@ from src.core.config import StrategyParams
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar
 from src.data.websocket_client import TradeEvent
+from src.signals.edge_filter import compute_edge_score
+from src.signals.panic_detector import PanicDetector
 from src.trading.executor import OrderSide
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 
@@ -156,9 +158,14 @@ class BotReplayAdapter(StrategyABC):
         self._initial_bankroll = initial_bankroll
         self._params = params or StrategyParams()
 
-        # Aggregators (created on init)
+        # Aggregators and detector (created on init)
         self._yes_agg: OHLCVAggregator | None = None
         self._no_agg: OHLCVAggregator | None = None
+        self._detector: PanicDetector | None = None
+
+        # Signal cooldown tracking
+        self._last_signal_time: float = 0.0
+        self._cooldown_seconds: float = self._params.signal_cooldown_minutes * 60.0
 
         # Pending orders we've submitted: sim_order_id → context
         self._pending_entries: dict[str, dict] = {}
@@ -190,6 +197,17 @@ class BotReplayAdapter(StrategyABC):
         """Initialise aggregators and detectors."""
         self._yes_agg = OHLCVAggregator(self._yes_asset_id)
         self._no_agg = OHLCVAggregator(self._no_asset_id)
+
+        # Use the real PanicDetector — same gates as live bot
+        self._detector = PanicDetector(
+            market_id=self._market_id,
+            yes_asset_id=self._yes_asset_id,
+            no_asset_id=self._no_asset_id,
+            yes_aggregator=self._yes_agg,
+            no_aggregator=self._no_agg,
+            zscore_threshold=self._params.zscore_threshold,
+            volume_ratio_threshold=self._params.volume_ratio_threshold,
+        )
 
         # Register market with PCE if enabled
         if self._pce is not None and self._yes_agg is not None:
@@ -235,46 +253,75 @@ class BotReplayAdapter(StrategyABC):
     def _on_yes_bar_closed(self, bar: OHLCVBar) -> None:
         """Evaluate the panic/mean-reversion signal on a YES bar close.
 
-        This mirrors the live bot's ``_on_yes_bar_closed()`` logic.
+        Uses the real ``PanicDetector`` for full signal parity with the
+        live bot, including z-score, volume ratio, intra-bar retracement,
+        NO-discount, and trend-guard gates.
         """
         if self._yes_agg is None or self._no_agg is None:
             return
-        if self.engine is None:
+        if self.engine is None or self._detector is None:
             return
 
-        # Check if we have enough history
-        if len(self._yes_agg.bars) < 5:
-            return
-
-        vwap = self._yes_agg.rolling_vwap
-        if vwap <= 0:
-            return
-
-        # Simple mean-reversion signal: YES price spikes above VWAP
         yes_price = bar.close
-        deviation = (yes_price - vwap) / max(vwap, 0.01)
+        bar_time = getattr(bar, 'open_time', 0.0)
+        if not isinstance(bar_time, (int, float)):
+            bar_time = 0.0
 
-        # The NO side is our entry — when YES spikes, NO drops
-        no_price = self._no_agg.current_price
-        if no_price <= 0:
+        # ── Near-resolved price guard (same as live bot) ───────────────
+        if yes_price >= 0.97 or yes_price <= 0.03:
             return
 
-        # Check if deviation is significant
-        vol = self._yes_agg.rolling_volatility
-        if vol <= 0:
-            vol = 0.01
-
-        zscore = deviation / vol
-        if zscore < self._params.zscore_threshold:
+        # ── Tradeable price band guard ─────────────────────────────────
+        if not (self._params.min_tradeable_price < yes_price < self._params.max_tradeable_price):
             return
 
-        # Too many open positions?
+        # ── Signal cooldown ────────────────────────────────────────────
+        if bar_time - self._last_signal_time < self._cooldown_seconds:
+            return
+
+        # ── Too many open positions? ───────────────────────────────────
         if len(self._open_positions) >= self._params.max_open_positions:
             return
 
-        # Entry: buy NO token at best ask
+        # ── NO best ask from the sim matching engine ───────────────────
         best_ask = self.engine.matching_engine.best_ask
         if best_ask <= 0:
+            return
+
+        # ── Run the real PanicDetector ─────────────────────────────────
+        # This checks: z-score, volume ratio, intra-bar retracement,
+        # NO discount factor, and trend guard — all identical to live
+        sig = self._detector.evaluate(bar, no_best_ask=best_ask)
+        if sig is None:
+            return
+
+        # Record signal time for cooldown
+        self._last_signal_time = bar_time
+
+        best_bid = self.engine.matching_engine.best_bid
+        if best_bid <= 0:
+            return
+
+        # ── Spread gate ────────────────────────────────────────────────
+        spread = best_ask - best_bid
+        if spread * 100.0 < self._params.min_spread_cents:
+            return
+
+        # ── Edge quality score gate ────────────────────────────────────
+        no_vwap = self._no_agg.rolling_vwap
+        eqs = compute_edge_score(
+            entry_price=best_ask,
+            no_vwap=no_vwap if no_vwap > 0 else sig.no_best_ask,
+            zscore=sig.zscore,
+            volume_ratio=sig.volume_ratio,
+            whale_confluence=sig.whale_confluence,
+            fee_enabled=self._fee_enabled,
+            alpha=self._params.alpha_default,
+            zscore_threshold=self._params.zscore_threshold,
+            min_score=self._params.min_edge_score,
+            current_ewma_vol=self._no_agg.rolling_volatility_ewma or None,
+        )
+        if not eqs.viable:
             return
 
         # Sizing driven by kelly_fraction & max_trade_size_usd
@@ -371,21 +418,22 @@ class BotReplayAdapter(StrategyABC):
         )
 
         # Track as pending entry
-        target_price = no_price + self._params.alpha_default * (vwap - no_price)
+        no_price = sig.no_best_ask
+        target_price = no_price + self._params.alpha_default * (max(no_vwap, no_price) - no_price)
         self._pending_entries[order.order_id] = {
             "order": order,
             "entry_price": best_ask,
             "target_price": max(target_price, best_ask + 0.01),
-            "zscore": zscore,
-            "yes_price": yes_price,
-            "vwap": vwap,
+            "zscore": sig.zscore,
+            "yes_price": sig.yes_price,
+            "vwap": sig.yes_vwap,
         }
 
         log.debug(
             "adapter_entry_signal",
             order_id=order.order_id,
             no_price=no_price,
-            zscore=round(zscore, 2),
+            zscore=round(sig.zscore, 2),
             target=round(target_price, 4),
         )
 

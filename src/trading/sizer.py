@@ -251,14 +251,36 @@ def compute_kelly_size(
 
     # ── Cold-start bypass ───────────────────────────────────────────────
     # When total_trades < MIN_KELLY_TRADES, the Kelly formula has
-    # insufficient data to compute a meaningful edge.  Use a fixed
-    # conservative fraction of max_trade_usd and skip the edge check
-    # to avoid a death spiral where bad early stats permanently block
-    # trading.
+    # insufficient data to compute a meaningful edge.  Use an adaptive
+    # fraction of max_trade_usd that decays toward Kelly-optimal as
+    # trades accumulate, and halts if rolling expectancy is negative.
     min_kelly_trades = strat.min_kelly_trades
     if total_trades < min_kelly_trades:
-        cold_start_frac = strat.cold_start_frac
-        cold_usd = max_trade_usd * cold_start_frac
+        # ── Adaptive cold-start fraction ───────────────────────────────
+        # Blend between cold_start_frac (initial) and Kelly-optimal (0)
+        # as trade count grows.  This replaces the fixed 50% that kept
+        # placing max-sized trades regardless of accumulating losses.
+        blend_weight = max(0.0, (min_kelly_trades - total_trades) / min_kelly_trades)
+        base_cold_frac = strat.cold_start_frac * blend_weight
+
+        # ── Negative expectancy halt ───────────────────────────────────
+        # If rolling N-trade expectancy is negative, throttle sizing.
+        meta = signal_metadata or {}
+        rolling_expectancy = float(meta.get("rolling_expectancy_cents", 0.0))
+        halt_window = strat.cold_start_halt_window
+        if (strat.cold_start_negative_ev_halt
+                and total_trades >= halt_window
+                and rolling_expectancy < 0):
+            # Reduce fraction by 75% when expectancy is negative
+            base_cold_frac *= 0.25
+            log.warning(
+                "kelly_cold_start_negative_ev_throttle",
+                total_trades=total_trades,
+                rolling_expectancy=round(rolling_expectancy, 2),
+                throttled_frac=round(base_cold_frac, 4),
+            )
+
+        cold_usd = max_trade_usd * base_cold_frac
 
         # Depth cap if book available
         if book is not None and book.has_data:
@@ -302,13 +324,21 @@ def compute_kelly_size(
         )
 
     # ── Estimate win probability ────────────────────────────────────────
-    base_wr = win_rate if win_rate > 0 else 0.55
+    # Use exponentially-decayed win rate if available in metadata,
+    # else fall back to aggregate win_rate, else prior from config.
+    meta = signal_metadata or {}
+    decayed_wr = float(meta.get("decayed_win_rate", 0.0))
+    if decayed_wr > 0:
+        base_wr = decayed_wr
+    elif win_rate > 0:
+        base_wr = win_rate
+    else:
+        base_wr = strat.kelly_prior_win_rate
     # Signal adds up to 15 percentage points
     raw_p = min(p_cap, max(0.01, base_wr + 0.15 * signal_score))
 
     # ── Edge discounting via uncertainty penalty ────────────────────────
     # Extract uncertainty from signal metadata; fall back to conservative default
-    meta = signal_metadata or {}
     uncertainty_penalty = float(meta.get("uncertainty_penalty", strat.kelly_default_uncertainty))
     uncertainty_penalty = max(0.0, min(1.0, uncertainty_penalty))
 

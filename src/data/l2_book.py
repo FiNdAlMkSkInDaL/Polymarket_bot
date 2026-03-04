@@ -91,11 +91,13 @@ class L2OrderBook:
         *,
         on_bbo_change: Callable[..., Any] | None = None,
         on_desync: Callable[..., Any] | None = None,
+        on_level_change: Callable[..., Any] | None = None,
         max_levels: int | None = None,
     ):
         self.asset_id = asset_id
         self._on_bbo_change = on_bbo_change
         self._on_desync = on_desync
+        self._on_level_change = on_level_change  # SI-2: iceberg detection hook
         self._max_levels = max_levels or settings.strategy.l2_max_levels
 
         # ── Core book data (SortedDict: price → size) ─────────────────
@@ -418,15 +420,23 @@ class L2OrderBook:
 
             if side in ("BUY", "BID"):
                 neg_price = -price
+                old_size = self._bids.get(neg_price, 0.0)
                 if size <= 0:
                     self._bids.pop(neg_price, None)
                 else:
                     self._bids[neg_price] = size
+                # SI-2: Fire level-change callback for iceberg detection
+                if self._on_level_change is not None and old_size != size:
+                    self._on_level_change("BUY", price, old_size, size)
             elif side in ("SELL", "ASK"):
+                old_size = self._asks.get(price, 0.0)
                 if size <= 0:
                     self._asks.pop(price, None)
                 else:
                     self._asks[price] = size
+                # SI-2: Fire level-change callback for iceberg detection
+                if self._on_level_change is not None and old_size != size:
+                    self._on_level_change("SELL", price, old_size, size)
 
         # Trim if over max levels
         self._trim_side(self._bids)

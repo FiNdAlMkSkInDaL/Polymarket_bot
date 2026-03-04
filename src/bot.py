@@ -57,7 +57,11 @@ from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderSta
 from src.trading.position_manager import PositionManager, PositionState
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
+from src.trading.stealth_executor import StealthExecutor
 from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
+from src.signals.regime_detector import RegimeDetector
+from src.signals.iceberg_detector import IcebergDetector
+from src.signals.cross_market import CrossMarketSignalGenerator
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
 try:
@@ -172,6 +176,18 @@ class TradingBot:
         # Spread-based signal evaluators (Problem 3)
         self._spread_evaluators: dict[str, CompositeSignalEvaluator] = {}  # condition_id → evaluator
         self._spread_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
+
+        # SI-1: Per-market regime detectors
+        self._regime_detectors: dict[str, RegimeDetector] = {}  # condition_id → detector
+
+        # SI-2: Per-asset iceberg detectors
+        self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
+
+        # SI-3: Cross-market signal generator
+        self._cross_market = CrossMarketSignalGenerator(self.pce) if settings.strategy.cross_mkt_enabled else None
+
+        # SI-4: Stealth executor wrapper
+        self._stealth = StealthExecutor(self.executor) if settings.strategy.stealth_enabled else None
 
         # Lifecycle
         self._running = False
@@ -508,6 +524,10 @@ class TradingBot:
         # Wiring is handled by the singleton self._rpe;
         # no per-market instance needed.
 
+        # SI-1: Per-market regime detector
+        if settings.strategy.regime_enabled:
+            self._regime_detectors[m.condition_id] = RegimeDetector(m.condition_id)
+
         # PCE: register market for correlation tracking (Pillar 15)
         self.pce.register_market(
             m.condition_id, m.event_id, getattr(m, 'tags', '') or '',
@@ -517,9 +537,17 @@ class TradingBot:
         # Orderbook trackers for both tokens
         if settings.strategy.l2_enabled:
             for token_id in (m.yes_token_id, m.no_token_id):
+                # SI-2: Create iceberg detector and wire as level-change callback
+                ice_cb = None
+                if settings.strategy.iceberg_enabled:
+                    ice_det = IcebergDetector(token_id)
+                    self._iceberg_detectors[token_id] = ice_det
+                    ice_cb = ice_det.on_level_change
+
                 l2_book = L2OrderBook(
                     token_id,
                     on_bbo_change=self._on_l2_bbo_change,
+                    on_level_change=ice_cb,
                 )
                 self._l2_books[token_id] = l2_book
                 self._book_trackers[token_id] = L2OrderBookAdapter(l2_book)
@@ -542,6 +570,7 @@ class TradingBot:
         self._detectors.pop(m.condition_id, None)
         self._spread_evaluators.pop(m.condition_id, None)
         self._spread_cooldowns.pop(m.condition_id, None)
+        self._regime_detectors.pop(m.condition_id, None)
         self._rpe.clear_market(m.condition_id)
         self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
@@ -551,6 +580,9 @@ class TradingBot:
             l2_book = self._l2_books.pop(token_id, None)
             if l2_book is not None:
                 l2_book.reset()
+            ice = self._iceberg_detectors.pop(token_id, None)
+            if ice is not None:
+                ice.reset()
         self._trade_counts.pop(m.yes_token_id, None)
         self._trade_counts.pop(m.no_token_id, None)
         self._taker_counts.pop(m.yes_token_id, None)
@@ -1063,11 +1095,39 @@ class TradingBot:
         whale = self.whale_monitor.has_confluence(market_info.no_token_id)
 
         if price_in_band:
+            # ── SI-1: Update regime detector and gate entries ───────────
+            regime_det = self._regime_detectors.get(market_info.condition_id)
+            yes_agg_regime = self._yes_aggs.get(market_info.yes_token_id)
+            if regime_det and yes_agg_regime:
+                # Compute log-return from the bar
+                closes = [b.close for b in yes_agg_regime.bars]
+                if len(closes) >= 2 and closes[-2] > 0:
+                    import math as _math
+                    lr = _math.log(closes[-1] / closes[-2])
+                else:
+                    lr = 0.0
+                regime_det.update(
+                    log_return=lr,
+                    ewma_vol=yes_agg_regime.rolling_volatility_ewma,
+                    ew_vol=yes_agg_regime.rolling_volatility,
+                )
+                # SI-3: record return for cross-market signal generator
+                if self._cross_market is not None:
+                    self._cross_market.record_return(market_info.condition_id, lr)
+
             sig = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
             if sig:
-                self._latest_z = sig.zscore
-                self.lifecycle.record_signal(market_info.condition_id)
-                await self._on_panic_signal(sig, no_agg, market_info)
+                # SI-1: Regime gate — suppress panic in trending regime
+                if regime_det and not regime_det.is_mean_revert:
+                    log.info(
+                        "regime_gate_suppressed",
+                        market_id=market_info.condition_id[:16],
+                        regime_score=round(regime_det.regime_score, 3),
+                    )
+                else:
+                    self._latest_z = sig.zscore
+                    self.lifecycle.record_signal(market_info.condition_id)
+                    await self._on_panic_signal(sig, no_agg, market_info)
 
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
@@ -1115,9 +1175,11 @@ class TradingBot:
         self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo
     ) -> None:
         """Handle a confirmed panic signal."""
-        await self.telegram.notify_signal(
+        # Fire-and-forget — Telegram notification must NOT block the
+        # alpha-critical execution path (saves 50-500ms per trade).
+        asyncio.ensure_future(self.telegram.notify_signal(
             sig.market_id, sig.zscore, sig.volume_ratio
-        )
+        ))
 
         # Compute days to resolution
         days = 30
@@ -1302,7 +1364,8 @@ class TradingBot:
             acc = cal_stats.get("direction_accuracy", "n/a")
             cal_footer = f"\nCalibration (N={cal_stats['resolved']}): Brier={brier} LL={logloss} Acc={acc}"
 
-        await self.telegram.notify_rpe_signal(
+        # Fire-and-forget — keep Telegram off the execution hot path.
+        asyncio.ensure_future(self.telegram.notify_rpe_signal(
             market_id=market.condition_id,
             model_prob=model_prob,
             market_price=display_price,
@@ -1311,7 +1374,7 @@ class TradingBot:
             shadow=shadow,
             question=market.question,
             calibration_footer=cal_footer,
-        )
+        ))
 
         # Record in data recorder for backtesting
         if self._recorder is not None:
@@ -1597,6 +1660,7 @@ class TradingBot:
     async def _record_and_notify_exit(self, pos: Any) -> None:
         try:
             await self.trade_store.record(pos)
+            self.positions._invalidate_stats_cache()
             await self.telegram.notify_exit(
                 pos.id, pos.entry_price, pos.exit_price, pos.pnl_cents, pos.exit_reason
             )
@@ -1993,6 +2057,7 @@ class TradingBot:
                         and not getattr(pos, "_recorded", False)
                     ):
                         await self.trade_store.record(pos)
+                        self.positions._invalidate_stats_cache()
                         await self.telegram.notify_exit(
                             pos.id, pos.entry_price, pos.exit_price,
                             pos.pnl_cents, pos.exit_reason,
@@ -2030,6 +2095,12 @@ class TradingBot:
                             await self._on_yes_bar_closed(asset_id, bar)
                 for no_agg in self._no_aggs.values():
                     no_agg.flush_stale_bar(now)
+
+                # SI-3: Cross-market divergence scan after all bars updated
+                if self._cross_market is not None:
+                    cm_signals = self._cross_market.scan()
+                    if cm_signals:
+                        log.info("cross_market_scan", signals=len(cm_signals))
             except asyncio.CancelledError:
                 break
             except Exception as exc:

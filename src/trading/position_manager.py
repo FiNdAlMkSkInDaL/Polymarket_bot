@@ -143,11 +143,21 @@ class PositionManager:
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
         self._daily_pnl_cents: float = 0.0
+
+        # ── Trade store stats cache (OE-1) ─────────────────────────────
+        # Caches get_stats() results with a 5-second TTL to avoid
+        # blocking aiosqlite reads on every signal evaluation.
+        self._stats_cache: dict[str, Any] | None = None
+        self._stats_cache_time: float = 0.0
+        self._STATS_CACHE_TTL: float = 5.0
         self._daily_pnl_date: str = ""  # YYYY-MM-DD
         self._cumulative_pnl_cents: float = 0.0
         self._peak_pnl_cents: float = 0.0
         self._max_drawdown_cents: float = 0.0
         self._circuit_breaker_tripped: bool = False
+        # Serialize entry attempts to prevent concurrent entries on
+        # the same market/event from racing past risk gates.
+        self._entry_lock = asyncio.Lock()
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -163,6 +173,35 @@ class PositionManager:
         self._daily_pnl_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._circuit_breaker_tripped = False
         log.info("daily_pnl_reset")
+
+    # ── Cached trade-store stats ───────────────────────────────────────────
+    async def _get_cached_stats(self) -> dict[str, Any]:
+        """Return trade-store stats with a 5-second TTL cache.
+
+        Avoids a blocking aiosqlite read on every signal evaluation.
+        Cache is invalidated whenever a trade is recorded.
+        """
+        now = time.time()
+        if (
+            self._stats_cache is not None
+            and (now - self._stats_cache_time) < self._STATS_CACHE_TTL
+        ):
+            return self._stats_cache
+        if self._trade_store is None:
+            return {}
+        try:
+            self._stats_cache = await self._trade_store.get_stats()
+            self._stats_cache_time = now
+        except Exception:
+            log.warning("trade_store_stats_unavailable")
+            if self._stats_cache is None:
+                self._stats_cache = {}
+        return self._stats_cache
+
+    def _invalidate_stats_cache(self) -> None:
+        """Invalidate the stats cache (call after recording a trade)."""
+        self._stats_cache = None
+        self._stats_cache_time = 0.0
 
     # ── Shared risk gates ──────────────────────────────────────────────────
     def _check_risk_gates(
@@ -325,6 +364,29 @@ class PositionManager:
             Whether this market category charges dynamic fees (crypto/sports).
             Used to compute the fee-adaptive stop-loss and net PnL.
         """
+        async with self._entry_lock:
+            return await self._open_position_inner(
+                signal, no_aggregator,
+                no_book=no_book, event_id=event_id,
+                days_to_resolution=days_to_resolution,
+                book_depth_ratio=book_depth_ratio,
+                fee_enabled=fee_enabled,
+                signal_metadata=signal_metadata,
+            )
+
+    async def _open_position_inner(
+        self,
+        signal: PanicSignal,
+        no_aggregator: OHLCVAggregator,
+        *,
+        no_book: OrderbookTracker | None = None,
+        event_id: str = "",
+        days_to_resolution: int = 30,
+        book_depth_ratio: float = 1.0,
+        fee_enabled: bool = True,
+        signal_metadata: dict | None = None,
+    ) -> Position | None:
+        """Inner implementation of open_position (runs under _entry_lock)."""
         strat = settings.strategy
 
         passed, max_trade = self._check_risk_gates(signal.market_id, event_id)
@@ -348,6 +410,7 @@ class PositionManager:
             volume_ratio=signal.volume_ratio,
             whale_confluence=signal.whale_confluence,
             fee_enabled=fee_enabled,
+            current_ewma_vol=no_aggregator.rolling_volatility_ewma or None,
         )
         if not edge.viable:
             return None
@@ -382,20 +445,32 @@ class PositionManager:
         avg_win_cents = 0.0
         avg_loss_cents = 0.0
         total_trades = 0
-        if self._trade_store is not None:
-            try:
-                stats = await self._trade_store.get_stats()
-                win_rate = stats.get("win_rate", 0.0)
-                avg_win_cents = stats.get("avg_win_cents", 0.0)
-                avg_loss_cents = stats.get("avg_loss_cents", 0.0)
-                total_trades = stats.get("total_trades", 0)
-            except Exception:
-                log.warning("trade_store_stats_unavailable")
+        stats = await self._get_cached_stats()
+        if stats:
+            win_rate = stats.get("win_rate", 0.0)
+            avg_win_cents = stats.get("avg_win_cents", 0.0)
+            avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+            total_trades = stats.get("total_trades", 0)
 
         # Normalise signal strength to 0.0–1.0 for Kelly sizer.
         # zscore is typically 2–5+; map the excess above threshold to [0, 1].
         z_threshold = strat.zscore_threshold
         signal_score = min(1.0, max(0.0, (signal.zscore - z_threshold) / z_threshold)) if z_threshold > 0 else 0.5
+
+        # Inject rolling expectancy for adaptive cold-start sizing
+        kelly_meta = dict(signal_metadata or {})
+        # Inject decayed win rate for non-stationary Kelly (OE-4)
+        decayed_wr = stats.get("decayed_win_rate", 0.0)
+        if decayed_wr > 0:
+            kelly_meta["decayed_win_rate"] = decayed_wr
+        if self._trade_store is not None and total_trades > 0:
+            try:
+                rolling_exp = await self._trade_store.get_rolling_expectancy(
+                    window=strat.cold_start_halt_window
+                )
+                kelly_meta["rolling_expectancy_cents"] = rolling_exp
+            except Exception:
+                pass
 
         kelly_result = compute_kelly_size(
             signal_score=signal_score,
@@ -406,7 +481,7 @@ class PositionManager:
             entry_price=entry_price,
             max_trade_usd=max_trade,
             book=no_book,
-            signal_metadata=signal_metadata,
+            signal_metadata=kelly_meta,
             total_trades=total_trades,
             _precomputed_depth_result=sizing,
         )
@@ -494,6 +569,42 @@ class PositionManager:
                 min_required=strat.min_spread_cents,
             )
             return None
+
+        # ── Minimum viable edge gate ───────────────────────────────────
+        # Reject trades where TP spread cannot cover slippage + fees.
+        # This was the #1 cause of losing "target" exits in post-mortem.
+        slippage_rt_cents = 2 * strat.paper_slippage_cents
+        entry_fee_cents = entry_fee_frac * 100.0
+        exit_est_price = tp.target_price
+        exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=fee_enabled) * 100.0
+        min_viable_spread = slippage_rt_cents + entry_fee_cents + exit_fee_cents + strat.desired_margin_cents
+        if tp.spread_cents < min_viable_spread:
+            log.info(
+                "skip_entry_insufficient_edge",
+                spread_cents=round(tp.spread_cents, 2),
+                min_viable=round(min_viable_spread, 2),
+                slippage_rt=slippage_rt_cents,
+                fee_rt=round(entry_fee_cents + exit_fee_cents, 2),
+                margin=strat.desired_margin_cents,
+            )
+            return None
+
+        # ── Dollar-risk cap ────────────────────────────────────────────
+        # Cap size so that a gap-to-zero cannot lose more than
+        # max_loss_per_trade_cents.
+        max_loss_cents = strat.max_loss_per_trade_cents
+        if max_loss_cents > 0 and entry_price > 0:
+            max_shares_for_risk = max_loss_cents / (entry_price * 100.0)
+            if entry_size > max_shares_for_risk:
+                entry_size = round(max_shares_for_risk, 2)
+                log.info(
+                    "dollar_risk_cap_applied",
+                    max_loss_cents=max_loss_cents,
+                    capped_size=entry_size,
+                )
+                if entry_size < 1:
+                    log.info("skip_entry_risk_cap_too_small")
+                    return None
 
         # Place entry order
         pos_id = f"POS-{self._next_id}"
@@ -594,6 +705,34 @@ class PositionManager:
         entry_price:
             Price to place the limit BUY order at.
         """
+        async with self._entry_lock:
+            return await self._open_rpe_position_inner(
+                market_id=market_id, yes_asset_id=yes_asset_id,
+                no_asset_id=no_asset_id, direction=direction,
+                model_probability=model_probability, confidence=confidence,
+                entry_price=entry_price, event_id=event_id,
+                days_to_resolution=days_to_resolution,
+                fee_enabled=fee_enabled, book=book,
+                signal_metadata=signal_metadata,
+            )
+
+    async def _open_rpe_position_inner(
+        self,
+        *,
+        market_id: str,
+        yes_asset_id: str,
+        no_asset_id: str,
+        direction: str,
+        model_probability: float,
+        confidence: float,
+        entry_price: float,
+        event_id: str = "",
+        days_to_resolution: int = 30,
+        fee_enabled: bool = True,
+        book: OrderbookTracker | None = None,
+        signal_metadata: dict | None = None,
+    ) -> Position | None:
+        """Inner implementation of open_rpe_position (runs under _entry_lock)."""
         strat = settings.strategy
 
         # Shadow mode: log but do not trade
@@ -684,15 +823,12 @@ class PositionManager:
         avg_win_cents = 0.0
         avg_loss_cents = 0.0
         total_trades_rpe = 0
-        if self._trade_store is not None:
-            try:
-                stats = await self._trade_store.get_stats()
-                win_rate = stats.get("win_rate", 0.0)
-                avg_win_cents = stats.get("avg_win_cents", 0.0)
-                avg_loss_cents = stats.get("avg_loss_cents", 0.0)
-                total_trades_rpe = stats.get("total_trades", 0)
-            except Exception:
-                log.warning("trade_store_stats_unavailable")
+        stats = await self._get_cached_stats()
+        if stats:
+            win_rate = stats.get("win_rate", 0.0)
+            avg_win_cents = stats.get("avg_win_cents", 0.0)
+            avg_loss_cents = stats.get("avg_loss_cents", 0.0)
+            total_trades_rpe = stats.get("total_trades", 0)
 
         signal_score = min(1.0, divergence_z / 3.0)
 
@@ -745,6 +881,21 @@ class PositionManager:
         if entry_size < 1:
             log.info("rpe_skip_insufficient_size")
             return None
+
+        # ── Dollar-risk cap (RPE) ──────────────────────────────────────
+        max_loss_cents = strat.max_loss_per_trade_cents
+        if max_loss_cents > 0 and entry_price > 0:
+            max_shares_for_risk = max_loss_cents / (entry_price * 100.0)
+            if entry_size > max_shares_for_risk:
+                entry_size = round(max_shares_for_risk, 2)
+                log.info(
+                    "rpe_dollar_risk_cap_applied",
+                    max_loss_cents=max_loss_cents,
+                    capped_size=entry_size,
+                )
+                if entry_size < 1:
+                    log.info("rpe_skip_risk_cap_too_small")
+                    return None
 
         # ── Take-profit target ─────────────────────────────────────────
         # Mean-reversion toward model estimate: price should converge

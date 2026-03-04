@@ -1300,6 +1300,66 @@ class PortfolioCorrelationEngine:
 
         return bars
 
+    # ── Prior validation (OE-7) ──────────────────────────────────────────
+
+    def validate_structural_priors(self) -> dict:
+        """Log structural-vs-empirical divergence for every tracked pair.
+
+        Useful as a periodic health-check (e.g. every 30 min alongside
+        ``refresh_correlations``).  Returns a summary dict for telemetry.
+        """
+        pairs = self.corr_matrix.all_pairs()
+        if not pairs:
+            log.info("pce_validate_priors_empty")
+            return {"pairs": 0}
+
+        same_event_devs: list[float] = []
+        same_tag_devs: list[float] = []
+        baseline_devs: list[float] = []
+
+        for (a, b), est in pairs.items():
+            if est.overlap_bars < 10:
+                continue  # not enough empirical data to judge
+
+            dev = est.empirical_corr - est.structural_corr
+            structural = est.structural_corr
+
+            if abs(structural - self.structural_same_event) < 0.01:
+                same_event_devs.append(dev)
+            elif abs(structural - self.structural_same_tag) < 0.01:
+                same_tag_devs.append(dev)
+            else:
+                baseline_devs.append(dev)
+
+        def _stats(devs: list[float]) -> dict:
+            if not devs:
+                return {"n": 0}
+            mean_d = sum(devs) / len(devs)
+            mad = sum(abs(d) for d in devs) / len(devs)
+            return {"n": len(devs), "mean_dev": round(mean_d, 4),
+                    "mad": round(mad, 4)}
+
+        summary = {
+            "pairs": len(pairs),
+            "same_event": _stats(same_event_devs),
+            "same_tag": _stats(same_tag_devs),
+            "baseline": _stats(baseline_devs),
+        }
+
+        # Flag large mean deviations
+        for tier in ("same_event", "same_tag", "baseline"):
+            s = summary[tier]
+            if s["n"] > 0 and abs(s.get("mean_dev", 0)) > 0.15:
+                log.warning(
+                    "pce_prior_misalignment",
+                    tier=tier,
+                    mean_deviation=s["mean_dev"],
+                    n_pairs=s["n"],
+                )
+
+        log.info("pce_validate_priors", **summary)
+        return summary
+
     # ── Internal helpers ───────────────────────────────────────────────────
 
     def _build_exposure_list(self, open_positions: list[Any]) -> list[dict]:

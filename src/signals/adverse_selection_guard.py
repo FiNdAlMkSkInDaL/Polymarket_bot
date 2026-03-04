@@ -188,6 +188,14 @@ class AdverseSelectionGuard:
         self._running = False
         self._cancel_count: int = 0
 
+        # Confirmation persistence — require 2-of-4 condition to hold
+        # for N consecutive poll cycles before firing a kill.  This
+        # filters transient microstructure noise (single-cycle spikes)
+        # that would be false positives.
+        # At 50ms poll cadence, 4 cycles = 200ms confirmation delay.
+        self._confirmation_required: int = strat.adverse_sel_confirmation_cycles
+        self._consecutive_trigger_count: int = 0
+
     # === Lifecycle ==========================================================
 
     async def start(self) -> None:
@@ -611,12 +619,29 @@ class AdverseSelectionGuard:
 
             # -- 2-of-4 composite trigger -----------------------------------
             if len(signals_fired) < 2:
+                self._consecutive_trigger_count = 0  # reset confirmation
                 if signals_fired:
                     log.debug(
                         "adverse_sel_single_signal",
                         signal=signals_fired[0].get("signal"),
                     )
                 continue
+
+            # -- Confirmation persistence gate (OE-3) -----------------------
+            # Require the trigger condition to persist for N consecutive
+            # poll cycles before actually firing the kill.
+            self._consecutive_trigger_count += 1
+            if self._consecutive_trigger_count < self._confirmation_required:
+                log.debug(
+                    "adverse_sel_confirming",
+                    count=self._consecutive_trigger_count,
+                    required=self._confirmation_required,
+                    signals=[d.get("signal") for d in signals_fired],
+                )
+                continue
+
+            # Reset counter — kill will fire
+            self._consecutive_trigger_count = 0
 
             # Skip no-op kills when there are no resting orders
             open_count = self._executor.open_order_count

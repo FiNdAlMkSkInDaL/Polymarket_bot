@@ -343,11 +343,11 @@ class TestPositionManagerRisk:
             no_best_ask=0.45, whale_confluence=False,
         )
 
-        pos1 = await pm.open_position(signal, no_agg)
+        pos1 = await pm.open_position(signal, no_agg, fee_enabled=False)
         assert pos1 is not None
 
         # Second position should be rejected
-        pos2 = await pm.open_position(signal, no_agg)
+        pos2 = await pm.open_position(signal, no_agg, fee_enabled=False)
         assert pos2 is None
 
     @pytest.mark.asyncio

@@ -291,6 +291,20 @@ class CryptoPriceModel(ProbabilityModel):
         self._price_fn = price_fn
         self._vol_override = vol_override
 
+        # ── Per-market adaptive σ via EWMA (OE-5) ─────────────────────
+        # Instead of a single global constant, track an EWMA of
+        # log-return² from the spot price feed.  Updated on each
+        # evaluate() call (every 5s via _rpe_crypto_retrigger_loop).
+        self._prev_spot: float | None = None
+        self._ewma_var: float = 0.0
+        self._ewma_initialised: bool = False
+        self._EWMA_LAMBDA: float = 0.94
+        self._MIN_ANNUALIZED_VOL: float = 0.30
+        self._MAX_ANNUALIZED_VOL: float = 1.50
+        # Constants for annualisation: ~525960 minutes/year, spot
+        # sampled every ~5 seconds (12/min), so scale sqrt(525960*12).
+        self._ANNUALISE_FACTOR: float = (525960.0 * 12.0) ** 0.5
+
     @property
     def name(self) -> str:
         return "crypto_lognormal"
@@ -361,8 +375,32 @@ class CryptoPriceModel(ProbabilityModel):
 
         T = days_left / 365.0
 
-        # Annualized volatility
-        sigma = self._vol_override or settings.strategy.rpe_crypto_vol_default
+        # ── Adaptive annualized volatility (OE-5) ─────────────────────
+        # 1) Explicit override (backtesting) takes priority.
+        # 2) EWMA from live spot feed (if enough samples).
+        # 3) Fall back to the global config constant.
+        if self._vol_override:
+            sigma = self._vol_override
+        elif self._ewma_initialised and self._ewma_var > 0:
+            # Annualise the per-sample EWMA std-dev
+            raw_annual = (self._ewma_var ** 0.5) * self._ANNUALISE_FACTOR
+            sigma = max(self._MIN_ANNUALIZED_VOL,
+                        min(self._MAX_ANNUALIZED_VOL, raw_annual))
+        else:
+            sigma = settings.strategy.rpe_crypto_vol_default
+
+        # Update EWMA variance from the latest spot observation
+        if self._prev_spot is not None and self._prev_spot > 0 and spot > 0:
+            log_ret = math.log(spot / self._prev_spot)
+            if not self._ewma_initialised:
+                self._ewma_var = log_ret * log_ret
+                self._ewma_initialised = True
+            else:
+                self._ewma_var = (
+                    self._EWMA_LAMBDA * self._ewma_var
+                    + (1.0 - self._EWMA_LAMBDA) * log_ret * log_ret
+                )
+        self._prev_spot = spot
 
         # Black-Scholes d2 with μ = 0 (risk-neutral)
         mu = 0.0

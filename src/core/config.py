@@ -103,15 +103,15 @@ class StrategyParams:
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
     alpha_min: float = _env_float("ALPHA_MIN", 0.40)
     alpha_max: float = _env_float("ALPHA_MAX", 0.70)
-    min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 2.0)
+    min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
-    # Lowered from 35→20 to increase signal throughput during paper
-    # soak testing.  The geometric-mean formula already hard-rejects
-    # trades where any factor is zero, so EQS=20 still enforces
-    # minimum quality across all four dimensions.
-    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 20.0)
+    # Set to 50 based on 3-day post-mortem: trades with EQS < 50 were
+    # consistently unprofitable due to insufficient edge vs slippage+fees.
+    # The geometric-mean formula already hard-rejects trades where any
+    # factor is zero.
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 50.0)
 
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 15.0)
@@ -147,6 +147,11 @@ class StrategyParams:
     stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 4.0)
     signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
+
+    # Maximum dollar-risk per trade.  Caps position size so that a
+    # gap-to-zero event cannot lose more than this many cents.
+    # max_loss = entry_price × size × 100 ≤ max_loss_per_trade_cents.
+    max_loss_per_trade_cents: float = _env_float("MAX_LOSS_PER_TRADE_CENTS", 50.0)
 
     # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
     chase_interval_ms: int = _env_int("CHASE_INTERVAL_MS", 250)
@@ -194,20 +199,20 @@ class StrategyParams:
 
     # Signal 2 — Book depth evaporation
     # When informed traders arrive, market makers pull quotes before the
-    # price moves.  A 60% depth drop within 2 seconds within 5¢ of mid
-    # is the classic signature.  Differs from ghost liquidity (which
-    # detects fake depth without corresponding trades) — this detects
-    # genuine quote withdrawal by real market makers.
-    adverse_sel_depth_drop_pct: float = _env_float("ADVERSE_SEL_DEPTH_DROP_PCT", 0.60)
+    # price moves.  A 75% depth drop within 2 seconds within 5¢ of mid
+    # is the classic signature.  Raised from 60% to 75% to reduce false
+    # positives on thin Polymarket books where natural noise can produce
+    # transient depth drops.
+    adverse_sel_depth_drop_pct: float = _env_float("ADVERSE_SEL_DEPTH_DROP_PCT", 0.75)
     adverse_sel_depth_window_s: float = _env_float("ADVERSE_SEL_DEPTH_WINDOW_S", 2.0)
     adverse_sel_depth_near_mid_cents: float = _env_float("ADVERSE_SEL_DEPTH_NEAR_MID_CENTS", 5.0)
 
     # Signal 3 — Spread blow-out
-    # When the bid-ask spread on a positioned market widens to 3× its
+    # When the bid-ask spread on a positioned market widens to 4× its
     # 5-minute rolling average, market makers are widening defensively
-    # in response to perceived information asymmetry.  The 5-minute
-    # window normalizes for time-of-day spread variation.
-    adverse_sel_spread_blowout_mult: float = _env_float("ADVERSE_SEL_SPREAD_BLOWOUT_MULT", 3.0)
+    # in response to perceived information asymmetry.  Raised from 3×
+    # to 4× to reduce false positives on naturally noisy spreads.
+    adverse_sel_spread_blowout_mult: float = _env_float("ADVERSE_SEL_SPREAD_BLOWOUT_MULT", 4.0)
     adverse_sel_spread_avg_window_s: float = _env_float("ADVERSE_SEL_SPREAD_AVG_WINDOW_S", 300.0)
 
     # Signal 4 — Velocity anomaly on positioned assets
@@ -230,6 +235,11 @@ class StrategyParams:
     # FP (it didn’t).  Results are logged and persisted to JSONL.
     adverse_sel_outcome_delay_s: float = _env_float("ADVERSE_SEL_OUTCOME_DELAY_S", 60.0)
     adverse_sel_tp_threshold_cents: float = _env_float("ADVERSE_SEL_TP_THRESHOLD_CENTS", 3.0)
+
+    # Confirmation persistence: require the 2-of-4 condition to hold
+    # for N consecutive poll cycles before firing.  At 50ms cadence,
+    # 4 cycles = 200ms delay.  Filters single-cycle transient spikes.
+    adverse_sel_confirmation_cycles: int = _env_int("ADVERSE_SEL_CONFIRMATION_CYCLES", 4)
     # ── Pillar 6: Dynamic Fee-Curve Integration ────────────────────────────
     fee_cache_ttl_s: int = _env_int("FEE_CACHE_TTL_S", 300)
     fee_default_bps: int = _env_int("FEE_DEFAULT_BPS", 200)
@@ -278,6 +288,10 @@ class StrategyParams:
     # ── Kelly cold-start ──────────────────────────────────────────────────
     min_kelly_trades: int = _env_int("MIN_KELLY_TRADES", 20)
     cold_start_frac: float = _env_float("COLD_START_FRAC", 0.50)
+    # Adaptive cold-start: halt new entries when rolling N-trade
+    # expectancy is negative, preventing compounding losses.
+    cold_start_halt_window: int = _env_int("COLD_START_HALT_WINDOW", 10)
+    cold_start_negative_ev_halt: bool = _env_bool("COLD_START_NEGATIVE_EV_HALT", True)
 
     # ── Spread-based signal source ────────────────────────────────────────
     spread_signal_enabled: bool = _env_bool("SPREAD_SIGNAL_ENABLED", True)
@@ -285,21 +299,41 @@ class StrategyParams:
 
     # ── Panic detector NO-discount gate ────────────────────────────────────
     # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
-    # Lower = stricter (1.02 means NO must be 2% below VWAP).
-    # 1.005 means just 0.5% below VWAP — much less restrictive.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
+    # Lower = stricter (0.98 means NO must be 2% below VWAP).
+    # Tightened from 1.005→0.98 based on 3-day post-mortem: permissive
+    # discount gate admitted entries with no structural discount to capture.
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.98)
 
     # ── Trend regime guard ────────────────────────────────────────────────
     # Suppress panic signals when YES has been trending upward over the
     # last N bars — sustained moves are regime shifts, not panics.
     trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
     trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.10)
+    # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
+    # Exponentially-weighted moving average of 1-min log-return variance.
+    # Reacts to regime changes in ~6 bars vs ~30 for equal-weight std.
+    # λ = 0.94 is the RiskMetrics standard for daily data scaled to 1-min.
+    volatility_ewma_lambda: float = _env_float("VOLATILITY_EWMA_LAMBDA", 0.94)
 
+    # ── Regime-adaptive EQS threshold (OE-6) ─────────────────────────────────
+    # Scale min_edge_score by EWMA σ.  Low-vol → raise threshold
+    # (avoid noise), high-vol → lower threshold (mean-reversion α).
+    eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", True)
+    eqs_vol_ref: float = _env_float("EQS_VOL_REF", 0.02)         # "normal" 1-min σ
+    eqs_vol_scale_range: float = _env_float("EQS_VOL_SCALE_RANGE", 0.25)  # ±25% max adjustment
     # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
     kelly_max_pct: float = _env_float("KELLY_MAX_PCT", 10.0)
     kelly_p_cap: float = _env_float("KELLY_P_CAP", 0.85)                      # max win probability estimate
     kelly_default_uncertainty: float = _env_float("KELLY_DEFAULT_UNCERTAINTY", 0.5)  # fallback when signal metadata missing
+
+    # Prior win rate used during cold-start (< min_kelly_trades).
+    # Set this from WFO OOS results to avoid the 0.55 guess.
+    kelly_prior_win_rate: float = _env_float("KELLY_PRIOR_WIN_RATE", 0.55)
+
+    # Decay factor for exponentially-weighted win rate.
+    # ŵ_t = α · 1[win_t] + (1-α) · ŵ_{t-1}.  α=0.10 → ~10-trade half-life.
+    kelly_wr_decay_alpha: float = _env_float("KELLY_WR_DECAY_ALPHA", 0.10)
 
     # ── Uncertainty penalty weights for edge discounting ──────────────────
     uncertainty_spread_weight: float = _env_float("UNCERTAINTY_SPREAD_WEIGHT", 0.6)
@@ -390,6 +424,41 @@ class StrategyParams:
     pce_near_extreme_threshold: float = _env_float("PCE_NEAR_EXTREME_THRESHOLD", 0.85)
     pce_near_extreme_overlap_multiplier: int = _env_int("PCE_NEAR_EXTREME_OVERLAP_MULTIPLIER", 3)
     pce_backtest_enabled: bool = _env_bool("PCE_BACKTEST_ENABLED", False)
+
+    # ── SI-1: Regime Detector ──────────────────────────────────────────────
+    # Per-market HMM-lite regime classifier.  Score ∈ [0,1] where
+    # 1 = mean-reversion favourable.  Entries are suppressed when the
+    # score drops below regime_threshold.
+    regime_enabled: bool = _env_bool("REGIME_ENABLED", True)
+    regime_ewma_lambda: float = _env_float("REGIME_EWMA_LAMBDA", 0.90)
+    regime_autocorr_window: int = _env_int("REGIME_AUTOCORR_WINDOW", 20)
+    regime_persistence_window: int = _env_int("REGIME_PERSISTENCE_WINDOW", 15)
+    regime_threshold: float = _env_float("REGIME_THRESHOLD", 0.40)
+
+    # ── SI-2: Iceberg Detector ─────────────────────────────────────────────
+    # Detects hidden reserve orders via repeated size replenishment at
+    # persistent price levels in the L2 book.
+    iceberg_enabled: bool = _env_bool("ICEBERG_ENABLED", True)
+    iceberg_refill_window_s: float = _env_float("ICEBERG_REFILL_WINDOW_S", 5.0)
+    iceberg_min_refills: int = _env_int("ICEBERG_MIN_REFILLS", 3)
+    iceberg_size_tolerance_pct: float = _env_float("ICEBERG_SIZE_TOLERANCE_PCT", 0.30)
+
+    # ── SI-3: Cross-Market Signal Generator ────────────────────────────────
+    # Offensive pairs-style alpha from correlated market lag divergences.
+    cross_mkt_enabled: bool = _env_bool("CROSS_MKT_ENABLED", True)
+    cross_mkt_shadow: bool = _env_bool("CROSS_MKT_SHADOW", True)  # log-only until calibrated
+    cross_mkt_min_correlation: float = _env_float("CROSS_MKT_MIN_CORRELATION", 0.50)
+    cross_mkt_z_entry: float = _env_float("CROSS_MKT_Z_ENTRY", 2.0)
+    cross_mkt_spread_ewma_lambda: float = _env_float("CROSS_MKT_SPREAD_EWMA_LAMBDA", 0.94)
+
+    # ── SI-4: Stealth Execution ────────────────────────────────────────────
+    # Time-sliced order splitting to reduce market footprint.
+    stealth_enabled: bool = _env_bool("STEALTH_ENABLED", False)  # off until tested
+    stealth_min_size_usd: float = _env_float("STEALTH_MIN_SIZE_USD", 5.0)
+    stealth_max_slices: int = _env_int("STEALTH_MAX_SLICES", 4)
+    stealth_min_delay_ms: float = _env_float("STEALTH_MIN_DELAY_MS", 200.0)
+    stealth_max_delay_ms: float = _env_float("STEALTH_MAX_DELAY_MS", 1500.0)
+    stealth_size_jitter_pct: float = _env_float("STEALTH_SIZE_JITTER_PCT", 0.15)
 
 
 @dataclass(frozen=True)

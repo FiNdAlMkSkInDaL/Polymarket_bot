@@ -262,11 +262,18 @@ class DataLoader:
         if not isinstance(payload, dict):
             return None
 
-        # Detect snapshot vs delta for "l2" source
-        if event_type == "l2_delta" and payload:
+        # Reconcile event type using payload hints.
+        # The recorder uses two top-level ``source`` tags ("l2" and
+        # "trade") but the payload's ``event_type`` is the ground truth.
+        if payload:
             payload_type = payload.get("event_type", "")
+
             if payload_type in ("book", "snapshot", "book_snapshot"):
+                # Full L2 snapshot regardless of source tag
                 event_type = "l2_snapshot"
+            elif payload_type == "last_trade_price":
+                # Public trade — contains price/size/side
+                event_type = "trade"
 
         # Extract server timestamp if present
         server_time = 0.0

@@ -115,6 +115,9 @@ class OHLCVAggregator:
         self.rolling_vwap: float = 0.0
         self.rolling_volatility: float = 0.0
         self.rolling_volatility_30m: float = 0.0  # 30-min window for TP rescaling
+        self.rolling_volatility_ewma: float = 0.0  # EWMA σ (fast-reacting)
+        self._ewma_variance: float = 0.0  # internal EWMA variance state
+        self._ewma_initialised: bool = False
         self.avg_bar_volume: float = 0.0
 
         # Most recent trade timestamp — used for data freshness checks.
@@ -213,6 +216,23 @@ class OHLCVAggregator:
         closes = np.maximum(closes, 1e-8)
         log_returns = np.diff(np.log(closes))
         self.rolling_volatility = float(log_returns.std()) if len(log_returns) > 1 else 0.0
+
+        # ── EWMA volatility (RiskMetrics λ=0.94) ────────────────────────
+        #   σ²_t = λ · σ²_{t-1} + (1 - λ) · r²_t
+        # Reacts to regime changes in ~6 bars instead of ~30.
+        lam = settings.strategy.volatility_ewma_lambda
+        if len(log_returns) > 0:
+            latest_return = float(log_returns[-1])
+            if not self._ewma_initialised:
+                # Seed with equal-weight variance for stability
+                self._ewma_variance = float((log_returns ** 2).mean())
+                self._ewma_initialised = True
+            else:
+                self._ewma_variance = (
+                    lam * self._ewma_variance
+                    + (1.0 - lam) * latest_return * latest_return
+                )
+            self.rolling_volatility_ewma = self._ewma_variance ** 0.5
 
         # ── 30-minute short-window volatility for TP rescaling ─────────
         n30 = len(self.bars)

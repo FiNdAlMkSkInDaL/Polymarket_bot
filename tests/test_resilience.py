@@ -290,7 +290,7 @@ class TestTimeoutEnforcement:
             no_best_ask=0.45, whale_confluence=False,
         )
 
-        pos = await pm.open_position(signal, no_agg)
+        pos = await pm.open_position(signal, no_agg, fee_enabled=False)
         assert pos is not None
 
         # Simulate passage of time beyond entry timeout
@@ -316,7 +316,7 @@ class TestTimeoutEnforcement:
             no_best_ask=0.45, whale_confluence=False,
         )
 
-        pos = await pm.open_position(signal, no_agg)
+        pos = await pm.open_position(signal, no_agg, fee_enabled=False)
         assert pos is not None
 
         # Simulate entry fill

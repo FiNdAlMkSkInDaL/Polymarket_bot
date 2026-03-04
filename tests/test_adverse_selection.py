@@ -318,25 +318,25 @@ class TestSpreadBlowout:
         return guard
 
     def test_fires_on_blowout(self, guard):
-        """Spread at 3x+ average should fire."""
+        """Spread at 4x+ average should fire."""
         now = time.time()
         history = deque(maxlen=10000)
         for i in range(50):
             history.append((now - 300 + i * 6, 2.0))
-        history.append((now, 7.0))
+        history.append((now, 9.0))  # 9/2 = 4.5x → above 4.0x threshold
         guard._spread_ts_history["ASSET_A"] = history
 
         fired, diag = guard._check_spread_blowout()
         assert fired is True
-        assert diag["worst_mult"] >= 3.0
+        assert diag["worst_mult"] >= 4.0
 
     def test_no_fire_below_multiplier(self, guard):
-        """Spread at 2x average should NOT fire (threshold is 3x)."""
+        """Spread at 3.5x average should NOT fire (threshold is 4x)."""
         now = time.time()
         history = deque(maxlen=10000)
         for i in range(50):
             history.append((now - 300 + i * 6, 2.0))
-        history.append((now, 4.0))
+        history.append((now, 7.0))  # 7/2 = 3.5x → below 4.0x threshold
         guard._spread_ts_history["ASSET_A"] = history
 
         fired, diag = guard._check_spread_blowout()
@@ -679,7 +679,7 @@ class TestSpreadBlowoutWindowed:
         Scenario: 50 old samples at spread=10 (outside window) + 50
         recent samples at spread=2.  If the old samples are included,
         the average would be ~6 and current=6 would only be 1x -> no
-        fire.  With proper windowing, avg=2 and current=6 -> 3x -> fires.
+        fire.  With proper windowing, avg=2 and current=9 -> 4.5x -> fires.
         """
         now = time.time()
         window = guard._spread_avg_window_s  # 300s default
@@ -694,12 +694,12 @@ class TestSpreadBlowoutWindowed:
             history.append((now - 200 + i * 4, 2.0))
 
         # Current spike
-        history.append((now, 7.0))
+        history.append((now, 9.0))  # 9/2 = 4.5x → above 4.0x threshold
         guard._spread_ts_history["ASSET_A"] = history
 
         fired, diag = guard._check_spread_blowout()
         assert fired is True
-        assert diag["worst_mult"] >= 3.0
+        assert diag["worst_mult"] >= 4.0
 
     def test_all_in_window_behaves_normally(self, guard):
         """When all samples are within window, behaviour is unchanged."""
@@ -707,7 +707,7 @@ class TestSpreadBlowoutWindowed:
         history = deque(maxlen=10000)
         for i in range(50):
             history.append((now - 250 + i * 5, 2.0))
-        history.append((now, 4.0))  # 2x -> below 3x threshold
+        history.append((now, 7.0))  # 3.5x -> below 4x threshold
         guard._spread_ts_history["ASSET_A"] = history
 
         fired, diag = guard._check_spread_blowout()

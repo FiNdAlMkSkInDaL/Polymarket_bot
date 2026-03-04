@@ -26,7 +26,7 @@ def _make_signal(market_id: str = "MKT_A") -> PanicSignal:
         yes_vwap=0.50,
         zscore=3.0,
         volume_ratio=5.0,
-        no_best_ask=0.55,
+        no_best_ask=0.26,
         whale_confluence=False,
     )
 
@@ -69,11 +69,11 @@ class TestConcentrationLimits:
 
         # Fill up per-market slots (default is 1 per market)
         sig = _make_signal("MKT_A")
-        pos1 = await pm.open_position(sig, _make_no_agg())
+        pos1 = await pm.open_position(sig, _make_no_agg(), fee_enabled=False)
         assert pos1 is not None
 
         # Second position on same market should be blocked
-        pos2 = await pm.open_position(sig, _make_no_agg())
+        pos2 = await pm.open_position(sig, _make_no_agg(), fee_enabled=False)
         assert pos2 is None
 
     @pytest.mark.asyncio
@@ -85,14 +85,14 @@ class TestConcentrationLimits:
         # Two different markets, same event
         sig1 = _make_signal("MKT_A")
         sig2 = _make_signal("MKT_B")
-        pos1 = await pm.open_position(sig1, _make_no_agg(), event_id="EVT_X")
+        pos1 = await pm.open_position(sig1, _make_no_agg(), event_id="EVT_X", fee_enabled=False)
         assert pos1 is not None
-        pos2 = await pm.open_position(sig2, _make_no_agg(), event_id="EVT_X")
+        pos2 = await pm.open_position(sig2, _make_no_agg(), event_id="EVT_X", fee_enabled=False)
         assert pos2 is not None
 
         # Third should be blocked (default per-event limit is 2)
         sig3 = _make_signal("MKT_C")
-        pos3 = await pm.open_position(sig3, _make_no_agg(), event_id="EVT_X")
+        pos3 = await pm.open_position(sig3, _make_no_agg(), event_id="EVT_X", fee_enabled=False)
         assert pos3 is None
 
 

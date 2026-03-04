@@ -270,7 +270,7 @@ class TestTakeProfitMath:
             entry_price=0.70, no_vwap=0.60,
             fee_enabled=False, desired_margin_cents=0.0,
         )
-        expected = 0.70 + 2.0 / 100.0  # min_spread_cents = 2
+        expected = 0.70 + 4.0 / 100.0  # min_spread_cents = 4
         assert r.target_price == pytest.approx(expected, abs=0.01)
         assert r.alpha == 0.40  # falls to alpha_min
 

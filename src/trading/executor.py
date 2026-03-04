@@ -228,13 +228,24 @@ class OrderExecutor:
 
     # ── Cancel all ──────────────────────────────────────────────────────────
     async def cancel_all(self) -> int:
-        """Cancel every open order.  Returns count cancelled."""
-        count = 0
-        for order in list(self._orders.values()):
-            if order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED):
-                await self.cancel_order(order)
-                count += 1
-        return count
+        """Cancel every open order.  Returns count cancelled.
+
+        Cancellations are dispatched in parallel (``asyncio.gather``)
+        so that N orders are cancelled in one round-trip window rather
+        than N sequential HTTP calls.
+        """
+        to_cancel = [
+            order
+            for order in self._orders.values()
+            if order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        ]
+        if not to_cancel:
+            return 0
+        await asyncio.gather(
+            *(self.cancel_order(order) for order in to_cancel),
+            return_exceptions=True,
+        )
+        return len(to_cancel)
 
     # ── Paper-mode fill simulation ──────────────────────────────────────────
     def check_paper_fill(self, asset_id: str, market_price: float) -> list[Order]:
