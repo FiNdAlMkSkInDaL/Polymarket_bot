@@ -246,8 +246,12 @@ def compute_edge_score(
             if v_thresh > 0
             else 0.0
         )
-        # Baseline 0.5 (just cleared PanicDetector), rises with excess
-        signal_q = min(1.0, 0.5 + 0.25 * z_excess + 0.25 * v_excess)
+        # Baseline 0.5 (just cleared PanicDetector), rises with excess.
+        # Z-score excess has diminishing returns above 2× threshold
+        # (extreme z-scores often indicate information, not noise).
+        z_contribution = min(z_excess, 2.0) * 0.25 / max(z_excess, 1.0) if z_excess > 0 else 0.0
+        z_contribution = min(0.35, 0.25 * z_excess) if z_excess <= 2.0 else 0.35 + 0.05 * min(z_excess - 2.0, 2.0)
+        signal_q = min(1.0, 0.5 + z_contribution + 0.20 * min(v_excess, 2.0))
     if whale_confluence:
         signal_q = min(1.0, signal_q + 0.15)
 

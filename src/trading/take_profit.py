@@ -88,11 +88,19 @@ def compute_take_profit(
 
     # ── Adjustments ─────────────────────────────────────────────────────────
 
-    # 1. Volatility adjustment: high vol → capture less (exit sooner)
+    # 1. Volatility adjustment: ASYMMETRIC
+    #    High vol during a panic = bigger dislocation = room for larger
+    #    reversion → INCREASE alpha (hold for bigger move).
+    #    Low vol = tight range = scalp quickly → decrease alpha.
     #    Benchmark σ ≈ 0.02 for "normal" prediction market 1-min bars.
     if realised_vol > 0:
         vol_factor = min(realised_vol / 0.02, 3.0)  # cap at 3×
-        alpha -= 0.05 * (vol_factor - 1.0)
+        if vol_factor > 1.0:
+            # High vol: widen target (panic = bigger reversion)
+            alpha += 0.04 * (vol_factor - 1.0)
+        else:
+            # Low vol: tighten target (scalp the small move)
+            alpha -= 0.08 * (1.0 - vol_factor)
 
     # 2. Book depth: deeper resting liquidity → can afford to wait
     if book_depth_ratio > 1.0:
@@ -105,6 +113,19 @@ def compute_take_profit(
     # 4. Time decay: closer to resolution → less room for mean reversion
     if days_to_resolution < 14:
         alpha -= 0.05 * (1.0 - days_to_resolution / 14.0)
+
+    # 5. VWAP proximity: if entry is very close to VWAP, the
+    #    mean-reversion anchor is weak → lower alpha to take profit
+    #    quickly.  If entry is far below VWAP, the dislocation is
+    #    large → higher alpha is justified.
+    if no_vwap > entry_price and entry_price > 0:
+        discount_pct = (no_vwap - entry_price) / no_vwap
+        if discount_pct > 0.10:
+            # Entry is 10%+ below VWAP — strong dislocation
+            alpha += 0.04 * min(discount_pct / 0.20, 1.0)
+        elif discount_pct < 0.02:
+            # Entry is within 2% of VWAP — weak edge, scalp it
+            alpha -= 0.05
 
     # Clamp alpha
     alpha = max(strat.alpha_min, min(strat.alpha_max, alpha))

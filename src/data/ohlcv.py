@@ -7,6 +7,7 @@ the panic-spike detector.
 from __future__ import annotations
 
 import time
+import itertools
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque
@@ -187,7 +188,9 @@ class OHLCVAggregator:
 
     def _recompute_stats(self) -> None:
         """Recompute rolling VWAP, σ and avg volume over the lookback window."""
-        window = list(self.bars)[-self.lookback :]
+        n = len(self.bars)
+        skip = max(0, n - self.lookback)
+        window = list(itertools.islice(self.bars, skip, n))
         if len(window) < 2:
             return
 
@@ -212,7 +215,9 @@ class OHLCVAggregator:
         self.rolling_volatility = float(log_returns.std()) if len(log_returns) > 1 else 0.0
 
         # ── 30-minute short-window volatility for TP rescaling ─────────
-        window_30 = list(self.bars)[-30:]
+        n30 = len(self.bars)
+        skip30 = max(0, n30 - 30)
+        window_30 = list(itertools.islice(self.bars, skip30, n30))
         if len(window_30) >= 3:
             closes_30 = np.array([b.close for b in window_30])
             closes_30 = np.maximum(closes_30, 1e-8)

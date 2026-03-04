@@ -408,6 +408,7 @@ class PositionManager:
             book=no_book,
             signal_metadata=signal_metadata,
             total_trades=total_trades,
+            _precomputed_depth_result=sizing,
         )
 
         # Reject if Kelly finds no edge (cold-start is allowed through)
@@ -748,13 +749,13 @@ class PositionManager:
         # ── Take-profit target ─────────────────────────────────────────
         # Mean-reversion toward model estimate: price should converge
         # to model_probability.
-        alpha = strat.alpha_default
-        target_price = round(
-            entry_price + alpha * (model_probability - entry_price), 2
-        )
-        # When buying NO (market overpriced), model_prob < market_price,
-        # so we bought at 1-market_price on the NO side.  The target
-        # needs to be above entry for a profitable exit.
+        # Use a confidence-scaled alpha: high confidence → capture more
+        # of the divergence; low confidence → conservative partial capture.
+        alpha_base = strat.alpha_default
+        # Scale alpha by confidence: [0.15..0.95] → [0.6..1.0] of base alpha
+        conf_scale = 0.6 + 0.4 * max(0.0, min(1.0, confidence))
+        alpha = alpha_base * conf_scale
+
         if direction == "buy_no":
             # NO token price ≈ 1 - YES price.  We enter at entry_price
             # (NO best ask - 1¢), target is higher (NO reverts up).

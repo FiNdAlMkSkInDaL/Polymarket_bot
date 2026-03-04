@@ -140,6 +140,8 @@ class TestAdverseSelectionGuard:
             {"signal": "flow_coherence"},
             {"signal": "depth_evaporation"},
         ])
+        # Telegram alert is fire-and-forget; yield to let the task complete
+        await asyncio.sleep(0.01)
         telegram.send.assert_called_once()
         msg = telegram.send.call_args[0][0]
         assert "Adverse Selection Kill" in msg

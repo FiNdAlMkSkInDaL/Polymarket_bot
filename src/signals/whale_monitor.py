@@ -90,6 +90,7 @@ class WhaleMonitor:
         self.baseline_interval = float(poll_interval or settings.whale_poll_interval_seconds)
         self._current_interval: float = self.baseline_interval
         self._recent: list[WhaleActivity] = []
+        self._recent_tx_hashes: set[str] = set()  # O(1) dedup for tx hashes
         self._running = False
         self._last_block: int = 0
 
@@ -262,12 +263,16 @@ class WhaleMonitor:
 
         # Always trim stale entries, even when no new txs arrive
         cutoff = time.time() - 3600
+        stale = [a for a in self._recent if a.timestamp < cutoff]
+        for a in stale:
+            self._recent_tx_hashes.discard(a.tx_hash)
         self._recent = [a for a in self._recent if a.timestamp >= cutoff]
 
         api_url = "https://api.polygonscan.com/api"
 
         async with httpx.AsyncClient(timeout=20) as client:
-            for wallet in self.wallets:
+            async def _fetch_wallet(wallet: str) -> list[tuple[dict, str]]:
+                """Fetch recent txs for a single wallet."""
                 params = {
                     "module": "account",
                     "action": "token1155tx",
@@ -283,13 +288,16 @@ class WhaleMonitor:
                     data = resp.json()
                     txs = data.get("result", [])
                     if not isinstance(txs, list):
-                        continue
-
-                    for tx in txs[:20]:  # Only recent
-                        self._process_tx(tx, wallet)
-
+                        return []
+                    return [(tx, wallet) for tx in txs[:20]]
                 except Exception as exc:
                     log.debug("whale_poll_wallet_error", wallet=wallet[:10], error=str(exc))
+                    return []
+
+            results = await asyncio.gather(*[_fetch_wallet(w) for w in self.wallets])
+            for wallet_txs in results:
+                for tx, wallet in wallet_txs:
+                    self._process_tx(tx, wallet)
 
     def _process_tx(self, tx: dict, wallet: str) -> None:
         """Parse a Polygonscan ERC-1155 transfer into WhaleActivity."""
@@ -305,8 +313,8 @@ class WhaleMonitor:
             if block > self._last_block:
                 self._last_block = block
 
-            # Deduplicate
-            if any(a.tx_hash == tx_hash for a in self._recent):
+            # Deduplicate (O(1) via set)
+            if tx_hash in self._recent_tx_hashes:
                 return
 
             # Determine direction using token→market mapping if available
@@ -332,9 +340,13 @@ class WhaleMonitor:
             )
 
             self._recent.append(activity)
+            self._recent_tx_hashes.add(tx_hash)
 
             # Trim old entries (keep last hour)
             cutoff = time.time() - 3600
+            stale = [a for a in self._recent if a.timestamp < cutoff]
+            for a in stale:
+                self._recent_tx_hashes.discard(a.tx_hash)
             self._recent = [a for a in self._recent if a.timestamp >= cutoff]
 
             log.info(

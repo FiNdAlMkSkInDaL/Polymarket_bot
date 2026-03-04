@@ -289,6 +289,12 @@ class StrategyParams:
     # 1.005 means just 0.5% below VWAP — much less restrictive.
     no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
 
+    # ── Trend regime guard ────────────────────────────────────────────────
+    # Suppress panic signals when YES has been trending upward over the
+    # last N bars — sustained moves are regime shifts, not panics.
+    trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
+    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.10)
+
     # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
     kelly_max_pct: float = _env_float("KELLY_MAX_PCT", 10.0)

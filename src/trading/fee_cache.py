@@ -53,7 +53,9 @@ class FeeCache:
         # {token_id: (fee_rate_bps, fetched_at)}
         self._cache: dict[str, tuple[int, float]] = {}
         self._max_size = max_size
-        self._lock = asyncio.Lock()
+        self._locks: dict[str, asyncio.Lock] = {}  # Per-token locks for concurrent fetches
+        self._global_lock = asyncio.Lock()  # Protects _locks dict creation
+        self._http_client: httpx.AsyncClient | None = None  # Persistent connection pool
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ class FeeCache:
         """Return the taker fee for *token_id* in basis points.
 
         Uses a cached value if fresh; otherwise fetches from the CLOB.
-        Thread-/task-safe via an asyncio lock.
+        Task-safe via per-token locks to avoid serialising unrelated tokens.
         """
         now = time.time()
         cached = self._cache.get(token_id)
@@ -70,7 +72,13 @@ class FeeCache:
             if now - ts < self._ttl:
                 return bps
 
-        async with self._lock:
+        # Get or create a per-token lock (lightweight; protects only this token)
+        async with self._global_lock:
+            if token_id not in self._locks:
+                self._locks[token_id] = asyncio.Lock()
+            token_lock = self._locks[token_id]
+
+        async with token_lock:
             # Double-check after acquiring lock
             cached = self._cache.get(token_id)
             if cached is not None and now - cached[1] < self._ttl:
@@ -156,13 +164,14 @@ class FeeCache:
         """Query the CLOB for the current taker fee rate."""
         url = f"{self._base_url}/fee-rate"
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url, params={"tokenID": token_id})
-                resp.raise_for_status()
-                data = resp.json()
-                bps = int(float(data.get("feeRateBps", self._default_bps)))
-                log.debug("fee_rate_fetched", token_id=token_id[:16], bps=bps)
-                return bps
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(timeout=5.0)
+            resp = await self._http_client.get(url, params={"tokenID": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+            bps = int(float(data.get("feeRateBps", self._default_bps)))
+            log.debug("fee_rate_fetched", token_id=token_id[:16], bps=bps)
+            return bps
         except Exception as exc:
             log.warning(
                 "fee_rate_fetch_failed",
@@ -171,6 +180,12 @@ class FeeCache:
                 fallback_bps=self._default_bps,
             )
             return self._default_bps
+
+    async def close(self) -> None:
+        """Close the shared HTTP client."""
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
 
 # ── Startup validation ─────────────────────────────────────────────────────

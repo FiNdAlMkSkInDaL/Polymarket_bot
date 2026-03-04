@@ -625,6 +625,34 @@ class L2OrderBook:
             for p in self._asks.islice(stop=n)
         ]
 
+    def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
+        """Sum resting depth (USD) within *cents* of mid, without allocating Level objects.
+
+        This is used by the AdverseSelectionGuard on a fast 50ms loop.
+        Iterating the SortedDict directly avoids creating intermediate
+        Level objects that would churn the GC.
+        """
+        bb = self.best_bid
+        ba = self.best_ask
+        if bb <= 0 or ba <= 0:
+            return 0.0
+        mid = (bb + ba) / 2.0
+        threshold = cents / 100.0
+
+        depth = 0.0
+        count = 0
+        for neg_p in self._bids.islice(stop=max_levels):
+            price = -neg_p
+            if abs(price - mid) <= threshold:
+                depth += price * self._bids[neg_p]
+            count += 1
+        count = 0
+        for p in self._asks.islice(stop=max_levels):
+            if abs(p - mid) <= threshold:
+                depth += p * self._asks[p]
+            count += 1
+        return depth
+
     # ── Ghost liquidity support ────────────────────────────────────────
     def _record_depth(self, now: float | None = None) -> None:
         depth = self.current_total_depth()

@@ -1067,7 +1067,7 @@ class TestSingletonRPE:
 class TestNearResolvedPriceGuard:
     """Verify that _on_yes_bar_closed blocks signals on near-resolved markets."""
 
-    def test_near_resolved_price_skips_signals_and_drains(self) -> None:
+    async def test_near_resolved_price_skips_signals_and_drains(self) -> None:
         """When yes_price=0.98, rpe.evaluate and detector.evaluate must NOT be
         called, and drain_market must be called with reason='near_resolved_price'.
         """
@@ -1116,9 +1116,7 @@ class TestNearResolvedPriceGuard:
         bar.close = 0.98
 
         # Run the handler
-        asyncio.get_event_loop().run_until_complete(
-            bot._on_yes_bar_closed("YES_NR", bar)
-        )
+        await bot._on_yes_bar_closed("YES_NR", bar)
 
         # Assertions
         mock_detector.evaluate.assert_not_called()
@@ -1127,7 +1125,7 @@ class TestNearResolvedPriceGuard:
             "NEAR_RESOLVED", reason="near_resolved_price"
         )
 
-    def test_accepting_orders_false_drains(self) -> None:
+    async def test_accepting_orders_false_drains(self) -> None:
         """When accepting_orders is False, drain with reason='not_accepting_orders'."""
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1155,9 +1153,7 @@ class TestNearResolvedPriceGuard:
         bar = MagicMock()
         bar.close = 0.55
 
-        asyncio.get_event_loop().run_until_complete(
-            bot._on_yes_bar_closed("YES_CL", bar)
-        )
+        await bot._on_yes_bar_closed("YES_CL", bar)
 
         # Should drain immediately, no signal evaluation
         bot.lifecycle.drain_market.assert_called_once_with(
@@ -1166,7 +1162,7 @@ class TestNearResolvedPriceGuard:
         mock_detector.evaluate.assert_not_called()
         mock_rpe.evaluate.assert_not_called()
 
-    def test_price_in_band_allows_evaluation(self) -> None:
+    async def test_price_in_band_allows_evaluation(self) -> None:
         """When yes_price=0.50 (within band), detector and RPE should be called."""
         from unittest.mock import AsyncMock, MagicMock
 
@@ -1205,9 +1201,7 @@ class TestNearResolvedPriceGuard:
         bar = MagicMock()
         bar.close = 0.50
 
-        asyncio.get_event_loop().run_until_complete(
-            bot._on_yes_bar_closed("YES_OK", bar)
-        )
+        await bot._on_yes_bar_closed("YES_OK", bar)
 
         # Both signals should be evaluated when price is normal
         mock_detector.evaluate.assert_called_once()

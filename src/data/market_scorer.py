@@ -25,9 +25,9 @@ _WEIGHTS = {
     "liquidity":       0.20,
     "spread":          0.20,
     "time_to_resolve": 0.15,
-    "price_range":     0.10,
+    "fee_zone":        0.10,
+    "price_range":     0.05,
     "trade_freq":      0.10,
-    "whale_interest":  0.05,
 }
 
 
@@ -39,6 +39,7 @@ class ScoreBreakdown:
     liquidity: float = 0.0
     spread: float = 0.0
     time_to_resolve: float = 0.0
+    fee_zone: float = 0.0
     price_range: float = 0.0
     trade_freq: float = 0.0
     whale_interest: float = 0.0
@@ -51,6 +52,7 @@ class ScoreBreakdown:
             "liq": round(self.liquidity, 1),
             "sprd": round(self.spread, 1),
             "ttr": round(self.time_to_resolve, 1),
+            "fz": round(self.fee_zone, 1),
             "prng": round(self.price_range, 1),
             "freq": round(self.trade_freq, 1),
             "whale": round(self.whale_interest, 1),
@@ -141,6 +143,19 @@ def score_whale_interest(has_whale_activity: bool) -> float:
     return 100.0 if has_whale_activity else 0.0
 
 
+def score_fee_zone(mid_price: float) -> float:
+    """Score based on fee efficiency — inverse of the quadratic fee curve.
+
+    Fee(p) = f_max · 4 · p · (1 - p) peaks at p=0.50.
+    Markets near the tails have lower fees, making edge easier to capture.
+    Score: (1 - 4p(1-p)) · 100  →  100 at tails, 0 at p=0.50.
+    """
+    if mid_price <= 0 or mid_price >= 1.0:
+        return 50.0  # no data yet
+    fee_drag = 4.0 * mid_price * (1.0 - mid_price)  # 0–1, peaks at 0.50
+    return (1.0 - fee_drag) * 100.0
+
+
 def compute_mti_penalty(taker_count: int, total_count: int) -> float:
     """Compute the Maker/Taker Imbalance penalty (graduated).
 
@@ -193,6 +208,7 @@ def compute_score(
         liquidity=score_liquidity(liquidity_usd),
         spread=live_spread_score if live_spread_score is not None else score_spread(spread_cents),
         time_to_resolve=score_time_to_resolution(end_date),
+        fee_zone=score_fee_zone(mid_price),
         price_range=score_price_range(mid_price),
         trade_freq=score_trade_frequency(trades_per_minute),
         whale_interest=score_whale_interest(has_whale_activity),
@@ -204,9 +220,9 @@ def compute_score(
         + bd.liquidity * _WEIGHTS["liquidity"]
         + bd.spread * _WEIGHTS["spread"]
         + bd.time_to_resolve * _WEIGHTS["time_to_resolve"]
+        + bd.fee_zone * _WEIGHTS["fee_zone"]
         + bd.price_range * _WEIGHTS["price_range"]
         + bd.trade_freq * _WEIGHTS["trade_freq"]
-        + bd.whale_interest * _WEIGHTS["whale_interest"]
     )
 
     bd.total = max(0.0, min(100.0, weighted_sum - penalty))

@@ -216,13 +216,13 @@ class TestTakeProfitMath:
         expected_spread = (r.target_price - r.entry_price) * 100
         assert r.spread_cents == pytest.approx(expected_spread, abs=0.1)
 
-    def test_high_vol_lowers_alpha(self):
-        """Realised vol = 3× benchmark → α decreases by 0.10."""
+    def test_high_vol_raises_alpha(self):
+        """Realised vol = 3× benchmark → α increases (panic = bigger reversion)."""
         baseline = compute_take_profit(entry_price=0.47, no_vwap=0.65, realised_vol=0.02)
         high_vol = compute_take_profit(entry_price=0.47, no_vwap=0.65, realised_vol=0.06)
-        assert high_vol.alpha < baseline.alpha
-        # vol_factor = 0.06/0.02 = 3.0, adjustment = -0.05*(3-1) = -0.10
-        assert high_vol.alpha == pytest.approx(baseline.alpha - 0.10, abs=0.01)
+        assert high_vol.alpha > baseline.alpha
+        # vol_factor = 0.06/0.02 = 3.0, adjustment = +0.04*(3-1) = +0.08
+        assert high_vol.alpha == pytest.approx(baseline.alpha + 0.08, abs=0.01)
 
     def test_deep_book_raises_alpha(self):
         """book_depth_ratio > 1 → α increases by 0.03*(ratio-1)."""
@@ -305,17 +305,17 @@ class TestNumericRegression:
     """Pin exact numeric outputs for known inputs (golden values)."""
 
     def test_take_profit_golden_value_1(self):
-        """entry=0.47, VWAP=0.65, default params → target≈0.56, α=0.50."""
+        """entry=0.47, VWAP=0.65, default params → α=0.54 (VWAP proximity +0.04), target≈0.567."""
         r = compute_take_profit(entry_price=0.47, no_vwap=0.65)
-        assert r.target_price == pytest.approx(0.56, abs=0.005)
-        assert r.alpha == pytest.approx(0.50, abs=0.005)
-        assert r.spread_cents == pytest.approx(9.0, abs=0.5)
+        assert r.target_price == pytest.approx(0.5672, abs=0.005)
+        assert r.alpha == pytest.approx(0.54, abs=0.005)
+        assert r.spread_cents == pytest.approx(9.72, abs=0.5)
 
     def test_take_profit_golden_value_2(self):
-        """entry=0.30, VWAP=0.80, whale=True → α = min(0.58, 0.70)."""
+        """entry=0.30, VWAP=0.80, whale=True → α = 0.62 (whale +0.08, proximity +0.04)."""
         r = compute_take_profit(entry_price=0.30, no_vwap=0.80, whale_confluence=True)
-        assert r.alpha == pytest.approx(0.58, abs=0.005)
-        expected_target = 0.30 + 0.58 * (0.80 - 0.30)  # 0.30 + 0.29 = 0.59
+        assert r.alpha == pytest.approx(0.62, abs=0.005)
+        expected_target = 0.30 + 0.62 * (0.80 - 0.30)  # 0.30 + 0.31 = 0.61
         assert r.target_price == pytest.approx(expected_target, abs=0.01)
 
     def test_pnl_formula(self):

@@ -198,6 +198,12 @@ class TradingBot:
         # Crypto retrigger state (Fix 2): last evaluated spot price
         self._rpe_last_spot: float | None = None
 
+        # Cached fee-category set (avoid re-parsing on every trade eval)
+        _fee_cats_raw = settings.strategy.fee_enabled_categories.lower().split(",")
+        self._fee_category_set: frozenset[str] = frozenset(
+            cat.strip() for cat in _fee_cats_raw if cat.strip()
+        )
+
         # RPE calibration tracker (Deliverable A)
         self._rpe_calibration = RPECalibrationTracker()
 
@@ -566,6 +572,13 @@ class TradingBot:
             ids.add(pos.trade_asset_id or pos.no_asset_id)
             ids.add(pos.no_asset_id)
         return ids
+
+    def _is_fee_enabled(self, market: MarketInfo) -> bool:
+        """Check if a market's tags match any fee-enabled category."""
+        market_tags = (getattr(market, 'tags', '') or '').lower()
+        if not market_tags:
+            return True
+        return any(cat in market_tags for cat in self._fee_category_set)
 
     def _get_crypto_spot(self) -> float | None:
         """Return latest BTC spot price from the adverse-selection guard.
@@ -937,9 +950,7 @@ class TradingBot:
             book_depth = no_book.book_depth_ratio
 
         # Determine fee category
-        fee_cats = strat.fee_enabled_categories.lower().split(",")
-        market_tags = (getattr(market_info, 'tags', '') or '').lower()
-        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+        fee_enabled = self._is_fee_enabled(market_info)
 
         pos = await self.positions.open_position(
             synthetic_sig,
@@ -1133,9 +1144,7 @@ class TradingBot:
 
         # Fetch fee rates for this token
         # Determine if market is fee-enabled based on category
-        fee_cats = settings.strategy.fee_enabled_categories.lower().split(",")
-        market_tags = (getattr(market, 'tags', '') or '').lower()
-        fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+        fee_enabled = self._is_fee_enabled(market)
 
         pos = await self.positions.open_position(
             sig,
@@ -1232,9 +1241,7 @@ class TradingBot:
                 eqs_entry = yes_agg.current_price if yes_agg else 0.0
 
         if eqs_entry > 0:
-            fee_cats = strat.fee_enabled_categories.lower().split(",")
-            market_tags = (getattr(market, 'tags', '') or '').lower()
-            fee_enabled = any(cat.strip() in market_tags for cat in fee_cats) if market_tags else True
+            fee_enabled = self._is_fee_enabled(market)
 
             edge = compute_edge_score(
                 entry_price=eqs_entry,
@@ -1366,9 +1373,7 @@ class TradingBot:
 
         # Live mode — open a position
         if not fee_enabled:
-            fee_cats_local = strat.fee_enabled_categories.lower().split(",")
-            market_tags_local = (getattr(market, 'tags', '') or '').lower()
-            fee_enabled = any(cat.strip() in market_tags_local for cat in fee_cats_local) if market_tags_local else True
+            fee_enabled = self._is_fee_enabled(market)
 
         # Determine entry price from the appropriate book
         if direction == "buy_no":
@@ -1771,6 +1776,14 @@ class TradingBot:
                             pos.entry_price + dynamic_spread / 100.0,
                         )
                         new_target = min(new_target, scalp_target)
+
+                    # Anti-ratchet guard: never move TP FURTHER from entry
+                    # than the original target.  Rescaling should only
+                    # tighten (lock profits) or track mean-reversion,
+                    # not chase a moving VWAP upward indefinitely.
+                    original_target = pos.tp_result.target_price if pos.tp_result else pos.target_price
+                    if new_target > original_target:
+                        new_target = original_target
 
                     # Only requote if target moved by more than 0.5¢
                     delta_cents = abs(new_target - pos.target_price) * 100
@@ -2350,8 +2363,8 @@ class TradingBot:
         while self._running:
             await asyncio.sleep(interval)
             try:
-                self.pce.refresh_correlations()
-                self.pce.save_state()
+                await asyncio.to_thread(self.pce.refresh_correlations)
+                await asyncio.to_thread(self.pce.save_state)
 
                 # Send Telegram dashboard
                 open_positions = self.positions.get_open_positions()

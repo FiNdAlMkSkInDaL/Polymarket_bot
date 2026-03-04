@@ -82,6 +82,20 @@ class PanicDetector:
         delta_p = bar.close - vwap
         zscore = delta_p / sigma
 
+        # ── Intra-bar momentum confirmation ────────────────────────────
+        # A spike where the bar closes at/near its high is more likely
+        # to be genuine retail panic than one where price reverted
+        # within the bar.  Discount the z-score by intra-bar retracement.
+        bar_range = bar.high - bar.low
+        if bar_range > 0 and delta_p > 0:
+            # close_position: 1.0 = closed at high, 0.0 = closed at low
+            close_position = (bar.close - bar.low) / bar_range
+            # Only discount when close is in the bottom half of the bar
+            # (price already started reverting within the bar → weaker signal)
+            if close_position < 0.5:
+                retracement_factor = 0.7 + 0.3 * close_position  # range [0.7, 0.85)
+                zscore *= retracement_factor
+
         # Volume ratio
         avg_vol = self.yes_agg.avg_bar_volume
         v_ratio = (bar.volume / avg_vol) if avg_vol > 0 else 0.0
@@ -136,6 +150,28 @@ class PanicDetector:
                 discount_factor=settings.strategy.no_discount_factor,
             )
             return None
+
+        # ── Trend regime guard ─────────────────────────────────────────────
+        # Suppress signals when the YES token has been trending steadily
+        # upward — this is a regime shift, not a panic spike.
+        trend_bars = settings.strategy.trend_guard_bars
+        trend_pct = settings.strategy.trend_guard_pct
+        if len(self.yes_agg.bars) >= trend_bars:
+            bars_list = self.yes_agg.bars
+            recent_close = bars_list[-1].close
+            anchor_close = bars_list[-trend_bars].close
+            if anchor_close > 0:
+                move = (recent_close - anchor_close) / anchor_close
+                if move >= trend_pct:
+                    log.info(
+                        "trend_guard_suppressed",
+                        market=self.market_id,
+                        trend_pct=round(move, 4),
+                        threshold=trend_pct,
+                        window_bars=trend_bars,
+                        zscore=round(zscore, 3),
+                    )
+                    return None
 
         # All conditions met
         signal = PanicSignal(

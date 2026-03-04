@@ -198,6 +198,7 @@ def compute_kelly_size(
     max_kelly_pct: float | None = None,
     signal_metadata: dict | None = None,
     total_trades: int = 0,
+    _precomputed_depth_result: SizingResult | None = None,
 ) -> KellyResult:
     """Compute position size using fractional Kelly criterion with
     **edge discounting** and **probability capping**.
@@ -358,12 +359,15 @@ def compute_kelly_size(
     # ── Depth cap (if book available) ───────────────────────────────────
     method = "kelly"
     if book is not None and book.has_data:
-        depth_result = compute_depth_aware_size(
-            book=book,
-            entry_price=entry_price,
-            max_trade_usd=size_usd,
-            side="BUY",
-        )
+        if _precomputed_depth_result is not None:
+            depth_result = _precomputed_depth_result
+        else:
+            depth_result = compute_depth_aware_size(
+                book=book,
+                entry_price=entry_price,
+                max_trade_usd=size_usd,
+                side="BUY",
+            )
         if depth_result.size_usd < size_usd and depth_result.size_usd > 0:
             size_usd = depth_result.size_usd
             method = "kelly_depth_capped"

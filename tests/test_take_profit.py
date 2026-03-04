@@ -18,12 +18,12 @@ class TestTakeProfit:
         assert result.alpha == pytest.approx(0.50, abs=0.05)
         assert result.spread_cents > 4.0
 
-    def test_high_volatility_reduces_alpha(self):
-        """High σ should lower α (exit sooner)."""
+    def test_high_volatility_increases_alpha(self):
+        """High σ during panic → bigger dislocation → higher α (hold for larger reversion)."""
         baseline = compute_take_profit(entry_price=0.47, no_vwap=0.65, realised_vol=0.02)
         high_vol = compute_take_profit(entry_price=0.47, no_vwap=0.65, realised_vol=0.06)
-        assert high_vol.alpha < baseline.alpha
-        assert high_vol.target_price < baseline.target_price
+        assert high_vol.alpha > baseline.alpha
+        assert high_vol.target_price > baseline.target_price
 
     def test_whale_confluence_increases_alpha(self):
         """Whale confirmation should push α higher (more aggressive target)."""

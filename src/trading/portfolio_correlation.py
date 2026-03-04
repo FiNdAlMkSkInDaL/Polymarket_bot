@@ -590,8 +590,12 @@ class VaRCalculator:
         market_ids_all = list(exposure_map_with.keys())
         weights_all = [exposure_map_with[m] for m in market_ids_all]
 
+        # Pre-build the covariance matrix once for reuse
+        cov_all = self._build_covariance(market_ids_all, corr_matrix, volatilities)
+
         var_total = self._compute_var_for_weights(
-            market_ids_all, weights_all, corr_matrix, volatilities
+            market_ids_all, weights_all, corr_matrix, volatilities,
+            _prebuilt_cov=cov_all,
         )
 
         # Compute gross VaR (assuming all correlations = 1)
@@ -637,14 +641,16 @@ class VaRCalculator:
         weights: list[float],
         corr_matrix: CorrelationMatrix,
         volatilities: dict[str, float],
+        *,
+        _prebuilt_cov: list[list[float]] | None = None,
     ) -> float:
         """VaR = z × √(w' Σ w)."""
         n = len(market_ids)
         if n == 0:
             return 0.0
 
-        # Build covariance matrix inline (small N, fast)
-        cov = self._build_covariance(market_ids, corr_matrix, volatilities)
+        # Reuse pre-built covariance matrix when available (avoids O(n²) rebuild)
+        cov = _prebuilt_cov if _prebuilt_cov is not None else self._build_covariance(market_ids, corr_matrix, volatilities)
 
         # w' Σ w = Σ_i Σ_j w_i * cov_ij * w_j
         portfolio_variance = 0.0

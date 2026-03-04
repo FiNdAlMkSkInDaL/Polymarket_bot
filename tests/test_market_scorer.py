@@ -10,6 +10,7 @@ import pytest
 from src.data.market_scorer import (
     ScoreBreakdown,
     compute_score,
+    score_fee_zone,
     score_liquidity,
     score_price_range,
     score_spread,
@@ -149,7 +150,8 @@ class TestComputeScore:
             trades_per_minute=5,
             has_whale_activity=True,
         )
-        assert bd.total >= 80
+        # fee_zone is 0 at p=0.50 (worst fee zone), so ceiling is ~76-77
+        assert bd.total >= 75
 
     def test_low_quality_market(self):
         bd = compute_score(
@@ -169,6 +171,7 @@ class TestComputeScore:
         assert "total" in d
         assert "vol" in d
         assert "liq" in d
+        assert "fz" in d
         assert all(isinstance(v, float) for v in d.values())
 
     def test_weights_sum_to_one(self):
@@ -293,3 +296,52 @@ class TestTailMarketVeto:
         )
         assert bd.total > 0.0
         assert bd.price_range == 100.0
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Fee-zone efficiency scoring
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestScoreFeeZone:
+    """Fee-zone efficiency prefers markets near the tails where fees are low."""
+
+    def test_mid_price_worst(self):
+        """p=0.50 → maximum fee drag → score ≈ 0."""
+        s = score_fee_zone(0.50)
+        assert s == pytest.approx(0.0, abs=0.1)
+
+    def test_tail_price_best(self):
+        """p=0.10 → low fee drag → high score."""
+        s = score_fee_zone(0.10)
+        assert s >= 60.0
+
+    def test_symmetric(self):
+        """Fee curve is symmetric around 0.50."""
+        assert score_fee_zone(0.20) == pytest.approx(score_fee_zone(0.80), abs=0.01)
+
+    def test_no_data(self):
+        """Edge cases return neutral score."""
+        assert score_fee_zone(0) == 50.0
+        assert score_fee_zone(1.0) == 50.0
+
+    def test_monotonic_toward_tail(self):
+        """Scores increase as price moves from 0.50 toward tails."""
+        assert score_fee_zone(0.50) < score_fee_zone(0.30) < score_fee_zone(0.10)
+
+    def test_fee_zone_in_compute_score(self):
+        """fee_zone field is populated in compute_score output."""
+        bd = compute_score(mid_price=0.10)
+        assert bd.fee_zone > 50.0
+        bd2 = compute_score(mid_price=0.50)
+        assert bd2.fee_zone < 1.0
+
+    def test_fee_zone_affects_total(self):
+        """Low-fee market should score higher than high-fee, all else equal."""
+        bd_tail = compute_score(
+            daily_volume_usd=50_000, liquidity_usd=50_000, mid_price=0.12,
+        )
+        bd_mid = compute_score(
+            daily_volume_usd=50_000, liquidity_usd=50_000, mid_price=0.50,
+        )
+        # fee_zone contributes positively for tail market
+        assert bd_tail.fee_zone > bd_mid.fee_zone

@@ -63,6 +63,7 @@ class OrderExecutor:
         self._orders: dict[str, Order] = {}
         self._next_id = 1
         self._clob_client: Any = None  # Lazy init
+        self._open_count: int = 0  # Incrementally maintained open-order counter
 
     # ── CLOB client ─────────────────────────────────────────────────────────
     def _get_clob_client(self) -> Any:
@@ -203,9 +204,10 @@ class OrderExecutor:
             )
 
         self._orders[order.order_id] = order
+        self._open_count += 1  # Track new live order
         return order
 
-    # ── Order cancellation ──────────────────────────────────────────────────
+    # ── Order cancellation ──────────────────────────────────────────────────────────
     async def cancel_order(self, order: Order) -> None:
         """Cancel a live order."""
         if order.status not in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED):
@@ -221,6 +223,7 @@ class OrderExecutor:
 
         order.status = OrderStatus.CANCELLED
         order.updated_at = time.time()
+        self._open_count = max(0, self._open_count - 1)
         log.info("order_cancelled", order_id=order.order_id)
 
     # ── Cancel all ──────────────────────────────────────────────────────────
@@ -271,6 +274,7 @@ class OrderExecutor:
                 order.filled_size = order.size
                 order.filled_avg_price = fill_price
                 order.updated_at = time.time()
+                self._open_count = max(0, self._open_count - 1)
                 log.info(
                     "paper_fill",
                     order_id=order.order_id,
@@ -288,10 +292,7 @@ class OrderExecutor:
     @property
     def open_order_count(self) -> int:
         """Number of currently resting (live or partially filled) orders."""
-        return sum(
-            1 for o in self._orders.values()
-            if o.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
-        )
+        return self._open_count
 
     def get_open_orders(self, market_id: str | None = None) -> list[Order]:
         return [
@@ -409,12 +410,12 @@ class OrderStatusPoller:
         if clob is None:
             return
 
-        for order in open_orders:
+        async def _fetch_one(order: Order) -> None:
             try:
                 resp = await asyncio.to_thread(clob.get_order, order.clob_order_id)
                 if resp is None:
                     self._record_error(order.clob_order_id)
-                    continue
+                    return
 
                 self._consecutive_errors.pop(order.clob_order_id, None)
                 self._apply_update(order, resp)
@@ -426,6 +427,8 @@ class OrderStatusPoller:
                     clob_id=order.clob_order_id,
                     error=str(exc),
                 )
+
+        await asyncio.gather(*[_fetch_one(o) for o in open_orders])
 
     def _record_error(self, clob_id: str) -> None:
         count = self._consecutive_errors.get(clob_id, 0) + 1
@@ -466,8 +469,14 @@ class OrderStatusPoller:
         # Detect terminal state transitions
         if new_status != order.status:
             old = order.status
+            was_open = old in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+            is_open = new_status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
             order.status = new_status
             order.updated_at = time.time()
+
+            # Maintain open order counter
+            if was_open and not is_open:
+                self._executor._open_count = max(0, self._executor._open_count - 1)
 
             log.info(
                 "order_status_updated",

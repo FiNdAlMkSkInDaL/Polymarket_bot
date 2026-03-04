@@ -156,6 +156,7 @@ class SpreadCompressionSignal(SignalGenerator):
         self.compression_pct = compression_pct if compression_pct is not None else settings.strategy.spread_compression_pct
         self.min_history = min_history
         self._spread_history: deque[float] = deque(maxlen=120)
+        self._running_sum: float = 0.0
 
     @property
     def name(self) -> str:
@@ -163,7 +164,11 @@ class SpreadCompressionSignal(SignalGenerator):
 
     def record_spread(self, spread: float) -> None:
         """Record a spread observation for rolling average computation."""
+        # If deque is full, the leftmost element will be evicted on append
+        if len(self._spread_history) == self._spread_history.maxlen:
+            self._running_sum -= self._spread_history[0]
         self._spread_history.append(spread)
+        self._running_sum += spread
 
     def evaluate(self, **kwargs: Any) -> SignalResult | None:
         """Expects kwargs: ``no_book`` (:class:`OrderbookTracker`)."""
@@ -183,7 +188,7 @@ class SpreadCompressionSignal(SignalGenerator):
         if len(self._spread_history) < self.min_history:
             return None
 
-        avg_spread = sum(self._spread_history) / len(self._spread_history)
+        avg_spread = self._running_sum / len(self._spread_history)
         if avg_spread <= 0:
             return None
 
@@ -328,11 +333,11 @@ class CompositeSignalEvaluator:
             current_spread = snap.best_ask - snap.best_bid if (snap.best_ask > 0 and snap.best_bid > 0) else 0.0
 
             # Look for a SpreadCompressionSignal among our generators to
-            # get the rolling average spread
+            # get the rolling average spread (use _running_sum for O(1))
             avg_spread = 0.0
             for gen, _ in self._generators:
                 if isinstance(gen, SpreadCompressionSignal) and gen._spread_history:
-                    avg_spread = sum(gen._spread_history) / len(gen._spread_history)
+                    avg_spread = gen._running_sum / len(gen._spread_history)
                     break
 
             if avg_spread > 0 and current_spread > 0:

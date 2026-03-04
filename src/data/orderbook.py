@@ -212,6 +212,23 @@ class OrderbookTracker:
             return list(self._bids[:n])
         return list(self._asks[:n])
 
+    def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
+        """Sum resting depth (USD) within *cents* of mid."""
+        bb = self.best_bid
+        ba = self.best_ask
+        if bb <= 0 or ba <= 0:
+            return 0.0
+        mid = (bb + ba) / 2.0
+        threshold = cents / 100.0
+        depth = 0.0
+        for lv in self._bids[:max_levels]:
+            if abs(lv.price - mid) <= threshold:
+                depth += lv.price * lv.size
+        for lv in self._asks[:max_levels]:
+            if abs(lv.price - mid) <= threshold:
+                depth += lv.price * lv.size
+        return depth
+
     @property
     def spread_cents(self) -> float:
         """Current spread in cents (convenience)."""
@@ -407,3 +424,6 @@ class L2OrderBookAdapter(OrderbookTracker):
 
     def depth_velocity(self, window_s: float = 2.0) -> float | None:
         return self._l2.depth_velocity(window_s)
+
+    def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
+        return self._l2.depth_near_mid_usd(cents, max_levels)

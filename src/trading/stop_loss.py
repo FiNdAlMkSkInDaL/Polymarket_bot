@@ -70,6 +70,13 @@ class StopLossMonitor:
         self._running = False
         # Trailing high-water marks: pos.id → highest mid-price seen since entry
         self._hwm: dict[str, float] = {}
+        # Breakeven activation: trailing stop only engages after position
+        # has been profitable by at least this many cents.  Prevents
+        # the trailing stop from ratcheting during the initial adverse
+        # move and cutting winners too early.
+        self._be_activation_cents = max(
+            1.0, self._trailing_offset * 0.5
+        ) if self._trailing_offset > 0 else 0.0
 
     def start(self) -> None:
         """Mark the monitor as active (called once during bot startup)."""
@@ -140,11 +147,19 @@ class StopLossMonitor:
         )
 
         if self._trailing_offset > 0 and hwm > pos.entry_price:
-            # Trailing stop: ratchet up the floor
-            trail_floor_price = hwm - self._trailing_offset / 100.0
-            trail_loss = (trail_floor_price - mid) * 100
-            entry_loss = (pos.entry_price - mid) * 100
-            unrealised_loss = max(trail_loss, entry_loss)
+            # Trailing stop: only activate after the position has been
+            # profitable by at least _be_activation_cents.  This prevents
+            # ratcheting during the initial adverse move from cutting
+            # winners before they reach target.
+            profit_from_entry = (hwm - pos.entry_price) * 100
+            if profit_from_entry >= self._be_activation_cents:
+                trail_floor_price = hwm - self._trailing_offset / 100.0
+                trail_loss = (trail_floor_price - mid) * 100
+                entry_loss = (pos.entry_price - mid) * 100
+                unrealised_loss = max(trail_loss, entry_loss)
+            else:
+                # Not yet profitable enough to trail — use fixed stop only
+                unrealised_loss = (pos.entry_price - mid) * 100
         else:
             unrealised_loss = (pos.entry_price - mid) * 100
 

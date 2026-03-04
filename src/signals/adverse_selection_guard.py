@@ -289,11 +289,14 @@ class AdverseSelectionGuard:
         """Compute total resting depth (USD) within ``depth_near_mid_cents``
         of mid-price for a given orderbook tracker.
 
-        Uses ``tracker.levels()`` to read full visible depth and filters
-        levels by proximity to mid.  This is semantically different from
-        ``tracker.current_total_depth()`` which sums top-5 levels
-        regardless of distance from mid.
+        Prefers the allocation-free ``depth_near_mid_usd()`` method when
+        available (L2OrderBook / L2OrderBookAdapter).  Falls back to
+        ``tracker.levels()`` for legacy trackers.
         """
+        # Fast path: use the allocation-free method if available
+        if hasattr(tracker, 'depth_near_mid_usd'):
+            return tracker.depth_near_mid_usd(self._depth_near_mid_cents, 50)
+
         best_bid = tracker.best_bid
         best_ask = tracker.best_ask
         if best_bid <= 0 or best_ask <= 0:
@@ -667,22 +670,25 @@ class AdverseSelectionGuard:
             signals=signal_names,
         )
 
-        # Send Telegram alert with signal breakdown
+        # Send Telegram alert with signal breakdown (fire-and-forget to avoid
+        # delaying the kill path if Telegram is slow/unreachable)
         if self._telegram and hasattr(self._telegram, "send"):
-            try:
-                signal_details = "\n".join(
-                    f"  - {d.get('signal', '?')}: {d}"
-                    for d in (signals or [])
-                )
-                await self._telegram.send(
-                    f"<b>Adverse Selection Kill #{self._cancel_count}</b>\n"
-                    f"Cancelled {count} orders in {elapsed_ms:.0f}ms\n"
-                    f"Signals ({len(signal_names)}): {', '.join(signal_names)}\n"
-                    f"Cooldown: {self._cooldown_s}s\n"
-                    f"<pre>{signal_details[:1000]}</pre>"
-                )
-            except Exception:
-                pass
+            async def _send_kill_alert() -> None:
+                try:
+                    signal_details = "\n".join(
+                        f"  - {d.get('signal', '?')}: {d}"
+                        for d in (signals or [])
+                    )
+                    await self._telegram.send(
+                        f"<b>Adverse Selection Kill #{self._cancel_count}</b>\n"
+                        f"Cancelled {count} orders in {elapsed_ms:.0f}ms\n"
+                        f"Signals ({len(signal_names)}): {', '.join(signal_names)}\n"
+                        f"Cooldown: {self._cooldown_s}s\n"
+                        f"<pre>{signal_details[:1000]}</pre>"
+                    )
+                except Exception:
+                    pass
+            asyncio.ensure_future(_send_kill_alert())
 
         # Schedule cooldown release
         loop = asyncio.get_running_loop()
