@@ -256,31 +256,37 @@ class TestTakeProfitMath:
         assert r.alpha <= 0.70
 
     def test_alpha_clamped_lower(self):
-        """α never goes below α_min (0.30)."""
+        """α never goes below α_min (0.40)."""
         r = compute_take_profit(
             entry_price=0.30, no_vwap=0.80,
             realised_vol=0.10, whale_confluence=False,
             days_to_resolution=1,
         )
-        assert r.alpha >= 0.30
+        assert r.alpha >= 0.40
 
     def test_edge_case_vwap_below_entry(self):
         """VWAP < entry → falls back to min_spread_cents/100 above entry."""
-        r = compute_take_profit(entry_price=0.70, no_vwap=0.60)
-        expected = 0.70 + 4.0 / 100.0  # min_spread_cents = 4
+        r = compute_take_profit(
+            entry_price=0.70, no_vwap=0.60,
+            fee_enabled=False, desired_margin_cents=0.0,
+        )
+        expected = 0.70 + 2.0 / 100.0  # min_spread_cents = 2
         assert r.target_price == pytest.approx(expected, abs=0.01)
-        assert r.alpha == 0.30  # falls to alpha_min
+        assert r.alpha == 0.40  # falls to alpha_min
 
     def test_not_viable_tiny_spread(self):
         """Spread < min_spread_cents → viable=False."""
-        r = compute_take_profit(entry_price=0.63, no_vwap=0.65)
+        r = compute_take_profit(
+            entry_price=0.63, no_vwap=0.64,
+            fee_enabled=False, desired_margin_cents=0.0,
+        )
         assert r.viable is False
 
     def test_viable_good_spread(self):
         """Spread >= min_spread_cents → viable=True."""
         r = compute_take_profit(entry_price=0.47, no_vwap=0.65)
         assert r.viable is True
-        assert r.spread_cents >= 4.0
+        assert r.spread_cents >= 2.0
 
     def test_deterministic_output(self):
         """Same inputs → identical outputs (no randomness)."""

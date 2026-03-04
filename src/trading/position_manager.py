@@ -131,12 +131,14 @@ class PositionManager:
         trade_store: Any | None = None,
         guard: DeploymentGuard | None = None,
         pce: Any | None = None,
+        book_trackers: dict[str, Any] | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
         self._trade_store = trade_store
         self._guard = guard
         self._pce = pce  # PortfolioCorrelationEngine (Pillar 15)
+        self._book_trackers = book_trackers or {}  # asset_id → OrderbookTracker
         self._positions: dict[str, Position] = {}
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
@@ -972,10 +974,13 @@ class PositionManager:
                         size=pos.effective_size,
                     )
                     pos.exit_order = exit_order
-                    # In paper mode, check for an immediate fill;
-                    # in live mode the fill will be detected by the
-                    # order-status poller or the next check_timeouts cycle.
+                    # In paper mode, simulate a realistic fill at the
+                    # current best bid rather than the literal 0.01.
                     if self.executor.paper_mode:
+                        fill_price = self._paper_market_sell_price(pos)
+                        exit_order.filled_avg_price = fill_price
+                        exit_order.filled_size = pos.effective_size
+                        exit_order.status = OrderStatus.FILLED
                         self.on_exit_filled(pos, reason="timeout")
                     else:
                         pos.exit_reason = "timeout"
@@ -984,6 +989,34 @@ class PositionManager:
                             pos_id=pos.id,
                             note="awaiting CLOB fill confirmation",
                         )
+
+    def _paper_market_sell_price(self, pos: Position) -> float:
+        """Estimate a realistic fill price for paper-mode market sells.
+
+        Looks up the current best bid from the book tracker for the
+        position's asset.  Falls back to ``entry - sl_trigger/100``
+        if no book data is available.  Applies ``paper_slippage_cents``
+        adversely (subtracts from bid) and floors at 0.01.
+        """
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        best_bid = 0.0
+
+        tracker = self._book_trackers.get(exit_asset)
+        if tracker is not None:
+            try:
+                snap = tracker.snapshot()
+                best_bid = getattr(snap, "best_bid", 0.0)
+            except Exception:
+                pass
+
+        if best_bid <= 0:
+            # Fallback: estimate exit price from entry and stop-loss
+            sl_cents = pos.sl_trigger_cents if pos.sl_trigger_cents > 0 else settings.strategy.stop_loss_cents
+            best_bid = pos.entry_price - sl_cents / 100.0
+
+        slippage = settings.strategy.paper_slippage_cents / 100.0
+        fill_price = best_bid - slippage
+        return max(0.01, round(fill_price, 4))
 
     async def force_stop_loss(self, pos: Position) -> None:
         """Force-close a position via market sell due to stop-loss trigger."""
@@ -1006,9 +1039,13 @@ class PositionManager:
             size=pos.effective_size,
         )
         pos.exit_order = exit_order
-        # In paper mode, close immediately; in live mode wait for CLOB
-        # fill confirmation from the order-status poller.
+        # In paper mode, simulate a realistic fill at the current best
+        # bid rather than the literal 0.01 limit price.
         if self.executor.paper_mode:
+            fill_price = self._paper_market_sell_price(pos)
+            exit_order.filled_avg_price = fill_price
+            exit_order.filled_size = pos.effective_size
+            exit_order.status = OrderStatus.FILLED
             self.on_exit_filled(pos, reason="stop_loss")
         else:
             pos.exit_reason = "stop_loss"

@@ -126,8 +126,11 @@ class TestHardZeros:
         assert ea.score == 0.0
         assert ea.rejection_reason == "sub_tick_spread"
 
-    def test_fees_exceed_spread_zeros_fee_efficiency(self):
-        """Small dislocation at p=0.50 (max fees) → fees eat all spread."""
+    def test_fees_exceed_spread_floors_fee_efficiency(self):
+        """Small dislocation at p=0.50 (max fees) → fees eat all spread.
+        Fee efficiency is floored at eqs_fee_efficiency_floor (default 0.10)
+        so it doesn't zero the entire geometric mean, but tick_viability=0
+        still zeros the score."""
         # entry=0.50, VWAP=0.53 → gross=0.50*0.03=1.5¢
         # Fee at 0.50 ≈ 1.56¢, fee at 0.515 ≈ 1.56¢ → total ≈ 3.12¢ > 1.5¢
         ea = compute_edge_score(
@@ -137,7 +140,9 @@ class TestHardZeros:
             volume_ratio=5.0,
             min_score=0.0,
         )
-        assert ea.fee_efficiency == 0.0
+        # Fee efficiency floored at 0.10, not zeroed
+        assert ea.fee_efficiency == 0.10
+        # Score is still 0 because tick_viability = 0 (net P&L negative)
         assert ea.score == 0.0
 
 
@@ -248,8 +253,8 @@ class TestSignalQuality:
         ea = compute_edge_score(
             entry_price=0.30,
             no_vwap=0.45,
-            zscore=1.2,       # exactly at threshold
-            volume_ratio=1.5,  # exactly at threshold
+            zscore=1.5,       # exactly at threshold (config default)
+            volume_ratio=1.2,  # exactly at threshold (config default)
             min_score=0.0,
         )
         assert ea.signal_quality == pytest.approx(0.5, abs=0.01)

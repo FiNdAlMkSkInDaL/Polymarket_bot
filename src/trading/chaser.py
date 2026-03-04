@@ -106,6 +106,7 @@ class OrderChaser:
         fee_rate_bps: int = 0,
         fast_kill_event: asyncio.Event | None = None,
         max_post_only_rejections: int | None = None,
+        urgent: bool = False,
     ):
         strat = settings.strategy
         self.executor = executor
@@ -116,6 +117,7 @@ class OrderChaser:
         self.target_size = target_size
         self.anchor_price = anchor_price
         self._latency_guard = latency_guard
+        self._urgent = urgent
 
         self._max_chase_cents = (
             max_chase_depth_cents
@@ -133,11 +135,16 @@ class OrderChaser:
         self._tp_target = tp_target_price
         self._fee_bps = fee_rate_bps
         self._fast_kill = fast_kill_event
-        self._max_rejections = (
-            max_post_only_rejections
-            if max_post_only_rejections is not None
-            else strat.chaser_max_rejections
-        )
+        # Urgent chasers escalate immediately on first POST_ONLY
+        # rejection, capturing the edge before it decays.
+        if urgent:
+            self._max_rejections = 0
+        else:
+            self._max_rejections = (
+                max_post_only_rejections
+                if max_post_only_rejections is not None
+                else strat.chaser_max_rejections
+            )
         self._escalation_ticks = strat.chaser_escalation_ticks
         self._desired_margin = strat.desired_margin_cents
         self._rejection_count: int = 0

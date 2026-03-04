@@ -95,25 +95,26 @@ class StrategyParams:
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 2.0)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.5)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.5)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.2)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
-    alpha_min: float = _env_float("ALPHA_MIN", 0.30)
+    alpha_min: float = _env_float("ALPHA_MIN", 0.40)
     alpha_max: float = _env_float("ALPHA_MAX", 0.70)
-    min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
+    min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 2.0)
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
-    # Raised from 25→35 to reduce low-quality trade throughput while
-    # keeping the threshold below the docstring-recommended 40 to avoid
-    # starving the paper-trade pipeline during soak testing.
-    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 35.0)
+    # Lowered from 35→20 to increase signal throughput during paper
+    # soak testing.  The geometric-mean formula already hard-rejects
+    # trades where any factor is zero, so EQS=20 still enforces
+    # minimum quality across all four dimensions.
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 20.0)
 
     # Risk
-    max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 5.0)
+    max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 15.0)
     max_wallet_risk_pct: float = _env_float("MAX_WALLET_RISK_PCT", 20.0)
 
     # Time limits
@@ -121,15 +122,15 @@ class StrategyParams:
     exit_timeout_seconds: int = _env_int("EXIT_TIMEOUT_SECONDS", 1800)
 
     # Market selection filters
-    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 50_000.0)
-    min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 7)
+    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 10_000.0)
+    min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 3)
     min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
 
     # Discovery behaviour
     discovery_tags: str = _env("DISCOVERY_TAGS", "")  # empty = all categories
-    reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", True)
+    reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", False)
     one_market_per_event: bool = _env_bool("ONE_MARKET_PER_EVENT", True)
-    market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 30)
+    market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 10)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
@@ -143,8 +144,8 @@ class StrategyParams:
     max_positions_per_event: int = _env_int("MAX_POSITIONS_PER_EVENT", 2)
     daily_loss_limit_usd: float = _env_float("DAILY_LOSS_LIMIT_USD", 25.0)
     max_drawdown_cents: float = _env_float("MAX_DRAWDOWN_CENTS", 2500.0)
-    stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 8.0)
-    signal_cooldown_minutes: int = _env_int("SIGNAL_COOLDOWN_MINUTES", 2)
+    stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 4.0)
+    signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
     # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
@@ -232,7 +233,7 @@ class StrategyParams:
     # ── Pillar 6: Dynamic Fee-Curve Integration ────────────────────────────
     fee_cache_ttl_s: int = _env_int("FEE_CACHE_TTL_S", 300)
     fee_default_bps: int = _env_int("FEE_DEFAULT_BPS", 200)
-    desired_margin_cents: float = _env_float("DESIRED_MARGIN_CENTS", 1.0)
+    desired_margin_cents: float = _env_float("DESIRED_MARGIN_CENTS", 2.5)
 
     # ── Pillar 7: Hybrid-Aggressive Chaser Escalation ──────────────────────
     chaser_max_rejections: int = _env_int("CHASER_MAX_REJECTIONS", 3)
@@ -257,6 +258,11 @@ class StrategyParams:
     fee_max_pct: float = _env_float("FEE_MAX_PCT", 1.56)  # peak fee %
     fee_enabled_categories: str = _env("FEE_ENABLED_CATEGORIES", "crypto,sports")
 
+    # Fee-efficiency floor for EQS.  Prevents fees from zeroing the
+    # entire geometric-mean EQS score.  At 0.10 trades are still heavily
+    # penalised for poor fee economics but no longer hard-rejected.
+    eqs_fee_efficiency_floor: float = _env_float("EQS_FEE_EFFICIENCY_FLOOR", 0.10)
+
     # ── Pillar 10: Order Status Polling ─────────────────────────────────
     order_status_poll_s: float = _env_float("ORDER_STATUS_POLL_S", 2.0)
     order_status_max_retries: int = _env_int("ORDER_STATUS_MAX_RETRIES", 3)
@@ -265,15 +271,23 @@ class StrategyParams:
     trailing_stop_offset_cents: float = _env_float("TRAILING_STOP_OFFSET_CENTS", 0.0)
 
     # ── Pillar 12: Multi-Signal Framework ─────────────────────────────────
-    imbalance_threshold: float = _env_float("IMBALANCE_THRESHOLD", 2.0)
-    spread_compression_pct: float = _env_float("SPREAD_COMPRESSION_PCT", 0.5)
-    min_composite_signal_score: float = _env_float("MIN_COMPOSITE_SIGNAL_SCORE", 0.3)
+    imbalance_threshold: float = _env_float("IMBALANCE_THRESHOLD", 1.5)
+    spread_compression_pct: float = _env_float("SPREAD_COMPRESSION_PCT", 0.70)
+    min_composite_signal_score: float = _env_float("MIN_COMPOSITE_SIGNAL_SCORE", 0.20)
 
     # ── Kelly cold-start ──────────────────────────────────────────────────
     min_kelly_trades: int = _env_int("MIN_KELLY_TRADES", 20)
+    cold_start_frac: float = _env_float("COLD_START_FRAC", 0.50)
 
     # ── Spread-based signal source ────────────────────────────────────────
     spread_signal_enabled: bool = _env_bool("SPREAD_SIGNAL_ENABLED", True)
+    spread_signal_cooldown_s: float = _env_float("SPREAD_SIGNAL_COOLDOWN_S", 30.0)
+
+    # ── Panic detector NO-discount gate ────────────────────────────────────
+    # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
+    # Lower = stricter (1.02 means NO must be 2% below VWAP).
+    # 1.005 means just 0.5% below VWAP — much less restrictive.
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
 
     # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
@@ -300,7 +314,7 @@ class StrategyParams:
     # Minimum ask-side depth (USD) required when discovering markets.
     # Markets with less than this on the ask side are too illiquid to
     # enter without excessive impact.
-    min_ask_depth_usd: float = _env_float("MIN_ASK_DEPTH_USD", 100.0)
+    min_ask_depth_usd: float = _env_float("MIN_ASK_DEPTH_USD", 25.0)
 
     # Whale cluster detection
     whale_cluster_lookback_blocks: int = _env_int("WHALE_CLUSTER_LOOKBACK_BLOCKS", 10000)
@@ -341,15 +355,15 @@ class StrategyParams:
     rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
 
     # RPE cooldown / freshness / calibration (Pillar 14 overhaul)
-    rpe_cooldown_seconds: int = _env_int("RPE_COOLDOWN_SECONDS", 300)
+    rpe_cooldown_seconds: int = _env_int("RPE_COOLDOWN_SECONDS", 120)
     rpe_max_data_age_seconds: int = _env_int("RPE_MAX_DATA_AGE_SECONDS", 300)
     # Dedicated stale-market eviction threshold (seconds without any
     # trade).  Markets exceeding this are evicted or drained.  Separate
     # from rpe_max_data_age_seconds so the two concerns can be tuned
     # independently.
-    stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 480.0)
+    stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 1800.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
-    rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 40.0)
+    rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)
 
     # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────

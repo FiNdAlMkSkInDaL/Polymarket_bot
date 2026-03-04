@@ -1378,7 +1378,7 @@ class TestConfigAdditions:
 
     def test_rpe_cooldown_seconds(self) -> None:
         from src.core.config import settings
-        assert settings.strategy.rpe_cooldown_seconds == 300
+        assert settings.strategy.rpe_cooldown_seconds == 120
 
     def test_rpe_max_data_age_seconds(self) -> None:
         from src.core.config import settings
@@ -1390,7 +1390,7 @@ class TestConfigAdditions:
 
     def test_rpe_min_eqs(self) -> None:
         from src.core.config import settings
-        assert settings.strategy.rpe_min_eqs == 40.0
+        assert settings.strategy.rpe_min_eqs == 25.0
 
     def test_rpe_tail_veto_threshold(self) -> None:
         from src.core.config import settings

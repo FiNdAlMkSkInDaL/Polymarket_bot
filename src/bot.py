@@ -137,9 +137,15 @@ class TradingBot:
         )
         self.pce.load_state()
 
+        # Per-market state — initialise book_trackers dict early so the
+        # PositionManager (which receives a reference to it for paper-mode
+        # fill simulation) sees subsequent additions.
+        self._book_trackers: dict[str, OrderbookTracker] = {}  # asset_id → tracker
+
         self.positions = PositionManager(
             self.executor, trade_store=self.trade_store, guard=self.guard,
             pce=self.pce,
+            book_trackers=self._book_trackers,
         )
         self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
@@ -156,7 +162,7 @@ class TradingBot:
         self._no_aggs: dict[str, OHLCVAggregator] = {}   # keyed by no_token_id
         self._detectors: dict[str, PanicDetector] = {}    # keyed by condition_id
         self._market_map: dict[str, MarketInfo] = {}      # asset_id → MarketInfo
-        self._book_trackers: dict[str, OrderbookTracker] = {}  # asset_id → tracker
+        # _book_trackers initialised above (before PositionManager)
         self._l2_books: dict[str, L2OrderBook] = {}  # asset_id → L2 book (when L2 enabled)
         self._trade_counts: dict[str, float] = {}  # asset_id → trades/min
         self._taker_counts: dict[str, int] = {}    # asset_id → taker-initiated trades
@@ -836,10 +842,10 @@ class TradingBot:
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
             return
 
-        # Per-signal-source cooldown: 60 seconds between spread signals
+        # Per-signal-source cooldown (configurable, default 30s)
         now = time.time()
         last_fire = self._spread_cooldowns.get(market_info.condition_id, 0.0)
-        if now - last_fire < 60.0:
+        if now - last_fire < settings.strategy.spread_signal_cooldown_s:
             return
 
         # Check minimum spread
@@ -1142,9 +1148,11 @@ class TradingBot:
         )
         if pos:
             # Launch entry chaser as a child task (Pillar 1)
+            # Panic signals use urgent=True to escalate immediately
+            # and capture the edge before it decays.
             if no_book and no_book.has_data:
                 chaser_task = asyncio.create_task(
-                    self._entry_chaser_flow(pos, no_book),
+                    self._entry_chaser_flow(pos, no_book, urgent=True),
                     name=f"chaser_entry_{pos.id}",
                 )
                 chaser_task.add_done_callback(_safe_task_done_callback)
@@ -1258,11 +1266,11 @@ class TradingBot:
                     direction=direction,
                     confidence=round(confidence, 3),
                 )
-                # Stamp the cooldown even on rejection — the market condition
-                # is unlikely to change within the cooldown window, and this
-                # prevents the same EQS rejection from filling the logs every
-                # evaluation cycle.
-                self._rpe_last_signal[market.condition_id] = now
+                # Do NOT stamp the cooldown on EQS rejection — market
+                # conditions (price, spread, depth) can change rapidly and
+                # we want to re-evaluate as soon as a new bar arrives.
+                # The per-source cooldown on *successful* fires prevents
+                # log spam from repeated passes.
                 return
 
         # ── Record cooldown timestamp (after EQS passes) ─────────────
@@ -1595,11 +1603,20 @@ class TradingBot:
     # ═══════════════════════════════════════════════════════════════════════
     #  Pillar 1 — Passive-aggressive chaser flows
     # ═══════════════════════════════════════════════════════════════════════
-    async def _entry_chaser_flow(self, pos: Any, no_book: OrderbookTracker) -> None:
+    async def _entry_chaser_flow(
+        self, pos: Any, no_book: OrderbookTracker, *, urgent: bool = False,
+    ) -> None:
         """Run the entry-side chaser for a position.
 
         If the chaser fills, triggers the entry-fill handler.
         If abandoned, cancels the position.
+
+        Parameters
+        ----------
+        urgent:
+            When True the chaser escalates immediately on the first
+            POST_ONLY rejection, capturing fast-decaying panic edges
+            by accepting a taker fill.
         """
         # Resolve the correct asset_id — RPE positions may trade YES.
         entry_asset = pos.trade_asset_id or pos.no_asset_id
@@ -1616,6 +1633,7 @@ class TradingBot:
                 tp_target_price=pos.target_price,
                 fee_rate_bps=pos.entry_fee_bps,
                 fast_kill_event=self._fast_kill_event,
+                urgent=urgent,
             )
             result = await chaser.run()
 

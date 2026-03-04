@@ -39,9 +39,12 @@ class TestTakeProfit:
         assert near.alpha < far.alpha
 
     def test_not_viable_when_spread_too_small(self):
-        """If the VWAP is very close to entry, spread < 4¢ → not viable."""
-        result = compute_take_profit(entry_price=0.63, no_vwap=0.65)
-        # target ≈ 0.63 + 0.5 * 0.02 = 0.64, spread = 1¢ < 4¢
+        """If the VWAP is very close to entry, spread < min_spread → not viable."""
+        result = compute_take_profit(
+            entry_price=0.63, no_vwap=0.64,
+            fee_enabled=False, desired_margin_cents=0.0,
+        )
+        # target ≈ 0.63 + 0.5 * 0.01 = 0.635, spread = 0.5¢ < 2¢
         assert result.viable is False
 
     def test_alpha_clamped_to_bounds(self):
@@ -66,13 +69,13 @@ class TestTakeProfit:
             whale_confluence=False,
             days_to_resolution=1,  # very close → pushes α down
         )
-        assert result2.alpha >= 0.30
+        assert result2.alpha >= 0.40
 
     def test_edge_case_vwap_below_entry(self):
         """If VWAP < entry (rare), should still produce a viable minimum spread."""
         result = compute_take_profit(entry_price=0.70, no_vwap=0.60)
         assert result.target_price > result.entry_price
-        assert result.alpha == 0.30  # falls to alpha_min
+        assert result.alpha == 0.40  # falls to alpha_min
 
 
 class TestTakeProfitFeeFloor:
@@ -96,13 +99,14 @@ class TestTakeProfitFeeFloor:
         # exceeds the fee floor — that's fine.
 
     def test_fee_floor_not_viable_when_insufficient(self):
-        """A narrow spread that can't cover fees should be not viable."""
+        """At extreme prices where fees are tiny, spread can't reach min_spread."""
         result = compute_take_profit(
-            entry_price=0.63, no_vwap=0.65,
-            entry_fee_bps=200, exit_fee_bps=200,
-            desired_margin_cents=1.0,
+            entry_price=0.93, no_vwap=0.94,
+            fee_enabled=True,
+            desired_margin_cents=0.0,
         )
-        # Spread is ~1¢ but fee floor is ~1.26 + 1.3 + 1.0 ≈ 3.6¢
+        # At p≈0.93, fees are tiny (~0.4¢/leg).  Fee floor ≈ 0.8¢.
+        # After widening, spread ≈ 0.8¢ < min_spread=2¢ → not viable.
         assert result.viable is False
 
     def test_zero_fees_legacy_behaviour(self):

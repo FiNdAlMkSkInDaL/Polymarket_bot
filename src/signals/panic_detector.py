@@ -127,12 +127,13 @@ class PanicDetector:
                 market=self.market_id,
             )
             return None
-        if no_best_ask >= no_vwap * 1.02:
+        if no_best_ask >= no_vwap * settings.strategy.no_discount_factor:
             log.debug(
                 "spike_check_fail_no_not_discounted",
                 market=self.market_id,
                 no_ask=no_best_ask,
                 no_vwap=round(no_vwap, 4),
+                discount_factor=settings.strategy.no_discount_factor,
             )
             return None
 

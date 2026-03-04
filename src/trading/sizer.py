@@ -256,7 +256,7 @@ def compute_kelly_size(
     # trading.
     min_kelly_trades = strat.min_kelly_trades
     if total_trades < min_kelly_trades:
-        cold_start_frac = 0.30  # 30% of max_trade_usd
+        cold_start_frac = strat.cold_start_frac
         cold_usd = max_trade_usd * cold_start_frac
 
         # Depth cap if book available

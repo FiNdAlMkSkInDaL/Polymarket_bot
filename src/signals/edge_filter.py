@@ -200,8 +200,13 @@ def compute_edge_score(
     net_cents = gross_cents - fee_cents
 
     # ── Factor 2: Fee efficiency ───────────────────────────────────────
+    # Floor at eqs_fee_efficiency_floor (default 0.10) so that fees
+    # cannot zero the entire geometric-mean EQS.  Trades with poor fee
+    # economics are still heavily penalised but not hard-rejected,
+    # allowing strong regime/signal/tick factors to rescue them.
+    fee_floor = strat.eqs_fee_efficiency_floor
     fee_eff = (
-        max(0.0, 1.0 - fee_cents / gross_cents)
+        max(fee_floor, 1.0 - fee_cents / gross_cents)
         if gross_cents > 0
         else 0.0
     )
