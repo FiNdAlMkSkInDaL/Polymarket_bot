@@ -62,24 +62,34 @@ class TestMinViableEdgeGate:
 
     @pytest.mark.asyncio
     async def test_thin_edge_rejected_with_fees(self):
-        """A trade where TP spread < slippage + fees + margin should be rejected."""
-        executor = OrderExecutor(paper_mode=True)
-        pm = PositionManager(executor)
-        pm.set_wallet_balance(50.0)
+        """A trade where TP spread < slippage + fees + margin should be rejected.
 
-        no_agg = OHLCVAggregator("NO_T", lookback_minutes=10)
-        build_bar_history(no_agg, [0.55] * 10, base_vol=10.0)
+        This test explicitly disables maker routing to validate that
+        taker-mode fee drag correctly rejects thin-edge entries.
+        """
+        # Disable maker routing so taker fees apply
+        orig = settings.strategy.maker_routing_enabled
+        object.__setattr__(settings.strategy, "maker_routing_enabled", False)
+        try:
+            executor = OrderExecutor(paper_mode=True)
+            pm = PositionManager(executor)
+            pm.set_wallet_balance(50.0)
 
-        # Price at 0.45 → entry at 0.44 → with fees, edge is thin
-        signal = PanicSignal(
-            market_id="MKT", yes_asset_id="YES_T", no_asset_id="NO_T",
-            yes_price=0.75, yes_vwap=0.50, zscore=3.0, volume_ratio=5.0,
-            no_best_ask=0.45, whale_confluence=False,
-        )
+            no_agg = OHLCVAggregator("NO_T", lookback_minutes=10)
+            build_bar_history(no_agg, [0.55] * 10, base_vol=10.0)
 
-        # Fee-enabled: trade should be rejected due to insufficient edge
-        pos = await pm.open_position(signal, no_agg, fee_enabled=True)
-        assert pos is None
+            # Price at 0.45 → entry at 0.44 → with fees, edge is thin
+            signal = PanicSignal(
+                market_id="MKT", yes_asset_id="YES_T", no_asset_id="NO_T",
+                yes_price=0.75, yes_vwap=0.50, zscore=3.0, volume_ratio=5.0,
+                no_best_ask=0.45, whale_confluence=False,
+            )
+
+            # Fee-enabled: trade should be rejected due to insufficient edge
+            pos = await pm.open_position(signal, no_agg, fee_enabled=True)
+            assert pos is None
+        finally:
+            object.__setattr__(settings.strategy, "maker_routing_enabled", orig)
 
     @pytest.mark.asyncio
     async def test_wide_edge_accepted_without_fees(self):

@@ -113,6 +113,32 @@ class StrategyParams:
     # factor is zero.
     min_edge_score: float = _env_float("MIN_EDGE_SCORE", 50.0)
 
+    # ── V1: Maker routing ─────────────────────────────────────────────────
+    # When True, entries priced as maker (best_ask - 1¢) use 0-fee EQS
+    # scoring and a relaxed viability gate (no slippage/fee drag).
+    maker_routing_enabled: bool = _env_bool("MAKER_ROUTING_ENABLED", True)
+    # Multiplier on min_edge_score when executing as maker (0.85 = 15% lower).
+    maker_eqs_discount: float = _env_float("MAKER_EQS_DISCOUNT", 0.85)
+
+    # ── V2: Multi-factor confluence routing ───────────────────────────────
+    # Dynamic EQS threshold discount when multiple independent signals
+    # confirm simultaneously.  Requires ≥ confluence_min_factors active.
+    confluence_eqs_floor: float = _env_float("CONFLUENCE_EQS_FLOOR", 35.0)
+    confluence_min_factors: int = _env_int("CONFLUENCE_MIN_FACTORS", 2)
+    # Per-factor EQS threshold discounts (points subtracted).
+    confluence_whale_discount: float = _env_float("CONFLUENCE_WHALE_DISCOUNT", 5.0)
+    confluence_spread_discount: float = _env_float("CONFLUENCE_SPREAD_DISCOUNT", 4.0)
+    confluence_l2_discount: float = _env_float("CONFLUENCE_L2_DISCOUNT", 3.0)
+    confluence_regime_discount: float = _env_float("CONFLUENCE_REGIME_DISCOUNT", 3.0)
+
+    # ── V4: Probe sizing ──────────────────────────────────────────────────
+    # Allow sub-threshold entries (EQS in [probe_eqs_floor, min_edge_score))
+    # at micro-size for market exploration and scale-in upon confirmation.
+    probe_sizing_enabled: bool = _env_bool("PROBE_SIZING_ENABLED", True)
+    probe_eqs_floor: float = _env_float("PROBE_EQS_FLOOR", 35.0)
+    probe_kelly_fraction: float = _env_float("PROBE_KELLY_FRACTION", 0.05)
+    probe_max_usd: float = _env_float("PROBE_MAX_USD", 2.0)
+
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 15.0)
     max_wallet_risk_pct: float = _env_float("MAX_WALLET_RISK_PCT", 20.0)
@@ -402,6 +428,15 @@ class StrategyParams:
     # from rpe_max_data_age_seconds so the two concerns can be tuned
     # independently.
     stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 1800.0)
+
+    # ── V3: Low-volatility drift signal ───────────────────────────────────
+    # Captures slow-bleed mean-reversion in sideways markets where
+    # PanicDetector is silent.  Requires MR regime + low EWMA σ.
+    drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
+    drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
+    drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 1.0)
+    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.015)
+    drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 120.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)

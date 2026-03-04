@@ -14,7 +14,7 @@ HTTP 429 rate-limit risk entirely.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.core.config import settings
 from src.core.logger import get_logger
@@ -55,6 +55,7 @@ class StopLossMonitor:
         telegram: "TelegramAlerter",
         *,
         trailing_offset_cents: float | None = None,
+        on_probe_breakeven: "Any | None" = None,
     ):
         self._pm = position_manager
         self._no_aggs = no_aggs
@@ -70,6 +71,10 @@ class StopLossMonitor:
         self._running = False
         # Trailing high-water marks: pos.id → highest mid-price seen since entry
         self._hwm: dict[str, float] = {}
+        # V4: Callback for probe positions that reach breakeven activation
+        self._on_probe_breakeven = on_probe_breakeven
+        # V4: Track which probes have already emitted breakeven callback
+        self._probe_breakeven_emitted: set[str] = set()
         # Breakeven activation: trailing stop only engages after position
         # has been profitable by at least this many cents.  Prevents
         # the trailing stop from ratcheting during the initial adverse
@@ -138,6 +143,30 @@ class StopLossMonitor:
         if mid > hwm:
             hwm = mid
             self._hwm[pos.id] = hwm
+
+        # ── V4: Probe breakeven callback ──────────────────────────────
+        # When a probe position reaches the breakeven activation point,
+        # emit a callback so the bot can evaluate scaling into a full
+        # position.  Only fires once per probe.
+        if (
+            getattr(pos, "is_probe", False)
+            and self._on_probe_breakeven is not None
+            and pos.id not in self._probe_breakeven_emitted
+        ):
+            profit_cents = (mid - pos.entry_price) * 100
+            be_threshold = self._be_activation_cents or 1.0
+            if profit_cents >= be_threshold:
+                self._probe_breakeven_emitted.add(pos.id)
+                log.info(
+                    "probe_breakeven_reached",
+                    pos_id=pos.id,
+                    profit_cents=round(profit_cents, 2),
+                    threshold=be_threshold,
+                )
+                try:
+                    await self._on_probe_breakeven(pos)
+                except Exception:
+                    log.error("probe_breakeven_callback_error", pos_id=pos.id, exc_info=True)
 
         # Determine effective stop-loss threshold
         base_sl = (

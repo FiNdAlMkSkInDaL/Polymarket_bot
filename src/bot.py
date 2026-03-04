@@ -62,6 +62,7 @@ from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.cross_market import CrossMarketSignalGenerator
+from src.signals.drift_signal import MeanReversionDrift
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
 try:
@@ -179,6 +180,10 @@ class TradingBot:
 
         # SI-1: Per-market regime detectors
         self._regime_detectors: dict[str, RegimeDetector] = {}  # condition_id → detector
+
+        # V3: Per-market drift signal detectors
+        self._drift_detectors: dict[str, MeanReversionDrift] = {}  # condition_id → detector
+        self._drift_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
 
         # SI-2: Per-asset iceberg detectors
         self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
@@ -528,6 +533,10 @@ class TradingBot:
         if settings.strategy.regime_enabled:
             self._regime_detectors[m.condition_id] = RegimeDetector(m.condition_id)
 
+        # V3: Per-market drift signal detector
+        if settings.strategy.drift_signal_enabled:
+            self._drift_detectors[m.condition_id] = MeanReversionDrift(m.condition_id)
+
         # PCE: register market for correlation tracking (Pillar 15)
         self.pce.register_market(
             m.condition_id, m.event_id, getattr(m, 'tags', '') or '',
@@ -571,6 +580,8 @@ class TradingBot:
         self._spread_evaluators.pop(m.condition_id, None)
         self._spread_cooldowns.pop(m.condition_id, None)
         self._regime_detectors.pop(m.condition_id, None)
+        self._drift_detectors.pop(m.condition_id, None)
+        self._drift_cooldowns.pop(m.condition_id, None)
         self._rpe.clear_market(m.condition_id)
         self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
@@ -1127,7 +1138,57 @@ class TradingBot:
                 else:
                     self._latest_z = sig.zscore
                     self.lifecycle.record_signal(market_info.condition_id)
-                    await self._on_panic_signal(sig, no_agg, market_info)
+                    await self._on_panic_signal(
+                        sig, no_agg, market_info,
+                        signal_metadata={
+                            "regime_mean_revert": (
+                                regime_det.is_mean_revert if regime_det else False
+                            ),
+                        },
+                    )
+
+            # ── V3: Drift signal (low-volatility mean-reversion) ───────────
+            # Only evaluate when PanicDetector did NOT fire — ensures
+            # uncorrelated signal source.  Requires MR regime.
+            if not sig and settings.strategy.drift_signal_enabled:
+                drift_det = self._drift_detectors.get(market_info.condition_id)
+                if drift_det and no_agg:
+                    # Drift cooldown
+                    now_drift = time.time()
+                    last_drift = self._drift_cooldowns.get(market_info.condition_id, 0.0)
+                    if now_drift - last_drift >= settings.strategy.drift_cooldown_s:
+                        # Check L2 reliability
+                        l2_no = self._l2_books.get(market_info.no_token_id)
+                        l2_ok = l2_no is None or l2_no.is_reliable
+
+                        drift_sig = drift_det.evaluate(
+                            no_agg,
+                            regime_is_mean_revert=(
+                                regime_det.is_mean_revert if regime_det else False
+                            ),
+                            l2_reliable=l2_ok,
+                        )
+                        if drift_sig and drift_sig.direction == "BUY_NO":
+                            self._drift_cooldowns[market_info.condition_id] = now_drift
+                            # Synthesise a PanicSignal for the standard flow
+                            drift_panic = PanicSignal(
+                                market_id=market_info.condition_id,
+                                no_asset_id=market_info.no_token_id,
+                                zscore=abs(drift_sig.displacement),
+                                volume_ratio=1.0,
+                                no_best_ask=no_best_ask,
+                                whale_confluence=whale,
+                            )
+                            self.lifecycle.record_signal(market_info.condition_id)
+                            await self._on_panic_signal(
+                                drift_panic, no_agg, market_info,
+                                signal_metadata={
+                                    "source": "drift",
+                                    "drift_score": drift_sig.score,
+                                    "regime_mean_revert": True,
+                                    "spread_compressed": False,
+                                },
+                            )
 
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
@@ -1172,7 +1233,8 @@ class TradingBot:
                 log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
 
     async def _on_panic_signal(
-        self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo
+        self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo,
+        signal_metadata: dict | None = None,
     ) -> None:
         """Handle a confirmed panic signal."""
         # Fire-and-forget — Telegram notification must NOT block the
@@ -1216,6 +1278,7 @@ class TradingBot:
             days_to_resolution=days,
             book_depth_ratio=book_depth,
             fee_enabled=fee_enabled,
+            signal_metadata=signal_metadata,
         )
         if pos:
             # Launch entry chaser as a child task (Pillar 1)

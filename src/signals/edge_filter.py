@@ -109,6 +109,67 @@ class EdgeAssessment:
     expected_net_cents: float     #: gross − fees
     viable: bool                  #: score ≥ threshold
     rejection_reason: str = ""    #: "" if viable
+    execution_mode: str = "taker" #: "maker" or "taker"
+
+
+@dataclass(slots=True)
+class ConfluenceContext:
+    """Multi-factor confluence signals for dynamic EQS threshold.
+
+    When ≥ ``confluence_min_factors`` independent signals confirm
+    simultaneously, the EQS threshold is reduced by the sum of their
+    individual discounts, floored at ``confluence_eqs_floor``.
+    """
+
+    whale_strong_confluence: bool = False   #: WhaleMonitor.has_strong_confluence()
+    spread_compressed: bool = False         #: SpreadCompressionSignal fired
+    l2_reliable: bool = False               #: L2OrderBook.is_reliable
+    regime_mean_revert: bool = False        #: RegimeDetector.is_mean_revert
+
+
+def compute_confluence_discount(
+    ctx: ConfluenceContext,
+    base_threshold: float,
+) -> float:
+    """Compute dynamically adjusted EQS threshold from confluence context.
+
+    Each verified factor contributes a configurable point-discount to the
+    base threshold.  Discounts only activate when the number of active
+    factors meets or exceeds ``confluence_min_factors``.
+
+    Returns
+    -------
+    float
+        Adjusted EQS threshold (≥ ``confluence_eqs_floor``).
+    """
+    strat = settings.strategy
+    min_factors = strat.confluence_min_factors
+    floor = strat.confluence_eqs_floor
+
+    discounts: list[float] = []
+    if ctx.whale_strong_confluence:
+        discounts.append(strat.confluence_whale_discount)
+    if ctx.spread_compressed:
+        discounts.append(strat.confluence_spread_discount)
+    if ctx.l2_reliable:
+        discounts.append(strat.confluence_l2_discount)
+    if ctx.regime_mean_revert:
+        discounts.append(strat.confluence_regime_discount)
+
+    if len(discounts) < min_factors:
+        return base_threshold
+
+    adjusted = base_threshold - sum(discounts)
+    result = max(floor, adjusted)
+
+    log.info(
+        "confluence_discount_applied",
+        base=base_threshold,
+        adjusted=round(result, 2),
+        factors=len(discounts),
+        total_discount=round(sum(discounts), 1),
+    )
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -130,6 +191,7 @@ def compute_edge_score(
     tick_size: float = 0.01,
     model_confidence: float | None = None,
     current_ewma_vol: float | None = None,
+    execution_mode: str = "taker",
 ) -> EdgeAssessment:
     """Compute the Edge Quality Score for a proposed trade.
 
@@ -217,9 +279,15 @@ def compute_edge_score(
     gross_cents = raw_gross * 100.0
 
     # ── Fee drag (quadratic curve) ─────────────────────────────────────
-    entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
-    exit_est = entry_price + raw_gross
-    exit_fee_frac = get_fee_rate(exit_est, fee_enabled=fee_enabled)
+    # V1: Maker routing — when execution_mode="maker", both entry and
+    # exit are POST_ONLY limit orders → 0 bps fee on Polymarket.
+    if execution_mode == "maker":
+        entry_fee_frac = 0.0
+        exit_fee_frac = 0.0
+    else:
+        entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
+        exit_est = entry_price + raw_gross
+        exit_fee_frac = get_fee_rate(exit_est, fee_enabled=fee_enabled)
     fee_cents = (entry_fee_frac + exit_fee_frac) * 100.0
 
     net_cents = gross_cents - fee_cents
@@ -325,6 +393,7 @@ def compute_edge_score(
         expected_net_cents=round(net_cents, 4),
         viable=viable,
         rejection_reason=reason,
+        execution_mode=execution_mode,
     )
 
     log.info(

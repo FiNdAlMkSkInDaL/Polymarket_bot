@@ -309,6 +309,7 @@ class BotReplayAdapter(StrategyABC):
 
         # ── Edge quality score gate ────────────────────────────────────
         no_vwap = self._no_agg.rolling_vwap
+        exec_mode = "maker" if self._params.maker_routing_enabled else "taker"
         eqs = compute_edge_score(
             entry_price=best_ask,
             no_vwap=no_vwap if no_vwap > 0 else sig.no_best_ask,
@@ -320,6 +321,7 @@ class BotReplayAdapter(StrategyABC):
             zscore_threshold=self._params.zscore_threshold,
             min_score=self._params.min_edge_score,
             current_ewma_vol=self._no_agg.rolling_volatility_ewma or None,
+            execution_mode=exec_mode,
         )
         if not eqs.viable:
             return

@@ -151,3 +151,119 @@ TestMinEdgeScore — 3 tests for raised min_edge_score=50.
 TestLogConcaveZScore — 3 tests for log-concave z-score contribution.
 TestRollingExpectancy — 2 tests for get_rolling_expectancy in TradeStore.
 Total regression: 1150 tests passing (1127 original + 23 new).
+
+// MARCH 4TH CHANGES — VOLUME EXPANSION PLAN (V1–V4):
+
+feat(config): add 17 new strategy parameters for all 4 volume expansion vectors
+
+V1 — Maker routing:
+  maker_routing_enabled=True — globally enables maker-order fee path.
+  maker_eqs_discount=0.85 — lowers EQS threshold by 15% for maker entries (50→42.5).
+
+V2 — Multi-factor confluence routing:
+  confluence_eqs_floor=35.0 — hard floor for threshold after applying discounts.
+  confluence_min_factors=2 — minimum active factors to unlock any discount.
+  confluence_whale_discount=5.0 — discount when whale strong-confluence present.
+  confluence_spread_discount=4.0 — discount when spread compressed signal active.
+  confluence_l2_discount=3.0 — discount when L2 book is reliable.
+  confluence_regime_discount=3.0 — discount when regime is mean-reverting.
+
+V3 — Drift signal:
+  drift_signal_enabled=True — activates MeanReversionDrift detector.
+  drift_lookback_bars=10 — cumulative displacement window.
+  drift_z_threshold=1.0 — minimum |displacement| to fire.
+  drift_vol_ceiling=0.015 — EWMA σ ceiling (low-vol only).
+  drift_cooldown_s=120.0 — per-market cooldown between drift signals.
+
+V4 — Probe sizing:
+  probe_sizing_enabled=True — enables micro-sized probe entries below threshold.
+  probe_eqs_floor=35.0 — minimum score for a probe tier to be considered.
+  probe_kelly_fraction=0.05 — probe size as fraction of normal Kelly size.
+  probe_max_usd=2.0 — hard cap on probe position USD value.
+
+feat(signals/edge_filter): add execution_mode parameter and confluence types
+
+Added execution_mode: str = "taker" parameter to compute_edge_score(). When
+"maker", entry_fee_frac and exit_fee_frac are set to 0.0 eliminating phantom
+fee drag (Polymarket maker fees are genuinely 0 bps).
+Added execution_mode field to EdgeAssessment dataclass.
+Added ConfluenceContext dataclass with 4 bool fields: whale_strong_confluence,
+spread_compressed, l2_reliable, regime_mean_revert.
+Added compute_confluence_discount(ctx, base_threshold) → float: counts active
+factors, applies per-factor discounts if count >= confluence_min_factors, 
+returns max(confluence_eqs_floor, base - sum(discounts)).
+
+feat(trading/position_manager): wire maker routing, confluence, and probe tier
+
+V1: exec_mode = "maker" when maker_routing_enabled; minimum viable spread gate
+now uses desired_margin_cents only (removes 2×slippage + entry+exit fee phantom
+drag) for maker entries.
+V2: Builds ConfluenceContext from signal_metadata and book reliability; calls
+compute_confluence_discount() to lower EQS threshold before compute_edge_score().
+V4: When score is in [probe_eqs_floor, threshold) and rejection is
+score_below_threshold, position is opened as is_probe=True instead of rejected.
+Probe sizes capped at max(1.0, min(probe_kelly_fraction × normal_size, probe_max_usd / price)).
+Added is_probe: bool = False field to Position dataclass.
+
+feat(trading/stop_loss): add probe breakeven callback
+
+Added on_probe_breakeven callback parameter to StopLossMonitor.__init__().
+Added _probe_breakeven_emitted: set[str] dedup tracking.
+In _evaluate_position(), when pos.is_probe and profit_cents >= be_activation_cents
+and not yet emitted, fires await self._on_probe_breakeven(pos) exactly once.
+
+feat(monitoring/trade_store): persist is_probe flag and exclude probes from expectancy
+
+Added is_probe INTEGER DEFAULT 0 column to trades CREATE TABLE schema.
+Updated INSERT OR REPLACE statement to write int(pos.is_probe).
+get_rolling_expectancy() query filters AND COALESCE(is_probe, 0) = 0 to prevent
+micro-sized probe entries from polluting the expectancy estimator.
+
+feat(signals/drift_signal): new file — MeanReversionDrift detector (V3)
+
+New src/signals/drift_signal.py with DriftSignal dataclass and MeanReversionDrift class.
+evaluate() enforces 6 gates: regime_is_mean_revert, l2_reliable, enough bars (>= lookback),
+EWMA vol < ceiling, no high-vol-ratio bar in window (uncorrelated with PanicDetector),
+|displacement| >= z_threshold.
+Score normalised to [0, 1] via min(1.0, |displacement| / (2 × z_threshold)).
+Direction: displacement < 0 → "BUY_NO" (NO token is cheap vs VWAP).
+
+feat(bot): wire MeanReversionDrift into main trading loop (V3)
+
+Added _drift_detectors: dict[str, MeanReversionDrift] and _drift_cooldowns: dict[str, float].
+_wire_market() creates one MeanReversionDrift per market when drift_signal_enabled.
+_unwire_market() cleans up drift detectors and cooldowns.
+_on_yes_bar_closed() evaluates drift after PanicDetector block (only when PanicDetector silent).
+Synthesises a PanicSignal from drift result and calls _on_panic_signal() with
+signal_metadata={"source": "drift", "drift_score": ..., "regime_mean_revert": True}.
+_on_panic_signal() now accepts signal_metadata: dict | None and forwards to open_position().
+Panic signal call sites pass signal_metadata={"regime_mean_revert": ...} for confluence routing.
+
+feat(backtest/strategy): pass execution_mode through EQS gate for live parity
+
+BotReplayAdapter._on_yes_bar_closed() now determines exec_mode = "maker" if
+params.maker_routing_enabled else "taker" and passes execution_mode=exec_mode
+to compute_edge_score(), matching the live bot's V1 routing behaviour.
+
+test: add 29 new tests covering all 4 volume expansion vectors (tests/test_volume_expansion.py)
+
+TestMakerRouting (5 tests) — maker EQS higher than taker, fee_cents=0.0, unlocks marginal
+entries, EdgeAssessment.execution_mode field, "taker" default.
+TestConfluenceDiscount (6 tests) — no discount below min_factors, two-factor activation,
+all-four-factor max discount, floor respected, zero factors, frozen config override.
+TestDriftSignal (8 tests) — fires on drift, silent in trending regime, silent in high vol,
+silent with unreliable L2, silent with high-vol bar, insufficient history, score in [0,1],
+no displacement no signal.
+TestProbeSizing (4 tests) — probe in EQS range, hard reject below floor, Position.is_probe
+default, EdgeAssessment.execution_mode field.
+TestStopLossProbeBreakeven (2 tests) — callback fires at BE threshold, fires only once.
+TestConfigFields (4 tests) — all 17 new config fields with correct defaults.
+
+fix(tests/test_alpha_evolution): update fee-rejection test for maker routing default
+
+test_thin_edge_rejected_with_fees now temporarily disables maker_routing_enabled
+(object.__setattr__ on frozen dataclass) before calling open_position, restoring it
+in a finally block. Preserves the original intent (taker fee drag causes rejection)
+without conflicting with V1 maker = 0-fee default.
+
+Total regression: 997 tests passing (968 existing + 29 new volume expansion tests).

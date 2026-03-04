@@ -26,7 +26,7 @@ from src.core.guard import DeploymentGuard
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
-from src.signals.edge_filter import compute_edge_score
+from src.signals.edge_filter import ConfluenceContext, compute_confluence_discount, compute_edge_score
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
@@ -101,6 +101,9 @@ class Position:
     # Fee tracking
     fee_enabled: bool = True
     sl_trigger_cents: float = 0.0     # fee-adaptive stop-loss threshold
+
+    # V4: Probe sizing flag
+    is_probe: bool = False
 
     created_at: float = field(default_factory=time.time)
 
@@ -403,6 +406,31 @@ class PositionManager:
         # Weighted geometric mean of regime entropy, fee efficiency,
         # tick viability, and signal quality.  Replaces the old naive
         # min/max price-range clamp with a principled EV gate.
+        #
+        # V1: Maker routing — entries priced at best_ask - 1¢ are maker
+        # orders with 0 bps fee; use execution_mode="maker" for EQS.
+        # V2: Confluence routing — multiple confirmed signals lower the
+        # EQS threshold dynamically.
+        exec_mode = "maker" if strat.maker_routing_enabled else "taker"
+
+        # Build confluence context for dynamic threshold (V2)
+        confluence = ConfluenceContext(
+            whale_strong_confluence=signal.whale_confluence,
+            spread_compressed=bool((signal_metadata or {}).get("spread_compressed", False)),
+            l2_reliable=(
+                no_book is not None
+                and no_book.has_data
+                and getattr(no_book, "is_reliable", True)
+            ),
+            regime_mean_revert=bool((signal_metadata or {}).get("regime_mean_revert", False)),
+        )
+        base_threshold = strat.min_edge_score
+        # V1: maker discount on threshold
+        if exec_mode == "maker":
+            base_threshold = base_threshold * strat.maker_eqs_discount
+        # V2: confluence discount on threshold
+        eqs_threshold = compute_confluence_discount(confluence, base_threshold)
+
         edge = compute_edge_score(
             entry_price=entry_price,
             no_vwap=no_aggregator.rolling_vwap,
@@ -411,9 +439,27 @@ class PositionManager:
             whale_confluence=signal.whale_confluence,
             fee_enabled=fee_enabled,
             current_ewma_vol=no_aggregator.rolling_volatility_ewma or None,
+            execution_mode=exec_mode,
+            min_score=eqs_threshold,
         )
+
+        # V4: Probe sizing — sub-threshold entries at micro-size
+        is_probe = False
         if not edge.viable:
-            return None
+            if (
+                strat.probe_sizing_enabled
+                and edge.score >= strat.probe_eqs_floor
+                and edge.rejection_reason == "score_below_threshold"
+            ):
+                is_probe = True
+                log.info(
+                    "probe_entry_accepted",
+                    score=edge.score,
+                    threshold=eqs_threshold,
+                    floor=strat.probe_eqs_floor,
+                )
+            else:
+                return None
 
         # ── Depth-aware sizing (Pillar 2) ──────────────────────────────────
         if no_book is not None:
@@ -499,6 +545,19 @@ class PositionManager:
         # Conservative sizing: min(depth-aware, kelly)
         entry_size = min(sizing.size_shares, kelly_result.size_shares)
 
+        # ── V4: Probe sizing cap ──────────────────────────────────────────
+        # Probe entries use micro-size (5% of standard Kelly, hard cap).
+        if is_probe:
+            probe_max_shares = round(strat.probe_max_usd / entry_price, 2) if entry_price > 0 else 0.0
+            probe_kelly_shares = round(entry_size * strat.probe_kelly_fraction, 2)
+            entry_size = max(1.0, min(probe_kelly_shares, probe_max_shares))
+            log.info(
+                "probe_sizing_applied",
+                probe_shares=entry_size,
+                probe_max_usd=strat.probe_max_usd,
+                probe_kelly_fraction=strat.probe_kelly_fraction,
+            )
+
         # ── Spread signal sizing multiplier ────────────────────────────────
         # Spread-opportunity entries are lower conviction; apply the
         # explicit sizing multiplier set by the spread signal source.
@@ -573,18 +632,23 @@ class PositionManager:
         # ── Minimum viable edge gate ───────────────────────────────────
         # Reject trades where TP spread cannot cover slippage + fees.
         # This was the #1 cause of losing "target" exits in post-mortem.
-        slippage_rt_cents = 2 * strat.paper_slippage_cents
-        entry_fee_cents = entry_fee_frac * 100.0
-        exit_est_price = tp.target_price
-        exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=fee_enabled) * 100.0
-        min_viable_spread = slippage_rt_cents + entry_fee_cents + exit_fee_cents + strat.desired_margin_cents
+        # V1: Maker routing — when execution is maker (POST_ONLY), both
+        # entry and exit have 0 slippage and 0 fees; the gate reduces to
+        # just the desired margin.
+        if exec_mode == "maker":
+            min_viable_spread = strat.desired_margin_cents
+        else:
+            slippage_rt_cents = 2 * strat.paper_slippage_cents
+            entry_fee_cents = entry_fee_frac * 100.0
+            exit_est_price = tp.target_price
+            exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=fee_enabled) * 100.0
+            min_viable_spread = slippage_rt_cents + entry_fee_cents + exit_fee_cents + strat.desired_margin_cents
         if tp.spread_cents < min_viable_spread:
             log.info(
                 "skip_entry_insufficient_edge",
                 spread_cents=round(tp.spread_cents, 2),
                 min_viable=round(min_viable_spread, 2),
-                slippage_rt=slippage_rt_cents,
-                fee_rt=round(entry_fee_cents + exit_fee_cents, 2),
+                exec_mode=exec_mode,
                 margin=strat.desired_margin_cents,
             )
             return None
@@ -644,6 +708,7 @@ class PositionManager:
             sl_trigger_cents=sl_trigger,
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=exit_fee_bps,
+            is_probe=is_probe,
         )
 
         self._positions[pos.id] = pos
@@ -659,6 +724,8 @@ class PositionManager:
             alpha=tp.alpha,
             sl_trigger=sl_trigger,
             fee_enabled=fee_enabled,
+            is_probe=is_probe,
+            exec_mode=exec_mode,
         )
 
         return pos

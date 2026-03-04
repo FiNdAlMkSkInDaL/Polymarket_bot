@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS trades (
     zscore          REAL,
     volume_ratio    REAL,
     whale           INTEGER,
-    created_at      REAL
+    created_at      REAL,
+    is_probe        INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_state ON trades(state);
 
@@ -148,8 +149,9 @@ class TradeStore:
             INSERT OR REPLACE INTO trades
             (id, market_id, state, entry_price, entry_size, entry_time,
              target_price, exit_price, exit_time, exit_reason, pnl_cents,
-             hold_seconds, alpha, zscore, volume_ratio, whale, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             hold_seconds, alpha, zscore, volume_ratio, whale, created_at,
+             is_probe)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos.id,
@@ -169,6 +171,7 @@ class TradeStore:
                 signal.volume_ratio if signal else None,
                 int(signal.whale_confluence) if signal else 0,
                 pos.created_at,
+                int(getattr(pos, 'is_probe', False)),
             ),
         )
         await self._db.commit()
@@ -286,10 +289,15 @@ class TradeStore:
         expectancy and throttle sizing.
 
         Returns 0.0 if fewer than *window* trades are available.
+
+        V4: Probe trades (is_probe=1) are excluded from the calculation
+        to prevent micro-sized exploratory entries from polluting the
+        expectancy estimator that governs full-size trades.
         """
         await self._ensure_db()
         cursor = await self._db.execute(
             "SELECT pnl_cents FROM trades WHERE state = ? "
+            "AND COALESCE(is_probe, 0) = 0 "
             "ORDER BY exit_time DESC LIMIT ?",
             (PositionState.CLOSED.value, window),
         )
