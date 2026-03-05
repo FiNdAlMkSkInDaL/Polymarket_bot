@@ -535,6 +535,10 @@ L2OrderBook (src/data/l2_book.py, ~790 lines):
 OrderbookTracker (src/data/orderbook.py):
   Simpler top-of-book tracker from WS price_change events.
   L2OrderBookAdapter wraps L2OrderBook behind this interface.
+  Also exposes is_reliable (always True), seq_gap_rate (0.0), delta_count (0),
+  desync_total (0) as no-op stubs so all consumer code works regardless of
+  whether L2 is enabled. Plain trackers have no desync concept, so is_reliable
+  is unconditionally True.
 
 OHLCVAggregator (src/data/ohlcv.py):
   Builds 1-minute bars from trade events.
@@ -1254,6 +1258,9 @@ SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
    L2OrderBook (full depth, SortedDict) vs OrderbookTracker (top-of-book).
    L2OrderBookAdapter bridges L2 behind Tracker interface.
    Both coexist — some code paths use L2, others use Tracker.
+   Both types expose is_reliable, seq_gap_rate, delta_count, desync_total:
+   plain trackers return safe non-L2 defaults (True, 0.0, 0, 0).
+   Consumer code MUST NOT isinstance-check — treat both as duck-typed.
 
 4. FAST_KILL_EVENT
    asyncio.Event shared between AdverseSelectionGuard and all OrderChasers.
@@ -1617,6 +1624,28 @@ March 5th — Dynamic Prior Generation Engine (DPGE):
   new semantics (tag priors intentionally diverge from market price).
 
 Current state: 1324 tests passing, 0 failures
+
+March 5th — Crash Hardening & Bug Fixes:
+  Root cause: L2OrderBookAdapter was missing is_reliable, seq_gap_rate,
+    delta_count, desync_total delegations → AttributeError crashed the bot.
+  Also fixed: plain OrderbookTracker (non-L2 mode) completely lacked these
+    properties → same crash if L2 ever disabled at runtime.
+  Fixes applied:
+  - L2OrderBookAdapter: added 4 missing property delegations
+  - OrderbookTracker base: added is_reliable/seq_gap_rate/delta_count/
+    desync_total as no-op stubs (always reliable, zero counts)
+  - _process_trades: loop body was completely unguarded — any exception in
+    bar processing / signal evaluation / position opening killed the bot.
+    Wrapped in try/except; exceptions now logged and skipped, loop continues.
+  - _process_book_updates: tracker calls now guarded; bad WS message cannot
+    kill the book-update task.
+  - AdverseSelectionGuard._decision_loop: had zero exception handling — any
+    evaluation error silently killed the adverse-selection task permanently.
+    Wrapped loop body in try/except.
+  - WhaleMonitor.start: pre-loop cluster-build call now try/except guarded.
+  - _health_reporter: pre-loop mkdir now try/except with tempdir fallback.
+  All changes: 1270 tests passing (excludes 3 pre-existing env-dependent
+    failures in test_architecture_fixes, test_deployment_guard, test_e2e).
 
 
 ================================================================================
