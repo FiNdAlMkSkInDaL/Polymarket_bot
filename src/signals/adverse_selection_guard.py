@@ -586,83 +586,88 @@ class AdverseSelectionGuard:
         """
         while self._running:
             await asyncio.sleep(self._poll_s)
-            now = time.time()
+            try:
+                now = time.time()
 
-            # Respect cooldown
-            if now < self._cooldown_until:
-                continue
+                # Respect cooldown
+                if now < self._cooldown_until:
+                    continue
 
-            # -- Snapshot phase (no I/O) ------------------------------------
-            self._snapshot_mti()
-            self._snapshot_depth()
-            self._snapshot_spreads()
-            self._snapshot_trade_rates()
+                # -- Snapshot phase (no I/O) ------------------------------------
+                self._snapshot_mti()
+                self._snapshot_depth()
+                self._snapshot_spreads()
+                self._snapshot_trade_rates()
 
-            # -- Evaluation phase -------------------------------------------
-            signals_fired: list[dict] = []
+                # -- Evaluation phase -------------------------------------------
+                signals_fired: list[dict] = []
 
-            flow_fired, flow_diag = self._check_flow_coherence()
-            if flow_fired:
-                signals_fired.append(flow_diag)
+                flow_fired, flow_diag = self._check_flow_coherence()
+                if flow_fired:
+                    signals_fired.append(flow_diag)
 
-            depth_fired, depth_diag = self._check_depth_evaporation()
-            if depth_fired:
-                signals_fired.append(depth_diag)
+                depth_fired, depth_diag = self._check_depth_evaporation()
+                if depth_fired:
+                    signals_fired.append(depth_diag)
 
-            spread_fired, spread_diag = self._check_spread_blowout()
-            if spread_fired:
-                signals_fired.append(spread_diag)
+                spread_fired, spread_diag = self._check_spread_blowout()
+                if spread_fired:
+                    signals_fired.append(spread_diag)
 
-            velocity_fired, velocity_diag = self._check_velocity_anomaly()
-            if velocity_fired:
-                signals_fired.append(velocity_diag)
+                velocity_fired, velocity_diag = self._check_velocity_anomaly()
+                if velocity_fired:
+                    signals_fired.append(velocity_diag)
 
-            # -- 2-of-4 composite trigger -----------------------------------
-            if len(signals_fired) < 2:
-                self._consecutive_trigger_count = 0  # reset confirmation
-                if signals_fired:
+                # -- 2-of-4 composite trigger -----------------------------------
+                if len(signals_fired) < 2:
+                    self._consecutive_trigger_count = 0  # reset confirmation
+                    if signals_fired:
+                        log.debug(
+                            "adverse_sel_single_signal",
+                            signal=signals_fired[0].get("signal"),
+                        )
+                    continue
+
+                # -- Confirmation persistence gate (OE-3) -----------------------
+                # Require the trigger condition to persist for N consecutive
+                # poll cycles before actually firing the kill.
+                self._consecutive_trigger_count += 1
+                if self._consecutive_trigger_count < self._confirmation_required:
                     log.debug(
-                        "adverse_sel_single_signal",
-                        signal=signals_fired[0].get("signal"),
+                        "adverse_sel_confirming",
+                        count=self._consecutive_trigger_count,
+                        required=self._confirmation_required,
+                        signals=[d.get("signal") for d in signals_fired],
                     )
-                continue
+                    continue
 
-            # -- Confirmation persistence gate (OE-3) -----------------------
-            # Require the trigger condition to persist for N consecutive
-            # poll cycles before actually firing the kill.
-            self._consecutive_trigger_count += 1
-            if self._consecutive_trigger_count < self._confirmation_required:
-                log.debug(
-                    "adverse_sel_confirming",
-                    count=self._consecutive_trigger_count,
-                    required=self._confirmation_required,
-                    signals=[d.get("signal") for d in signals_fired],
+                # Reset counter — kill will fire
+                self._consecutive_trigger_count = 0
+
+                # Skip no-op kills when there are no resting orders
+                open_count = self._executor.open_order_count
+                if open_count == 0:
+                    log.debug(
+                        "adverse_sel_skip",
+                        reason="no_open_orders",
+                        signals=[d.get("signal") for d in signals_fired],
+                    )
+                    self._cooldown_until = time.time() + self._cooldown_s
+                    continue
+
+                signal_names = [d.get("signal") for d in signals_fired]
+                log.warning(
+                    "adverse_sel_trigger",
+                    signals=signal_names,
+                    signals_fired=len(signals_fired),
+                    open_orders=open_count,
+                    diagnostics=signals_fired,
                 )
-                continue
-
-            # Reset counter — kill will fire
-            self._consecutive_trigger_count = 0
-
-            # Skip no-op kills when there are no resting orders
-            open_count = self._executor.open_order_count
-            if open_count == 0:
-                log.debug(
-                    "adverse_sel_skip",
-                    reason="no_open_orders",
-                    signals=[d.get("signal") for d in signals_fired],
-                )
-                self._cooldown_until = time.time() + self._cooldown_s
-                continue
-
-            signal_names = [d.get("signal") for d in signals_fired]
-            log.warning(
-                "adverse_sel_trigger",
-                signals=signal_names,
-                signals_fired=len(signals_fired),
-                open_orders=open_count,
-                diagnostics=signals_fired,
-            )
-            await self._execute_fast_kill(signals_fired)
+                await self._execute_fast_kill(signals_fired)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error("adverse_sel_loop_error", exc_info=True)
 
     # === Kill execution =====================================================
 

@@ -249,6 +249,26 @@ class OrderbookTracker:
     def has_data(self) -> bool:
         return self._last_update > 0
 
+    @property
+    def is_reliable(self) -> bool:
+        """Legacy trackers have no desync tracking — always reliable."""
+        return True
+
+    @property
+    def seq_gap_rate(self) -> float:
+        """Legacy trackers have no sequence tracking."""
+        return 0.0
+
+    @property
+    def delta_count(self) -> int:
+        """Legacy trackers don't count deltas."""
+        return 0
+
+    @property
+    def desync_total(self) -> int:
+        """Legacy trackers don't track desyncs."""
+        return 0
+
     # ── BBO change detection ─────────────────────────────────────────────
     def _check_bbo_change(self) -> None:
         """Fire ``on_bbo_change`` callback if the BBO has changed."""
@@ -402,6 +422,22 @@ class L2OrderBookAdapter(OrderbookTracker):
     @property
     def has_data(self) -> bool:
         return self._l2.has_data
+
+    @property
+    def is_reliable(self) -> bool:
+        return self._l2.is_reliable
+
+    @property
+    def seq_gap_rate(self) -> float:
+        return self._l2.seq_gap_rate
+
+    @property
+    def delta_count(self) -> int:
+        return self._l2.delta_count
+
+    @property
+    def desync_total(self) -> int:
+        return self._l2.desync_total
 
     @property
     def _last_update(self) -> float:

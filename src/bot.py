@@ -804,69 +804,78 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
 
-            # ── Pillar 4: Latency gate ─────────────────────────────────
-            latency_state = self.latency_guard.check(event.timestamp)
-            is_blocked = latency_state == LatencyState.BLOCKED
+            try:
+                # ── Pillar 4: Latency gate ─────────────────────────────────
+                latency_state = self.latency_guard.check(event.timestamp)
+                is_blocked = latency_state == LatencyState.BLOCKED
 
-            if is_blocked and latency_state != getattr(self, "_prev_latency", None):
-                await self.telegram.send(
-                    "🚨 <b>Latency BLOCKED</b> — execution halted until WS stabilises.\n"
-                    f"Delta: {self.latency_guard.last_delta_ms:.0f}ms"
+                if is_blocked and latency_state != getattr(self, "_prev_latency", None):
+                    await self.telegram.send(
+                        "🚨 <b>Latency BLOCKED</b> — execution halted until WS stabilises.\n"
+                        f"Delta: {self.latency_guard.last_delta_ms:.0f}ms"
+                    )
+                if not is_blocked and getattr(self, "_prev_latency", None) == LatencyState.BLOCKED:
+                    await self.telegram.send("✅ <b>Latency recovered</b> — execution resumed.")
+                self._prev_latency = latency_state
+
+                # Track trade frequency
+                self._trade_counts[event.asset_id] = (
+                    self._trade_counts.get(event.asset_id, 0.0) + 1.0
                 )
-            if not is_blocked and getattr(self, "_prev_latency", None) == LatencyState.BLOCKED:
-                await self.telegram.send("✅ <b>Latency recovered</b> — execution resumed.")
-            self._prev_latency = latency_state
 
-            # Track trade frequency
-            self._trade_counts[event.asset_id] = (
-                self._trade_counts.get(event.asset_id, 0.0) + 1.0
-            )
+                # ── MTI: classify trade as taker or maker ──────────────────
+                book = self._book_trackers.get(event.asset_id)
+                if book and book.has_data:
+                    snap = book.snapshot()
+                    is_taker = False
+                    if event.side == "buy" and snap.best_ask > 0 and event.price >= snap.best_ask:
+                        is_taker = True
+                    elif event.side == "sell" and snap.best_bid > 0 and event.price <= snap.best_bid:
+                        is_taker = True
+                    event.is_taker = is_taker
 
-            # ── MTI: classify trade as taker or maker ──────────────────
-            book = self._book_trackers.get(event.asset_id)
-            if book and book.has_data:
-                snap = book.snapshot()
-                is_taker = False
-                if event.side == "buy" and snap.best_ask > 0 and event.price >= snap.best_ask:
-                    is_taker = True
-                elif event.side == "sell" and snap.best_bid > 0 and event.price <= snap.best_bid:
-                    is_taker = True
-                event.is_taker = is_taker
+                    self._total_counts[event.asset_id] = (
+                        self._total_counts.get(event.asset_id, 0) + 1
+                    )
+                    if is_taker:
+                        self._taker_counts[event.asset_id] = (
+                            self._taker_counts.get(event.asset_id, 0) + 1
+                        )
 
-                self._total_counts[event.asset_id] = (
-                    self._total_counts.get(event.asset_id, 0) + 1
-                )
-                if is_taker:
-                    self._taker_counts[event.asset_id] = (
-                        self._taker_counts.get(event.asset_id, 0) + 1
+                # ── Ghost liquidity: record recent trade volume ────────────
+                market_info = self._market_map.get(event.asset_id)
+                if market_info:
+                    cid = market_info.condition_id
+                    if cid not in self._recent_trade_volume:
+                        self._recent_trade_volume[cid] = []
+                    self._recent_trade_volume[cid].append(
+                        (event.timestamp, event.price * event.size)
                     )
 
-            # ── Ghost liquidity: record recent trade volume ────────────
-            market_info = self._market_map.get(event.asset_id)
-            if market_info:
-                cid = market_info.condition_id
-                if cid not in self._recent_trade_volume:
-                    self._recent_trade_volume[cid] = []
-                self._recent_trade_volume[cid].append(
-                    (event.timestamp, event.price * event.size)
-                )
+                # Route to the correct aggregator (always, even when blocked)
+                yes_agg = self._yes_aggs.get(event.asset_id)
+                no_agg = self._no_aggs.get(event.asset_id)
 
-            # Route to the correct aggregator (always, even when blocked)
-            yes_agg = self._yes_aggs.get(event.asset_id)
-            no_agg = self._no_aggs.get(event.asset_id)
+                if yes_agg:
+                    bar = yes_agg.on_trade(event)
+                    if bar and not is_blocked:
+                        await self._on_yes_bar_closed(event.asset_id, bar)
 
-            if yes_agg:
-                bar = yes_agg.on_trade(event)
-                if bar and not is_blocked:
-                    await self._on_yes_bar_closed(event.asset_id, bar)
+                if no_agg:
+                    no_agg.on_trade(event)
+                    if self.paper_mode and not is_blocked:
+                        self._check_paper_fills(event)
 
-            if no_agg:
-                no_agg.on_trade(event)
-                if self.paper_mode and not is_blocked:
+                if self.paper_mode and yes_agg and not is_blocked:
                     self._check_paper_fills(event)
-
-            if self.paper_mode and yes_agg and not is_blocked:
-                self._check_paper_fills(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error(
+                    "trade_processing_error",
+                    asset_id=event.asset_id,
+                    exc_info=True,
+                )
 
     async def _process_book_updates(self) -> None:
         """Consume orderbook WS events and update trackers.
@@ -900,10 +909,20 @@ class TradingBot:
 
             # L2-backed trackers are no-ops for these calls, but we
             # still route for backward compat and non-L2 fallback.
-            if event_type == "price_change":
-                tracker.on_price_change(msg)
-            elif event_type == "book":
-                tracker.on_book_snapshot(msg)
+            try:
+                if event_type == "price_change":
+                    tracker.on_price_change(msg)
+                elif event_type == "book":
+                    tracker.on_book_snapshot(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error(
+                    "book_update_error",
+                    asset_id=asset_id,
+                    event_type=event_type,
+                    exc_info=True,
+                )
 
     # ── L2 callbacks ──────────────────────────────────────────────────────
     async def _on_l2_bbo_change(self, asset_id: str, score: Any) -> None:
@@ -2415,15 +2434,20 @@ class TradingBot:
         import tempfile
         from pathlib import Path as _Path
 
-        health_dir = _Path(settings.log_dir)
-        health_dir.mkdir(parents=True, exist_ok=True)
-        health_path = health_dir / "system_health.json"
+        try:
+            health_dir = _Path(settings.log_dir)
+            health_dir.mkdir(parents=True, exist_ok=True)
+            health_path = health_dir / "system_health.json"
+        except Exception:
+            log.warning("health_reporter_dir_error", exc_info=True)
+            health_dir = _Path(tempfile.gettempdir())
+            health_path = health_dir / "system_health.json"
 
         # Try to import psutil for memory tracking; degrade gracefully.
         try:
             import psutil  # type: ignore[import-untyped]
             _process = psutil.Process(_os.getpid())
-        except ImportError:
+        except (ImportError, Exception):
             _process = None
 
         while self._running:

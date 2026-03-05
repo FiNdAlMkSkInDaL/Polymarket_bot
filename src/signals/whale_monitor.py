@@ -152,7 +152,10 @@ class WhaleMonitor:
         log.info("whale_monitor_started", wallets=len(self.wallets))
 
         # Build initial cluster map
-        await self._maybe_rebuild_clusters()
+        try:
+            await self._maybe_rebuild_clusters()
+        except Exception:
+            log.warning("whale_initial_cluster_build_error", exc_info=True)
 
         while self._running:
             try:
