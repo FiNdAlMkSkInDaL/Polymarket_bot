@@ -26,20 +26,28 @@ from dataclasses import dataclass
 
 from src.core.config import settings
 from src.core.logger import get_logger
+from src.signals.signal_framework import BaseSignal
 
 log = get_logger(__name__)
 
 
-@dataclass(slots=True)
-class DriftSignal:
-    """Result from a drift evaluation."""
+@dataclass
+class DriftSignal(BaseSignal):
+    """Result from a drift evaluation.
 
-    market_id: str
-    displacement: float      #: cumulative z-score displacement
-    score: float             #: normalised signal quality [0, 1]
-    direction: str           #: "BUY_NO" (NO is cheap) or "SELL_NO"
-    ewma_vol: float          #: current EWMA volatility
-    lookback_bars: int       #: number of bars in the window
+    Inherits from :class:`~src.signals.signal_framework.BaseSignal`:
+    ``market_id``, ``no_asset_id``, ``no_best_ask``.
+
+    The ``no_asset_id`` and ``no_best_ask`` fields are populated by the
+    caller (``_on_yes_bar_closed`` in ``bot.py``) when invoking
+    ``MeanReversionDrift.evaluate()`` with the market-specific values.
+    """
+
+    displacement: float = 0.0   #: cumulative z-score displacement
+    score: float = 0.0          #: normalised signal quality [0, 1]
+    direction: str = "BUY_NO"   #: "BUY_NO" (NO is cheap) or "SELL_NO"
+    ewma_vol: float = 0.0       #: current EWMA volatility
+    lookback_bars: int = 0      #: number of bars in the window
     timestamp: float = 0.0
 
 
@@ -81,6 +89,8 @@ class MeanReversionDrift:
         self,
         no_aggregator,
         *,
+        no_asset_id: str = "",
+        no_best_ask: float = 0.0,
         regime_is_mean_revert: bool = False,
         l2_reliable: bool = True,
     ) -> DriftSignal | None:
@@ -90,6 +100,13 @@ class MeanReversionDrift:
         ----------
         no_aggregator:
             The ``OHLCVAggregator`` for the NO token.
+        no_asset_id:
+            Token ID for the NO outcome token.  Forwarded into the
+            returned :class:`DriftSignal` so the execution layer can
+            route the order without needing to re-look it up.
+        no_best_ask:
+            Current best-ask price for the NO token.  Used as the
+            entry-price reference inside the returned signal.
         regime_is_mean_revert:
             Whether the ``RegimeDetector`` classifies the current regime
             as mean-reverting.
@@ -184,6 +201,8 @@ class MeanReversionDrift:
 
         signal = DriftSignal(
             market_id=self.market_id,
+            no_asset_id=no_asset_id,
+            no_best_ask=no_best_ask,
             displacement=round(displacement, 4),
             score=round(score, 4),
             direction=direction,

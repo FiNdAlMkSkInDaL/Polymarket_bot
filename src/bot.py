@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.config import settings, DeploymentEnv
+from src.core.exception_circuit_breaker import ExceptionCircuitBreaker
 from src.core.guard import DeploymentGuard
 from src.core.heartbeat import BookHeartbeat, PolygonHeadLagChecker
 from src.core.latency_guard import LatencyGuard, LatencyState
@@ -46,6 +47,7 @@ from src.signals.resolution_probability import (
     ResolutionProbabilityEngine,
 )
 from src.signals.signal_framework import (
+    BaseSignal,
     CompositeSignalEvaluator,
     OrderbookImbalanceSignal,
     SignalResult,
@@ -62,7 +64,7 @@ from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.cross_market import CrossMarketSignalGenerator
-from src.signals.drift_signal import MeanReversionDrift
+from src.signals.drift_signal import DriftSignal, MeanReversionDrift
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
@@ -232,6 +234,9 @@ class TradingBot:
         # RPE calibration tracker (Deliverable A)
         self._rpe_calibration = RPECalibrationTracker()
 
+        # Exception circuit breakers for critical async loops
+        self._trade_loop_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+
         # RPE per-market cooldown (Deliverable C)
         self._rpe_last_signal: dict[str, float] = {}
 
@@ -377,6 +382,7 @@ class TradingBot:
             trade_counts=self._trade_counts,
             get_position_assets=self._positioned_asset_ids,
             telegram=self.telegram,
+            on_shutdown=self.stop,
         )
 
         # Polygon head-lag checker (moved from adverse-selection guard)
@@ -870,12 +876,31 @@ class TradingBot:
                     self._check_paper_fills(event)
             except asyncio.CancelledError:
                 raise
+            except KeyError:
+                # Stale / missing asset data — non-fatal, skip this event
+                log.warning(
+                    "trade_processing_stale_key",
+                    asset_id=event.asset_id,
+                    exc_info=True,
+                )
             except Exception:
                 log.error(
                     "trade_processing_error",
                     asset_id=event.asset_id,
                     exc_info=True,
                 )
+                if self._trade_loop_breaker.record():
+                    log.critical(
+                        "trade_processor_circuit_breaker_tripped",
+                        errors_in_window=self._trade_loop_breaker.recent_errors,
+                        msg="Too many unexpected errors in trade processor — initiating shutdown",
+                    )
+                    await self.telegram.send(
+                        "🔴 <b>CIRCUIT BREAKER</b>: trade_processor tripped "
+                        "(5 unexpected errors in 60s) — shutting down."
+                    )
+                    asyncio.ensure_future(self.stop())
+                    return
 
     async def _process_book_updates(self) -> None:
         """Consume orderbook WS events and update trackers.
@@ -1207,7 +1232,12 @@ class TradingBot:
                 )
                 # SI-3: record return for cross-market signal generator
                 if self._cross_market is not None:
-                    self._cross_market.record_return(market_info.condition_id, lr)
+                    self._cross_market.record_return(
+                        market_info.condition_id,
+                        lr,
+                        yes_asset_id=market_info.yes_token_id,
+                        no_asset_id=market_info.no_token_id,
+                    )
 
             sig = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
             if sig:
@@ -1246,6 +1276,8 @@ class TradingBot:
 
                         drift_sig = drift_det.evaluate(
                             no_agg,
+                            no_asset_id=market_info.no_token_id,
+                            no_best_ask=no_best_ask,
                             regime_is_mean_revert=(
                                 regime_det.is_mean_revert if regime_det else False
                             ),
@@ -1253,25 +1285,9 @@ class TradingBot:
                         )
                         if drift_sig and drift_sig.direction == "BUY_NO":
                             self._drift_cooldowns[market_info.condition_id] = now_drift
-                            # Synthesise a PanicSignal for the standard flow
-                            # Derive YES-side fields for PanicSignal compat
-                            yes_agg_drift = self._yes_aggs.get(market_info.yes_token_id)
-                            drift_yes_price = yes_agg_drift.current_price if yes_agg_drift else 0.0
-                            drift_yes_vwap = yes_agg_drift.rolling_vwap if yes_agg_drift else 0.0
-                            drift_panic = PanicSignal(
-                                market_id=market_info.condition_id,
-                                yes_asset_id=market_info.yes_token_id,
-                                no_asset_id=market_info.no_token_id,
-                                yes_price=drift_yes_price,
-                                yes_vwap=drift_yes_vwap,
-                                zscore=abs(drift_sig.displacement),
-                                volume_ratio=1.0,
-                                no_best_ask=no_best_ask,
-                                whale_confluence=whale,
-                            )
                             self.lifecycle.record_signal(market_info.condition_id)
                             await self._on_panic_signal(
-                                drift_panic, no_agg, market_info,
+                                drift_sig, no_agg, market_info,
                                 signal_metadata={
                                     "signal_source": "drift",  # Flaw 2: suppresses regime discount
                                     "source": "drift",         # legacy compat
@@ -1342,14 +1358,16 @@ class TradingBot:
                 log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
 
     async def _on_panic_signal(
-        self, sig: PanicSignal, no_agg: OHLCVAggregator, market: MarketInfo,
+        self, sig: BaseSignal, no_agg: OHLCVAggregator, market: MarketInfo,
         signal_metadata: dict | None = None,
     ) -> None:
-        """Handle a confirmed panic signal."""
+        """Handle a confirmed entry signal (PanicSignal or DriftSignal)."""
         # Fire-and-forget — Telegram notification must NOT block the
         # alpha-critical execution path (saves 50-500ms per trade).
+        _notify_zscore = sig.zscore if isinstance(sig, PanicSignal) else abs(getattr(sig, "displacement", 0.0))
+        _notify_vratio = sig.volume_ratio if isinstance(sig, PanicSignal) else 1.0
         asyncio.ensure_future(self.telegram.notify_signal(
-            sig.market_id, sig.zscore, sig.volume_ratio
+            sig.market_id, _notify_zscore, _notify_vratio
         ))
 
         # Compute days to resolution

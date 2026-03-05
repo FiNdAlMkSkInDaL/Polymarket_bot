@@ -1,0 +1,448 @@
+================================================================================
+CHANGE REPORT — DriftSignal / PanicSignal Decoupling
+Date: 2026-03-05
+================================================================================
+
+BACKGROUND
+----------
+A TypeError caused 92 DriftSignal fires to fail on 2026-03-05 because the
+signal synthesis block in bot.py omitted the yes_asset_id, yes_price, and
+yes_vwap fields required by the PanicSignal dataclass. A hotfix injected
+dummy/fallback data (e.g., yes_agg.current_price) to satisfy the constructor,
+even though the BUY_NO execution path does not consume those fields.
+
+This refactor eliminates that brittle coupling by introducing a clean
+polymorphic base interface (BaseSignal) so that MeanReversionDrift yields a
+native DriftSignal that PositionManager natively understands.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. src/signals/signal_framework.py
+   - Added new BaseSignal dataclass above SignalResult.
+   - BaseSignal defines the three fields required by the execution layer:
+       market_id: str
+       no_asset_id: str = ""
+       no_best_ask: float = 0.0
+
+2. src/signals/panic_detector.py
+   - Added import: from src.signals.signal_framework import BaseSignal
+   - PanicSignal now inherits from BaseSignal (was a standalone dataclass).
+   - Removed market_id, no_asset_id, no_best_ask from the child class body
+     (all three are now inherited from BaseSignal).
+   - Panic-specific fields (yes_asset_id, yes_price, yes_vwap, zscore,
+     volume_ratio, whale_confluence) remain in PanicSignal with defaults.
+
+3. src/signals/drift_signal.py
+   - Added import: from src.signals.signal_framework import BaseSignal
+   - DriftSignal now inherits from BaseSignal (was a standalone slots dataclass).
+   - Removed slots=True (incompatible with dataclass inheritance).
+   - Removed market_id from the child class body (inherited from BaseSignal).
+   - All DriftSignal-specific fields given explicit defaults to satisfy
+     dataclass field-ordering rules with the inherited base fields.
+   - MeanReversionDrift.evaluate() signature extended with two new kwargs:
+       no_asset_id: str = ""
+       no_best_ask: float = 0.0
+     These are forwarded directly into the constructed DriftSignal so the
+     returned signal is fully execution-ready before it reaches the position
+     manager — no caller-side field injection required.
+
+4. src/trading/position_manager.py
+   - Added imports: BaseSignal (signal_framework), DriftSignal (drift_signal).
+   - Position.signal field re-typed from PanicSignal | None → BaseSignal | None.
+   - open_position() signature: signal: PanicSignal → signal: BaseSignal.
+   - _open_position_inner() signature: signal: PanicSignal → signal: BaseSignal.
+   - Docstring updated to reflect both signal types.
+   - Added polymorphic extraction block immediately after _check_risk_gates():
+
+       if isinstance(signal, PanicSignal):
+           _zscore           = signal.zscore
+           _volume_ratio     = signal.volume_ratio
+           _whale_confluence = signal.whale_confluence
+       else:  # DriftSignal (or any future BaseSignal subclass)
+           _zscore           = abs(signal.displacement)
+           _volume_ratio     = 1.0
+           _whale_confluence = False
+
+   - All downstream consumers (ConfluenceContext, compute_edge_score, Kelly
+     signal_score formula, compute_take_profit) updated to reference the
+     extracted locals (_zscore, _volume_ratio, _whale_confluence) instead of
+     raw signal.* attributes.
+   - signal.market_id, signal.no_asset_id, signal.no_best_ask accessed
+     directly on any BaseSignal subclass without isinstance guards.
+
+5. src/bot.py
+   - Added imports: BaseSignal (signal_framework), DriftSignal (drift_signal).
+   - Removed the synthetic PanicSignal construction in the drift evaluation
+     block (_on_yes_bar_closed). The 12-line block that fetched yes_agg and
+     constructed drift_panic = PanicSignal(...) is deleted.
+   - drift_det.evaluate() now called with no_asset_id and no_best_ask kwargs
+     so the native DriftSignal carries all execution fields:
+         drift_sig = drift_det.evaluate(
+             no_agg,
+             no_asset_id=market_info.no_token_id,
+             no_best_ask=no_best_ask,
+             regime_is_mean_revert=...,
+             l2_reliable=l2_ok,
+         )
+   - The native DriftSignal is passed directly to _on_panic_signal() (no
+     intermediate wrapping in PanicSignal).
+   - _on_panic_signal() re-typed: sig: PanicSignal → sig: BaseSignal.
+   - Telegram notify call made polymorphic:
+         _notify_zscore = sig.zscore if isinstance(sig, PanicSignal)
+                          else abs(getattr(sig, "displacement", 0.0))
+         _notify_vratio = sig.volume_ratio if isinstance(sig, PanicSignal)
+                          else 1.0
+
+================================================================================
+ARCHITECTURAL INVARIANTS PRESERVED
+================================================================================
+
+- PanicDetector.evaluate() return type is unchanged (PanicSignal | None).
+- All existing PanicSignal construction sites in tests use keyword arguments
+  and remain valid with no modification required.
+- EQS scoring, Kelly sizing, take-profit computation, and PCE haircut logic
+  are all unchanged in behaviour — only the field-access path changed.
+- is_drift_signal detection in position_manager still works via
+  signal_metadata["signal_source"] == "drift" (unchanged).
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+Suite   : tests/  (all test files)
+Run     : 1324 passed
+Failures: 0
+Duration: 64.03s
+
+Specifically verified:
+  - test_volume_expansion.py  : PASS (all DriftSignal / MeanReversionDrift tests)
+  - test_signal_framework.py  : PASS (all SignalResult / CompositeEvaluator tests)
+  - test_system.py            : PASS (full lifecycle, max-positions, circuit-breaker)
+
+================================================================================
+
+
+================================================================================
+CHANGE REPORT — Exception Circuit Breaker for Critical Loops
+Date: 2026-03-05
+================================================================================
+
+BACKGROUND
+----------
+During the March 5th crash-hardening sweep, broad `except Exception` blocks
+were introduced into `_process_trades` (bot.py) and `_decision_loop`
+(adverse_selection_guard.py).  While this prevented isolated errors from
+permanently killing concurrent tasks, swallowing every exception risked
+masking severe L2 state corruption or fast-kill evaluation errors — leading
+to degraded and dangerous trading states operating silently.
+
+This refactoring replaces the blanket exception handlers with:
+  1. Targeted catches for expected, non-fatal exceptions.
+  2. An "Exception Circuit Breaker" that trips after a configurable
+     threshold of unexpected errors and triggers the bot's graceful
+     shutdown sequence.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. src/core/exception_circuit_breaker.py  (NEW)
+   - New module: ExceptionCircuitBreaker class.
+   - Rolling-window error counter using collections.deque of timestamps.
+   - record() returns True when threshold breached (breaker trips).
+   - Once tripped, always returns True (latching behaviour).
+   - Configurable: threshold (default 5), window_s (default 60.0).
+   - Uses time.monotonic() for reliable monotonic timing.
+
+2. src/bot.py
+   - Added import: ExceptionCircuitBreaker from src.core.exception_circuit_breaker.
+   - Added _trade_loop_breaker instance (threshold=5, window_s=60.0) in __init__.
+   - _process_trades inner except block refactored:
+     a. KeyError caught explicitly — logs as warning, continues (stale data).
+     b. Remaining Exception: logs error, records in circuit breaker.
+        If breaker trips → logs CRITICAL, sends Telegram alert, schedules
+        self.stop() via asyncio.ensure_future(), returns from loop.
+   - AdverseSelectionGuard construction: added on_shutdown=self.stop kwarg.
+
+3. src/signals/adverse_selection_guard.py
+   - Added import: ExceptionCircuitBreaker from src.core.exception_circuit_breaker.
+   - __init__ signature extended with on_shutdown: Callable[[], Any] | None = None.
+   - Added _loop_breaker instance (threshold=5, window_s=60.0) in __init__.
+   - _decision_loop except block refactored:
+     a. (KeyError, AttributeError) caught explicitly — logs as warning,
+        continues (stale/missing book data, non-fatal).
+     b. Remaining Exception: logs error, records in circuit breaker.
+        If breaker trips → logs CRITICAL, sends Telegram alert, sets
+        _running=False, schedules on_shutdown() callback, returns from loop.
+
+================================================================================
+CIRCUIT BREAKER LOGIC
+================================================================================
+
+Threshold: 5 unexpected exceptions within a 60-second rolling window.
+
+Mechanism:
+  - Each unexpected (non-targeted) exception appends time.monotonic() to a
+    deque.  Timestamps older than window_s are evicted on each call.
+  - If len(timestamps) >= threshold → breaker trips (latching).
+  - Once tripped, the loop exits and triggers graceful shutdown:
+    * Logs CRITICAL with error count.
+    * Sends Telegram alert.
+    * Calls self.stop() (TradingBot) — cancels all orders, cancels chasers,
+      stops all subsystems, calls trade_store.clear_live_state().
+
+Targeted (non-fatal) exceptions that DO NOT count towards the breaker:
+  - _process_trades: KeyError (stale asset data in shared dicts).
+  - _decision_loop: KeyError, AttributeError (missing book/asset data).
+  - Both loops: asyncio.CancelledError (always re-raised, never caught).
+  - Both loops: asyncio.TimeoutError on queue.get() (explicit continue).
+
+================================================================================
+TEST STATUS
+================================================================================
+
+Suite   : tests/  (all test files)
+Run     : 1324 passed
+Failures: 0
+Duration: 60.61s
+
+No test modifications required — all existing tests (including adverse
+selection, system lifecycle, and loop continuation tests) pass unchanged.
+
+================================================================================
+
+
+================================================================================
+CHANGE REPORT — SI-3 Shadow Signal Analyser Script
+Date: 2026-03-05
+================================================================================
+
+BACKGROUND
+----------
+The Portfolio Correlation Engine (PCE) was moved to active enforcement,
+providing the trusted ρ matrix that SI-3 (Cross-Market Stat-Arb) depends
+on to identify pairs (ρ ≥ 0.50, z ≥ 2.0).  Before graduating SI-3 from
+shadow mode (`cross_mkt_shadow = True → False`), we need to prove
+positive expected value (EV) from the shadow signals.
+
+This script — modelled on the existing `parse_drift_logs.py` diagnostic
+parser — extracts SI-3 shadow signals from structlog JSONL and
+(optionally) the TradeStore SQLite database, then simulates theoretical
+execution against the 1-minute tick data to compute EV, win rate, and
+per-bucket performance.
+
+================================================================================
+FILE CREATED
+================================================================================
+
+1. scripts/parse_si3_logs.py  (NEW — ~1350 lines)
+
+   Purpose: Parse SI-3 shadow signal logs and simulate theoretical
+   performance for graduation analysis.
+
+   Conforms to existing script standards:
+     - Same log auto-discovery (logs/, data/vps_march2026/logs/)
+     - Same JSONL streaming parser with bad-line skip
+     - Same --after / --before ISO-8601 time-window filters
+     - Same ANSI colour output with NO_COLOR env support
+     - Same --json machine-readable output mode
+     - Windows UTF-8 stdout reconfiguration
+
+   CLI Arguments:
+     files          Log file path(s) or glob patterns (auto-discovers
+                    if omitted). Use '-' for stdin.
+     --after        ISO-8601 lower bound for signal timestamps.
+     --before       ISO-8601 upper bound for signal timestamps.
+     --tick-dir     Path to tick data directory (auto-discovers
+                    data/vps_march2026/ticks/ if omitted).
+     --db           Path to TradeStore SQLite DB (auto-discovers
+                    logs/trades.db and data/vps_march2026/db/trades.db).
+     --recommend    Include graduation recommendation.  Uses strict
+                    criteria: ≥ 20 signals with tick data, win rate
+                    ≥ 52%, positive avg EV, Sharpe > 0, at least one
+                    bucket with positive EV and ≥ 5 samples.
+     --json         Output all results as JSON (for CI/automation).
+     --hold-minutes Default holding period for exit simulation
+                    (default: 5 min).
+     --f-max        Peak fee rate for the dynamic fee curve
+                    (default: 0.0156 = 1.56%).
+
+   Report Sections:
+     1. Signal Distribution — by ρ bucket, z-score bucket, direction.
+     2. Overall Theoretical Performance — win rate, avg EV, total PnL,
+        Sharpe ratio, max drawdown, PnL percentiles.
+     3. Performance by Correlation Bucket — (0.50 ≤ ρ < 0.65, ρ ≥ 0.65).
+     4. Performance by Z-Score Bucket — (2.0 ≤ z < 2.5, z ≥ 2.5).
+     5. Per-Pair Breakdown — top 15 pairs by total PnL.
+     6. Fee Impact Analysis — gross vs net PnL, break-even f_max.
+     7. Graduation Recommendation (--recommend flag).
+
+   Theoretical Execution Simulation:
+     - Entry: mid-price at signal timestamp + 1-tick (1¢) slippage.
+     - Exit: mid-price at signal timestamp + hold_minutes.
+     - Fees: f_max · 4 · p · (1-p) applied at both entry and exit.
+     - Deduplication: signals with identical (timestamp, lagger, leader)
+       are deduplicated across log and DB sources.
+
+   Data Sources:
+     a) structlog JSONL: event="[SHADOW] cross_market_signal" with
+        fields: lagging, leading, direction, z, rho, confidence.
+     b) TradeStore SQLite: queries shadow_signals / si3_signals /
+        cross_market_signals tables if they exist (future-proof).
+     c) Tick data: per-asset JSONL files in date sub-directories,
+        indexed lazily with binary-search price lookups.
+
+   Recommendation Engine:
+     If all 5 criteria pass, the script outputs the exact config change:
+       cross_mkt_shadow: True → False  (CROSS_MKT_SHADOW=false)
+     Otherwise, lists each failing criterion with data.
+
+================================================================================
+VERIFICATION
+================================================================================
+
+Smoke test against production logs (bot.jsonl, 22,924 lines):
+  - Found 14 unique SI-3 shadow signals (all ρ ≥ 0.65, z < 2.0).
+  - Tick data match: 0 (log uses truncated MKT_A/MKT_B test IDs).
+  - Recommendation: DO NOT GRADUATE (insufficient tick-matched data).
+  - --json output: valid JSON, correct structure.
+  - --help: clean argparse output.
+  - py_compile: passes with no errors.
+
+Script is ready for use once production logs contain full condition_id
+market identifiers (which they will once the live bot emits them).
+
+================================================================================
+
+================================================================================
+CHANGE REPORT — SI-3 Cross-Market Signal: Logging Payload & Direction Fix
+Date: 2026-03-05
+================================================================================
+
+BACKGROUND
+----------
+A 20-hour production log analysis via parse_si3_logs.py revealed two critical
+defects in the Cross-Market Stat-Arb (SI-3) shadow signal system
+(src/signals/cross_market.py):
+
+1. DATA DISCONNECT — The [SHADOW] cross_market_signal structlog payload only
+   emitted truncated condition_ids (lagging, leading). It lacked the specific
+   YES/NO token asset_ids required to join log entries to tick data for
+   offline P&L reconstruction.
+
+2. DIRECTIONAL BUG — 100% of the 35 logged signals over 20 hours carried
+   direction="YES". For a stat-arb pair trade across diverse correlated
+   markets, a mixed YES/NO distribution is expected. Root cause: a
+   copy-paste error in the direction assignment.
+
+================================================================================
+MATHEMATICAL FLAW — DIRECTION CALCULATION
+================================================================================
+
+The original code determined the lagging/leading market from the z-score sign
+but hardcoded direction="YES" in BOTH branches:
+
+    if z > 0:
+        lagging_id = mkt_b
+        leading_id = mkt_a
+        direction = "YES"          # ← correct only when leader went UP
+    else:
+        lagging_id = mkt_a
+        leading_id = mkt_b
+        direction = "YES"          # ← BUG: copy-paste of the z > 0 case
+
+The z-score tells us WHICH market is lagging, but the DIRECTION of the
+convergence trade depends on the leader's return sign:
+
+  - If the leader's YES-token return is positive (probability increased),
+    the lagging market should converge UPWARD  → buy YES on the lagger.
+  - If the leader's YES-token return is negative (probability decreased),
+    the lagging market should converge DOWNWARD → buy NO on the lagger.
+
+CORRECTED LOGIC:
+
+    if z > 0:
+        lagging_id = mkt_b
+        leading_id = mkt_a
+        leader_return = ret_a
+    else:
+        lagging_id = mkt_a
+        leading_id = mkt_b
+        leader_return = ret_b
+
+    direction = "YES" if leader_return > 0 else "NO"
+
+This produces the expected statistical mix of YES/NO signals that tracks
+the actual directional co-movement of correlated prediction markets.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. src/signals/cross_market.py
+   ─────────────────────────────
+   a) CrossMarketSignal dataclass — added two new fields:
+        lagging_asset_id: str   # specific YES/NO token id on the lagger
+        leading_asset_id: str   # specific YES/NO token id on the leader
+
+   b) CrossMarketSignalGenerator.__init__ — added internal lookup dict:
+        self._asset_ids: dict[str, tuple[str, str]]
+      Maps condition_id → (yes_asset_id, no_asset_id).
+
+   c) record_return() — extended signature with keyword args:
+        yes_asset_id: str = ""
+        no_asset_id: str = ""
+      Stores the mapping in self._asset_ids when provided.
+
+   d) scan() — Direction logic:
+      BEFORE:  direction = "YES" in both z > 0 and z < 0 branches.
+      AFTER:   direction = "YES" if leader_return > 0 else "NO"
+               where leader_return is the 1-bar return of the leading market.
+
+   e) scan() — Asset-id resolution:
+      Resolves lagging_asset_id and leading_asset_id from self._asset_ids
+      based on the computed direction and leader return sign, and passes
+      them into both the CrossMarketSignal dataclass and the structlog call.
+
+   f) structlog payload — added two new keys to the log.info() call:
+        lagging_asset_id=<token_id>
+        leading_asset_id=<token_id>
+
+   g) reset() — also clears self._asset_ids.
+
+2. src/bot.py
+   ───────────
+   Updated the record_return() call site (line ~1235) to forward
+   market_info.yes_token_id and market_info.no_token_id:
+
+     self._cross_market.record_return(
+         market_info.condition_id,
+         lr,
+         yes_asset_id=market_info.yes_token_id,
+         no_asset_id=market_info.no_token_id,
+     )
+
+3. tests/test_cross_market.py
+   ──────────────────────────
+   a) test_signal_on_divergence — updated to pass asset_ids via
+      record_return() kwargs.
+   b) test_reset — added assertion: gen._asset_ids == {}.
+   c) NEW: test_direction_yes_when_leader_positive
+      Leader A goes UP (+0.20), lagger B flat → z > 0 → direction = YES.
+   d) NEW: test_direction_no_when_leader_negative
+      Both A and B drop; B drops far more → z > 0 → leader A return is
+      negative → direction = NO.
+   e) NEW: test_signal_includes_asset_ids
+      Verifies that lagging_asset_id and leading_asset_id resolve to the
+      correct YES/NO token ids based on the trade direction.
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+  All 1327 tests pass (11 in test_cross_market.py, including 3 new).
+  No regressions across the full test suite.
+
+================================================================================

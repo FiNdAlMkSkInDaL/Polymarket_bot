@@ -54,6 +54,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any, Callable
 
 from src.core.config import settings
+from src.core.exception_circuit_breaker import ExceptionCircuitBreaker
 from src.core.logger import get_logger
 
 if TYPE_CHECKING:
@@ -114,6 +115,7 @@ class AdverseSelectionGuard:
         trade_counts: dict[str, float] | None = None,
         get_position_assets: Callable[[], set[str]] | None = None,
         telegram: object | None = None,
+        on_shutdown: Callable[[], Any] | None = None,
     ):
         strat = settings.strategy
         self._executor = executor
@@ -126,6 +128,10 @@ class AdverseSelectionGuard:
         self._trade_counts = trade_counts if trade_counts is not None else {}
         self._get_position_assets = get_position_assets or _no_positions
         self._telegram = telegram
+        self._on_shutdown = on_shutdown
+
+        # Exception circuit breaker for the decision loop
+        self._loop_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
 
         # Core lifecycle config (preserved from v1)
         self._enabled = strat.adverse_sel_enabled
@@ -666,8 +672,29 @@ class AdverseSelectionGuard:
                 await self._execute_fast_kill(signals_fired)
             except asyncio.CancelledError:
                 raise
+            except (KeyError, AttributeError):
+                # Stale/missing book or asset data — non-fatal, skip cycle
+                log.warning("adverse_sel_stale_data", exc_info=True)
             except Exception:
                 log.error("adverse_sel_loop_error", exc_info=True)
+                if self._loop_breaker.record():
+                    log.critical(
+                        "adverse_sel_circuit_breaker_tripped",
+                        errors_in_window=self._loop_breaker.recent_errors,
+                        msg="Too many unexpected errors in decision loop — initiating shutdown",
+                    )
+                    if self._telegram and hasattr(self._telegram, "send"):
+                        try:
+                            await self._telegram.send(
+                                "\U0001f534 <b>CIRCUIT BREAKER</b>: adverse_sel_loop tripped "
+                                "(5 unexpected errors in 60s) — shutting down."
+                            )
+                        except Exception:
+                            pass
+                    self._running = False
+                    if self._on_shutdown is not None:
+                        asyncio.ensure_future(self._on_shutdown())
+                    return
 
     # === Kill execution =====================================================
 

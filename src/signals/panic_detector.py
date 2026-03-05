@@ -10,25 +10,26 @@ from dataclasses import dataclass
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar
+from src.signals.signal_framework import BaseSignal
 
 log = get_logger(__name__)
 
 
 @dataclass
-class PanicSignal:
-    """Emitted when all entry conditions are met."""
+class PanicSignal(BaseSignal):
+    """Emitted when all panic-spike entry conditions are met.
 
-    market_id: str
-    yes_asset_id: str
-    no_asset_id: str
+    Inherits from :class:`~src.signals.signal_framework.BaseSignal`:
+    ``market_id``, ``no_asset_id``, ``no_best_ask``.
+    """
 
-    # Diagnostics
-    yes_price: float           # current YES price (spike)
-    yes_vwap: float            # rolling VWAP for YES
-    zscore: float              # Z-score of the move
-    volume_ratio: float        # current bar volume / avg bar volume
-    no_best_ask: float         # current best ask for NO token
-    whale_confluence: bool     # whether a whale bought NO recently
+    # YES-side diagnostics (panic-specific)
+    yes_asset_id: str = ""
+    yes_price: float = 0.0      # current YES price (spike)
+    yes_vwap: float = 0.0       # rolling VWAP for YES
+    zscore: float = 0.0         # Z-score of the move
+    volume_ratio: float = 0.0   # current bar volume / avg bar volume
+    whale_confluence: bool = False  # whether a whale bought NO recently
 
 
 class PanicDetector:

@@ -28,6 +28,8 @@ from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
 from src.signals.edge_filter import ConfluenceContext, compute_confluence_discount, compute_edge_score
 from src.signals.panic_detector import PanicSignal
+from src.signals.drift_signal import DriftSignal
+from src.signals.signal_framework import BaseSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
 from src.trading.sizer import (
@@ -81,7 +83,7 @@ class Position:
     yes_asset_id: str = ""     # YES token id (for RPE YES-side entries)
 
     # Signal metadata
-    signal: PanicSignal | None = None
+    signal: BaseSignal | None = None
 
     # Sizing metadata
     sizing: SizingResult | None = None
@@ -357,7 +359,7 @@ class PositionManager:
     # ── Open a new position on signal ──────────────────────────────────────
     async def open_position(
         self,
-        signal: PanicSignal,
+        signal: BaseSignal,
         no_aggregator: OHLCVAggregator,
         *,
         no_book: OrderbookTracker | None = None,
@@ -367,10 +369,16 @@ class PositionManager:
         fee_enabled: bool = True,
         signal_metadata: dict | None = None,
     ) -> Position | None:
-        """Attempt to open a mean-reversion position on a panic signal.
+        """Attempt to open a mean-reversion position on a panic or drift signal.
 
         Parameters
         ----------
+        signal:
+            A :class:`~src.signals.signal_framework.BaseSignal` (either a
+            :class:`~src.signals.panic_detector.PanicSignal` or a
+            :class:`~src.signals.drift_signal.DriftSignal`).  Signal-type-
+            specific fields (z-score, volume ratio, whale confluence) are
+            extracted polymorphically inside ``_open_position_inner``.
         no_book:
             Live L2 order book for the NO token.  Used by the depth-aware
             sizer to cap order size.  Falls back to fixed sizing with
@@ -391,7 +399,7 @@ class PositionManager:
 
     async def _open_position_inner(
         self,
-        signal: PanicSignal,
+        signal: BaseSignal,
         no_aggregator: OHLCVAggregator,
         *,
         no_book: OrderbookTracker | None = None,
@@ -409,6 +417,20 @@ class PositionManager:
         )
         if not passed:
             return None
+
+        # ── Polymorphic signal-field extraction ────────────────────────────
+        # PanicSignal carries live z-score, volume ratio, and whale flag.
+        # DriftSignal carries a cumulative displacement; map it to the same
+        # semantic slots so downstream EQS / Kelly / TP logic is unchanged.
+        if isinstance(signal, PanicSignal):
+            _zscore: float = signal.zscore
+            _volume_ratio: float = signal.volume_ratio
+            _whale_confluence: bool = signal.whale_confluence
+        else:
+            # DriftSignal (and any future BaseSignal subclass)
+            _zscore = abs(signal.displacement) if hasattr(signal, "displacement") else 0.0
+            _volume_ratio = 1.0
+            _whale_confluence = False
 
         # Entry price: undercut the best ask by 1¢ to ensure maker
         entry_price = round(signal.no_best_ask - 0.01, 2)
@@ -443,7 +465,7 @@ class PositionManager:
 
         # Build confluence context for dynamic threshold (V2)
         confluence = ConfluenceContext(
-            whale_strong_confluence=signal.whale_confluence,
+            whale_strong_confluence=_whale_confluence,
             spread_compressed=bool(meta.get("spread_compressed", False)),
             l2_reliable=(
                 no_book is not None
@@ -467,9 +489,9 @@ class PositionManager:
         edge = compute_edge_score(
             entry_price=entry_price,
             no_vwap=no_aggregator.rolling_vwap,
-            zscore=signal.zscore,
-            volume_ratio=signal.volume_ratio,
-            whale_confluence=signal.whale_confluence,
+            zscore=_zscore,
+            volume_ratio=_volume_ratio,
+            whale_confluence=_whale_confluence,
             fee_enabled=fee_enabled,
             current_ewma_vol=no_aggregator.rolling_volatility_ewma or None,
             execution_mode=exec_mode,
@@ -566,9 +588,10 @@ class PositionManager:
             total_trades = stats.get("total_trades", 0)
 
         # Normalise signal strength to 0.0–1.0 for Kelly sizer.
-        # zscore is typically 2–5+; map the excess above threshold to [0, 1].
+        # For PanicSignal: map z-score excess above threshold to [0, 1].
+        # For DriftSignal: use pre-normalised score directly.
         z_threshold = strat.zscore_threshold
-        signal_score = min(1.0, max(0.0, (signal.zscore - z_threshold) / z_threshold)) if z_threshold > 0 else 0.5
+        signal_score = min(1.0, max(0.0, (_zscore - z_threshold) / z_threshold)) if z_threshold > 0 else 0.5
 
         # Inject rolling expectancy for adaptive cold-start sizing
         kelly_meta = dict(signal_metadata or {})
@@ -689,7 +712,7 @@ class PositionManager:
             entry_price=entry_price,
             no_vwap=no_aggregator.rolling_vwap,
             realised_vol=no_aggregator.rolling_volatility,
-            whale_confluence=signal.whale_confluence,
+            whale_confluence=_whale_confluence,
             book_depth_ratio=actual_depth_ratio,
             days_to_resolution=days_to_resolution,
             entry_fee_bps=entry_fee_bps,

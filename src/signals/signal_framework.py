@@ -25,6 +25,35 @@ log = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Base execution interface
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class BaseSignal:
+    """Minimum fields required by the execution layer for any entry signal.
+
+    Both ``PanicSignal`` and ``DriftSignal`` inherit from this class so
+    that ``PositionManager.open_position()`` can accept either without
+    caring about signal-type-specific metadata (z-score, volume ratio, etc.).
+
+    Fields
+    ------
+    market_id:
+        Condition ID of the Polymarket market.
+    no_asset_id:
+        Token ID for the NO outcome token to trade.
+    no_best_ask:
+        Current best-ask price for the NO token; used as the entry
+        price reference (entry = ``no_best_ask - 0.01`` for maker orders).
+    """
+
+    market_id: str
+    no_asset_id: str = ""
+    no_best_ask: float = 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Abstract base
 # ═══════════════════════════════════════════════════════════════════════════
 

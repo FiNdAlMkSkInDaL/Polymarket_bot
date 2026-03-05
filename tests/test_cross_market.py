@@ -56,13 +56,13 @@ class TestCrossMarketSignalGenerator:
             pce, z_entry=1.0, min_correlation=0.50, spread_ewma_lambda=0.50,
         )
         # First call: seeds the spread variance
-        gen.record_return("MKT_A", 0.001)
-        gen.record_return("MKT_B", 0.001)
+        gen.record_return("MKT_A", 0.001, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
         gen.scan()
 
         # Second call: large divergence
-        gen.record_return("MKT_A", 0.20)   # big move on A
-        gen.record_return("MKT_B", 0.001)  # B didn't follow
+        gen.record_return("MKT_A", 0.20, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
         signals = gen.scan()
         assert len(signals) > 0
         sig = signals[0]
@@ -115,3 +115,77 @@ class TestCrossMarketSignalGenerator:
         gen.reset()
         assert gen._last_returns == {}
         assert gen._spread_var == {}
+        assert gen._asset_ids == {}
+
+    def test_direction_yes_when_leader_positive(self):
+        """When the leader moved UP, direction should be YES (lagger converges up)."""
+        pce = FakePCE({
+            ("MKT_A", "MKT_B"): FakeEstimate(blended=0.90),
+        })
+        gen = CrossMarketSignalGenerator(
+            pce, z_entry=1.0, min_correlation=0.50, spread_ewma_lambda=0.50,
+        )
+        # Seed spread variance
+        gen.record_return("MKT_A", 0.001, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
+        gen.scan()
+
+        # Leader A goes UP sharply, lagger B flat → z > 0 → direction YES
+        gen.record_return("MKT_A", 0.20, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
+        signals = gen.scan()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.direction == "YES"
+        assert sig.lagging_market_id == "MKT_B"
+        assert sig.leading_market_id == "MKT_A"
+
+    def test_direction_no_when_leader_negative(self):
+        """When the leader moved DOWN, direction should be NO (lagger converges down).
+
+        Scenario: both markets drop, but B drops far more than A.
+        spread = ret_a − ρ*ret_b = −0.05 − 0.9*(−0.20) = +0.13 → z > 0.
+        Leader = A (ret_a = −0.05), Lagger = B.
+        Leader's return is negative → direction = NO on the lagger.
+        """
+        pce = FakePCE({
+            ("MKT_A", "MKT_B"): FakeEstimate(blended=0.90),
+        })
+        gen = CrossMarketSignalGenerator(
+            pce, z_entry=1.0, min_correlation=0.50, spread_ewma_lambda=0.50,
+        )
+        # Seed spread variance
+        gen.record_return("MKT_A", -0.001, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", -0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
+        gen.scan()
+
+        # A drops slightly, B drops much more → z > 0 → B is lagger, A is leader
+        # Leader A has a negative return → direction = NO
+        gen.record_return("MKT_A", -0.05, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", -0.20, yes_asset_id="B_YES", no_asset_id="B_NO")
+        signals = gen.scan()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.direction == "NO"
+        assert sig.lagging_market_id == "MKT_B"
+        assert sig.leading_market_id == "MKT_A"
+
+    def test_signal_includes_asset_ids(self):
+        """Signals should include the specific YES/NO token asset IDs."""
+        pce = FakePCE({
+            ("MKT_A", "MKT_B"): FakeEstimate(blended=0.90),
+        })
+        gen = CrossMarketSignalGenerator(
+            pce, z_entry=1.0, min_correlation=0.50, spread_ewma_lambda=0.50,
+        )
+        gen.record_return("MKT_A", 0.001, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
+        gen.scan()
+
+        gen.record_return("MKT_A", 0.20, yes_asset_id="A_YES", no_asset_id="A_NO")
+        gen.record_return("MKT_B", 0.001, yes_asset_id="B_YES", no_asset_id="B_NO")
+        signals = gen.scan()
+        sig = signals[0]
+        # Leader A went up → direction YES → lagging_asset_id = B's YES token
+        assert sig.lagging_asset_id == "B_YES"
+        assert sig.leading_asset_id == "A_YES"

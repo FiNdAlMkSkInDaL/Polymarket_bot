@@ -51,6 +51,8 @@ class CrossMarketSignal:
 
     lagging_market_id: str    # condition_id of the lagging market
     leading_market_id: str    # condition_id of the leading market
+    lagging_asset_id: str     # specific YES/NO token id being traded on the lagger
+    leading_asset_id: str     # specific YES/NO token id being tracked on the leader
     direction: str            # "YES" or "NO" — which side to enter on the lagger
     z_score: float            # standardised spread
     correlation: float        # pair ρ used
@@ -102,11 +104,35 @@ class CrossMarketSignalGenerator:
         # Last bar returns per market_id
         self._last_returns: dict[str, float] = {}
 
+        # Asset-id lookup:  condition_id → (yes_asset_id, no_asset_id)
+        self._asset_ids: dict[str, tuple[str, str]] = {}
+
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def record_return(self, market_id: str, log_return: float) -> None:
-        """Record the latest 1-bar log return for a market."""
+    def record_return(
+        self,
+        market_id: str,
+        log_return: float,
+        *,
+        yes_asset_id: str = "",
+        no_asset_id: str = "",
+    ) -> None:
+        """Record the latest 1-bar log return for a market.
+
+        Parameters
+        ----------
+        market_id:
+            The condition_id of the market.
+        log_return:
+            The 1-bar log return.
+        yes_asset_id:
+            The YES token asset id for this market.
+        no_asset_id:
+            The NO token asset id for this market.
+        """
         self._last_returns[market_id] = log_return
+        if yes_asset_id or no_asset_id:
+            self._asset_ids[market_id] = (yes_asset_id, no_asset_id)
 
     def scan(self) -> list[CrossMarketSignal]:
         """Scan all high-ρ pairs for divergence signals.
@@ -160,21 +186,34 @@ class CrossMarketSignalGenerator:
             # Determine which market is lagging
             if z > 0:
                 # A moved more than expected given B's move
-                # A is the leader, B is lagging (should move up)
+                # A is the leader, B is lagging
                 lagging_id = mkt_b
                 leading_id = mkt_a
-                direction = "YES"  # buy the lagger
+                leader_return = ret_a
             else:
                 # B moved more than expected
                 lagging_id = mkt_a
                 leading_id = mkt_b
-                direction = "YES"
+                leader_return = ret_b
+
+            # Direction derives from the leader's return sign:
+            # if the leader went UP, the lagger should converge UP → buy YES;
+            # if the leader went DOWN, the lagger should converge DOWN → buy NO.
+            direction = "YES" if leader_return > 0 else "NO"
 
             confidence = min(1.0, (abs(z) - self._z_entry) / self._z_entry + 0.5)
+
+            # Resolve asset IDs for lagging/leading markets
+            lag_yes, lag_no = self._asset_ids.get(lagging_id, ("", ""))
+            lead_yes, lead_no = self._asset_ids.get(leading_id, ("", ""))
+            lagging_asset = lag_yes if direction == "YES" else lag_no
+            leading_asset = lead_yes if leader_return > 0 else lead_no
 
             sig = CrossMarketSignal(
                 lagging_market_id=lagging_id,
                 leading_market_id=leading_id,
+                lagging_asset_id=lagging_asset,
+                leading_asset_id=leading_asset,
                 direction=direction,
                 z_score=round(z, 3),
                 correlation=round(rho, 4),
@@ -191,6 +230,8 @@ class CrossMarketSignalGenerator:
                 f"{prefix}cross_market_signal",
                 lagging=lagging_id[:16],
                 leading=leading_id[:16],
+                lagging_asset_id=lagging_asset,
+                leading_asset_id=leading_asset,
                 direction=direction,
                 z=round(z, 3),
                 rho=round(rho, 4),
@@ -211,3 +252,4 @@ class CrossMarketSignalGenerator:
         self._spread_var.clear()
         self._spread_initialised.clear()
         self._last_returns.clear()
+        self._asset_ids.clear()
