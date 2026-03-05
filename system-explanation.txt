@@ -91,11 +91,11 @@ Root:
 
 src/                      — main bot package
   __init__.py             — "Polymarket Mean-Reversion Market Maker PoC"
-  bot.py                  — TradingBot class (main entry, ~1200 lines)
+  bot.py                  — TradingBot class (main entry, ~2750 lines)
   cli.py                  — Click CLI: run, stats, kill, scores, backtest, wfo, data
 
   core/                   — foundational infrastructure
-    config.py             — StrategyParams (~160 fields), Settings, DeploymentEnv (~670 lines)
+    config.py             — StrategyParams (~160 fields), Settings, DeploymentEnv (~705 lines)
     guard.py              — DeploymentGuard (PAPER/PENNY_LIVE/PRODUCTION caps)
     heartbeat.py          — BookHeartbeat (3-layer staleness detection)
     latency_guard.py      — LatencyGuard (HEALTHY→DEGRADED→BLOCKED state machine)
@@ -132,7 +132,7 @@ src/                      — main bot package
     executor.py           — OrderExecutor (paper/live), OrderStatusPoller
     chaser.py             — OrderChaser (passive-aggressive POST_ONLY + escalation)
     stealth_executor.py   — StealthExecutor (time-sliced order splitting, SI-4)
-    position_manager.py   — PositionManager (~1500 lines, full lifecycle + risk gates)
+    position_manager.py   — PositionManager (~1613 lines, full lifecycle + risk gates)
     sizer.py              — Kelly sizing, depth-aware sizing, cold-start blend
     fees.py               — Parabolic fee curve, roundtrip fee, adaptive stop-loss
     fee_cache.py          — Per-token fee cache with TTL + per-token locks
@@ -156,16 +156,19 @@ src/                      — main bot package
     wfo_optimizer.py      — Walk-forward optimization (Optuna, ~1030 lines)
 
 scripts/
-  confluence_sensitivity.py — Bootstrap win-rate analysis + Sobol indices
-  backtest_comparison.py    — PRE vs POST parameter comparison
-  run_diagnostics.py        — System health diagnostics
-  check_db.py               — SQLite inspection
-  explore_data.py           — Data exploration
-  extract_signals.py        — Signal extraction from logs
-  scan_events.py            — Event scanning
-  validate_pce_priors.py    — PCE structural prior validation (tick replay + state-file MAE)
-  verify_launch.py          — Pre-launch checks
-  parse_drift_logs.py       — JSONL log parser for MeanReversionDrift gate survival funnel
+  confluence_sensitivity.py  — Bootstrap win-rate analysis + Sobol indices
+  backtest_comparison.py     — PRE vs POST parameter comparison
+  param_optimizer.py         — Data-driven parameter optimisation (3.53M tick analysis,
+                               z-score/vol/EV surface generation, march2026 calibration)
+  counterfactual_analysis.py — Counterfactual scenario analysis
+  run_diagnostics.py         — System health diagnostics
+  check_db.py                — SQLite inspection
+  explore_data.py            — Data exploration
+  extract_signals.py         — Signal extraction from logs
+  scan_events.py             — Event scanning
+  validate_pce_priors.py     — PCE structural prior validation (tick replay + state-file MAE)
+  verify_launch.py           — Pre-launch checks
+  parse_drift_logs.py        — JSONL log parser for MeanReversionDrift gate survival funnel
                               analysis, EWMA vol breakdown, hourly heatmap, per-market
                               rejection breakdown, and parameter calibration recommendations.
                               Supports: auto-discovery, glob patterns, stdin,
@@ -178,7 +181,7 @@ scripts/
 tests/
   conftest.py             — 5 fixtures (executor, aggregators, trade_store, detector)
   helpers.py              — make_trade, build_bar_history, make_position
-  ~40 test files          — ~1000+ tests total
+  ~40 test files          — ~1270 tests total
 
 data/
   market_map.json         — 31 actionable markets with YES/NO token IDs
@@ -284,7 +287,7 @@ GRACEFUL SHUTDOWN:
 SECTION 4: CONFIGURATION SYSTEM
 ================================================================================
 
-File: src/core/config.py (~670 lines)
+File: src/core/config.py (~705 lines)
 
 Architecture:
   - Two frozen dataclasses: StrategyParams and Settings
@@ -777,7 +780,7 @@ RPE (src/signals/resolution_probability.py):
 SECTION 8: TRADING LAYER (Execution & Risk)
 ================================================================================
 
-PositionManager (src/trading/position_manager.py, ~1500 lines):
+PositionManager (src/trading/position_manager.py, ~1613 lines):
   THE CENTRAL EXECUTION HUB — manages Position lifecycle from entry to exit.
 
   Position states: ENTRY_PENDING → ENTRY_FILLED → EXIT_PENDING → CLOSED
@@ -1118,6 +1121,17 @@ scripts/backtest_comparison.py:
   PRE vs POST parameter comparison across 5 markets × 3 days.
   Side-by-side: PnL, drawdown, fills, win rate, risk-adjusted ratio
 
+scripts/param_optimizer.py:
+  Data-driven parameter optimisation — processes 3.53M trade ticks from
+  data/vps_march2026/ticks/ (80 assets, 133,198 1-min bars).
+  Outputs: z-score distribution, volume ratio, P&L simulation, EWMA vol
+  distribution, fee-efficiency curves, mean-reversion half-life analysis,
+  EV surface, EQS viability, inter-arrival times.
+  Source of the March 2026 calibration changes to 9 parameters.
+
+scripts/counterfactual_analysis.py:
+  Counterfactual scenario analysis
+
 scripts/run_diagnostics.py:      System health diagnostics
 scripts/check_db.py:            SQLite inspection
 scripts/explore_data.py:         Data exploration
@@ -1135,7 +1149,7 @@ SECTION 13: TEST INFRASTRUCTURE
 ================================================================================
 
 Framework: pytest 8.0+, pytest-asyncio 0.23+ (asyncio_mode = "auto")
-Total: ~1000+ tests across ~40 test files
+Total: ~1270 tests across ~40 test files
 
 conftest.py fixtures (all function-scoped):
   paper_executor  — OrderExecutor(paper_mode=True)
