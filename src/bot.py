@@ -63,6 +63,7 @@ from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.cross_market import CrossMarketSignalGenerator
 from src.signals.drift_signal import MeanReversionDrift
+from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
 try:
@@ -184,6 +185,9 @@ class TradingBot:
         # V3: Per-market drift signal detectors
         self._drift_detectors: dict[str, MeanReversionDrift] = {}  # condition_id → detector
         self._drift_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
+
+        # Maker adverse-selection monitor (V1/V4 calibration)
+        self._maker_monitor: AdverseSelectionMonitor | None = None
 
         # SI-2: Per-asset iceberg detectors
         self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
@@ -404,14 +408,55 @@ class TradingBot:
         )
 
         # Event-driven stop-loss monitor (Pillar 11) — no polling task
+        # V4: on_probe_breakeven wires back to PositionManager.scale_probe_to_full
+        def _probe_breakeven_cb(pos):
+            return self.positions.scale_probe_to_full(
+                pos,
+                get_mid_price_fn=lambda asset_id: (
+                    self._stop_loss_monitor._get_mid_price(asset_id)
+                    if hasattr(self, "_stop_loss_monitor")
+                    else 0.0
+                ),
+            )
+
         self._stop_loss_monitor = StopLossMonitor(
             position_manager=self.positions,
             no_aggs=self._no_aggs,
             book_trackers=self._book_trackers,
             trade_store=self.trade_store,
             telegram=self.telegram,
+            on_probe_breakeven=_probe_breakeven_cb,
         )
         self._stop_loss_monitor.start()  # mark active, no coroutine
+
+        # Maker adverse-selection monitor — tracks T+5/15/60 PnL for POST_ONLY fills
+        async def _mid_price_for_monitor(asset_id: str) -> float | None:
+            mid = self._stop_loss_monitor._get_mid_price(asset_id)
+            return mid if mid > 0 else None
+
+        def _vol_provider_for_monitor(market_id: str) -> float | None:
+            """Return current EWMA vol for *market_id* from the NO aggregator."""
+            agg = self._no_aggs.get(market_id)
+            if agg is None:
+                return None
+            return agg.rolling_volatility_ewma
+
+        self._vol_provider_for_monitor = _vol_provider_for_monitor
+
+        self._maker_monitor = AdverseSelectionMonitor(
+            mid_price_fn=_mid_price_for_monitor,
+            alpha=settings.strategy.adverse_monitor_alpha_base,
+            vol_provider=self._vol_provider_for_monitor,
+            vol_ref=settings.strategy.adverse_monitor_vol_ref,
+            alpha_gamma=settings.strategy.adverse_monitor_alpha_gamma,
+            alpha_min=settings.strategy.adverse_monitor_alpha_min,
+            alpha_max=settings.strategy.adverse_monitor_alpha_max,
+        )
+        # Wire monitor into PositionManager for exec-mode downgrade on suspension
+        self.positions._maker_monitor = self._maker_monitor
+        # Wire stealth executor into PositionManager for sliced probe scale-ups
+        if self._stealth is not None:
+            self.positions._stealth = self._stealth
 
         self._tasks = [
             asyncio.create_task(self._ws.start(), name="ws"),
@@ -710,6 +755,21 @@ class TradingBot:
             if pos.entry_order and pos.entry_order.order_id == order.order_id:
                 if pos.state == PositionState.ENTRY_PENDING:
                     await self._handle_entry_fill(pos)
+                    # V1 Adverse-selection monitor: record POST_ONLY entry fills
+                    if (
+                        self._maker_monitor is not None
+                        and getattr(order, "post_only", False)
+                        and order.filled_avg_price > 0
+                        and order.filled_size > 0
+                    ):
+                        fill_rec = make_fill_record(
+                            market_id=pos.market_id,
+                            asset_id=pos.trade_asset_id or pos.no_asset_id,
+                            fill_price=order.filled_avg_price,
+                            fill_side="BUY",
+                            size_usd=order.filled_avg_price * order.filled_size,
+                        )
+                        self._maker_monitor.record_maker_fill(fill_rec)
                 return
             if pos.exit_order and pos.exit_order.order_id == order.order_id:
                 if pos.state == PositionState.EXIT_PENDING:
@@ -877,6 +937,10 @@ class TradingBot:
         )
         # Drive event-driven stop-loss evaluation
         await self._stop_loss_monitor.on_bbo_update(asset_id)
+
+        # Tick the maker adverse-selection monitor (schedules T+5/15/60 marks)
+        if self._maker_monitor is not None:
+            await self._maker_monitor.tick()
 
         # ── Spread-based signal evaluation (Problem 3) ─────────────────
         if not settings.strategy.spread_signal_enabled:
@@ -1183,7 +1247,8 @@ class TradingBot:
                             await self._on_panic_signal(
                                 drift_panic, no_agg, market_info,
                                 signal_metadata={
-                                    "source": "drift",
+                                    "signal_source": "drift",  # Flaw 2: suppresses regime discount
+                                    "source": "drift",         # legacy compat
                                     "drift_score": drift_sig.score,
                                     "regime_mean_revert": True,
                                     "spread_compressed": False,
@@ -1219,13 +1284,31 @@ class TradingBot:
                     return
 
             days = 30
+            total_duration_days = 90.0
             if market_info.end_date:
                 days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
+                # Estimate total market duration from creation to end.
+                # Polymarket markets typically run 30-180 days.  If we
+                # don't know the creation date, assume 90 days total.
+                total_duration_days = max(float(days), 90.0)
+
+            # Thread L2 order-book data into RPE for continuous
+            # observation updates (Dynamic Prior Generation Engine).
+            no_book_rpe = self._book_trackers.get(market_info.no_token_id)
+            book_ratio = None
+            l2_ok = False
+            if no_book_rpe and no_book_rpe.has_data:
+                book_ratio = no_book_rpe.book_depth_ratio
+                l2_ok = no_book_rpe.is_reliable
+
             try:
                 rpe_signal = rpe.evaluate(
                     market=market_info,
                     market_price=yes_price,
                     days_to_resolution=days,
+                    total_duration_days=total_duration_days,
+                    book_depth_ratio=book_ratio,
+                    l2_reliable=l2_ok,
                 )
                 if rpe_signal:
                     await self._on_rpe_signal(rpe_signal, market_info, days, current_price=yes_price)
@@ -1409,6 +1492,7 @@ class TradingBot:
         self._rpe_last_signal[market.condition_id] = now
 
         # ── Record in calibration tracker (Deliverable A) ────────────
+        model_meta = meta.get("model_metadata", {})
         self._rpe_calibration.record_signal(
             market_id=market.condition_id,
             model_prob=model_prob,
@@ -1416,6 +1500,9 @@ class TradingBot:
             direction=direction,
             timestamp=time.time(),
             shadow=shadow,
+            prior_source=model_meta.get("prior_source", ""),
+            l2_active=model_meta.get("l2_active", False),
+            theta_w_prior=model_meta.get("w_prior", 0.0),
         )
 
         # ── Telegram notification (with calibration footer) ───────────
@@ -1549,6 +1636,61 @@ class TradingBot:
             signal_metadata=meta,
         )
 
+        # ── Model-only probe routing (Dynamic Prior Engine) ──────────
+        # When GenericBayesianModel fires a massive divergence but
+        # PanicDetector is silent, route through V4 probe sizing for
+        # bounded-risk model exploration.
+        if pos is None and meta.get("model_name") == "generic_bayesian":
+            model_meta = meta.get("model_metadata", {})
+            divergence_abs = abs(meta.get("divergence", 0.0))
+            probe_min = settings.strategy.rpe_probe_divergence_min
+
+            # Check PanicDetector is truly silent for this market
+            panic_det = self._detectors.get(market.condition_id)
+            panic_silent = True
+            if panic_det and no_agg and no_agg.bars:
+                latest_bar = no_agg.bars[-1]
+                no_book_probe = self._book_trackers.get(market.no_token_id)
+                no_ask_probe = 0.0
+                if no_book_probe and no_book_probe.has_data:
+                    no_ask_probe = no_book_probe.snapshot().best_ask
+                try:
+                    panic_sig = panic_det.evaluate(latest_bar, no_ask_probe)
+                    if panic_sig is not None:
+                        panic_silent = False
+                except Exception:
+                    pass
+
+            if (
+                divergence_abs >= probe_min
+                and panic_silent
+                and model_meta.get("dynamic_prior_enabled", False)
+            ):
+                probe_meta = dict(meta)
+                probe_meta["force_probe"] = True
+                probe_meta["probe_reason"] = "model_divergence_no_panic"
+                log.info(
+                    "rpe_model_probe_attempt",
+                    market=market.condition_id,
+                    divergence=round(divergence_abs, 4),
+                    probe_min=probe_min,
+                    prior_source=model_meta.get("prior_source", "unknown"),
+                )
+                pos = await self.positions.open_rpe_position(
+                    market_id=market.condition_id,
+                    yes_asset_id=market.yes_token_id,
+                    no_asset_id=market.no_token_id,
+                    direction=direction,
+                    model_probability=model_prob,
+                    confidence=confidence,
+                    entry_price=entry_price,
+                    event_id=market.event_id,
+                    days_to_resolution=days_to_resolution,
+                    fee_enabled=fee_enabled,
+                    book=book,
+                    signal_metadata=probe_meta,
+                )
+
         if pos:
             if book and book.has_data:
                 chaser_task = asyncio.create_task(
@@ -1648,13 +1790,26 @@ class TradingBot:
                             continue
 
                     days = 30
+                    total_dur = 90.0
                     if m.end_date:
                         days = max(1, (m.end_date - datetime.now(timezone.utc)).days)
+                        total_dur = max(float(days), 90.0)
+
+                    # Thread L2 data for retrigger path
+                    no_book_rt = self._book_trackers.get(m.no_token_id)
+                    rt_ratio = None
+                    rt_l2_ok = False
+                    if no_book_rt and no_book_rt.has_data:
+                        rt_ratio = no_book_rt.book_depth_ratio
+                        rt_l2_ok = no_book_rt.is_reliable
 
                     rpe_signal = self._rpe.evaluate(
                         market=m,
                         market_price=yes_price,
                         days_to_resolution=days,
+                        total_duration_days=total_dur,
+                        book_depth_ratio=rt_ratio,
+                        l2_reliable=rt_l2_ok,
                     )
                     if rpe_signal:
                         await self._on_rpe_signal(rpe_signal, m, days, current_price=yes_price)
@@ -1766,6 +1921,8 @@ class TradingBot:
                 fee_rate_bps=pos.entry_fee_bps,
                 fast_kill_event=self._fast_kill_event,
                 urgent=urgent,
+                iceberg_detector=self._iceberg_detectors.get(entry_asset),
+                adverse_monitor=self._maker_monitor,
             )
             result = await chaser.run()
 
@@ -1815,6 +1972,8 @@ class TradingBot:
                 latency_guard=self.latency_guard,
                 fee_rate_bps=pos.exit_fee_bps,
                 fast_kill_event=self._fast_kill_event,
+                iceberg_detector=self._iceberg_detectors.get(exit_asset),
+                adverse_monitor=self._maker_monitor,
             )
             result = await chaser.run()
 
@@ -2494,11 +2653,20 @@ class TradingBot:
     async def _pce_refresh_loop(self) -> None:
         """Periodically recompute correlations, persist, and send dashboard."""
         interval = settings.strategy.pce_correlation_refresh_minutes * 60
+        cycle_count = 0
         while self._running:
             await asyncio.sleep(interval)
             try:
+                cycle_count += 1
                 await asyncio.to_thread(self.pce.refresh_correlations)
                 await asyncio.to_thread(self.pce.save_state)
+
+                # Every 12th cycle (~6 hours) validate structural priors
+                if cycle_count % 12 == 0:
+                    prior_summary = await asyncio.to_thread(
+                        self.pce.validate_structural_priors
+                    )
+                    log.info("pce_prior_validation", **prior_summary)
 
                 # Send Telegram dashboard
                 open_positions = self.positions.get_open_positions()

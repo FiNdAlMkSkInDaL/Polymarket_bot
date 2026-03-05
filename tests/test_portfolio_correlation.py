@@ -1720,3 +1720,183 @@ class TestBacktestPosHasTradeSide:
         assert pos.market_id == "MKT_TEST"
         assert abs(pos.entry_price - 0.55) < 1e-6
         assert abs(pos.entry_size - 10.0) < 1e-6
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  PCE Activation Blueprint — Probe Harvest Bisection (Guard 5)
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestProbeHarvestBisection:
+    """Guard 5 in scale_probe_to_full should use bisection (compute_var_sizing_cap)
+    instead of binary reject (check_var_gate), allowing partial scale-up."""
+
+    def test_bisection_allows_partial_scale(self):
+        """A probe increment that exceeds VaR should be partially capped,
+        not entirely rejected."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_probe",
+            shadow_mode=False,
+            max_portfolio_var_usd=15.0,
+            structural_same_event=0.85,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        # Same event → high correlation (ρ=0.85), high marginal VaR
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E1", "", _FakeAggregator(vol=0.10))
+
+        # Existing position in MKT_A uses most of VaR budget
+        # VaR(existing MKT_A 80) = 1.645 * 80 * 0.10 = 13.16
+        # Headroom ≈ 15.0 - 13.16 = 1.84
+        # With same-event ρ=0.85, marginal VaR per $ is high
+        positions = [_FakePosition("MKT_A", 1.0, 80.0)]
+
+        result = pce.compute_var_sizing_cap(
+            open_positions=positions,
+            proposed_market_id="MKT_B",
+            proposed_size_usd=38.0,
+        )
+
+        # Should get a partial cap, not zero
+        assert result.cap_usd > 0, "Bisection should allow partial scale-up"
+        assert result.cap_usd < 38.0, "Full amount should exceed VaR"
+        assert result.bisect_iterations > 0, "Should have iterated"
+
+    def test_bisection_rejects_when_below_min_increment(self):
+        """When even $1 of additional exposure exceeds VaR, cap should be 0."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_probe_rej",
+            shadow_mode=False,
+            max_portfolio_var_usd=1.0,  # tiny limit
+            structural_baseline=0.05,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E2", "", _FakeAggregator(vol=0.10))
+
+        # VaR(existing) = 1.645 * 50 * 0.10 = 8.225 >> 1.0
+        positions = [_FakePosition("MKT_A", 1.0, 50.0)]
+
+        result = pce.compute_var_sizing_cap(
+            open_positions=positions,
+            proposed_market_id="MKT_B",
+            proposed_size_usd=10.0,
+        )
+
+        assert result.cap_usd == 0.0, "Zero headroom should yield zero cap"
+
+    def test_bisection_full_size_when_ample_headroom(self):
+        """When headroom is ample, bisection returns full size (0 iterations)."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_probe_full",
+            shadow_mode=False,
+            max_portfolio_var_usd=100.0,
+            structural_baseline=0.05,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E2", "", _FakeAggregator(vol=0.10))
+
+        # Small existing position, plenty of headroom
+        positions = [_FakePosition("MKT_A", 1.0, 5.0)]
+
+        result = pce.compute_var_sizing_cap(
+            open_positions=positions,
+            proposed_market_id="MKT_B",
+            proposed_size_usd=10.0,
+        )
+
+        assert result.cap_usd == 10.0, "Full size should pass"
+        assert result.bisect_iterations == 0, "No bisection needed"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  PCE Activation Blueprint — Anti-Double-Penalization
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestAntiDoublePenalization:
+    """When VaR bisection already reduced sizing (bisect_iterations > 0),
+    the concentration haircut should be skipped to avoid double-penalization."""
+
+    def test_bisection_flag_set_on_partial_cap(self):
+        """VaRSizingResult.bisect_iterations > 0 when bisection fires."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_dblpen",
+            shadow_mode=False,
+            max_portfolio_var_usd=5.0,
+            structural_baseline=0.05,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E2", "", _FakeAggregator(vol=0.10))
+
+        # Existing position near VaR limit: VaR(30 * 0.10 * 1.645) ≈ 4.935
+        positions = [_FakePosition("MKT_A", 1.0, 30.0)]
+
+        result = pce.compute_var_sizing_cap(
+            open_positions=positions,
+            proposed_market_id="MKT_B",
+            proposed_size_usd=20.0,
+        )
+
+        # Bisection should have fired (partial cap)
+        assert result.bisect_iterations > 0, "Bisection should have iterated"
+        assert result.cap_usd < 20.0, "Cap should be reduced"
+        assert result.cap_usd > 0, "Should still allow some"
+
+        # The key contract: callers should use bisect_iterations > 0
+        # to decide whether to skip the concentration haircut
+        var_was_bisected = result.bisect_iterations > 0
+        assert var_was_bisected is True
+
+    def test_no_bisection_flag_when_ample_headroom(self):
+        """VaRSizingResult.bisect_iterations == 0 when full size passes."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_dblpen2",
+            shadow_mode=False,
+            max_portfolio_var_usd=100.0,
+            structural_baseline=0.05,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E2", "", _FakeAggregator(vol=0.10))
+
+        positions = [_FakePosition("MKT_A", 1.0, 5.0)]
+
+        result = pce.compute_var_sizing_cap(
+            open_positions=positions,
+            proposed_market_id="MKT_B",
+            proposed_size_usd=10.0,
+        )
+
+        assert result.bisect_iterations == 0, "No bisection needed"
+        assert result.cap_usd == 10.0, "Full size should pass"
+
+        # Concentration haircut should still apply in this case
+        var_was_bisected = result.bisect_iterations > 0
+        assert var_was_bisected is False
+
+    def test_haircut_value_independent_of_bisection(self):
+        """Haircut computation itself is unchanged; only the application
+        in the position manager changes based on var_was_bisected."""
+        pce = PortfolioCorrelationEngine(
+            data_dir="/tmp/test_pce_dblpen3",
+            shadow_mode=False,
+            max_portfolio_var_usd=50.0,
+            haircut_threshold=0.65,  # raised per blueprint
+            structural_same_event=0.85,
+            structural_prior_weight=10,
+            holding_period_minutes=1,
+        )
+        pce.register_market("MKT_A", "E1", "", _FakeAggregator(vol=0.10))
+        pce.register_market("MKT_B", "E1", "", _FakeAggregator(vol=0.10))  # same event
+
+        # Same event → structural ρ=0.85 > 0.65 threshold → haircut should fire
+        positions = [_FakePosition("MKT_A", 0.50, 50.0)]
+        haircut = pce.compute_concentration_haircut("MKT_B", positions)
+        assert haircut < 1.0, "Haircut should apply for same-event pair"
+        assert haircut >= 0.05, "Floor should be respected"

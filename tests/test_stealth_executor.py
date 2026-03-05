@@ -126,3 +126,93 @@ class TestStealthExecution:
 
     def test_executor_property(self, stealth):
         assert isinstance(stealth.executor, OrderExecutor)
+
+
+class TestStealthAbandonment:
+    """Tests for mid-slice abandonment guards."""
+
+    @pytest.fixture
+    def stealth(self):
+        executor = OrderExecutor(paper_mode=True)
+        return StealthExecutor(
+            executor,
+            min_size_usd=5.0,
+            max_slices=4,
+            min_delay_ms=10.0,
+            max_delay_ms=20.0,
+            size_jitter_pct=0.10,
+        )
+
+    @pytest.mark.asyncio
+    async def test_drift_abandonment(self, stealth):
+        """If mid-price drifts adversely between slices, stop placing."""
+        call_count = 0
+
+        def drifting_mid():
+            nonlocal call_count
+            call_count += 1
+            # First check: no drift. Second check: 3¢ adverse drift.
+            if call_count <= 1:
+                return 0.50
+            return 0.53  # 3¢ above anchor → exceeds 2¢ default threshold
+
+        stealth._abandon_drift_cents = 2.0
+        orders = await stealth.place_stealth_order(
+            market_id="MKT_1",
+            asset_id="ASSET_1",
+            side=OrderSide.BUY,
+            price=0.50,
+            total_size=20.0,  # $10 → should want 4 slices
+            get_mid_fn=drifting_mid,
+        )
+        # Should have stopped early — fewer slices than the full plan
+        assert len(orders) < 4
+
+    @pytest.mark.asyncio
+    async def test_no_abandonment_without_drift(self, stealth):
+        """If mid stays stable, all slices should be placed."""
+        stealth._abandon_drift_cents = 2.0
+        orders = await stealth.place_stealth_order(
+            market_id="MKT_1",
+            asset_id="ASSET_1",
+            side=OrderSide.BUY,
+            price=0.50,
+            total_size=20.0,
+            get_mid_fn=lambda: 0.50,  # stable mid
+        )
+        assert len(orders) >= 2
+
+    @pytest.mark.asyncio
+    async def test_no_mid_fn_places_all_slices(self, stealth):
+        """Without get_mid_fn, no abandonment checks — all slices placed."""
+        orders = await stealth.place_stealth_order(
+            market_id="MKT_1",
+            asset_id="ASSET_1",
+            side=OrderSide.BUY,
+            price=0.50,
+            total_size=20.0,
+        )
+        assert len(orders) >= 2
+
+    @pytest.mark.asyncio
+    async def test_sell_side_drift_abandonment(self, stealth):
+        """SELL orders abandon when mid drops adversely."""
+        call_count = 0
+
+        def dropping_mid():
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return 0.50
+            return 0.47  # 3¢ below anchor → adverse for SELL
+
+        stealth._abandon_drift_cents = 2.0
+        orders = await stealth.place_stealth_order(
+            market_id="MKT_1",
+            asset_id="ASSET_1",
+            side=OrderSide.SELL,
+            price=0.50,
+            total_size=20.0,
+            get_mid_fn=dropping_mid,
+        )
+        assert len(orders) < 4

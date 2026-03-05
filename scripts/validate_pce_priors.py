@@ -6,8 +6,16 @@ bars per market (using YES-side midpoint prices), computes realised
 pairwise Pearson correlations, and compares against the structural
 priors (same_event=0.85, same_tag=0.30, baseline=0.05).
 
+Can also operate on a persisted PCE correlation state file
+(``data/pce_correlation.json``) to compute per-tier MAE between
+structural priors and mature empirical correlations.
+
 Usage:
+    # From raw tick data
     python scripts/validate_pce_priors.py [--tick-dir data/vps_march2026/ticks]
+
+    # From persisted PCE state (faster)
+    python scripts/validate_pce_priors.py --state-file data/pce_correlation.json
 """
 from __future__ import annotations
 
@@ -319,20 +327,149 @@ def report(pairs: list[dict]) -> None:
         print("  ✓ <10% of pairs above same-tag threshold — tag structure adequate.")
 
 
+# ── State-file mode ────────────────────────────────────────────────────────
+
+def _tier_label(
+    structural_corr: float,
+    same_event: float = STRUCTURAL_PRIORS["same_event"],
+    same_tag: float = STRUCTURAL_PRIORS["same_tag"],
+) -> str:
+    """Classify a pair into its structural prior tier."""
+    if abs(structural_corr - same_event) < 0.01:
+        return "same_event"
+    elif abs(structural_corr - same_tag) < 0.01:
+        return "same_tag"
+    return "baseline"
+
+
+def _tier_summary(devs: list[float]) -> dict:
+    if not devs:
+        return {"n": 0}
+    mae = sum(abs(d) for d in devs) / len(devs)
+    bias = sum(devs) / len(devs)
+    max_abs = max(abs(d) for d in devs)
+    return {
+        "n": len(devs),
+        "mae": round(mae, 4),
+        "mean_bias": round(bias, 4),
+        "max_abs": round(max_abs, 4),
+    }
+
+
+def validate_from_state_file(
+    state_file: str,
+    min_overlap: int = MIN_OVERLAP_BARS,
+) -> dict:
+    """Compute per-tier MAE from a persisted PCE correlation state file.
+
+    This is the fast-path validation: reads ``pce_correlation.json`` produced
+    by ``PortfolioCorrelationEngine.save_state()``, filters pairs that have
+    reached ``min_overlap`` bars, and computes per-tier MAE and bias between
+    the structural priors and the mature empirical correlations.
+
+    Parameters
+    ----------
+    state_file
+        Path to the JSON file produced by ``save_state()``.
+    min_overlap
+        Minimum overlap bars to consider a pair "mature".
+
+    Returns
+    -------
+    dict with ``pairs_total``, ``pairs_mature``, and per-tier stats.
+    """
+    state_path = Path(state_file)
+    if not state_path.exists():
+        print(f"ERROR: state file not found: {state_file}", file=sys.stderr)
+        return {"error": f"file not found: {state_file}"}
+
+    with open(state_path) as f:
+        data = json.load(f)
+
+    pairs_data = data.get("pairs", {})
+    buckets: dict[str, list[float]] = {
+        "same_event": [],
+        "same_tag": [],
+        "baseline": [],
+    }
+
+    mature_count = 0
+    for _pair_key, est in pairs_data.items():
+        overlap = est.get("overlap_bars", 0)
+        if overlap < min_overlap:
+            continue
+        mature_count += 1
+        empirical = est.get("empirical_corr", 0.0)
+        structural = est.get("structural_corr", 0.0)
+        tier = _tier_label(structural)
+        buckets[tier].append(empirical - structural)
+
+    result = {
+        "pairs_total": len(pairs_data),
+        "pairs_mature": mature_count,
+        "min_overlap_threshold": min_overlap,
+    }
+    for tier_name in ("same_event", "same_tag", "baseline"):
+        result[tier_name] = _tier_summary(buckets[tier_name])
+
+    # Pretty-print
+    print(f"\n{'=' * 64}")
+    print("PCE Structural Prior Validation — State File Mode")
+    print(f"{'=' * 64}")
+    print(f"  Source:           {state_file}")
+    print(f"  Total pairs:      {result['pairs_total']}")
+    print(f"  Mature (≥{min_overlap} bars): {mature_count}")
+    print()
+
+    for tier_name in ("same_event", "same_tag", "baseline"):
+        prior_val = STRUCTURAL_PRIORS[tier_name]
+        s = result[tier_name]
+        print(f"  {tier_name.upper()} (prior ρ = {prior_val}):")
+        if s["n"] == 0:
+            print("    No mature pairs in this tier yet.\n")
+        else:
+            print(f"    Pairs:      {s['n']}")
+            print(f"    MAE:        {s['mae']:.4f}")
+            print(f"    Mean Bias:  {s['mean_bias']:+.4f}")
+            print(f"    Max |dev|:  {s['max_abs']:.4f}")
+            verdict = "OK" if s["mae"] < 0.20 and abs(s["mean_bias"]) < 0.15 else "⚠ REVIEW"
+            print(f"    Verdict:    {verdict}\n")
+
+    print(f"{'=' * 64}")
+    return result
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(
-        description="Validate PCE structural priors against tick data"
+        description="Validate PCE structural priors against tick data or state file"
     )
     parser.add_argument(
         "--tick-dir",
         default="data/vps_march2026/ticks",
         help="Path to tick data directory (default: data/vps_march2026/ticks)",
     )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Path to PCE correlation state JSON (skips tick replay)",
+    )
+    parser.add_argument(
+        "--min-overlap",
+        type=int,
+        default=MIN_OVERLAP_BARS,
+        help=f"Minimum overlap bars for mature pairs (default: {MIN_OVERLAP_BARS})",
+    )
     args = parser.parse_args()
 
+    # Fast path: validate from persisted state file
+    if args.state_file is not None:
+        validate_from_state_file(args.state_file, args.min_overlap)
+        return
+
+    # Full path: replay tick data
     project_root = Path(__file__).resolve().parent.parent
     tick_dir = Path(args.tick_dir)
     if not tick_dir.is_absolute():

@@ -126,10 +126,13 @@ class StrategyParams:
     confluence_eqs_floor: float = _env_float("CONFLUENCE_EQS_FLOOR", 35.0)
     confluence_min_factors: int = _env_int("CONFLUENCE_MIN_FACTORS", 2)
     # Per-factor EQS threshold discounts (points subtracted).
-    confluence_whale_discount: float = _env_float("CONFLUENCE_WHALE_DISCOUNT", 5.0)
+    # Whale: 5→4 to tighten Sobol S1 variance (dominant first-order index).
+    # L2: 3→0 — reclassified as hard gate; failed binomial H₀: w_on ≤ w_off.
+    # Regime: 3→0 — failed binomial test; already required by drift Gate 1.
+    confluence_whale_discount: float = _env_float("CONFLUENCE_WHALE_DISCOUNT", 4.0)
     confluence_spread_discount: float = _env_float("CONFLUENCE_SPREAD_DISCOUNT", 4.0)
-    confluence_l2_discount: float = _env_float("CONFLUENCE_L2_DISCOUNT", 3.0)
-    confluence_regime_discount: float = _env_float("CONFLUENCE_REGIME_DISCOUNT", 3.0)
+    confluence_l2_discount: float = _env_float("CONFLUENCE_L2_DISCOUNT", 0.0)
+    confluence_regime_discount: float = _env_float("CONFLUENCE_REGIME_DISCOUNT", 0.0)
 
     # ── V4: Probe sizing ──────────────────────────────────────────────────
     # Allow sub-threshold entries (EQS in [probe_eqs_floor, min_edge_score))
@@ -138,6 +141,48 @@ class StrategyParams:
     probe_eqs_floor: float = _env_float("PROBE_EQS_FLOOR", 35.0)
     probe_kelly_fraction: float = _env_float("PROBE_KELLY_FRACTION", 0.05)
     probe_max_usd: float = _env_float("PROBE_MAX_USD", 2.0)
+
+    # ── V1-V4 Risk Guard: combined maker+confluence floor (Flaw 1) ────────
+    # When both maker_routing AND all-4-confluence fire simultaneously,
+    # the score is inflated (0 fees) while the threshold is compressed.
+    # This hard floor prevents the adjusted threshold from falling below
+    # this value when maker routing is active.
+    confluence_maker_combined_floor: float = _env_float("CONFLUENCE_MAKER_COMBINED_FLOOR", 40.0)
+
+    # ── V3/V2 Drift-regime double-count guard (Flaw 2) ────────────────────
+    # DriftSignal gate 1 requires regime_mean_revert; confluence also awards
+    # confluence_regime_discount when regime is mean-reverting.  These are
+    # NOT independent bits.  When the primary signal is a drift signal,
+    # the regime discount is suppressed to avoid double-counting.
+    drift_suppress_regime_discount: bool = _env_bool("DRIFT_SUPPRESS_REGIME_DISCOUNT", True)
+
+    # ── V4 Probe risk controls (Flaw 3) ───────────────────────────────────
+    # Probes are sub-threshold micro-entries designed for data gathering, not
+    # strong-signal confirmation trades.  Confluence discounts (especially
+    # the 5-pt whale discount) should NOT lower the probe threshold: probes
+    # are admitted via the confluence-independent probe_eqs_floor, so
+    # applying confluence discounts to them double-counts unconfirmed signals.
+    probe_suppress_confluence: bool = _env_bool("PROBE_SUPPRESS_CONFLUENCE", True)
+
+    # ── Probe harvesting ──────────────────────────────────────────────────
+    # When a probe reaches breakeven (StopLossMonitor fires on_probe_breakeven),
+    # scale_probe_to_full() pyramids the position up to full Kelly.
+    # harvest_max_progress: skip scale-in if > this fraction of TP achieved.
+    # harvest_min_profit_cents: position must still be net-positive.
+    # harvest_min_increment_usd: don't bother with tiny scale-ins.
+    harvest_max_progress: float = _env_float("HARVEST_MAX_PROGRESS", 0.60)
+    harvest_min_profit_cents: float = _env_float("HARVEST_MIN_PROFIT_CENTS", 0.50)
+    harvest_min_increment_usd: float = _env_float("HARVEST_MIN_INCREMENT_USD", 0.50)
+
+    # ── Adverse Selection Monitor: dynamic alpha ──────────────────────────
+    # The fixed α=0.05 over-suspends in low-vol and under-suspends in
+    # high-vol.  Scale α with rolling EWMA volatility:
+    #   α_dynamic = α_base × (σ_rolling / σ_ref)^γ, clamped to [α_min, α_max]
+    adverse_monitor_alpha_base: float = _env_float("ADVERSE_MONITOR_ALPHA_BASE", 0.05)
+    adverse_monitor_vol_ref: float = _env_float("ADVERSE_MONITOR_VOL_REF", 0.01)
+    adverse_monitor_alpha_gamma: float = _env_float("ADVERSE_MONITOR_ALPHA_GAMMA", 0.5)
+    adverse_monitor_alpha_min: float = _env_float("ADVERSE_MONITOR_ALPHA_MIN", 0.01)
+    adverse_monitor_alpha_max: float = _env_float("ADVERSE_MONITOR_ALPHA_MAX", 0.15)
 
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 15.0)
@@ -274,6 +319,9 @@ class StrategyParams:
     # ── Pillar 7: Hybrid-Aggressive Chaser Escalation ──────────────────────
     chaser_max_rejections: int = _env_int("CHASER_MAX_REJECTIONS", 3)
     chaser_escalation_ticks: int = _env_int("CHASER_ESCALATION_TICKS", 1)
+    # Anti-toxicity guard: if the adverse-selection p-value drops below
+    # this ceiling during a chase, cancel rather than crossing the spread.
+    chaser_toxicity_p_value_ceil: float = _env_float("CHASER_TOXICITY_P_VALUE_CEIL", 0.10)
 
     # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
@@ -441,6 +489,21 @@ class StrategyParams:
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)
 
+    # ── Dynamic Prior Generation Engine (RPE upgrade) ──────────────────────
+    # L2 order-book imbalance sensitivity — scales ln(book_depth_ratio)
+    # into Beta pseudo-counts.  Higher = more responsive to book skew.
+    rpe_l2_kappa: float = _env_float("RPE_L2_KAPPA", 1.5)
+    # Time-decay sigmoid steepness (higher = sharper transition).
+    rpe_theta_gamma: float = _env_float("RPE_THETA_GAMMA", 8.0)
+    # Time-decay half-life as fraction of market duration remaining.
+    # At this fraction the prior / observation weights are equal.
+    rpe_theta_half: float = _env_float("RPE_THETA_HALF", 0.15)
+    # Minimum divergence (model vs market) to trigger a model-only
+    # probe entry when PanicDetector is silent.
+    rpe_probe_divergence_min: float = _env_float("RPE_PROBE_DIVERGENCE_MIN", 0.12)
+    # Enable tag-based dynamic priors (vs fixed/market-anchored).
+    rpe_dynamic_prior_enabled: bool = _env_bool("RPE_DYNAMIC_PRIOR_ENABLED", True)
+
     # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────
     pce_shadow_mode: bool = _env_bool("PCE_SHADOW_MODE", True)
     pce_max_portfolio_var_usd: float = _env_float("PCE_MAX_PORTFOLIO_VAR_USD", 50.0)
@@ -477,6 +540,8 @@ class StrategyParams:
     iceberg_refill_window_s: float = _env_float("ICEBERG_REFILL_WINDOW_S", 5.0)
     iceberg_min_refills: int = _env_int("ICEBERG_MIN_REFILLS", 3)
     iceberg_size_tolerance_pct: float = _env_float("ICEBERG_SIZE_TOLERANCE_PCT", 0.30)
+    # Minimum iceberg confidence to activate peg routing in the chaser.
+    iceberg_peg_min_confidence: float = _env_float("ICEBERG_PEG_MIN_CONFIDENCE", 0.50)
 
     # ── SI-3: Cross-Market Signal Generator ────────────────────────────────
     # Offensive pairs-style alpha from correlated market lag divergences.
@@ -488,12 +553,16 @@ class StrategyParams:
 
     # ── SI-4: Stealth Execution ────────────────────────────────────────────
     # Time-sliced order splitting to reduce market footprint.
-    stealth_enabled: bool = _env_bool("STEALTH_ENABLED", False)  # off until tested
+    stealth_enabled: bool = _env_bool("STEALTH_ENABLED", True)
     stealth_min_size_usd: float = _env_float("STEALTH_MIN_SIZE_USD", 5.0)
     stealth_max_slices: int = _env_int("STEALTH_MAX_SLICES", 4)
     stealth_min_delay_ms: float = _env_float("STEALTH_MIN_DELAY_MS", 200.0)
     stealth_max_delay_ms: float = _env_float("STEALTH_MAX_DELAY_MS", 1500.0)
     stealth_size_jitter_pct: float = _env_float("STEALTH_SIZE_JITTER_PCT", 0.15)
+    # Abandonment: abort remaining slices if mid drifts adversely.
+    stealth_abandon_drift_cents: float = _env_float("STEALTH_ABANDON_DRIFT_CENTS", 2.0)
+    # Abandonment: skip remaining slices if this fraction already filled.
+    stealth_abandon_fill_pct: float = _env_float("STEALTH_ABANDON_FILL_PCT", 0.75)
 
 
 @dataclass(frozen=True)

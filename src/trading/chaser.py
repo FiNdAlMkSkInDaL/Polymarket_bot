@@ -34,6 +34,8 @@ from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 
 if TYPE_CHECKING:
     from src.core.latency_guard import LatencyGuard
+    from src.signals.iceberg_detector import IcebergDetector
+    from src.trading.adverse_selection_monitor import AdverseSelectionMonitor
 
 log = get_logger(__name__)
 
@@ -107,6 +109,8 @@ class OrderChaser:
         fast_kill_event: asyncio.Event | None = None,
         max_post_only_rejections: int | None = None,
         urgent: bool = False,
+        iceberg_detector: IcebergDetector | None = None,
+        adverse_monitor: AdverseSelectionMonitor | None = None,
     ):
         strat = settings.strategy
         self.executor = executor
@@ -148,6 +152,26 @@ class OrderChaser:
         self._escalation_ticks = strat.chaser_escalation_ticks
         self._desired_margin = strat.desired_margin_cents
         self._rejection_count: int = 0
+
+        # SI-2: Iceberg-aware routing
+        self._iceberg = iceberg_detector
+        self._iceberg_peg_min_conf = getattr(
+            strat, "iceberg_peg_min_confidence", 0.50
+        )
+
+        # Anti-toxicity guard: cancel chase instead of crossing when
+        # adverse-selection p-value is dropping.
+        self._adverse_monitor = adverse_monitor
+        self._toxicity_market_id = market_id  # condition_id for stats lookup
+        self._toxicity_ceil = getattr(
+            strat, "chaser_toxicity_p_value_ceil", 0.10
+        )
+        # Snapshot the initial p-value to detect rapid deterioration.
+        self._initial_p_value: float = 1.0
+        if self._adverse_monitor is not None:
+            _stats = self._adverse_monitor.get_stats(market_id)
+            if _stats is not None:
+                self._initial_p_value = _stats.last_p_value
 
         # State
         self.state = ChaserState.QUOTING
@@ -241,6 +265,11 @@ class OrderChaser:
                 return None
 
             # ── Cancel-and-replace ────────────────────────────────
+            # ── Toxicity guard (mid-chase) ───────────────────
+            if self._should_abort_toxicity():
+                await self._cancel_resting()
+                self.state = ChaserState.ABANDONED
+                return None
             self.state = ChaserState.CANCELLING
             await self._cancel_resting()
             # Yield to let cancel propagate
@@ -267,14 +296,52 @@ class OrderChaser:
             pass
 
     def _optimal_quote(self) -> float | None:
-        """The price at which to rest the order (top-of-book, maker side)."""
+        """The price at which to rest the order (top-of-book, maker side).
+
+        When an iceberg detector is available and detects a whale on
+        **our side** of the book, pegs the order at the iceberg price
+        to hide behind the institutional liquidity wall.
+        """
         if not self.book.has_data:
             return None
         snap = self.book.snapshot()
         if self.side == OrderSide.BUY:
-            return snap.best_bid if snap.best_bid > 0 else None
+            bbo = snap.best_bid if snap.best_bid > 0 else None
         else:
-            return snap.best_ask if snap.best_ask > 0 else None
+            bbo = snap.best_ask if snap.best_ask > 0 else None
+
+        if bbo is None:
+            return None
+
+        # ── SI-2: Iceberg peg ───────────────────────────────────
+        if self._iceberg is not None:
+            our_side = "BUY" if self.side == OrderSide.BUY else "SELL"
+            iceberg = self._iceberg.strongest_iceberg(our_side)
+            if (
+                iceberg is not None
+                and iceberg.confidence >= self._iceberg_peg_min_conf
+            ):
+                # Peg at iceberg price — sit behind whale wall
+                peg = iceberg.price
+                # Clamp so we never give up queue priority beyond BBO
+                if self.side == OrderSide.BUY:
+                    peg = min(peg, bbo)  # don't bid above best bid
+                else:
+                    peg = max(peg, bbo)  # don't ask below best ask
+
+                log.debug(
+                    "chaser_iceberg_peg",
+                    side=self.side.value,
+                    iceberg_price=iceberg.price,
+                    iceberg_confidence=iceberg.confidence,
+                    iceberg_refills=iceberg.refill_count,
+                    bbo=bbo,
+                    peg=peg,
+                    asset=self.asset_id[:16],
+                )
+                return peg
+
+        return bbo
 
     def _drift_cents(self, current_quote: float) -> float:
         """How far the current BBO has drifted from the anchor (in cents)."""
@@ -284,6 +351,38 @@ class OrderChaser:
         else:
             # For SELL, adverse drift = price going DOWN (we receive less)
             return max(0.0, (self.anchor_price - current_quote) * 100)
+
+    def _should_abort_toxicity(self) -> bool:
+        """Check if the adverse-selection monitor signals rising toxicity.
+
+        Returns ``True`` (abort the chase) when **both**:
+          1. The market's current p-value is below ``chaser_toxicity_p_value_ceil``.
+          2. The p-value has dropped by ≥ 50% since the chaser started.
+
+        This prevents us from aggressively crossing the spread into a
+        market that is becoming increasingly toxic — even if the formal
+        suspension threshold has not yet been breached.
+        """
+        if self._adverse_monitor is None:
+            return False
+        stats = self._adverse_monitor.get_stats(self._toxicity_market_id)
+        if stats is None:
+            return False
+        p = stats.last_p_value
+        if p >= self._toxicity_ceil:
+            return False
+        # Also require a meaningful drop from the snapshot taken at init
+        if self._initial_p_value > 0 and p < self._initial_p_value * 0.50:
+            log.info(
+                "chaser_toxicity_abort",
+                side=self.side.value,
+                asset=self.asset_id[:16],
+                p_value=round(p, 6),
+                initial_p=round(self._initial_p_value, 6),
+                ceil=self._toxicity_ceil,
+            )
+            return True
+        return False
 
     async def _place(self, price: float) -> None:
         """Place a new resting order at *price*."""
@@ -337,8 +436,18 @@ class OrderChaser:
         Before crossing, runs an alpha-sufficiency check to ensure the
         full round-trip cost (including taker fee) still beats the
         minimum profit margin.
+
+        Also checks the adverse-selection monitor: if the market's
+        toxicity p-value is below the ceiling, the chaser abandons
+        rather than aggressively crossing the spread into toxic flow.
         """
         self.state = ChaserState.ESCALATING
+
+        # ── Toxicity guard ─────────────────────────────────────
+        if self._should_abort_toxicity():
+            self.state = ChaserState.ABANDONED
+            return
+
         snap = self.book.snapshot()
         tick = 0.01 * self._escalation_ticks
 

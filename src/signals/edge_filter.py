@@ -130,31 +130,82 @@ class ConfluenceContext:
 def compute_confluence_discount(
     ctx: ConfluenceContext,
     base_threshold: float,
+    *,
+    is_drift_signal: bool = False,
+    maker_routing_active: bool = False,
 ) -> float:
     """Compute dynamically adjusted EQS threshold from confluence context.
 
-    Each verified factor contributes a configurable point-discount to the
-    base threshold.  Discounts only activate when the number of active
-    factors meets or exceeds ``confluence_min_factors``.
+    After the B=2000 bootstrap calibration (one-sided binomial test,
+    H₀: w_on ≤ w_off), L2 Reliability and Regime Mean-Reversion failed
+    to reject at α=0.10.  They are structurally reclassified:
+
+    - **L2 Reliability** → hard gate.  If the L2 book is unreliable, no
+      confluence discount is applied at all (returns base_threshold).
+      This preserves data-quality protection without granting an
+      unjustified threshold reduction.
+    - **Regime Mean-Revert** → discount zeroed (config default 0.0).
+      The regime detector remains active for Gate 1 of
+      MeanReversionDrift; the Flaw 2 suppression is now redundant but
+      kept for defence-in-depth.
+
+    Justified factors (whale, spread) require ≥ confluence_min_factors
+    active to fire.
+
+    Parameters
+    ----------
+    is_drift_signal:
+        When True, the regime-mean-reversion discount is **suppressed**.
+        Gate 1 of MeanReversionDrift already requires regime_mean_revert;
+        awarding the confluence regime discount on top would double-count
+        the same bit of information (Flaw 2).
+    maker_routing_active:
+        When True, the combined floor (``confluence_maker_combined_floor``)
+        is applied instead of the standard ``confluence_eqs_floor``.  This
+        prevents the EQS threshold from dropping too far when the inflated
+        maker score (0 fees) and the confluence discount both fire
+        simultaneously (Flaw 1).
 
     Returns
     -------
     float
-        Adjusted EQS threshold (≥ ``confluence_eqs_floor``).
+        Adjusted EQS threshold (≥ effective floor).
     """
     strat = settings.strategy
+
+    # ── Hard gate: L2 reliability (reclassified from discount factor) ──
+    # L2 reliability is a data-quality precondition, not an alpha signal.
+    # Bootstrap showed Δw ≈ 0 (p > 0.10).  If the book is unreliable,
+    # refuse ALL confluence discounts — the signal quality is suspect.
+    if not ctx.l2_reliable:
+        return base_threshold
+
     min_factors = strat.confluence_min_factors
-    floor = strat.confluence_eqs_floor
+
+    # Flaw 1: use the tighter combined floor when maker routing is active.
+    floor = (
+        strat.confluence_maker_combined_floor
+        if maker_routing_active
+        else strat.confluence_eqs_floor
+    )
 
     discounts: list[float] = []
     if ctx.whale_strong_confluence:
         discounts.append(strat.confluence_whale_discount)
     if ctx.spread_compressed:
         discounts.append(strat.confluence_spread_discount)
-    if ctx.l2_reliable:
+    # L2 reliability is now a hard gate above — no longer an additive discount.
+    # Kept with config value 0.0 for backward compatibility; the gate enforces
+    # the structural requirement without granting unearned threshold relief.
+    if ctx.l2_reliable and strat.confluence_l2_discount > 0:
         discounts.append(strat.confluence_l2_discount)
-    if ctx.regime_mean_revert:
-        discounts.append(strat.confluence_regime_discount)
+    # Flaw 2: suppress regime discount when drift signal is the primary source,
+    # since gate 1 of MeanReversionDrift already hard-requires regime_mean_revert.
+    # With default confluence_regime_discount=0.0 this branch is effectively dead,
+    # but retained for defence-in-depth if the discount is re-enabled via env var.
+    if ctx.regime_mean_revert and not (is_drift_signal and strat.drift_suppress_regime_discount):
+        if strat.confluence_regime_discount > 0:
+            discounts.append(strat.confluence_regime_discount)
 
     if len(discounts) < min_factors:
         return base_threshold
@@ -168,6 +219,10 @@ def compute_confluence_discount(
         adjusted=round(result, 2),
         factors=len(discounts),
         total_discount=round(sum(discounts), 1),
+        is_drift_signal=is_drift_signal,
+        maker_routing_active=maker_routing_active,
+        floor_applied=round(floor, 2),
+        l2_hard_gate=True,
     )
     return result
 

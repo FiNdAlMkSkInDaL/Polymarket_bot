@@ -243,7 +243,10 @@ class L2WebSocket:
                         msg = json.loads(raw)
                         self._handle_message(msg)
                     except json.JSONDecodeError:
-                        log.warning("l2_ws_bad_json", raw=raw[:200])
+                        if raw.strip() == "INVALID OPERATION":
+                            log.debug("l2_ws_invalid_op")
+                        else:
+                            log.warning("l2_ws_bad_json", raw=raw[:200])
             finally:
                 silence_task.cancel()
 

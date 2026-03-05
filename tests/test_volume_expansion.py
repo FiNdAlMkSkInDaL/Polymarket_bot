@@ -147,24 +147,25 @@ class TestConfluenceDiscount:
     def test_two_factors_activates_discount(self):
         """Two factors should reduce threshold."""
         ctx = ConfluenceContext(
-            whale_strong_confluence=True,   # -5
+            whale_strong_confluence=True,   # -4
             spread_compressed=True,         # -4
-            l2_reliable=False,
+            l2_reliable=True,               # hard gate passes
             regime_mean_revert=False,
         )
         result = compute_confluence_discount(ctx, 50.0)
-        assert result == 50.0 - 5.0 - 4.0  # 41.0
+        assert result == 50.0 - 4.0 - 4.0  # 42.0
 
     def test_all_four_factors(self):
-        """All four factors should produce maximum discount."""
+        """All four flags set: only whale + spread produce discounts
+        (L2 is hard gate, regime discount is 0.0)."""
         ctx = ConfluenceContext(
-            whale_strong_confluence=True,   # -5
+            whale_strong_confluence=True,   # -4
             spread_compressed=True,         # -4
-            l2_reliable=True,              # -3
-            regime_mean_revert=True,        # -3
+            l2_reliable=True,              # hard gate passes
+            regime_mean_revert=True,        # discount=0, no effect
         )
         result = compute_confluence_discount(ctx, 50.0)
-        assert result == 50.0 - 5.0 - 4.0 - 3.0 - 3.0  # 35.0
+        assert result == 50.0 - 4.0 - 4.0  # 42.0
 
     def test_floor_respected(self):
         """Discount should never go below confluence_eqs_floor."""
@@ -174,8 +175,8 @@ class TestConfluenceDiscount:
             l2_reliable=True,
             regime_mean_revert=True,
         )
-        # Total discount = 15 points.  Starting from 45 → 30, but floor is 35.
-        result = compute_confluence_discount(ctx, 45.0)
+        # Total discount = 8 points.  Starting from 40 → 32, but floor is 35.
+        result = compute_confluence_discount(ctx, 40.0)
         assert result == 35.0
 
     def test_zero_active_factors(self):
@@ -191,6 +192,7 @@ class TestConfluenceDiscount:
         ctx = ConfluenceContext(
             whale_strong_confluence=True,
             spread_compressed=True,
+            l2_reliable=True,              # hard gate passes
         )
         orig_whale = settings.strategy.confluence_whale_discount
         orig_spread = settings.strategy.confluence_spread_discount
@@ -527,10 +529,10 @@ class TestConfigFields:
         params = StrategyParams()
         assert params.confluence_eqs_floor == 35.0
         assert params.confluence_min_factors == 2
-        assert params.confluence_whale_discount == 5.0
+        assert params.confluence_whale_discount == 4.0
         assert params.confluence_spread_discount == 4.0
-        assert params.confluence_l2_discount == 3.0
-        assert params.confluence_regime_discount == 3.0
+        assert params.confluence_l2_discount == 0.0
+        assert params.confluence_regime_discount == 0.0
 
     def test_v3_drift_defaults(self):
         params = StrategyParams()

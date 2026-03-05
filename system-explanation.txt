@@ -1,0 +1,1624 @@
+================================================================================
+  POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
+  Last updated: March 5, 2026
+================================================================================
+
+This document exhaustively describes the entire Polymarket Mean-Reversion
+Market-Maker bot system. It is designed so that an AI model can understand
+the full architecture, data flow, configuration, and code relationships
+without manually reviewing every file.
+
+Table of Contents:
+  1.  System Overview & Trading Philosophy
+  2.  Repository Structure & File Map
+  3.  Core Architecture (bot.py entry flow)
+  4.  Configuration System (~160 parameters)
+  5.  Deployment Guard & Phases
+  6.  Data Layer (Market Data Pipeline)
+  7.  Signal Layer (Alpha Generation)
+  8.  Trading Layer (Execution & Risk)
+  9.  Monitoring Layer
+  10. Backtest System
+  11. Walk-Forward Optimization (WFO)
+  12. Scripts & Tooling
+  13. Test Infrastructure
+  14. Key Formulas & Algorithms
+  15. Important Design Patterns & Gotchas
+  16. Pillar System (Feature Numbering)
+  17. Volume Expansion Architecture (V1-V4)
+  18. Signal Intelligence (SI-1 through SI-4)
+  19. Cross-Module Dependencies Graph
+  20. Change History Evolution
+
+
+================================================================================
+SECTION 1: SYSTEM OVERVIEW & TRADING PHILOSOPHY
+================================================================================
+
+What it is:
+  A fully automated high-frequency trading bot for Polymarket binary prediction
+  markets. It runs on Polygon (chain ID 137) and places orders on the
+  Polymarket CLOB (Central Limit Order Book).
+
+Core strategy:
+  CONTRARIAN MEAN-REVERSION on the NO token.
+
+  When the YES token experiences a sudden price spike (retail panic buying),
+  the bot buys the NO token at a temporary discount, betting that the spike
+  will revert. The NO token is always cheaper during YES panic because
+  YES + NO = $1 in a binary market.
+
+  Secondary strategies: drift signal (slow-bleed displacement in low-vol
+  regimes), RPE (model-based probability divergence for crypto markets),
+  cross-market stat-arb, and spread-compression entries.
+
+How money is made:
+  1. YES spikes from 0.60 to 0.68 on retail panic
+  2. NO drops correspondingly from 0.40 to 0.32
+  3. Bot buys NO at 0.32 (entry)
+  4. Spike reverts, NO returns to ~0.38 (exit at take-profit)
+  5. Profit = ~6 cents per share (minus fees)
+
+Market:
+  - Polymarket CLOB: REST + WebSocket, binary YES/NO markets
+  - Assets: YES and NO tokens per condition (market question)
+  - Price range: 0.01 to 0.99 (probabilities)
+  - Tick size: 1 cent ($0.01)
+  - Fee model: Dynamic parabolic curve — f(p) = f_max × 4 × p × (1 − p)
+    Peak at p=0.50 (1.56%), zero at tails. Maker fee = 0 bps.
+  - Chain: Polygon mainnet (137), settlements on-chain
+
+Deployment modes:
+  PAPER       — simulated fills, mocked $50 wallet, data recording forced ON
+  PENNY_LIVE  — real CLOB + real wallet, HARDCODED $1 max per trade (un-overridable)
+  PRODUCTION  — all guardrails lifted, requires --confirm-production flag
+
+VPS:
+  Runs on a Linux VPS (135.181.85.32) as a systemd service (polymarket-bot.service).
+  Secrets stored in /dev/shm/secrets/.env (tmpfs, never touches disk).
+
+
+================================================================================
+SECTION 2: REPOSITORY STRUCTURE & FILE MAP
+================================================================================
+
+Root:
+  pyproject.toml          — build config, dependencies, entry points
+  delta-file.txt          — changelog of all modifications
+  POR.txt                 — Parameter Optimization Report
+  system-explanation.txt  — this file
+  README.md               — user-facing readme
+
+src/                      — main bot package
+  __init__.py             — "Polymarket Mean-Reversion Market Maker PoC"
+  bot.py                  — TradingBot class (main entry, ~1200 lines)
+  cli.py                  — Click CLI: run, stats, kill, scores, backtest, wfo, data
+
+  core/                   — foundational infrastructure
+    config.py             — StrategyParams (~160 fields), Settings, DeploymentEnv (~670 lines)
+    guard.py              — DeploymentGuard (PAPER/PENNY_LIVE/PRODUCTION caps)
+    heartbeat.py          — BookHeartbeat (3-layer staleness detection)
+    latency_guard.py      — LatencyGuard (HEALTHY→DEGRADED→BLOCKED state machine)
+    logger.py             — structlog JSON logging with async-safe QueueHandler
+
+  data/                   — market data pipeline
+    types.py              — Level dataclass (price, size)
+    websocket_client.py   — MarketWebSocket (trade + book events)
+    l2_websocket.py       — L2WebSocket (dedicated L2 delta stream)
+    l2_book.py            — L2OrderBook (full-depth reconstruction, seq tracking ~790 lines)
+    orderbook.py          — OrderbookTracker (top-of-book), L2OrderBookAdapter
+    ohlcv.py              — OHLCVAggregator (1-min bars, VWAP, EWMA vol ~240 lines)
+    spread_score.py       — SpreadScore (0-100 L2 quality metric)
+    market_discovery.py   — 3-tier discovery (CLOB→Gamma events→Gamma markets)
+    market_lifecycle.py   — observing→active→draining→emergency state machine
+    market_scorer.py      — 7-component composite quality score
+    prep_data.py          — JSONL→Parquet conversion with health auditing
+    synthetic.py          — GBM-based synthetic data generator for testing
+
+  signals/                — alpha generation
+    panic_detector.py     — PanicDetector (z-score + 5 gates → PanicSignal)
+    drift_signal.py       — MeanReversionDrift (6 gates → DriftSignal, V3)
+    edge_filter.py        — EQS scoring (geometric mean), ConfluenceContext, confluence discount
+    adverse_selection_guard.py — Fast-kill (4 microstructure signals, 2-of-4 composite)
+    regime_detector.py    — RegimeDetector (autocorr/vol-ratio/persistence → MR/trending)
+    whale_monitor.py      — WhaleMonitor (Polygonscan CTF transfers, wallet clustering)
+    cross_market.py       — CrossMarketSignalGenerator (correlated pairs stat-arb, SI-3)
+    iceberg_detector.py   — IcebergDetector (L2 refill pattern detection, SI-2)
+    tag_prior_registry.py — TagPriorRegistry (stateless tag→Beta(α,β) routing, DPGE)
+    resolution_probability.py — RPE (CryptoPriceModel + GenericBayesianModel/DPGE, Pillar 14)
+    signal_framework.py   — SignalGenerator ABC, CompositeSignalEvaluator
+
+  trading/                — execution and risk
+    executor.py           — OrderExecutor (paper/live), OrderStatusPoller
+    chaser.py             — OrderChaser (passive-aggressive POST_ONLY + escalation)
+    stealth_executor.py   — StealthExecutor (time-sliced order splitting, SI-4)
+    position_manager.py   — PositionManager (~1500 lines, full lifecycle + risk gates)
+    sizer.py              — Kelly sizing, depth-aware sizing, cold-start blend
+    fees.py               — Parabolic fee curve, roundtrip fee, adaptive stop-loss
+    fee_cache.py          — Per-token fee cache with TTL + per-token locks
+    stop_loss.py          — StopLossMonitor (event-driven, trailing, probe breakeven)
+    take_profit.py        — TP computation (alpha with 6 adjustments, fee floor)
+    adverse_selection_monitor.py — AdverseSelectionMonitor (Welch t-test, dynamic α)
+    portfolio_correlation.py — PCE (N×N correlation, VaR, bisection sizing ~1400 lines)
+
+  monitoring/
+    trade_store.py        — SQLite persistence (trades, crash recovery checkpoints)
+    telegram.py           — TelegramAlerter (rate-limited HTML notifications)
+
+  backtest/               — offline replay system
+    engine.py             — BacktestEngine (event-driven replay with SimClock)
+    strategy.py           — BotReplayAdapter (production signal gates in backtest)
+    matching_engine.py    — MatchingEngine (pessimistic CLOB sim ~750 lines)
+    data_loader.py        — DataLoader (JSONL/Parquet heapq merge)
+    data_recorder.py      — MarketDataRecorder (live→JSONL, zero cached file handles)
+    clock.py              — SimClock (monkey-patches time.time)
+    telemetry.py          — BacktestMetrics (Sharpe, Sortino, drawdown, etc.)
+    wfo_optimizer.py      — Walk-forward optimization (Optuna, ~1030 lines)
+
+scripts/
+  confluence_sensitivity.py — Bootstrap win-rate analysis + Sobol indices
+  backtest_comparison.py    — PRE vs POST parameter comparison
+  run_diagnostics.py        — System health diagnostics
+  check_db.py               — SQLite inspection
+  explore_data.py           — Data exploration
+  extract_signals.py        — Signal extraction from logs
+  scan_events.py            — Event scanning
+  validate_pce_priors.py    — PCE structural prior validation (tick replay + state-file MAE)
+  verify_launch.py          — Pre-launch checks
+  vps_setup.sh              — VPS provisioning
+  decrypt_secrets.sh        — Secret decryption
+  watchdog.sh               — Process watchdog
+
+tests/
+  conftest.py             — 5 fixtures (executor, aggregators, trade_store, detector)
+  helpers.py              — make_trade, build_bar_history, make_position
+  ~40 test files          — ~1000+ tests total
+
+data/
+  market_map.json         — 31 actionable markets with YES/NO token IDs
+  vps_march2026/          — production tick data from VPS
+
+
+================================================================================
+SECTION 3: CORE ARCHITECTURE (bot.py)
+================================================================================
+
+Entry point: `polybot run` (cli.py) → TradingBot(deployment_env).start()
+
+The TradingBot class is the central orchestrator. It owns ~30 subsystem
+instances and runs 18+ concurrent asyncio tasks.
+
+INITIALIZATION SEQUENCE:
+  1. Resolve deployment environment (PAPER/PENNY_LIVE/PRODUCTION)
+  2. Create DeploymentGuard (phase-aware size caps)
+  3. Create OrderExecutor (paper or live CLOB client)
+  4. Create TradeStore (SQLite)
+  5. Create PortfolioCorrelationEngine (Pillar 15)
+  6. Create PositionManager (receives executor, store, guard, PCE, book_trackers)
+  7. Create WhaleMonitor (Polygonscan polling)
+  8. Create TelegramAlerter
+  9. Create MarketLifecycleManager
+  10. Create LatencyGuard
+  11. boot_start() → setup_logging → credential gate → _run()
+
+_run() SEQUENCE:
+  1. Initialize TradeStore (SQLite schema)
+  2. Discover markets → wire each market (create aggregators, detectors, books)
+  3. Set wallet balance
+  4. Fee model validation (live only)
+  5. Create WebSocket connections (trade + L2)
+  6. Create AdverseSelectionGuard
+  7. Create BookHeartbeat
+  8. Create OrderStatusPoller
+  9. Create StopLossMonitor
+  10. Create AdverseSelectionMonitor (maker fill tracking)
+  11. Launch 18+ asyncio tasks
+  12. Install signal handlers
+  13. await asyncio.gather(*tasks)
+
+MARKET WIRING (_wire_market):
+  For each market, creates:
+  - OHLCVAggregator (YES) + OHLCVAggregator (NO)
+  - PanicDetector (wired to both aggregators)
+  - CompositeSignalEvaluator (imbalance + spread compression signals)
+  - RegimeDetector (SI-1, if enabled)
+  - MeanReversionDrift (V3, if enabled)
+  - L2OrderBook per token (with BBO callback and iceberg detector)
+  - L2OrderBookAdapter (wraps L2 behind OrderbookTracker interface)
+  - PCE market registration
+
+CONCURRENT TASKS (18+):
+  ws                  — Trade/book WebSocket
+  trade_processor     — Main trade consumption loop (signals fire here)
+  book_processor      — Orderbook update consumption
+  timeout_loop        — Position timeout checks (10s)
+  stats_loop          — Stats broadcast (15 min)
+  whale_monitor       — Polygonscan polling
+  market_refresh      — Re-discovery/re-scoring (10 min)
+  cleanup             — Stale cleanup + daily PnL reset (5 min)
+  tp_rescale          — Adaptive TP target rescaling (15s)
+  adverse_sel         — Fast-kill detection (50ms)
+  heartbeat           — Book staleness detection
+  ghost_liquidity     — Ghost liquidity circuit breaker (500ms)
+  order_status_poller — CLOB order fill polling (2s)
+  health_reporter     — system_health.json writer (60s)
+  rpe_retrigger       — BTC spot retrigger (5s)
+  pce_refresh         — Correlation matrix recalc (30 min) + prior validation (every 6h)
+  stale_bar_flush     — Flush stale OHLCV bars (30s)
+  paper_summary       — Paper trade summary (30 min)
+  data_recorder       — (conditional) Data recording
+  l2_ws              — (conditional) L2 WebSocket
+
+THE THREE SIGNAL PATHS:
+
+  Path 1: PanicDetector (primary)
+    YES bar close → guards → PanicDetector.evaluate() → PanicSignal
+    → EQS gate → PositionManager.open_position() → entry chaser
+
+  Path 2: DriftSignal (V3, secondary)
+    Only fires when PanicDetector is SILENT (signals are uncorrelated).
+    YES bar close → drift cooldown → MeanReversionDrift.evaluate() → DriftSignal
+    → synthesize PanicSignal → PositionManager.open_position()
+
+  Path 3: RPE (Pillar 14, independent)
+    YES bar close → data freshness → RPE.evaluate() → SignalResult
+    → EQS gate → calibration tracking → PositionManager.open_rpe_position()
+
+ORDER EXECUTION FLOW:
+  Signal fires → open_position() → risk gates (6 checks) → entry price (ask-1¢)
+  → EQS scoring → Kelly sizing → place BUY limit order → OrderChaser
+  → POST_ONLY repricing loop → fill → place SELL at TP → exit chaser → close
+
+GRACEFUL SHUTDOWN:
+  stop(): _running=False → cancel_all orders → cancel chasers → stop all
+  subsystems → final stats → trade_store.clear_live_state() → close()
+
+
+================================================================================
+SECTION 4: CONFIGURATION SYSTEM
+================================================================================
+
+File: src/core/config.py (~670 lines)
+
+Architecture:
+  - Two frozen dataclasses: StrategyParams and Settings
+  - DeploymentEnv enum: PAPER, PENNY_LIVE, PRODUCTION
+  - Every field overridable via environment variable
+  - Secrets loaded from /dev/shm/secrets/.env (tmpfs) or project root .env
+  - Module-level singleton: settings = Settings()
+
+IMPORTANT: StrategyParams is a frozen dataclass. Tests override fields using
+  object.__setattr__(settings.strategy, "field_name", value)
+  wrapped in try/finally for cleanup.
+
+Key parameter groups (~160 total):
+
+  TRADEABLE PRICE BAND:
+    min_tradeable_price = 0.05    (floor — near resolution)
+    max_tradeable_price = 0.95    (ceiling — near resolution)
+
+  PANIC DETECTOR:
+    zscore_threshold = 1.5        (z-score trigger)
+    volume_ratio_threshold = 1.2  (volume spike trigger)
+    lookback_minutes = 60         (rolling window)
+    no_discount_factor = 0.98     (NO must be 2% below VWAP)
+    trend_guard_bars = 15         (suppress during sustained uptrends)
+    trend_guard_pct = 0.10        (10% move = regime shift not panic)
+
+  EDGE QUALITY SCORE (EQS):
+    min_edge_score = 50.0         (geometric-mean threshold 0-100)
+    eqs_fee_efficiency_floor = 0.10  (prevents fees from zeroing score)
+    eqs_vol_adaptive = True       (vol-adaptive threshold)
+    eqs_vol_ref = 0.02            (reference 1-min σ)
+    eqs_vol_scale_range = 0.25    (±25% adjustment range)
+
+  V1 MAKER ROUTING:
+    maker_routing_enabled = True  (price as POST_ONLY at best_ask - 1¢)
+    maker_eqs_discount = 0.85    (15% lower EQS threshold for makers)
+
+  V2 CONFLUENCE:
+    confluence_eqs_floor = 35.0   (hard EQS floor under confluence)
+    confluence_min_factors = 2    (min confirming signals to activate)
+    confluence_whale_discount = 4.0  (justified — bootstrap p=0.041)
+    confluence_spread_discount = 4.0 (justified — bootstrap p=0.023)
+    confluence_l2_discount = 0.0     (NOT justified — p=0.38, now hard gate)
+    confluence_regime_discount = 0.0 (NOT justified — p=0.52)
+
+  V3 DRIFT SIGNAL:
+    drift_signal_enabled = True
+    drift_lookback_bars = 10
+    drift_z_threshold = 1.0       (|displacement| trigger)
+    drift_vol_ceiling = 0.015     (low-vol only)
+    drift_cooldown_s = 120.0
+
+  V4 PROBE SIZING:
+    probe_sizing_enabled = True
+    probe_eqs_floor = 35.0        (min EQS for probe)
+    probe_kelly_fraction = 0.05   (5% of normal Kelly)
+    probe_max_usd = 2.0           (hard cap)
+
+  FLAW GUARDS:
+    confluence_maker_combined_floor = 40.0  (Flaw 1: maker+confluence double-dip)
+    drift_suppress_regime_discount = True   (Flaw 2: drift/regime double-count)
+    probe_suppress_confluence = True        (Flaw 3: stale whale in probes)
+
+  PROBE HARVESTING:
+    harvest_max_progress = 0.60   (only scale up if < 60% to TP)
+    harvest_min_profit_cents = 0.50
+    harvest_min_increment_usd = 0.50
+
+  ADVERSE SELECTION MONITOR (Dynamic Alpha):
+    adverse_monitor_alpha_base = 0.05   (baseline significance)
+    adverse_monitor_vol_ref = 0.01      (reference EWMA σ)
+    adverse_monitor_alpha_gamma = 0.5   (square-root scaling)
+    adverse_monitor_alpha_min = 0.01    (floor)
+    adverse_monitor_alpha_max = 0.15    (ceiling)
+    Formula: α = α_base × (σ/σ_ref)^γ, clamped [α_min, α_max]
+
+  RISK CONTROLS:
+    max_trade_size_usd = 15.0
+    max_wallet_risk_pct = 20.0
+    max_open_positions = 5
+    max_positions_per_market = 1
+    max_positions_per_event = 2
+    daily_loss_limit_usd = 25.0
+    max_drawdown_cents = 2500.0
+    stop_loss_cents = 4.0
+    max_loss_per_trade_cents = 50.0
+    max_total_exposure_pct = 60.0
+
+  TAKE PROFIT:
+    alpha_default = 0.50          (mean-reversion alpha)
+    alpha_min = 0.40
+    alpha_max = 0.70
+    min_spread_cents = 4.0
+    tp_rescale_interval_s = 15
+    tp_vol_sensitivity = 1.5
+
+  KELLY SIZING:
+    kelly_fraction = 0.25         (quarter Kelly)
+    kelly_max_pct = 10.0
+    kelly_p_cap = 0.85
+    kelly_prior_win_rate = 0.55
+    kelly_wr_decay_alpha = 0.10   (~10-trade half-life)
+    min_kelly_trades = 20         (cold-start window)
+    cold_start_frac = 0.50
+
+  CHASER:
+    chase_interval_ms = 250       (repricing cadence)
+    max_chase_depth_cents = 3.0   (max adverse movement)
+    post_only_enabled = True
+    chaser_max_rejections = 3
+    chaser_escalation_ticks = 1
+    chaser_toxicity_p_value_ceil = 0.10  (Pillar 7 anti-toxicity: p-value ceiling)
+    iceberg_peg_min_confidence = 0.50    (SI-2: min IcebergSignal confidence to peg)
+
+  LATENCY GUARD:
+    latency_block_ms = 1500
+    latency_warn_ms = 800
+    latency_recovery_count = 3    (consecutive healthy ticks to recover)
+
+  ADVERSE SELECTION GUARD (Fast-Kill):
+    adverse_sel_enabled = True
+    adverse_sel_poll_ms = 50      (50ms polling)
+    adverse_sel_confirmation_cycles = 4  (200ms confirmation)
+    4 signal thresholds (MTI, depth, spread, velocity)
+
+  FEES:
+    fee_max_pct = 1.56            (peak fee %)
+    fee_cache_ttl_s = 300
+    fee_default_bps = 200
+    desired_margin_cents = 2.5
+
+  L2 ORDER BOOK:
+    l2_enabled = True
+    l2_max_levels = 50
+    l2_max_seq_gap_rate = 0.02    (2% threshold for reliability)
+
+  RPE (Pillar 14) — Dynamic Prior Generation Engine (DPGE):
+    rpe_shadow_mode = False           (live by default now)
+    rpe_generic_enabled = True        (GenericBayesianModel ACTIVE — DPGE replaces Beta(2,2))
+    rpe_confidence_threshold = 0.08
+    rpe_min_confidence = 0.15
+    rpe_crypto_vol_default = 0.80     (80% annualised)
+    rpe_tail_veto_threshold = 0.05
+    rpe_l2_kappa = 1.5                (L2 imbalance pseudo-count scale, κ)
+    rpe_theta_gamma = 8.0             (sigmoid time-decay steepness, γ)
+    rpe_theta_half = 0.15             (sigmoid inflection point, t_half = 15% through life)
+    rpe_probe_divergence_min = 0.12   (min model vs market divergence for model-probe)
+    rpe_dynamic_prior_enabled = True  (use tag-based priors; False = legacy prior_k)
+
+  PCE (Pillar 15):
+    pce_shadow_mode = False       (ACTIVE enforcement since March 5th)
+    pce_max_portfolio_var_usd = 35.0  (calibrated: P95 normal-operation VaR = $28)
+    pce_var_soft_cap = True       (bisection sizing)
+    pce_correlation_haircut_threshold = 0.65  (raised from 0.50 — anti-double-penalization)
+
+  REGIME (SI-1):
+    regime_enabled = True
+    regime_threshold = 0.40       (min score for mean-reversion)
+
+  CROSS-MARKET (SI-3):
+    cross_mkt_enabled = True
+    cross_mkt_shadow = True       (log-only)
+    cross_mkt_min_correlation = 0.50
+
+  STEALTH (SI-4):
+    stealth_enabled = True               (ACTIVE — time-sliced probe scale-ups)
+    stealth_n_slices = 3                 (order split count)
+    stealth_min_size_usd = 0.50          (minimum order for stealth routing)
+    stealth_delay_min_ms = 200           (inter-slice delay lower bound)
+    stealth_delay_max_ms = 1500          (inter-slice delay upper bound)
+    stealth_jitter_pct = 0.15            (±15% size randomisation per slice)
+    stealth_abandon_drift_cents = 2.0    (mid-price drift abort threshold)
+    stealth_abandon_fill_pct = 0.75      (abort after 75% filled — good enough)
+
+Settings dataclass (outer wrapper):
+  - API credentials: polymarket_api_key/secret/passphrase, eoa_private_key
+  - RPC: polygon_rpc_url, polygonscan_api_key
+  - Telegram: bot_token, chat_id
+  - URLs: clob_http_url, clob_ws_url, clob_l2_ws_url, clob_book_url
+  - Whale: whale_poll_interval_seconds=30, whale_lookback_seconds=600
+  - validate_credentials() → list[str] (missing fields for live modes)
+  - __repr__ masks secrets: shows first 4 chars + ***
+
+
+================================================================================
+SECTION 5: DEPLOYMENT GUARD & PHASES
+================================================================================
+
+File: src/core/guard.py
+
+DeploymentGuard enforces capital constraints WITHOUT mutating frozen config.
+
+  PAPER:
+    - get_allowed_trade_size(raw) → pass-through
+    - get_wallet_balance() → mocked $50
+    - enforce_data_recording() → always True
+
+  PENNY_LIVE:
+    - get_allowed_trade_size(raw) → min(raw, $1.00) — UN-OVERRIDEABLE
+    - get_allowed_trade_shares() → iteratively clamps to $1.00 notional
+    - get_wallet_balance() → max_trade_size_usd × 5
+
+  PRODUCTION:
+    - Pass-through to Kelly sizer
+    - Requires confirmed_production=True (5-second countdown in CLI)
+
+Critical: PENNY_LIVE_MAX_TRADE_USD = 1.0 is a CONSTANT, not an env var.
+The share clamping loop runs up to 100 iterations for float edge cases.
+
+
+================================================================================
+SECTION 6: DATA LAYER (Market Data Pipeline)
+================================================================================
+
+Two parallel WebSocket connections:
+
+  A) MarketWebSocket (src/data/websocket_client.py)
+     - Subscribes to "market" channel for all tracked assets
+     - Routes: trades → trade_queue, book events → book_queue
+     - TradeEvent dataclass: timestamp, market_id, asset_id, side, price, size
+     - Auto-reconnect with exponential backoff (1s to 60s) + jitter
+     - Silence watchdog: closes WS if no messages for ws_silence_timeout_s
+     - Bounded queues: drops OLDEST on overflow (preserves latest state)
+
+  B) L2WebSocket (src/data/l2_websocket.py)
+     - Dedicated connection for L2 deltas (separated to prevent delta storms
+       from starving trade processing)
+     - Routes to L2OrderBook instances directly
+     - Handles snapshot fetching on connect/desync
+     - Retry with exponential backoff
+
+L2OrderBook (src/data/l2_book.py, ~790 lines):
+  CRITICAL COMPONENT — full-depth local order book reconstruction
+
+  State machine: EMPTY → BUFFERING → SYNCED ↔ DESYNCED
+  Uses SortedDict from sortedcontainers for O(log n) operations.
+  Bids stored with negated keys (ascending iteration = descending price).
+
+  Key properties:
+    is_reliable — True if delta_count < 50 OR seq_gap_rate < 2%
+    seq_gap_rate — desync_total / delta_count (NEVER reset)
+    best_bid, best_ask, spread_cents, book_depth_ratio
+
+  Recovery flow:
+    Seq gap detected → DESYNCED → fire on_desync callback →
+    L2WebSocket._on_book_desync() → begin_buffering() →
+    REST snapshot fetch (up to 3 retries) → apply_snapshot() →
+    replay buffered deltas → SYNCED
+
+  depth_near_mid_usd(cents, max_levels):
+    Iterates SortedDict keys directly — ZERO Level allocations.
+    Designed for the 50ms adverse selection polling loop.
+
+OrderbookTracker (src/data/orderbook.py):
+  Simpler top-of-book tracker from WS price_change events.
+  L2OrderBookAdapter wraps L2OrderBook behind this interface.
+
+OHLCVAggregator (src/data/ohlcv.py):
+  Builds 1-minute bars from trade events.
+
+  Key outputs:
+    rolling_vwap         — volume-weighted average across lookback window
+    rolling_volatility   — std dev of 1-min log returns
+    rolling_volatility_30m — 30-minute window for TP rescaling
+    rolling_volatility_ewma — EWMA σ (RiskMetrics λ=0.94, fast-reacting)
+    avg_bar_volume       — mean bar volume
+    last_trade_time      — updated on EVERY trade
+    current_price        — last traded price
+
+  flush_stale_bar(now): Closes current bar if open > 60s.
+    Critical for low-volume markets to prevent frozen VWAP/σ.
+
+  _BarBuilder: internal, caps at 10,000 ticks per bar to prevent
+  unbounded memory growth. On overflow, keeps most recent half.
+
+Market Discovery (src/data/market_discovery.py):
+  3-tier fetching: CLOB REST → Gamma events → Gamma markets
+  MarketInfo: condition_id, question, yes/no_token_ids, volume, end_date,
+    event_id, liquidity, score, accepting_orders, tags
+
+  Filters: active, not closed, accepting orders, binary (2 tokens),
+  volume ≥ min, liquidity ≥ min, resolution ≥ min_days
+
+Market Lifecycle (src/data/market_lifecycle.py):
+  4-tier state machine: observing → active → draining → emergency
+
+  Market scoring: 7-component weighted composite (0-100):
+    volume(0.20), liquidity(0.20), spread(0.20), time_to_resolve(0.15),
+    fee_zone(0.10), price_range(0.05), trade_freq(0.10)
+    Plus: whale_interest bonus, mti_penalty deduction
+    Hard veto: tail prices (< rpe_tail_veto_threshold)
+
+  Promotion: observing → active after observation_period_minutes IF score OK
+  Demotion: active → draining after demotion_cycles_before_evict low-score cycles
+  Emergency: ghost liquidity → emergency drain → recovery (depth 50% for ghost_recovery_s)
+
+Data Recording (src/backtest/data_recorder.py):
+  Persists raw WebSocket events to JSONL files for later replay.
+  File layout: <data_dir>/raw_ticks/YYYY-MM-DD/<asset_id>.jsonl
+  Zero cached file handles — flush batch opens/appends/closes immediately.
+  50,000 queue, 5s flush interval, 1000 batch size.
+
+
+================================================================================
+SECTION 7: SIGNAL LAYER (Alpha Generation)
+================================================================================
+
+PanicDetector (src/signals/panic_detector.py):
+  PRIMARY SIGNAL — fires on YES price/volume spikes.
+  Returns PanicSignal: market_id, prices, zscore, volume_ratio, no_best_ask, whale
+
+  Gate sequence (all must pass):
+    1. History gate: ≥ 5 bars in aggregator
+    2. VWAP/σ validity: σ > 0, vwap > 0
+    3. Z-score computation: (bar.close - vwap) / σ
+    4. Intra-bar retracement discount: if price already reverting within bar
+       (close in lower half), discounts z-score by 0.70-0.85
+    5. Volume ratio: bar.volume / avg_bar_volume
+    6. Z-score gate: zscore ≥ zscore_threshold
+    7. Volume ratio gate: v_ratio ≥ volume_ratio_threshold
+    8. NO discount check: no_best_ask < no_vwap × no_discount_factor
+       (NO must actually be discounted vs its VWAP)
+    9. Trend guard: suppress if YES has moved ≥ trend_guard_pct over
+       trend_guard_bars (regime shift, not panic)
+
+MeanReversionDrift (src/signals/drift_signal.py):
+  V3 SIGNAL — captures slow-bleed displacement in low-vol regimes.
+  Intentionally orthogonal to PanicDetector. Only fires when panic is SILENT.
+  Returns DriftSignal: displacement, score, direction, ewma_vol
+
+  Gate sequence (all must pass):
+    1. Regime: regime_is_mean_revert must be True
+    2. L2 reliability: l2_reliable must be True
+    3. History: ≥ lookback_bars in NO aggregator
+    4. EWMA vol ceiling: vol > 0 AND vol < vol_ceiling (low-vol only)
+    5. No high-volume bars: all bars in window have vol/avg ≤ 1.5
+       (ensures uncorrelated with PanicDetector)
+    6. Displacement threshold: |displacement| ≥ z_threshold
+
+  Displacement: (current_price - vwap) / sigma
+  Direction: negative → "BUY_NO" (NO is cheap), positive → "SELL_NO"
+  Score: min(1.0, |displacement| / (2 × z_threshold)), saturates at 2x
+
+EdgeFilter / EQS (src/signals/edge_filter.py):
+  PRE-TRADE QUALITY GATE — geometric mean of 4 normalised factors:
+
+  EQS = 100 × R^0.35 × F^0.30 × T^0.20 × S^0.15
+
+  Where:
+    R = regime_quality = binary_entropy(entry_price)
+        Markets near 50/50 → max uncertainty → noise → mean-revertible
+    F = fee_efficiency = max(floor, 1 - fee_cents/gross_cents)
+        floor = 0.10 prevents fee from zeroing entire geometric mean
+    T = tick_viability = min(1.0, discretised_net_cents / 3.0)
+        How many 1¢ ticks the expected move spans on Polymarket grid
+    S = signal_quality:
+        Panic: 0.5 + 0.35(1-exp(-0.5·z_excess)) + 0.20·min(v_excess, 2.0)
+        Model: clamp(confidence, 0.1, 1.0)
+        Whale bonus: +0.15
+
+  CRITICAL PROPERTY: geometric mean → any factor at zero zeros entire score.
+
+  Regime-adaptive threshold (OE-6):
+    When vol is available: ratio = ewma_vol / eqs_vol_ref
+    adjustment = clamp(1 - ratio, -0.25, +0.25)
+    threshold *= (1 + adjustment)
+    → High vol lowers threshold, low vol raises it
+
+  ConfluenceContext: whale_strong_confluence, spread_compressed, l2_reliable,
+    regime_mean_revert — 4 binary factors
+
+  compute_confluence_discount(ctx, base_threshold):
+    1. HARD GATE: if !l2_reliable → return base (no discounts)
+    2. Floor: maker_routing_active → 40.0, else → 35.0 (Flaw 1)
+    3. Accumulate discounts for whale (4.0), spread (4.0), l2 (0.0), regime (0.0)
+       Regime suppressed for drift signals (Flaw 2)
+    4. Need ≥ confluence_min_factors active to apply
+    5. Result: max(floor, base - sum(discounts))
+
+RegimeDetector (src/signals/regime_detector.py):
+  Per-market HMM-lite two-state model: MEAN_REVERT vs TRENDING
+  Score ∈ [0, 1], higher = more mean-revertible
+  is_mean_revert = score ≥ 0.40
+
+  Three features combined via geometric mean:
+    autocorrelation: lag-1 ACF mapped through sigmoid(-ac1 × 3)
+      ac1 = -1 → 1.0 (strong MR), ac1 = +1 → 0.0 (trending)
+    vol_ratio: ewma_vol / equal_weight_vol, sigmoid-mapped
+      ratio > 2 → trending, ratio < 0.5 → calm/MR
+    persistence: fraction of same-sign returns, sigmoid-mapped
+      ~0.5 random → MR friendly, > 0.7 → trending
+
+  Score smoothed via EWMA: score = λ·score + (1-λ)·raw
+
+WhaleMonitor (src/signals/whale_monitor.py):
+  Polls Polygonscan for CTF ERC-1155 transfers by known whale wallets.
+  10 default wallets (Theo, PredictionKing, PolyWhale, vitalik.eth, GCR, etc.)
+
+  Adaptive polling: z-score > threshold → 2s, otherwise → 15-30s baseline
+  Wallet cluster detection: groups wallets funded from same address
+  O(1) tx hash dedup via _recent_tx_hashes set
+
+  Public API:
+    has_confluence(no_token, lookback) → any whale bought NO
+    has_strong_confluence(no_token, lookback, min_wallets=2) → ≥2 entities
+    has_whale_sells(token, lookback) → exit activity warning
+
+AdverseSelectionGuard (src/signals/adverse_selection_guard.py):
+  DEFENSIVE FAST-KILL — 4 microstructure signals, any 2 fire = kill all orders
+
+  Signal 1: Cross-market flow coherence (MTI ≥ 0.85 on ≥ 3 markets)
+  Signal 2: Book depth evaporation (75% drop near mid in 2s)
+  Signal 3: Spread blow-out (4× rolling average spread)
+  Signal 4: Velocity anomaly (5× trade arrival rate spike)
+
+  Confirmation: trigger must persist 4 cycles (200ms at 50ms polling)
+  Kill: clears fast_kill_event → pauses all chasers → cancels all orders
+  Outcome check: 60s later, compares mid to kill-time snapshot (TP/FP logging)
+
+CrossMarketSignalGenerator (src/signals/cross_market.py):
+  SI-3 — correlated pairs stat-arb. Shadow mode by default.
+  Requires ρ ≥ 0.50, z-score ≥ 2.0 of return spread vs EWMA variance.
+
+IcebergDetector (src/signals/iceberg_detector.py):
+  SI-2 — L2 refill pattern detection. Tracks level consumption → reappearance
+  at same price with similar size. ≥3 refills within 5s window = iceberg.
+
+RPE (src/signals/resolution_probability.py):
+  Pillar 14 — model-based alpha.
+
+  CryptoPriceModel: log-normal Black-Scholes for "Will BTC exceed $X" markets
+    P(S_T > K) = Φ(d2), d2 = (ln(S/K) + (0 − σ²/2)T) / (σ√T)
+    Risk-neutral drift (μ=0) — prediction markets are risk-neutral
+    Adaptive σ via EWMA of log-return² from spot feed
+
+  GenericBayesianModel: Beta-Binomial model for non-crypto markets
+    NOW ACTIVE — Dynamic Prior Generation Engine (DPGE) replaces static Beta(2,2)
+
+    5-step estimate() flow:
+      1. Tag prior — TagPriorRegistry.get_prior(tags) → (α₀, β₀, label)
+         Falls back to prior_k market-anchored prior when dynamic priors disabled
+      2. Time kernel — w_prior = sigmoid(γ × (t − t_half))
+         t = days_remaining / total_duration, γ=8.0, t_half=0.15
+         High early in market life, decays steeply near expiry
+      3. L2 pseudo-counts — Δ = κ_eff × clamp(ln(book_depth_ratio), −2, 2)
+         κ_eff = rpe_l2_kappa × w_prior; only applied when l2_reliable=True
+         Buy-side pressure (ratio>1) → additive YES pseudo-counts; sell-side → NO
+      4. Bayesian update — posterior = (α₀ + obs × w_price + Δ) / (α₀ + β₀ + n_eff + |Δ|)
+         n_eff = obs_weight × w_obs / (w_prior + ε), capped at 200
+         w_obs = 1 − w_prior (complementary weights sum to 1)
+      5. Confidence — (α_post + β_post) / (α₀ + β₀ + n_eff + |Δ| + 1) × w_prior
+         Near-expiry suppression: w_prior → 0 → confidence → 0 (terminal noise filter)
+
+    New metadata keys: prior_source, w_prior, n_eff, kappa_eff, l2_active,
+      dynamic_prior_enabled, alpha0, beta0
+
+  TagPriorRegistry (src/signals/tag_prior_registry.py):
+    Stateless router — maps Gamma API tag strings → Beta(α, β) parameters
+    Priority-ordered regex table, first-match-wins:
+      crypto / bitcoin / ethereum → Beta(2.0, 2.0)  (symmetric, max entropy)
+      election / politics / vote  → Beta(3.0, 2.0)  (YES-biased empirical)
+      lawsuit / court / legal     → Beta(2.0, 3.0)  (NO-biased empirical)
+      nba / nfl / soccer / sports → Beta(2.5, 2.5)  (slightly informative)
+      economy / cpi / fed         → Beta(2.5, 2.0)  (mild YES lean)
+      war / conflict / geopolit.  → Beta(2.0, 2.5)  (mild NO lean)
+      celebrity / pop culture     → Beta(2.0, 2.0)  (symmetric)
+      science / tech / nasa       → Beta(2.0, 2.0)  (symmetric)
+      weather / hurricane         → Beta(2.2, 2.0)  (slight YES lean)
+      default (no match)          → Beta(2.0, 3.0)  (generic NO-biased)
+
+  Model-probe routing (bot.py + position_manager.py):
+    When GenericBayesianModel fires AND PanicDetector is silent AND
+    |prob − market_price| ≥ rpe_probe_divergence_min AND dynamic_prior_enabled:
+    → retry open_rpe_position() with force_probe=True metadata flag
+    → position_manager overrides sizing to probe_kelly_fraction × Kelly,
+      capped at probe_max_usd, marks pos.is_probe=True for graduation path
+
+  RPECalibrationTracker:
+    Extended with per-signal metadata fields: prior_source, l2_active, theta_w_prior
+    New method: compute_per_tag_brier() → dict mapping prior_source → Brier/accuracy
+    calibration_summary() now includes per_tag_brier breakdown key
+
+
+================================================================================
+SECTION 8: TRADING LAYER (Execution & Risk)
+================================================================================
+
+PositionManager (src/trading/position_manager.py, ~1500 lines):
+  THE CENTRAL EXECUTION HUB — manages Position lifecycle from entry to exit.
+
+  Position states: ENTRY_PENDING → ENTRY_FILLED → EXIT_PENDING → CLOSED
+                                                                → CANCELLED
+
+  Position dataclass fields (27+): id, market_id, no_asset_id, event_id,
+    state, entry/exit orders, prices, sizes, times, target_price, tp_result,
+    signal, sizing/kelly results, fee info, chaser tasks, pnl_cents,
+    is_probe, sl_trigger_cents, trade_side ("YES"/"NO"), trade_asset_id
+
+  open_position() — THE MAIN ENTRY PATH:
+    1. Acquire _entry_lock (serialized entries)
+    2. _check_risk_gates() — returns (passed, max_trade, var_was_bisected):
+       a. Circuit breaker (daily loss limit)
+       b. Daily loss limit check
+       c. Max drawdown check
+       d. Max open positions
+       e. Per-market/per-event concentration
+       f. Total exposure cap
+       g. Capital allocation
+       h. PCE VaR (soft-cap bisection or hard block)
+          var_was_bisected = True when bisection iterations > 0
+    3. Entry price = no_best_ask - 0.01
+    4. Determine execution mode: maker routing + adverse selection monitor check
+       If maker monitor says market not allowed → auto-downgrade to taker
+    5. EQS scoring with:
+       - V1 maker discount (threshold × 0.85)
+       - V2 confluence discount (per active factors)
+       - Regime-adaptive vol adjustment
+    6. V4 probe path: if EQS fails but score ≥ probe_eqs_floor → probe entry
+    7. Depth-aware sizing (scans L2 within impact_depth_cents)
+    8. Kelly sizing (cold-start blend if < 20 trades)
+    9. Probe caps: max(1.0, min(probe_kelly_fraction × normal, probe_max_usd / price))
+    10. Spread sizing multiplier (for spread-compression signals: 0.50)
+    11. PCE concentration haircut — SKIPPED when var_was_bisected=True
+        (anti-double-penalization: bisection already reduced sizing)
+    12. Deployment guard cap (PENNY_LIVE → $1)
+    13. Dollar-risk cap: max_loss_per_trade_cents / (entry × 100)
+    14. TP viability check (compute_take_profit)
+    15. Minimum viable edge gate (margin after fees)
+    16. Fee-adaptive stop-loss
+    17. Place limit BUY order
+    18. Return Position
+
+  scale_probe_to_full(pos) — V4 Probe Harvesting:
+    6 guards: still open + profitable, idempotent, not too late (< 60%),
+    increment ≥ $0.50, PCE VaR bisection (partial scale-up), guard allows
+    Guard 5 uses compute_var_sizing_cap() (bisection) — NOT binary reject.
+    If VaR budget allows partial but not full increment, the increment is
+    capped to the bisection result instead of being entirely rejected.
+    Prices scale-in at min(mid, entry + 0.01)
+    Stealth routing: if _stealth is not None AND increment ≥ stealth_min_size_usd
+      → delegates to StealthExecutor.place_stealth_order() for sliced execution
+      Passes live mid-price callback so StealthExecutor can detect drift abandonment
+      Falls back to single monolithic limit order when stealth unavailable or too small
+
+StealthExecutor (src/trading/stealth_executor.py):
+  SI-4 — time-sliced order splitting to reduce market footprint.
+  Wraps OrderExecutor. Called by PositionManager._stealth for probe scale-ups.
+
+  place_stealth_order(market_id, asset_id, side, price, total_size, get_mid_fn):
+    Computes per-slice sizes with ±stealth_jitter_pct randomisation
+    Between slices: sleeps stealth_delay_min_ms to stealth_delay_max_ms
+
+  Two abandonment guards (evaluated between every pair of slices):
+    1. Fill-pct guard: if already_filled / total ≥ stealth_abandon_fill_pct
+       → stop slicing immediately (good-enough fill, avoid over-execution)
+       Checked BEFORE inter-slice sleep.
+    2. Mid-price drift guard: if get_mid_fn supplied and mid has drifted
+       > stealth_abandon_drift_cents adversely since slice-1 fill
+       → abandon remaining slices (market moved against us)
+       Checked AFTER inter-slice sleep.
+
+OrderExecutor (src/trading/executor.py):
+  Paper mode: records locally, simulates fills with slippage
+  Live mode: py-clob-client → create_order + post_order
+  POST_ONLY rejection detection: status="rejected" → CANCELLED + "would_cross"
+  OrderStatusPoller: polls CLOB REST for live-order updates (2s interval)
+
+OrderChaser (src/trading/chaser.py):
+  Passive-aggressive POST_ONLY repricing loop.
+
+  Flow: place at best_bid → sleep 250ms → check fill → check BBO moved →
+    cancel-and-replace at new best_bid → repeat
+  
+  Escalation: after chaser_max_rejections POST_ONLY rejections → crosses spread
+    (places marketable limit at best_ask + 1 tick, checks alpha viability first)
+  
+  fast_kill_event: asyncio.Event that pauses all chasers when adverse selection
+    guard fires. Chasers block on _wait_fast_kill() until event is set.
+
+  Urgent mode: for panic signals, max_rejections=0 → escalates immediately
+
+  SI-2 Iceberg Pegging (iceberg_detector param):
+    _optimal_quote(): queries IcebergDetector.strongest_iceberg(our_side)
+    If confidence ≥ iceberg_peg_min_confidence → peg quote to iceberg price
+    Clamp to BBO: BUY pegs ≤ best_bid, SELL pegs ≥ best_ask
+    Falls back to BBO when no qualifying iceberg is detected
+
+  Pillar 7 Toxicity Guard (adverse_monitor param):
+    _should_abort_toxicity(): snapshots p-value at chaser construction
+    Dual condition: p < chaser_toxicity_p_value_ceil AND p < initial_p × 0.50
+    (requires BOTH ceiling breach AND 50% relative deterioration — prevents
+     false positives from markets that start with naturally low p-values)
+    Checked in _chase_loop() before each requote AND in _escalate() before crossing
+
+Kelly Sizer (src/trading/sizer.py):
+  COLD START (< min_kelly_trades = 20):
+    f_cold = cold_start_frac × (min_kelly_trades - total_trades) / min_kelly_trades
+    Negative-EV throttle: if rolling 10-trade expectancy < 0 → 75% reduction
+
+  FULL KELLY:
+    1. Win probability: max(0.01, decayed_wr + 0.15 × signal_score), capped at p_cap
+    2. Edge discount: p_adj = 0.5 + (p_raw - 0.5) × (1 - uncertainty_penalty)
+    3. Payoff ratio: b = |avg_win| / |avg_loss|
+    4. Edge: p_adj × b - (1 - p_adj). If ≤ 0 → reject
+    5. Kelly fraction: f* = edge / b, f_adj = f* × kelly_fraction (quarter Kelly)
+    6. Capital caps: min(f_adj × bankroll, bankroll × max_pct/100, max_trade)
+    7. Depth cap: further limited by available book liquidity
+
+Fee Model (src/trading/fees.py):
+  Polymarket dynamic curve: f(p) = f_max × 4 × p × (1 − p)
+  Peak 1.56% at p=0.50, zero at tails. Maker = always 0 bps.
+
+  compute_net_pnl_cents(entry, exit, size, fee_enabled):
+    PnL = [(exit - entry) - Fee_entry - Fee_exit] × size × 100
+
+  compute_adaptive_stop_loss_cents(sl_base, entry, fee_enabled):
+    SL_trigger = SL_base - roundtrip_fee_cents, floor at 1.0¢
+
+Take Profit (src/trading/take_profit.py):
+  Base model: target = entry + α × (VWAP_no - entry)
+
+  Alpha adjustments (6 factors):
+    1. Volatility (asymmetric): high → +0.04, low → −0.08
+    2. Book depth: deep → +0.03
+    3. Whale confluence: +0.08
+    4. Time decay: < 14d → −0.05
+    5. VWAP proximity: > 10% discount → +0.04, < 2% → −0.05
+    6. Clamp to [alpha_min, alpha_max]
+
+  Fee-floor enforcement: Newton step to widen target if spread < fees
+
+  Dynamic spread rescaling (Pillar 3): σ-proportional TP width adjustment
+
+StopLossMonitor (src/trading/stop_loss.py):
+  EVENT-DRIVEN — fires on BBO change callbacks, no polling loop.
+
+  Fixed stop: unrealised_loss ≥ sl_trigger_cents → force_stop_loss()
+  Trailing stop: activates after profit ≥ be_activation_cents
+    trail_floor = hwm - trailing_offset/100
+    loss = max(trail_loss, entry_loss) — uses worse of both
+
+  V4 probe breakeven: if probe + profitable → fire on_probe_breakeven callback
+    (triggers scale_probe_to_full in PositionManager)
+
+AdverseSelectionMonitor (src/trading/adverse_selection_monitor.py):
+  POST_ONLY fill mark-to-market monitor.
+
+  Records maker fills → marks at T+5, T+15, T+60 via async tick()
+  At T+15: classifies adverse if pnl < -0.20¢ per USD
+  Welch t-test: H₀: μ(PnL_T+15) ≥ 0, one-sided
+  Suspension: exponential backoff 15min → 30min → 60min → ... → 4hr
+
+  Dynamic alpha: α = α_base × (σ/σ_ref)^γ, clamped [0.01, 0.15]
+    High vol → more lenient (larger α, harder to reject H₀)
+    Low vol → stricter (smaller α, easier to suspend)
+
+  Pure-Python stats: _t_cdf_lower_tail uses Lentz continued-fraction
+  for regularised incomplete beta (no scipy/numpy dependency)
+
+PortfolioCorrelationEngine (src/trading/portfolio_correlation.py, ~1400 lines):
+  Pillar 15 — cross-position risk management.  ACTIVE ENFORCEMENT (March 5th).
+
+  CorrelationMatrix: N×N symmetric, Bayesian blend:
+    blended = (prior_weight × structural + overlap_bars × empirical) / (pw + n)
+
+  Structural priors: same_event=0.85, same_tag=0.30, baseline=0.05
+  Near-extreme gate: both prices near 0 or 1 → require 3× min_overlap_bars
+
+  VaR: z × sqrt(w' Σ w), where Σ_ij = σ_i × σ_j × ρ_ij
+  Bisection sizing: binary search for max USD within VaR threshold
+  VaR limit: $35 (calibrated from 3-day shadow data, P95 regime)
+
+  Concentration haircut: exposure-weighted avg ρ with peers → if > 0.65,
+    haircut = max(0.05, 1 - weighted_corr)
+    Anti-double-penalization: haircut is SKIPPED when VaR bisection already
+    reduced sizing (var_was_bisected flag from _check_risk_gates).
+
+  Probe harvest integration: Guard 5 in scale_probe_to_full() uses
+    compute_var_sizing_cap() (bisection) for partial scale-up, NOT
+    check_var_gate() (binary reject).
+
+  Prior validation: validate_structural_priors() runs every 6 hours
+    (12th PCE refresh cycle) — logs per-tier MAE and bias for ongoing
+    calibration monitoring.
+
+
+================================================================================
+SECTION 9: MONITORING LAYER
+================================================================================
+
+TradeStore (src/monitoring/trade_store.py):
+  SQLite with WAL mode, busy_timeout=5s, wal_autocheckpoint=1000
+
+  3 tables:
+    trades          — completed round-trips (27 columns, incl is_probe)
+    live_orders     — crash recovery checkpoint
+    live_positions  — crash recovery checkpoint
+
+  Key methods:
+    record(pos)                    — INSERT OR REPLACE into trades
+    get_stats()                    — aggregates: total, win_rate, expectancy,
+                                     decayed_win_rate (EWMA α=0.10)
+    get_rolling_expectancy(window) — last N trades avg PnL (excludes probes)
+    passes_go_live_criteria()      — ≥20 trades, wr≥55%, positive EV
+    checkpoint_orders/positions()  — crash recovery persistence (5 min)
+    restore_orders/positions()     — crash recovery on startup
+
+TelegramAlerter (src/monitoring/telegram.py):
+  HTML-formatted notifications via Telegram Bot API.
+  Rate limited: 30 messages per 60 seconds, drops excess.
+  Message truncation at 4096 chars.
+  Convenience methods: signal, entry, exit, stats, RPE, PCE, paper summary, kill
+
+
+================================================================================
+SECTION 10: BACKTEST SYSTEM
+================================================================================
+
+Architecture:
+  DataLoader → BacktestEngine → Strategy hooks
+                ├── MatchingEngine (pessimistic CLOB sim)
+                ├── OHLCVAggregators
+                ├── SimClock (patches time.time)
+                └── Telemetry
+
+DataLoader (src/backtest/data_loader.py):
+  Reads JSONL + Parquet files, heapq.merge for cross-file chronological order.
+  MarketEvent: timestamp, event_type, asset_id, data dict
+
+  Event types: l2_delta, l2_snapshot, trade, external_price
+  Handles timestamp normalisation: µs → ms → s
+
+BacktestEngine (src/backtest/engine.py):
+  Synchronous event-driven replay. NOT async.
+
+  Per event:
+    1. Advance SimClock to event timestamp
+    2. Activate pending orders (latency simulation)
+    3. Route by event type → book update, trade, or external price
+    4. Strategy callbacks: on_book_update, on_trade, on_bar, on_fill
+
+  Order processing:
+    strategy.engine.submit_order() → MatchingEngine
+    Fills: BUY → deduct cash + add shares, SELL → add cash + remove shares
+
+MatchingEngine (src/backtest/matching_engine.py, ~750 lines):
+  ELIMINATES THREE DEADLY SINS OF NAÏVE BACKTESTING:
+    1. Look-ahead bias: orders invisible until submit_time + latency_ms
+    2. Queue-position optimism: maker orders track queue_ahead, fill only
+       after sufficient taker volume drains the queue (FIFO)
+    3. Latency blindness: configurable latency penalty (default 150ms)
+
+  Book: SortedDict from sortedcontainers (bids negated for desc order)
+  Taker execution: walks opposite side level-by-level (VWAP slippage)
+  Maker resting: queue_ahead = depth at price level on submission
+  Queue drain: trade at compatible price → decrement queue, fill when exhausted
+  Maker fills are fee-free (consistent with Polymarket)
+
+BotReplayAdapter (src/backtest/strategy.py):
+  Production-parity adapter. Runs the REAL PanicDetector with ALL gates:
+    1. Near-resolved price guard (≥0.97 / ≤0.03)
+    2. Tradeable price band
+    3. Signal cooldown
+    4. Max open positions
+    5. NO best ask validity
+    6. PanicDetector evaluation (all 9 gates)
+    7. Spread gate (min_spread_cents)
+    8. EQS gate (compute_edge_score with maker/taker mode)
+    9. Kelly sizing
+    10. PCE VaR gate (optional)
+
+Telemetry (src/backtest/telemetry.py):
+  BacktestMetrics: total_pnl, fees, fills, slippage, max_drawdown,
+    sharpe_ratio, sortino_ratio, win_rate, profit_factor, equity_curve
+
+  Annualisation: sqrt(525,960) for minute-level returns
+  Drawdown: numpy maximum.accumulate for HWM
+
+
+================================================================================
+SECTION 11: WALK-FORWARD OPTIMIZATION (WFO)
+================================================================================
+
+File: src/backtest/wfo_optimizer.py (~1030 lines)
+
+Time-series cross-validation with Optuna hyperparameter optimisation.
+
+WfoConfig: train_days=30, test_days=7, step_days=7, embargo_days=1,
+  n_trials=100, max_workers=cpu_count-1
+
+17-parameter search space:
+  Core: zscore_threshold, spread_compression_pct, volume_ratio_threshold
+  Risk: stop_loss_cents, trailing_stop, kelly_fraction, max_impact_pct
+  TP: alpha_default, tp_vol_sensitivity
+  Edge: min_edge_score
+  RPE: confidence_threshold, bayesian_obs_weight, crypto_vol_default
+  PCE: max_portfolio_var, haircut_threshold, prior_weight, holding_period
+
+Composite objective:
+  Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
+  Returns -inf when fills < min_trades
+
+Fold generation: rolling/anchored IS window with embargo gap
+Warm-start: seeds from previous fold's best params
+Parallel: ProcessPoolExecutor with shared Optuna study
+
+Overfitting diagnostics:
+  avg_sharpe_decay_pct: (OOS - IS) / |IS| × 100
+  overfit_probability: fraction of folds with OOS Sharpe < 0
+  unstable_params: CV > 0.50 across folds
+
+Stitched equity curve: OOS curves concatenated, rebased at fold boundaries
+
+
+================================================================================
+SECTION 12: SCRIPTS & TOOLING
+================================================================================
+
+scripts/confluence_sensitivity.py:
+  Bootstrap win-rate analysis for 4 confluence factors.
+  B=2000 replicates, one-sided binomial test H₀: w_on ≤ w_off, α=0.10
+  Sobol indices via SALib Saltelli sampling for 17 parameters
+  CLI: python scripts/confluence_sensitivity.py --db-path trades.db --sobol
+
+scripts/backtest_comparison.py:
+  PRE vs POST parameter comparison across 5 markets × 3 days.
+  Side-by-side: PnL, drawdown, fills, win rate, risk-adjusted ratio
+
+scripts/run_diagnostics.py:      System health diagnostics
+scripts/check_db.py:            SQLite inspection
+scripts/explore_data.py:         Data exploration
+scripts/extract_signals.py:      Signal extraction from logs
+scripts/scan_events.py:          Event scanning
+scripts/validate_pce_priors.py:  PCE structural prior validation
+scripts/verify_launch.py:        Pre-launch checks
+scripts/vps_setup.sh:            VPS provisioning
+scripts/decrypt_secrets.sh:      Secret decryption
+scripts/watchdog.sh:             Process watchdog
+
+
+================================================================================
+SECTION 13: TEST INFRASTRUCTURE
+================================================================================
+
+Framework: pytest 8.0+, pytest-asyncio 0.23+ (asyncio_mode = "auto")
+Total: ~1000+ tests across ~40 test files
+
+conftest.py fixtures (all function-scoped):
+  paper_executor  — OrderExecutor(paper_mode=True)
+  yes_aggregator  — OHLCVAggregator("YES_TOKEN", lookback=10)
+  no_aggregator   — OHLCVAggregator("NO_TOKEN", lookback=10)
+  trade_store     — TradeStore in tmp_path
+  detector        — PanicDetector(z=2.0, v=3.0)
+
+Environment hardening: PAPER_MODE=true, DEPLOYMENT_ENV=PAPER before all tests
+
+helpers.py factory functions:
+  make_trade(price, size, ts)     — builds TradeEvent
+  build_bar_history(agg, prices)  — feeds prices to force bar closures
+  make_position(id, entry, exit)  — fully closed Position with signals
+
+Test patterns:
+  - Class-per-feature organisation (pytest -k filtering)
+  - Hand-rolled fakes over MagicMock (FakeSnap, FakeBook, AlwaysFireSignal)
+  - Comparative assertions (maker.score > taker.score) for tuning resilience
+  - Config mutation: object.__setattr__(settings.strategy, field, val) + try/finally
+  - Direct private-function testing for critical internals (_signed_pnl, _t_cdf)
+  - Local module-level factories for specialised test helpers
+  - Async tests automatic with asyncio_mode="auto"
+
+Key test files:
+  test_dynamic_prior_engine.py   — DPGE (49 tests: tag routing, L2 imbalance,
+                                     time-decay, per-tag Brier, probe routing)
+  test_volume_expansion.py       — V1-V4 features (29 tests → updated to match POR)
+  test_adverse_selection_monitor.py — Welch t-test, dynamic α (10 new tests)
+  test_alpha_evolution.py        — Alpha evolution features (23 tests)
+  test_signal_framework.py       — Multi-signal framework
+  test_edge_filter.py            — EQS scoring
+  test_fees.py                   — Fee curve
+  test_kelly_sizer.py            — Kelly sizing
+  test_stop_loss.py              — Stop loss logic
+  test_take_profit.py            — TP computation
+  test_orderbook.py              — Orderbook tracker
+  test_l2_book.py                — L2 book reconstruction
+  test_regime_detector.py        — Regime classifier
+  test_risk_controls.py          — Risk gates
+  test_system.py                 — End-to-end integration
+  test_e2e_integration.py        — Full E2E with mocked WS
+  test_backtest/                 — Backtest engine tests
+
+
+================================================================================
+SECTION 14: KEY FORMULAS & ALGORITHMS
+================================================================================
+
+EQS (Edge Quality Score):
+  EQS = 100 × R^0.35 × F^0.30 × T^0.20 × S^0.15
+  R = binary_entropy(p) = -p·log₂(p) - (1-p)·log₂(1-p)
+  F = max(0.10, 1 - fee_cents/gross_cents)
+  T = min(1.0, discretised_net_cents / 3.0)
+  S = 0.5 + 0.35(1-exp(-0.5·z_excess)) + 0.20·min(v_excess, 2.0)
+
+Kelly Criterion:
+  f* = (p·b - q) / b, where b = |avg_win/avg_loss|, q = 1-p
+  f_adj = f* × 0.25 (quarter Kelly)
+
+Dynamic Fee Curve:
+  f(p) = f_max × 4 × p × (1 − p), f_max = 0.0156
+
+Take-Profit:
+  target = entry + α × (VWAP - entry)
+  α adjusted by: vol(±0.04-0.08), depth(+0.03), whale(+0.08),
+    time(-0.05), VWAP proximity(±0.04-0.05)
+
+Dynamic Alpha (Adverse Selection):
+  α_dynamic = α_base × (σ_rolling / σ_ref)^γ, clamped [0.01, 0.15]
+
+Welch t-test (one-sided):
+  t = x̄ / (s / √n), H₀: μ ≥ 0, H₁: μ < 0
+  Pure-Python CDF via Lentz continued-fraction (no scipy)
+
+VaR (Portfolio):
+  VaR = z × √(w' Σ w), Σ_ij = σ_i × σ_j × ρ_ij, z = 1.645 (95%)
+
+Regime Score:
+  raw = (autocorr × vol_ratio × persistence)^(1/3)  (geometric mean)
+  score = λ·score + (1-λ)·raw  (EWMA smoothing)
+
+EWMA Volatility:
+  σ²_t = λ·σ²_(t-1) + (1-λ)·r²_t, λ = 0.94 (RiskMetrics)
+
+Crypto RPE (Black-Scholes):
+  P(S_T > K) = Φ(d₂)
+  d₂ = (ln(S/K) + (0 - σ²/2)T) / (σ√T)  [risk-neutral, μ=0]
+
+DPGE (Dynamic Prior Generation Engine) — GenericBayesianModel:
+  Time-decay kernel (sigmoid):
+    t = days_remaining / total_duration_days
+    w_prior(t) = 1 / (1 + exp(−γ × (t − t_half))),  γ=8.0, t_half=0.15
+    → near t=0 (at expiry): w_prior → 0  (prior irrelevant, suppress noise)
+    → near t=1 (new market): w_prior → 1  (prior dominates sparse data)
+
+  L2 imbalance pseudo-counts:
+    raw = clamp(ln(book_depth_ratio), −2.0, +2.0)
+    κ_eff = rpe_l2_kappa × w_prior
+    Δ_yes = max(0, raw × κ_eff),  Δ_no = max(0, −raw × κ_eff)
+
+  Bayesian posterior (Beta-Binomial conjugate update):
+    n_eff = min(200, obs_weight × w_obs / (w_prior + ε)),  w_obs = 1 − w_prior
+    α_post = α₀ + market_price × n_eff + Δ_yes
+    β_post = β₀ + (1 − market_price) × n_eff + Δ_no
+    probability = α_post / (α_post + β_post)
+
+  Confidence (near-expiry suppression):
+    concentration = α_post + β_post
+    confidence = (concentration / (α₀ + β₀ + n_eff + Δ_total + 1)) × w_prior
+
+
+================================================================================
+SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
+================================================================================
+
+1. FROZEN DATACLASS CONFIGS
+   StrategyParams is frozen. Tests override via object.__setattr__ + try/finally.
+   Never modify settings.strategy directly in production code.
+
+2. FIRE-AND-FORGET PATTERN
+   _safe_fire_and_forget(coro) wraps in asyncio.ensure_future with
+   _safe_task_done_callback to log any unhandled exceptions.
+   Used for Telegram notifications (off the hot path).
+
+3. DUAL BOOK SYSTEMS
+   L2OrderBook (full depth, SortedDict) vs OrderbookTracker (top-of-book).
+   L2OrderBookAdapter bridges L2 behind Tracker interface.
+   Both coexist — some code paths use L2, others use Tracker.
+
+4. FAST_KILL_EVENT
+   asyncio.Event shared between AdverseSelectionGuard and all OrderChasers.
+   Cleared = pauses all chasers. Set = resume.
+   Critical path: 50ms adverse detection → clear event → cancel orders.
+
+5. ENTRY LOCK (asyncio.Lock)
+   PositionManager._entry_lock serializes all position entries.
+   Prevents per-event burst from opening multiple positions simultaneously.
+
+6. NEGATED BIDS IN SORTEDDICT
+   Both L2OrderBook and MatchingEngine store bids with negated prices:
+   _bids[−price] = size. This makes SortedDict ascending iteration
+   yield prices in descending order (best bid first).
+
+7. SEQUENCE GAP TRACKING
+   L2OrderBook.desync_total is NEVER reset (cumulative lifetime counter).
+   desync_count resets on each snapshot. seq_gap_rate = total / delta_count.
+   is_reliable = gap_rate < 2%. This drives the L2 hard gate decision.
+
+8. MAKER FEE = 0
+   Polymarket charges 0 bps for maker (POST_ONLY) orders.
+   This is why V1 maker routing eliminates the fee_efficiency factor.
+   compute_edge_score with execution_mode="maker" → entry/exit fees = 0.
+
+9. ZERO-ALLOCATION DEPTH QUERY
+   L2OrderBook.depth_near_mid_usd iterates SortedDict keys directly.
+   No Level objects allocated. Designed for 50ms adverse selection loop.
+
+10. BAR BUILDER TRUNCATION
+    OHLCVAggregator._BarBuilder caps at 10,000 ticks per bar.
+    On overflow, keeps most recent half but preserves _true_open and
+    _total_volume. Prevents unbounded memory in high-frequency markets.
+
+11. ATOMIC FILE WRITES
+    system_health.json written via tempfile → os.replace() in a thread.
+    CorrelationMatrix.save() uses same pattern.
+
+12. CRASH RECOVERY
+    Every 5 minutes: checkpoint_orders + checkpoint_positions to SQLite.
+    On restart: restore_orders + restore_positions.
+    Clean shutdown: clear_live_state().
+
+13. PROBE EXCLUSION FROM EXPECTANCY
+    TradeStore.get_rolling_expectancy filters WHERE is_probe=0.
+    Prevents micro-sized probes from polluting the Kelly estimator.
+
+14. BOOTSTRAP FACTOR AUDIT RESULTS
+    Whale (p=0.041): justified, weight 5→4
+    Spread (p=0.023): justified, unchanged at 4
+    L2 (p=0.38): NOT justified, zeroed → hard gate
+    Regime (p=0.52): NOT justified, zeroed
+    These p-values from scripts/confluence_sensitivity.py with B=2000.
+
+15. THREE FLAW GUARDS
+    Flaw 1: Maker + confluence amplification → combined floor 40.0
+    Flaw 2: Drift + regime double-count → suppress regime for drift
+    Flaw 3: Stale whale in probes → suppress confluence for probes
+
+
+================================================================================
+SECTION 16: PILLAR SYSTEM (Feature Numbering)
+================================================================================
+
+Historical feature numbering used in code comments and delta-file:
+
+  Pillar 1:  Passive-Aggressive Chasing (POST_ONLY + escalation)
+  Pillar 2:  Liquidity-Sensing Sizing (depth-aware)
+  Pillar 3:  Adaptive TP Rescaling (vol-proportional)
+  Pillar 4:  Stale-Data Kill-Switch (LatencyGuard)
+  Pillar 5:  Anti-Adverse-Selection (Fast-Kill, 4-signal composite)
+  Pillar 6:  Dynamic Fee-Curve Integration
+  Pillar 7:  Hybrid-Aggressive Chaser Escalation
+  Pillar 8:  Clock-Skew & Stale Book Safety (Heartbeat)
+  Pillar 9:  Toxic Flow Avoidance / Ghost Liquidity
+  Pillar 10: Order Status Polling
+  Pillar 11: Active Stop-Loss Engine
+  Pillar 12: Multi-Signal Framework
+  Pillar 13: Kelly Sizing
+  Pillar 14: Resolution Probability Engine (RPE)
+  Pillar 15: Portfolio Correlation Engine (PCE) — ACTIVE
+
+
+================================================================================
+SECTION 17: VOLUME EXPANSION ARCHITECTURE (V1-V4)
+================================================================================
+
+Four vectors designed to expand trading volume while maintaining risk controls:
+
+V1 — MAKER ROUTING:
+  Config: maker_routing_enabled=True, maker_eqs_discount=0.85
+  Effect: POST_ONLY orders → 0 bps fees → 15% lower EQS threshold
+  Implementation: execution_mode="maker" in compute_edge_score
+
+V2 — MULTI-FACTOR CONFLUENCE:
+  Config: 6 fields (floor, min_factors, 4 discount weights)
+  Effect: Multiple confirming signals lower EQS threshold
+  Factors: whale (4.0), spread (4.0), l2 (0.0 = gate only), regime (0.0)
+  Gate: ≥ 2 factors must be active (confluence_min_factors)
+  Implementation: compute_confluence_discount() in edge_filter.py
+
+V3 — DRIFT SIGNAL:
+  Config: 5 fields (enabled, lookback, threshold, vol_ceiling, cooldown)
+  Effect: Captures slow-bleed displacement in quiet markets
+  Gate: 6 sequential gates (regime, L2, history, vol, no high-vol bars, displacement)
+  Implementation: MeanReversionDrift class in drift_signal.py
+
+V4 — PROBE SIZING:
+  Config: 4 fields (enabled, eqs_floor, kelly_fraction, max_usd)
+  Effect: Micro-sized entries for sub-threshold signals → scale up if profitable
+  Gate: EQS fails normal threshold but score ≥ probe_eqs_floor
+  Harvesting: scale_probe_to_full() with 6 guards
+    Guard 5 uses bisection (compute_var_sizing_cap) for graceful partial
+    scale-up instead of binary reject.  If VaR budget allows partial but
+    not full increment, the increment is capped rather than blocked.
+  Stealth routing (SI-4): when _stealth is wired in, scale-up is delegated to
+    StealthExecutor.place_stealth_order() for time-sliced execution with
+    abandonment guards (drift + fill-pct). Monolithic fallback applies when
+    stealth disabled or increment below stealth_min_size_usd.
+  Stop-loss: on_probe_breakeven callback when profitable
+
+FLAW GUARDS (discovered and patched post-V1-V4):
+  Flaw 1: Maker + all-4 confluence could reduce EQS to ~20-25
+    Fix: confluence_maker_combined_floor=40.0
+  Flaw 2: DriftSignal Gate 1 already requires regime_mean_revert
+    Fix: drift_suppress_regime_discount=True (no double-counting)
+  Flaw 3: Whale data up to 600s stale could inflate probe entries
+    Fix: probe_suppress_confluence=True
+
+
+================================================================================
+SECTION 18: SIGNAL INTELLIGENCE (SI-1 through SI-4)
+================================================================================
+
+SI-1 — REGIME DETECTOR:
+  Per-market HMM-lite classifier. Three features via geometric mean.
+  Used as: DriftSignal Gate 1, EQS regime quality factor, confluence signal
+  Config: regime_enabled=True, regime_threshold=0.40
+
+SI-2 — ICEBERG DETECTOR (WEAPONIZED):
+  L2 refill pattern detection via on_level_change callback.
+  ≥3 refills at same price within 5s, size within ±30% tolerance.
+  Intelligence now consumed by OrderChaser via iceberg_detector param.
+  _optimal_quote() pegs behind the strongest qualifying iceberg (confidence
+    ≥ iceberg_peg_min_confidence=0.50), clamped to BBO so POST_ONLY always valid.
+  Config: iceberg_enabled=True, iceberg_min_refills=3, iceberg_peg_min_confidence=0.50
+
+SI-3 — CROSS-MARKET SIGNAL:
+  Correlated pairs stat-arb. Shadow mode by default.
+  Requires ρ ≥ 0.50, z-score ≥ 2.0.
+  Uses PCE correlation matrix for pair identification.
+  Config: cross_mkt_enabled=True, cross_mkt_shadow=True
+
+SI-4 — STEALTH EXECUTION (ACTIVE):
+  Time-sliced order splitting for probe scale-ups. Active by default.
+  Activated for PositionManager.scale_probe_to_full() when increment ≥ $0.50.
+  ±15% size jitter per slice. Min slice $0.10. 200-1500ms inter-slice delays.
+  Two abandonment guards between slices:
+    fill-pct abort (≥75% filled → stop, lock in partial gain)
+    mid-price drift abort (>2¢ adverse drift → stop, market moved against us)
+  Config: stealth_enabled=True, stealth_abandon_drift_cents=2.0,
+    stealth_abandon_fill_pct=0.75
+
+
+================================================================================
+SECTION 19: CROSS-MODULE DEPENDENCY GRAPH
+================================================================================
+
+bot.py (orchestrator)
+  ├── core/config.py (settings singleton — referenced by ALL modules)
+  ├── core/guard.py (DeploymentGuard → used by PositionManager)
+  ├── core/heartbeat.py (BookHeartbeat → uses LatencyGuard, OrderbookTrackers)
+  ├── core/latency_guard.py (LatencyGuard → used by bot + chaser)
+  ├── core/logger.py (structlog → used by ALL modules)
+  │
+  ├── data/websocket_client.py (MarketWebSocket → feeds trade_queue, book_queue)
+  ├── data/l2_websocket.py (L2WebSocket → feeds L2OrderBooks)
+  ├── data/l2_book.py (L2OrderBook → feeds OrderbookTracker via Adapter)
+  ├── data/orderbook.py (OrderbookTracker, L2OrderBookAdapter)
+  ├── data/ohlcv.py (OHLCVAggregator → feeds PanicDetector, RegimeDetector, DriftSignal)
+  ├── data/market_discovery.py (MarketInfo → feeds lifecycle, scoring)
+  ├── data/market_lifecycle.py (state machine → manages market tiers)
+  ├── data/market_scorer.py (scoring → drives lifecycle decisions)
+  │
+  ├── signals/panic_detector.py (PanicSignal → triggers open_position)
+  ├── signals/drift_signal.py (DriftSignal → synthesized as PanicSignal → open_position)
+  ├── signals/edge_filter.py (EQS → gates ALL entries)
+  ├── signals/adverse_selection_guard.py (fast-kill → cancels orders)
+  ├── signals/regime_detector.py (regime → DriftSignal gate, EQS factor, confluence)
+  ├── signals/whale_monitor.py (confluence → EQS bonus, TP boost)
+  ├── signals/cross_market.py (shadow signals → future alpha)
+  ├── signals/iceberg_detector.py (L2 intelligence → OrderChaser iceberg peg routing)
+  ├── signals/resolution_probability.py (RPE → open_rpe_position)
+  ├── signals/signal_framework.py (composite → spread-compression entries)
+  │
+  ├── trading/executor.py (OrderExecutor → places/cancels orders)
+  ├── trading/stealth_executor.py (StealthExecutor → sliced scale-up routing)
+  ├── trading/chaser.py (OrderChaser → iceberg-pegged + toxicity-guarded repricing)
+  ├── trading/position_manager.py (PositionManager → central execution hub)
+  ├── trading/sizer.py (Kelly + depth-aware sizing)
+  ├── trading/fees.py (fee calculation → used by EQS, TP, SL)
+  ├── trading/fee_cache.py (CLOB fee lookup → per-token caching)
+  ├── trading/stop_loss.py (StopLossMonitor → event-driven on BBO)
+  ├── trading/take_profit.py (TP computation → targets exit)
+  ├── trading/adverse_selection_monitor.py (fill tracking → maker downgrade)
+  ├── trading/portfolio_correlation.py (PCE → VaR gate, concentration haircut)
+  │
+  ├── monitoring/trade_store.py (SQLite → stats, crash recovery)
+  └── monitoring/telegram.py (notifications)
+
+Key data flows:
+  WebSocket → trade_queue → _process_trades → OHLCVAggregator → bar close
+    → PanicDetector → PanicSignal → PositionManager.open_position
+    → EdgeFilter (EQS gate) → Kelly sizer → OrderExecutor → OrderChaser
+
+  L2WebSocket → L2OrderBook → L2OrderBookAdapter → BBO callback
+    → StopLossMonitor.on_bbo_update
+    → AdverseSelectionMonitor.tick
+    → CompositeSignalEvaluator → spread-compression entries
+
+  WhaleMonitor → Polygonscan → has_strong_confluence → PanicDetector.evaluate
+    → compute_confluence_discount → EQS threshold reduction
+
+  AdverseSelectionGuard → 50ms polling → 2-of-4 signals → clear fast_kill_event
+    → pause all chasers → cancel all orders → outcome analysis
+
+  IcebergDetector → on_level_change (L2 refill) → strongest_iceberg()
+    → OrderChaser._optimal_quote() → POST_ONLY peg behind whale liquidity
+
+  AdverseSelectionMonitor.get_stats(market_id).last_p_value
+    → OrderChaser._should_abort_toxicity() → abort if p < ceil AND p < initial×0.50
+    → prevents toxic escalation through degraded micro-structure regimes
+
+  StopLossMonitor.on_probe_breakeven → PositionManager.scale_probe_to_full()
+    → StealthExecutor.place_stealth_order() (if stealth_enabled)
+    → sliced BUY orders with drift + fill-pct abandonment guards
+
+
+================================================================================
+SECTION 20: CHANGE HISTORY EVOLUTION
+================================================================================
+
+The system has evolved through several major phases:
+
+March 2nd: Initial calibration
+  - Z-score, edge score, L2 reliability, heartbeat, ghost liquidity
+
+March 4th — Alpha Evolution:
+  - Raised min_spread_cents 2→4, min_edge_score 20→50
+  - Log-concave z-score contribution (diminishing returns)
+  - Adaptive cold-start Kelly, negative-EV throttle
+  - Dollar-risk cap from stop-loss distance
+  - BotReplayAdapter with full gate parity
+  - Backtest result: 98% drawdown reduction, 84% marginal entry filtering
+
+March 4th — Volume Expansion (V1-V4):
+  - 17 new parameters across 4 vectors
+  - Maker routing, confluence discount, drift signal, probe sizing
+
+March 5th — Execution Risk & Calibration:
+  - AdverseSelectionMonitor (Welch t-test, T+5/15/60 marking)
+  - 3 flaw guards (maker+confluence, drift+regime, whale+probe)
+  - Probe harvesting (6-guard scale-up)
+  - Confluence sensitivity script (bootstrap + Sobol)
+
+March 5th — Parameter Optimization Report:
+  - Bootstrap factor audit: L2 and regime zeroed
+  - Whale discount reduced 5→4
+  - Dynamic alpha implementation
+  - Sobol bounds tightened for zeroed parameters
+  - 10 new dynamic alpha tests
+
+March 5th — PCE Activation Blueprint (Shadow → Active Enforcement):
+  - pce_shadow_mode: True → False (active enforcement)
+  - pce_max_portfolio_var_usd: 50 → 35 (calibrated from 3-day shadow data)
+  - pce_correlation_haircut_threshold: 0.50 → 0.65 (anti-double-penalization)
+  - Guard 5 in scale_probe_to_full: check_var_gate → compute_var_sizing_cap
+    (bisection allows partial scale-up instead of binary reject)
+  - _check_risk_gates returns 3-tuple: (passed, max_trade, var_was_bisected)
+  - Concentration haircut skipped when VaR bisection already reduced sizing
+  - RPE entry path: same anti-double-penalization guard applied
+  - Prior validation wired into PCE refresh loop (every 6 hours)
+  - validate_pce_priors.py extended with --state-file MAE analysis mode
+  - 6 new tests (TestProbeHarvestBisection, TestAntiDoublePenalization)
+
+Execution Alpha & Microstructure Blueprint:
+  Three execution vectors implemented across 5 source files + 2 test files:
+
+  Vector 1 — SI-4 Stealth Scale-Up (StealthExecutor fully activated):
+  - stealth_enabled: False → True
+  - PositionManager._stealth injected by bot.py; scale_probe_to_full() delegates
+    to StealthExecutor.place_stealth_order() for probe scale-ups > $0.50
+  - place_stealth_order() gains get_mid_fn callback for real-time drift detection
+  - Fill-pct abandon guard: if ≥75% filled between slices → stop, preserve partial fill
+  - Mid-drift abandon guard: if mid drifts >2¢ adversely after sleep → stop
+  - 2 new config knobs: stealth_abandon_drift_cents=2.0, stealth_abandon_fill_pct=0.75
+  - 4 new tests in TestStealthAbandonment
+
+  Vector 2 — SI-2 Iceberg Peg Routing (IcebergDetector weaponized into OrderChaser):
+  - OrderChaser gains iceberg_detector param; injected by bot.py at both entry/exit chaser sites
+  - _optimal_quote() pegs behind strongest_iceberg() when confidence ≥ 0.50
+  - BBO clamp ensures POST_ONLY validity even when iceberg is at aggressive level
+  - 1 new config knob: iceberg_peg_min_confidence=0.50
+  - 5 new tests in TestChaserIcebergPeg
+
+  Vector 3 — AdverseSelectionMonitor p-value toxicity guard in OrderChaser:
+  - OrderChaser gains adverse_monitor param; injected by bot.py at both chaser sites
+  - _should_abort_toxicity(): dual condition prevents false positives:
+    p < chaser_toxicity_p_value_ceil (0.10) AND p < initial_p_value × 0.50
+  - Checked in _chase_loop() before requote AND in _escalate() before crossing spread
+  - 1 new config knob: chaser_toxicity_p_value_ceil=0.10
+  - 4 new tests in TestChaserToxicityGuard
+
+  Test summary: 33 new tests pass; 66/66 execution-pipeline tests pass
+
+March 5th — Dynamic Prior Generation Engine (DPGE):
+  Replaces static Beta(2,2) prior in GenericBayesianModel across 4 vectors:
+
+  Vector 1 — Tag-based empirical priors (TagPriorRegistry):
+  - New module: src/signals/tag_prior_registry.py
+  - TagPrior frozen dataclass: alpha, beta, label
+  - 9 category-specific Beta priors derived from empirical resolution rates
+    (politics→Beta(3,2), legal→Beta(2,3), sports→Beta(2.5,2.5), etc.)
+  - Priority-ordered compiled regex table, first-match-wins
+  - rpe_dynamic_prior_enabled=True activates; False falls back to prior_k path
+
+  Vector 2 — L2 order book imbalance as continuous observations:
+  - book_depth_ratio extracted from _book_trackers and passed to RPE evaluate()
+  - ln(book_depth_ratio) clamped to [−2, 2] → additive pseudo-counts scaled by κ_eff
+  - κ_eff = rpe_l2_kappa × w_prior (decays with time kernel, floor at zero)
+  - Applied only when l2_reliable=True; silently ignored on stale/desynced book
+  - New config: rpe_l2_kappa=1.5
+
+  Vector 3 — Sigmoid time-decay calibration (theta kernel):
+  - w_prior(t) = 1/(1+exp(−γ(t−t_half))), t = days_remaining/total_duration
+  - Near-expiry: w_prior→0 → prior contribution drops → confidence drops
+    (suppresses terminal noise signals — intentionally the opposite of old linear decay)
+  - New config: rpe_theta_gamma=8.0, rpe_theta_half=0.15
+  - total_duration_days extracted from market.end_date vs now in bot.py evaluate block
+
+  Vector 4 — Model-probe routing integration:
+  - When GenericBayesianModel signals, PanicDetector is silent, and
+    |prob − market_price| ≥ rpe_probe_divergence_min → open model-probe
+  - PositionManager._open_rpe_position_inner detects force_probe flag in metadata
+  - Overrides sizing: probe_kelly_fraction × Kelly, capped at probe_max_usd
+  - Position marked is_probe=True → eligible for graduation via scale_probe_to_full()
+  - New config: rpe_probe_divergence_min=0.12
+
+  Calibration tracker extension:
+  - _CalibrationEntry gains: prior_source, l2_active, theta_w_prior fields
+  - record_signal() accepts and stores all three new fields
+  - compute_per_tag_brier() → per-tag Brier/accuracy breakdown dict
+  - calibration_summary() includes per_tag_brier key
+
+  Test coverage: 49 new tests in test_dynamic_prior_engine.py across 7 classes:
+    TestTagPriorRegistry (18), TestGenericBayesianModelDynamicPriors (6),
+    TestL2ImbalanceUpdate (7), TestTimaDecayKernel (7),
+    TestRPECalibrationPerTag (5), TestRPEWithDynamicPriors (3),
+    TestBackwardCompatibility (4)
+  All existing test_resolution_probability.py assertions updated to reflect
+  new semantics (tag priors intentionally diverge from market price).
+
+Current state: 1324 tests passing, 0 failures
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

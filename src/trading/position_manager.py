@@ -135,6 +135,7 @@ class PositionManager:
         guard: DeploymentGuard | None = None,
         pce: Any | None = None,
         book_trackers: dict[str, Any] | None = None,
+        maker_monitor: Any | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
@@ -142,6 +143,8 @@ class PositionManager:
         self._guard = guard
         self._pce = pce  # PortfolioCorrelationEngine (Pillar 15)
         self._book_trackers = book_trackers or {}  # asset_id → OrderbookTracker
+        self._maker_monitor = maker_monitor  # AdverseSelectionMonitor (V1/V4)
+        self._stealth = None  # StealthExecutor — injected by bot.py when stealth_enabled
         self._positions: dict[str, Position] = {}
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
@@ -161,6 +164,10 @@ class PositionManager:
         # Serialize entry attempts to prevent concurrent entries on
         # the same market/event from racing past risk gates.
         self._entry_lock = asyncio.Lock()
+        # V4 Probe harvesting: track which probes have been scaled in already
+        self._probe_scaled_set: set[str] = set()
+        # V4 Probe harvesting: track which probes have been scaled in already
+        self._probe_scaled_set: set[str] = set()
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -209,19 +216,22 @@ class PositionManager:
     # ── Shared risk gates ──────────────────────────────────────────────────
     def _check_risk_gates(
         self, market_id: str, event_id: str = "", *, trade_direction: str = "NO"
-    ) -> tuple[bool, float]:
+    ) -> tuple[bool, float, bool]:
         """Run all risk gates shared between panic and RPE entries.
 
-        Returns (passed: bool, max_trade_usd: float).  When passed
-        is False, the caller must abort.  max_trade_usd is the
-        capital-allocation cap for this entry attempt.
+        Returns (passed: bool, max_trade_usd: float, var_was_bisected: bool).
+        When passed is False, the caller must abort.  max_trade_usd is the
+        capital-allocation cap for this entry attempt.  var_was_bisected
+        indicates whether the PCE VaR soft-cap already reduced sizing via
+        bisection (used to avoid double-penalization with the concentration
+        haircut).
         """
         strat = settings.strategy
 
         # ── Circuit breaker check ──────────────────────────────────────────
         if self._circuit_breaker_tripped:
             log.warning("circuit_breaker_active", reason="daily_loss_or_drawdown")
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Daily loss check ───────────────────────────────────────────────
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -236,7 +246,7 @@ class PositionManager:
                 daily_pnl=round(self._daily_pnl_cents, 2),
                 limit=daily_loss_limit_cents,
             )
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Max drawdown check ─────────────────────────────────────────────
         if self._max_drawdown_cents >= strat.max_drawdown_cents:
@@ -246,13 +256,13 @@ class PositionManager:
                 drawdown=round(self._max_drawdown_cents, 2),
                 limit=strat.max_drawdown_cents,
             )
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Risk gate: max open positions ──────────────────────────────────
         open_positions = self.get_open_positions()
         if len(open_positions) >= self.max_open:
             log.warning("max_positions_reached", open=len(open_positions))
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Risk gate: per-market concentration ────────────────────────────
         market_count = sum(
@@ -265,7 +275,7 @@ class PositionManager:
                 count=market_count,
                 limit=strat.max_positions_per_market,
             )
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Risk gate: per-event concentration ─────────────────────────────
         if event_id:
@@ -279,7 +289,7 @@ class PositionManager:
                     count=event_count,
                     limit=strat.max_positions_per_event,
                 )
-                return False, 0.0
+                return False, 0.0, False
 
         # ── Risk gate: total exposure ──────────────────────────────────────
         total_exposure = sum(
@@ -292,7 +302,7 @@ class PositionManager:
                 exposure=round(total_exposure, 2),
                 limit=round(max_exposure, 2),
             )
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Risk gate: capital allocation ──────────────────────────────────
         max_trade = min(
@@ -301,9 +311,10 @@ class PositionManager:
         )
         if max_trade <= 0:
             log.warning("insufficient_balance", balance=self._wallet_balance_usd)
-            return False, 0.0
+            return False, 0.0, False
 
         # ── Risk gate: Portfolio Correlation Engine (PCE) VaR ──────────────
+        var_was_bisected = False
         if self._pce is not None:
             if self._pce.var_soft_cap:
                 # Soft cap: skip check_var_gate(); compute_var_sizing_cap
@@ -321,8 +332,9 @@ class PositionManager:
                         portfolio_var=sizing_result.current_var,
                         threshold=self._pce.max_portfolio_var_usd,
                     )
-                    return False, 0.0
+                    return False, 0.0, False
                 max_trade = min(max_trade, sizing_result.cap_usd)
+                var_was_bisected = sizing_result.bisect_iterations > 0
             else:
                 # Hard block mode: binary accept/reject
                 allowed, var_result = self._pce.check_var_gate(
@@ -338,9 +350,9 @@ class PositionManager:
                         portfolio_var=var_result.portfolio_var_usd,
                         threshold=self._pce.max_portfolio_var_usd,
                     )
-                    return False, 0.0
+                    return False, 0.0, False
 
-        return True, max_trade
+        return True, max_trade, var_was_bisected
 
     # ── Open a new position on signal ──────────────────────────────────────
     async def open_position(
@@ -392,7 +404,9 @@ class PositionManager:
         """Inner implementation of open_position (runs under _entry_lock)."""
         strat = settings.strategy
 
-        passed, max_trade = self._check_risk_gates(signal.market_id, event_id)
+        passed, max_trade, var_was_bisected = self._check_risk_gates(
+            signal.market_id, event_id,
+        )
         if not passed:
             return None
 
@@ -413,23 +427,42 @@ class PositionManager:
         # EQS threshold dynamically.
         exec_mode = "maker" if strat.maker_routing_enabled else "taker"
 
+        # V1 Adverse-selection monitor: downgrade to taker if maker is suspended
+        # for this specific market (statistical toxic-flow detection).
+        if exec_mode == "maker" and self._maker_monitor is not None:
+            if not self._maker_monitor.is_maker_allowed(signal.market_id):
+                exec_mode = "taker"
+                log.info(
+                    "maker_downgraded_asl_suspension",
+                    market_id=signal.market_id,
+                )
+
+        # Determine signal source for flaw guards
+        meta = signal_metadata or {}
+        is_drift_signal: bool = meta.get("signal_source") == "drift"
+
         # Build confluence context for dynamic threshold (V2)
         confluence = ConfluenceContext(
             whale_strong_confluence=signal.whale_confluence,
-            spread_compressed=bool((signal_metadata or {}).get("spread_compressed", False)),
+            spread_compressed=bool(meta.get("spread_compressed", False)),
             l2_reliable=(
                 no_book is not None
                 and no_book.has_data
                 and getattr(no_book, "is_reliable", True)
             ),
-            regime_mean_revert=bool((signal_metadata or {}).get("regime_mean_revert", False)),
+            regime_mean_revert=bool(meta.get("regime_mean_revert", False)),
         )
         base_threshold = strat.min_edge_score
         # V1: maker discount on threshold
         if exec_mode == "maker":
             base_threshold = base_threshold * strat.maker_eqs_discount
-        # V2: confluence discount on threshold
-        eqs_threshold = compute_confluence_discount(confluence, base_threshold)
+        # V2: confluence discount on threshold; propagate flaw-guard flags
+        eqs_threshold = compute_confluence_discount(
+            confluence,
+            base_threshold,
+            is_drift_signal=is_drift_signal,      # Flaw 2: suppress regime double-count
+            maker_routing_active=(exec_mode == "maker"),  # Flaw 1: tighter combined floor
+        )
 
         edge = compute_edge_score(
             entry_price=entry_price,
@@ -452,6 +485,27 @@ class PositionManager:
                 and edge.rejection_reason == "score_below_threshold"
             ):
                 is_probe = True
+                # Flaw 3: probes are sub-threshold data-gathering entries.
+                # Confluence discounts (particularly the 5-pt whale discount)
+                # must NOT lower the probe threshold — the probe is admitted
+                # via the confluence-independent probe_eqs_floor, so applying
+                # discounts would double-count unconfirmed signals.  Verify
+                # that the raw score still clears the floor without confluence.
+                if strat.probe_suppress_confluence and confluence.whale_strong_confluence:
+                    raw_threshold = strat.min_edge_score  # no discounts at all
+                    if edge.score < strat.probe_eqs_floor:
+                        log.info(
+                            "probe_rejected_stale_whale_confluence",
+                            score=edge.score,
+                            probe_eqs_floor=strat.probe_eqs_floor,
+                        )
+                        return None
+                    log.info(
+                        "probe_whale_confluence_suppressed",
+                        score=edge.score,
+                        probe_eqs_floor=strat.probe_eqs_floor,
+                        raw_threshold=raw_threshold,
+                    )
                 log.info(
                     "probe_entry_accepted",
                     score=edge.score,
@@ -572,7 +626,9 @@ class PositionManager:
             )
 
         # ── PCE concentration haircut (Pillar 15) ─────────────────────────
-        if self._pce is not None:
+        # Skip haircut when VaR bisection already reduced sizing to avoid
+        # double-penalizing correlated entries (blueprint §III-B).
+        if self._pce is not None and not var_was_bisected:
             pce_haircut = self._pce.compute_concentration_haircut(
                 signal.market_id, self.get_open_positions()
             )
@@ -583,6 +639,12 @@ class PositionManager:
                     haircut=round(pce_haircut, 4),
                     new_size=entry_size,
                 )
+        elif self._pce is not None and var_was_bisected:
+            log.info(
+                "pce_haircut_skipped_bisected",
+                market=signal.market_id,
+                reason="var_bisection_already_applied",
+            )
 
         # ── Deployment guard: enforce phase-specific size cap ──────────────
         if self._guard is not None:
@@ -817,7 +879,7 @@ class PositionManager:
         # Determine trade direction before risk gates for PCE directional awareness
         trade_direction = "YES" if direction == "buy_yes" else "NO"
 
-        passed, max_trade = self._check_risk_gates(
+        passed, max_trade, var_was_bisected = self._check_risk_gates(
             market_id, event_id, trade_direction=trade_direction,
         )
         if not passed:
@@ -927,8 +989,29 @@ class PositionManager:
 
         entry_size = min(sizing.size_shares, kelly_result.size_shares)
 
+        # ── V4 Probe sizing for model-only divergences ─────────────────
+        # When the Dynamic Prior Engine flags a divergence but no panic
+        # signal exists, open at probe size (5% Kelly, $2 cap) to
+        # explore model-based alpha with bounded downside.
+        is_model_probe = bool(rpe_metadata.get("force_probe", False))
+        if is_model_probe:
+            probe_max_usd = strat.probe_max_usd
+            probe_fraction = strat.probe_kelly_fraction
+            probe_max_shares = round(probe_max_usd / entry_price, 2) if entry_price > 0 else 0.0
+            probe_kelly_shares = round(entry_size * probe_fraction, 2)
+            entry_size = max(1.0, min(probe_kelly_shares, probe_max_shares))
+            log.info(
+                "rpe_model_probe_sizing",
+                probe_shares=entry_size,
+                probe_max_usd=probe_max_usd,
+                probe_fraction=probe_fraction,
+                probe_reason=rpe_metadata.get("probe_reason", ""),
+            )
+
         # ── PCE concentration haircut (Pillar 15) ─────────────────────
-        if self._pce is not None:
+        # Skip haircut when VaR bisection already reduced sizing to avoid
+        # double-penalizing correlated entries (blueprint §III-B).
+        if self._pce is not None and not var_was_bisected:
             pce_haircut = self._pce.compute_concentration_haircut(
                 market_id, self.get_open_positions()
             )
@@ -939,6 +1022,12 @@ class PositionManager:
                     haircut=round(pce_haircut, 4),
                     new_size=entry_size,
                 )
+        elif self._pce is not None and var_was_bisected:
+            log.info(
+                "rpe_pce_haircut_skipped_bisected",
+                market=market_id,
+                reason="var_bisection_already_applied",
+            )
 
         if self._guard is not None:
             entry_size = self._guard.get_allowed_trade_shares(
@@ -1037,6 +1126,11 @@ class PositionManager:
 
         self._positions[pos.id] = pos
 
+        # Mark model-only probes so they can graduate via
+        # scale_probe_to_full() on breakeven.
+        if is_model_probe:
+            pos.is_probe = True
+
         log.info(
             "rpe_position_opened",
             pos_id=pos.id,
@@ -1049,6 +1143,7 @@ class PositionManager:
             model_prob=round(model_probability, 4),
             confidence=round(confidence, 3),
             sl_trigger=sl_trigger,
+            is_model_probe=is_model_probe,
         )
 
         return pos
@@ -1281,6 +1376,184 @@ class PositionManager:
             exit=pos.exit_price if pos.state == PositionState.CLOSED else 0.0,
             pnl_cents=pos.pnl_cents if pos.state == PositionState.CLOSED else 0.0,
         )
+
+    # ── V4: Probe harvesting ───────────────────────────────────────────────
+    async def scale_probe_to_full(
+        self,
+        pos: "Position",
+        get_mid_price_fn,
+    ) -> "Order | None":
+        """Pyramid a confirmed probe into a full-Kelly position.
+
+        Called by the ``on_probe_breakeven`` callback from
+        :class:`~src.trading.stop_loss.StopLossMonitor`.  Six sequential
+        guards ensure the scale-in remains safe, timely, and still has edge.
+
+        When ``StealthExecutor`` is available, orders above the stealth
+        threshold are sliced into 2–4 randomised clips with inter-slice
+        delays and mid-price abandonment checks.
+
+        Guards
+        ------
+        1. Position still open and currently net-positive
+        2. Not already scaled (idempotent — uses ``_probe_scaled_set``)
+        3. "Not too late": current profit < ``harvest_max_progress`` × TP span
+        4. Incremental USD ≥ ``harvest_min_increment_usd``
+        5. PCE VaR budget allows additional exposure
+        6. Deployment guard phase size cap respected
+        """
+        if pos.state != PositionState.EXIT_PENDING:
+            return None
+
+        strat = settings.strategy
+
+        # Guard 1: still open and net-positive
+        asset_id = pos.trade_asset_id or pos.no_asset_id
+        mid = get_mid_price_fn(asset_id)
+        if not mid or mid <= 0:
+            return None
+        direction = 1.0 if (pos.trade_side or "NO") == "NO" else -1.0
+        current_pnl_cents = direction * (mid - pos.entry_price) * 100.0
+        if current_pnl_cents < strat.harvest_min_profit_cents:
+            log.info(
+                "probe_harvest_not_profitable",
+                pos_id=pos.id,
+                pnl_cents=round(current_pnl_cents, 2),
+                min_required=strat.harvest_min_profit_cents,
+            )
+            return None
+
+        # Guard 2: idempotent — only scale once per probe
+        if pos.id in self._probe_scaled_set:
+            return None
+
+        # Guard 3: not too late — avoid pyramiding into a nearly-completed move
+        if pos.tp_result is not None and pos.tp_result.target_price > pos.entry_price:
+            tp_span_cents = (pos.tp_result.target_price - pos.entry_price) * 100.0
+            if tp_span_cents > 0:
+                progress = current_pnl_cents / tp_span_cents
+                if progress > strat.harvest_max_progress:
+                    log.info(
+                        "probe_harvest_skipped_late",
+                        pos_id=pos.id,
+                        progress=round(progress, 3),
+                        max_allowed=strat.harvest_max_progress,
+                    )
+                    return None
+
+        # Guard 4: incremental size must be worthwhile
+        if pos.kelly_result is None:
+            return None
+        # The probe was sized at probe_kelly_fraction of full Kelly;
+        # reverse-engineer the full-Kelly share count.
+        full_kelly_shares = pos.kelly_result.size_shares / max(
+            strat.probe_kelly_fraction, 0.001
+        )
+        incremental_shares = max(0.0, full_kelly_shares - pos.entry_size)
+        incremental_usd = incremental_shares * pos.entry_price
+        if incremental_usd < strat.harvest_min_increment_usd:
+            log.info(
+                "probe_harvest_increment_too_small",
+                pos_id=pos.id,
+                incremental_usd=round(incremental_usd, 3),
+                min_required=strat.harvest_min_increment_usd,
+            )
+            return None
+
+        # Guard 5: PCE VaR budget (bisection — allows partial scale-up)
+        if self._pce is not None and hasattr(self._pce, "compute_var_sizing_cap"):
+            open_positions = self.get_open_positions()
+            sizing_result = self._pce.compute_var_sizing_cap(
+                open_positions=open_positions,
+                proposed_market_id=pos.market_id,
+                proposed_size_usd=incremental_usd,
+                proposed_direction=pos.trade_side or "NO",
+            )
+            if sizing_result.cap_usd < strat.harvest_min_increment_usd:
+                log.warning(
+                    "probe_harvest_var_rejected",
+                    pos_id=pos.id,
+                    market_id=pos.market_id,
+                    incremental_usd=round(incremental_usd, 2),
+                    var_cap=round(sizing_result.cap_usd, 2),
+                    headroom=round(sizing_result.headroom, 2),
+                )
+                return None
+            if sizing_result.cap_usd < incremental_usd:
+                original_usd = incremental_usd
+                incremental_usd = sizing_result.cap_usd
+                incremental_shares = round(
+                    incremental_usd / pos.entry_price, 2
+                ) if pos.entry_price > 0 else 0.0
+                log.info(
+                    "probe_harvest_var_sized",
+                    pos_id=pos.id,
+                    original_usd=round(original_usd, 2),
+                    capped_usd=round(incremental_usd, 2),
+                    bisect_iterations=sizing_result.bisect_iterations,
+                )
+
+        # Guard 6: deployment guard phase cap
+        if self._guard is not None:
+            incremental_shares = self._guard.get_allowed_trade_shares(
+                incremental_shares, pos.entry_price
+            )
+            incremental_usd = incremental_shares * pos.entry_price
+            if incremental_usd < strat.harvest_min_increment_usd:
+                return None
+
+        # Place scale-in limit order — price-cap: don't chase above entry + 1¢
+        scale_price = min(mid, pos.entry_price + 0.01)
+        scale_price = max(0.01, round(scale_price, 2))
+        scale_shares = round(incremental_shares, 2)
+        if scale_shares < 1:
+            return None
+
+        # ── SI-4: Stealth slicing for scale-ups ───────────────────────
+        if self._stealth is not None and incremental_usd >= self._stealth._min_size:
+            # Build a mid-price reader that closes over the asset_id
+            _asset = asset_id
+            _mid_fn = get_mid_price_fn
+
+            def _get_mid() -> float | None:
+                return _mid_fn(_asset)
+
+            stealth_orders = await self._stealth.place_stealth_order(
+                market_id=pos.market_id,
+                asset_id=asset_id,
+                side=OrderSide.BUY,
+                price=scale_price,
+                total_size=scale_shares,
+                post_only=True,
+                get_mid_fn=_get_mid,
+            )
+            order = stealth_orders[0] if stealth_orders else None
+        else:
+            order = await self.executor.place_limit_order(
+                market_id=pos.market_id,
+                asset_id=asset_id,
+                side=OrderSide.BUY,
+                price=scale_price,
+                size=scale_shares,
+            )
+
+        self._probe_scaled_set.add(pos.id)
+        pos.is_probe = False  # graduated: now tracked as a full position
+
+        new_avg = (
+            (pos.entry_price * pos.entry_size + scale_price * scale_shares)
+            / (pos.entry_size + scale_shares)
+        )
+        log.info(
+            "probe_harvested",
+            pos_id=pos.id,
+            scale_shares=scale_shares,
+            incremental_usd=round(incremental_usd, 2),
+            scale_price=round(scale_price, 4),
+            new_avg_entry=round(new_avg, 4),
+            pnl_cents_at_scale=round(current_pnl_cents, 2),
+        )
+        return order
 
     # ── Cleanup ────────────────────────────────────────────────────────────
     def cleanup_closed(self) -> list[Position]:

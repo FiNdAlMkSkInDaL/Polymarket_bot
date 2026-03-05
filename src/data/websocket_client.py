@@ -175,7 +175,10 @@ class MarketWebSocket:
                         msg = json.loads(raw)
                         await self._handle_message(msg)
                     except json.JSONDecodeError:
-                        log.warning("ws_bad_json", raw=raw[:200])
+                        if raw.strip() == "INVALID OPERATION":
+                            log.debug("ws_invalid_op")
+                        else:
+                            log.warning("ws_bad_json", raw=raw[:200])
             finally:
                 silence_task.cancel()
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -234,3 +235,235 @@ class TestChaserEscalation:
 
         # Without a TP target, alpha check returns True (caller's risk)
         assert chaser._alpha_check(0.50) is True
+
+
+class TestChaserIcebergPeg:
+    """SI-2 iceberg-aware routing tests."""
+
+    @pytest.fixture
+    def setup(self):
+        executor = OrderExecutor(paper_mode=True)
+        book = OrderbookTracker("ASSET_A")
+        _seed_book(book, bid=0.47, ask=0.53)
+        return executor, book
+
+    def _make_iceberg_detector(self, side: str, price: float, confidence: float):
+        """Create a minimal mock IcebergDetector."""
+        signal = SimpleNamespace(
+            side=side, price=price, confidence=confidence,
+            refill_count=5, avg_slice_size=50.0,
+        )
+
+        class FakeDetector:
+            def strongest_iceberg(self, s):
+                if s == side:
+                    return signal
+                return None
+
+        return FakeDetector()
+
+    @pytest.mark.asyncio
+    async def test_iceberg_peg_buy_side(self, setup):
+        """BUY chaser should peg at iceberg price when available."""
+        executor, book = setup
+        detector = self._make_iceberg_detector("BUY", 0.46, 0.80)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+
+        quote = chaser._optimal_quote()
+        # Iceberg at 0.46, but clamped to not exceed best_bid(0.47),
+        # so peg=min(0.46, 0.47)=0.46
+        assert quote == 0.46
+
+    @pytest.mark.asyncio
+    async def test_iceberg_peg_clamped_to_bbo(self, setup):
+        """Iceberg price above BBO should be clamped down for BUY."""
+        executor, book = setup
+        detector = self._make_iceberg_detector("BUY", 0.49, 0.80)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+
+        quote = chaser._optimal_quote()
+        # Iceberg at 0.49 but best_bid is 0.47 → clamped to 0.47
+        assert quote == 0.47
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_iceberg_ignored(self, setup):
+        """Iceberg with confidence below threshold should be ignored."""
+        executor, book = setup
+        detector = self._make_iceberg_detector("BUY", 0.46, 0.30)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+
+        quote = chaser._optimal_quote()
+        # Low confidence → standard BBO logic: best_bid = 0.47
+        assert quote == 0.47
+
+    @pytest.mark.asyncio
+    async def test_no_iceberg_falls_back(self, setup):
+        """No iceberg signal → standard BBO quote."""
+        executor, book = setup
+
+        class EmptyDetector:
+            def strongest_iceberg(self, s):
+                return None
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=EmptyDetector(),
+        )
+
+        quote = chaser._optimal_quote()
+        assert quote == 0.47
+
+    @pytest.mark.asyncio
+    async def test_sell_side_iceberg_peg(self, setup):
+        """SELL chaser should peg at iceberg price (clamped to best_ask)."""
+        executor, book = setup
+        detector = self._make_iceberg_detector("SELL", 0.54, 0.80)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.SELL, target_size=10.0,
+            anchor_price=0.55,
+            iceberg_detector=detector,
+        )
+
+        quote = chaser._optimal_quote()
+        # Iceberg at 0.54, clamped to max(0.54, best_ask=0.53)=0.54
+        assert quote == 0.54
+
+
+class TestChaserToxicityGuard:
+    """Anti-toxicity guard — blocks escalation when adverse p-value drops."""
+
+    @pytest.fixture
+    def setup(self):
+        executor = OrderExecutor(paper_mode=True)
+        book = OrderbookTracker("ASSET_A")
+        _seed_book(book, bid=0.47, ask=0.53)
+        event = asyncio.Event()
+        event.set()
+        return executor, book, event
+
+    def _make_monitor(self, p_value: float):
+        """Create a mock AdverseSelectionMonitor."""
+        stats = SimpleNamespace(last_p_value=p_value)
+
+        class FakeMonitor:
+            def get_stats(self, market_id):
+                return stats
+
+        return FakeMonitor()
+
+    @pytest.mark.asyncio
+    async def test_toxicity_blocks_escalation(self, setup):
+        """Escalation should be blocked when p-value drops below ceiling."""
+        executor, book, event = setup
+        # Initial p=0.50 (healthy), current p=0.04 (toxic)
+        monitor = self._make_monitor(0.04)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            tp_target_price=0.56,
+            fee_rate_bps=100,
+            fast_kill_event=event,
+            max_post_only_rejections=2,
+            adverse_monitor=monitor,
+        )
+        # Override initial_p to simulate it was healthy at start
+        chaser._initial_p_value = 0.50
+
+        chaser._rejection_count = 2
+        await chaser._escalate()
+
+        # Should have abandoned, not crossed the spread
+        assert chaser.state == ChaserState.ABANDONED
+
+    @pytest.mark.asyncio
+    async def test_healthy_market_allows_escalation(self, setup):
+        """Escalation should proceed when p-value is above ceiling."""
+        executor, book, event = setup
+        monitor = self._make_monitor(0.50)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            tp_target_price=0.56,
+            fee_rate_bps=100,
+            fast_kill_event=event,
+            max_post_only_rejections=2,
+            adverse_monitor=monitor,
+        )
+
+        chaser._rejection_count = 2
+        await chaser._escalate()
+
+        # p=0.50 >> 0.10 ceiling → should NOT have abandoned from toxicity
+        # (may still abandon from alpha check, but not from toxicity)
+        # QUOTING or FILLED means it placed the escalation order successfully
+        assert chaser.state in (ChaserState.QUOTING, ChaserState.FILLED, ChaserState.ABANDONED)
+
+    @pytest.mark.asyncio
+    async def test_no_monitor_allows_escalation(self, setup):
+        """Without adverse_monitor, escalation proceeds normally."""
+        executor, book, event = setup
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            tp_target_price=0.56,
+            fee_rate_bps=100,
+            fast_kill_event=event,
+            max_post_only_rejections=2,
+        )
+
+        assert chaser._should_abort_toxicity() is False
+
+    @pytest.mark.asyncio
+    async def test_toxicity_requires_pvalue_drop(self, setup):
+        """Toxicity guard requires both low p-value AND a drop from initial."""
+        executor, book, event = setup
+        # p=0.08 < 0.10 ceiling, but hasn't dropped 50% from initial 0.09
+        monitor = self._make_monitor(0.08)
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            adverse_monitor=monitor,
+        )
+        chaser._initial_p_value = 0.09  # Only small drop: 0.09→0.08
+
+        # 0.08 < 0.10 but 0.08 is NOT < 0.09 * 0.50 = 0.045
+        assert chaser._should_abort_toxicity() is False

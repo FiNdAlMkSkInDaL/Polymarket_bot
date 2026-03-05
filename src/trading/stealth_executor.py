@@ -37,6 +37,7 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from src.core.config import settings
 from src.core.logger import get_logger
@@ -94,6 +95,9 @@ class StealthExecutor:
         self._min_delay = min_delay_ms or getattr(strat, "stealth_min_delay_ms", 200.0)
         self._max_delay = max_delay_ms or getattr(strat, "stealth_max_delay_ms", 1500.0)
         self._size_jitter = size_jitter_pct or getattr(strat, "stealth_size_jitter_pct", 0.15)
+        # Abandonment controls
+        self._abandon_drift_cents = getattr(strat, "stealth_abandon_drift_cents", 2.0)
+        self._abandon_fill_pct = getattr(strat, "stealth_abandon_fill_pct", 0.75)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -107,11 +111,20 @@ class StealthExecutor:
         *,
         post_only: bool = False,
         fee_rate_bps: int = 0,
+        get_mid_fn: Callable[[], float | None] | None = None,
     ) -> list[Order]:
         """Place a parent order as time-sliced child orders.
 
         If ``total_size * price`` is below ``min_size_usd``, the order
         is placed as a single un-split order.
+
+        Parameters
+        ----------
+        get_mid_fn:
+            Optional callable returning the current mid-price.  When
+            supplied, the executor checks for adverse drift between
+            slices and abandons remaining slices if the mid has moved
+            more than ``stealth_abandon_drift_cents`` from *price*.
 
         Returns the list of all child Order objects.
         """
@@ -136,6 +149,7 @@ class StealthExecutor:
         )
 
         orders: list[Order] = []
+        filled_size = 0.0
         for i, (slice_size, delay_ms) in enumerate(
             zip(plan.slice_sizes, plan.delays_ms)
         ):
@@ -153,9 +167,50 @@ class StealthExecutor:
                 )
                 break
 
+            # Track filled volume for abandonment check
+            if order.status == OrderStatus.FILLED:
+                filled_size += order.size
+
             # Delay before next slice (skip delay after last slice)
             if i < plan.num_slices - 1:
+                # ── Abandonment check: filled-pct ─────────────────
+                if (
+                    filled_size > 0
+                    and total_size > 0
+                    and filled_size / total_size >= self._abandon_fill_pct
+                ):
+                    log.info(
+                        "stealth_abandoned_fill_pct",
+                        asset_id=asset_id[:16],
+                        filled_pct=round(filled_size / total_size, 3),
+                        threshold=self._abandon_fill_pct,
+                        slices_done=i + 1,
+                        slices_total=plan.num_slices,
+                    )
+                    break
+
                 await asyncio.sleep(delay_ms / 1000.0)
+
+                # ── Abandonment check: mid-price drift ────────────
+                if get_mid_fn is not None:
+                    mid = get_mid_fn()
+                    if mid is not None and mid > 0:
+                        if side == OrderSide.BUY:
+                            drift_cents = (mid - price) * 100.0
+                        else:
+                            drift_cents = (price - mid) * 100.0
+                        if drift_cents > self._abandon_drift_cents:
+                            log.info(
+                                "stealth_abandoned_drift",
+                                asset_id=asset_id[:16],
+                                drift_cents=round(drift_cents, 2),
+                                threshold=self._abandon_drift_cents,
+                                mid=round(mid, 4),
+                                anchor=round(price, 4),
+                                slices_done=i + 1,
+                                slices_total=plan.num_slices,
+                            )
+                            break
 
         placed = sum(1 for o in orders if o.status == OrderStatus.LIVE)
         log.info(

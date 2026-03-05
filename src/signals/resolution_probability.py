@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.signals.signal_framework import SignalGenerator, SignalResult
+from src.signals.tag_prior_registry import TagPriorRegistry
 
 if TYPE_CHECKING:
     from src.data.market_discovery import MarketInfo
@@ -450,62 +451,66 @@ class CryptoPriceModel(ProbabilityModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GenericBayesianModel
+#  GenericBayesianModel — Dynamic Prior Generation Engine
 # ═══════════════════════════════════════════════════════════════════════════
 
 class GenericBayesianModel(ProbabilityModel):
     r"""Bayesian prior model for non-crypto markets.
 
-    Combines three information sources:
+    Upgraded with the Dynamic Prior Generation Engine (DPGE):
 
-    1. **Prior**: ``Beta(α₀, β₀)`` with ``α₀ = β₀ = 2`` (mildly
-       uninformative, peaked at 0.5).  Why not ``Beta(1,1)`` (uniform)?
-       Because a single noisy market-price observation would dominate
-       the posterior, producing extreme estimates (0.05 or 0.95) with
-       unwarranted confidence.  The ``Beta(2,2)`` regularization pulls
-       the estimate toward 0.5 absent strong evidence — this is a
-       deliberate conservatism choice.
+    1. **Tag-based empirical priors**: Routes market tags to calibrated
+       Beta(α₀, β₀) distributions via ``TagPriorRegistry``.  Different
+       market categories receive historically accurate priors instead of
+       a static Beta(2,2).
 
-    2. **Market price as noisy signal**: The current YES price ``p`` is
-       treated as a draw from the market's collective wisdom.  We
-       update the prior with observation weight ``n`` (configurable via
-       ``RPE_BAYESIAN_OBS_WEIGHT``):
+    2. **L2 order-book imbalance as continuous observation**: Uses the
+       ``book_depth_ratio`` (bid/ask volume imbalance) as a continuous
+       signal.  The log-ratio is converted to additive pseudo-counts:
 
        .. math::
-           \alpha' = \alpha_0 + n \cdot p \\
-           \beta' = \beta_0 + n \cdot (1 - p)
+           \alpha' = \alpha_0 + n_{\text{eff}} \cdot p
+                     + \kappa_{\text{eff}} \cdot \max(0, \ln r)
+           \\
+           \beta'  = \beta_0  + n_{\text{eff}} \cdot (1-p)
+                     + \kappa_{\text{eff}} \cdot \max(0, \ln(1/r))
 
-       Higher ``n`` = more trust in the market price.  The default
-       ``n = 5`` reflects that liquid Polymarket prices are informative
-       but not perfectly efficient (thin books, retail noise).
+       where r = book_depth_ratio, κ = ``rpe_l2_kappa``.
 
-    3. **Time decay**: As ``days_to_resolution`` shrinks, the market
-       price becomes a stronger signal (more information has been
-       revealed).  Counter-intuitively, confidence *increases* as
-       resolution approaches, because:
-       - Fewer unknown future events can shift the probability
-       - Market participants have more information
-       - Price discovery converges
+    3. **Sigmoid time-decay (theta calibration)**: As T → 0 the model
+       becomes less responsive to prior beliefs and L2 noise, heavily
+       weighting the passage of time (market price convergence).
 
-       This is implemented as:
-       ``confidence *= min(1.0, 1.0 - (days / 90) * 0.3)``
-       At 90+ days: up to 30% confidence discount; at 0 days: no discount.
+       The prior/observation balance follows a sigmoid:
+
+       .. math::
+           w_{\text{prior}}(t) = \frac{1}{1 + e^{-\gamma(t - t_{\text{half}})}}
+
+       where t = days_to_resolution / max(total_market_duration, 1),
+       γ = ``rpe_theta_gamma``, t_half = ``rpe_theta_half``.
+
+       Near expiry (t → 0):  w_prior → 0, n_eff → ∞, κ_eff → 0.
+       Early in market (t → 1): w_prior → 1, prior dominates.
+
+    Backward compatibility
+    ──────────────────────
+    When ``rpe_dynamic_prior_enabled = False`` or ``rpe_prior_k > 0``
+    and the tag registry returns no match, the model falls back to
+    market-anchored adaptive priors (posterior = market price, zero
+    divergence).
 
     Parameters
     ----------
     alpha0:
-        Prior α parameter for Beta distribution.
+        Legacy prior α parameter (used when dynamic priors disabled).
     beta0:
-        Prior β parameter for Beta distribution.
+        Legacy prior β parameter.
     obs_weight:
-        How many pseudo-observations the market price contributes.
-        Default from ``settings.strategy.rpe_bayesian_obs_weight``.
+        Base pseudo-observation count for market-price updates.
     prior_k:
-        Beta prior concentration parameter.  When provided, the prior
-        is anchored to market price: α₀ = k * p, β₀ = k * (1 - p).
-        This eliminates the persistent divergence on tail markets
-        caused by the old fixed Beta(2,2) prior pulling toward 50%.
-        Default from ``settings.strategy.rpe_prior_k``.
+        Market-anchored prior concentration (legacy fallback).
+    tag_registry:
+        Injected TagPriorRegistry (default: singleton instance).
     """
 
     def __init__(
@@ -515,11 +520,13 @@ class GenericBayesianModel(ProbabilityModel):
         beta0: float = 2.0,
         obs_weight: float | None = None,
         prior_k: float | None = None,
+        tag_registry: TagPriorRegistry | None = None,
     ) -> None:
         self._alpha0 = alpha0
         self._beta0 = beta0
         self._obs_weight = obs_weight
         self._prior_k = prior_k
+        self._tag_registry = tag_registry or TagPriorRegistry()
 
     @property
     def _n(self) -> float:
@@ -548,50 +555,146 @@ class GenericBayesianModel(ProbabilityModel):
         """
         return True
 
+    # ── Time-decay kernel ────────────────────────────────────────────
+
+    @staticmethod
+    def _sigmoid_time_weight(
+        days_to_resolution: float,
+        total_duration_days: float,
+        gamma: float,
+        t_half: float,
+    ) -> float:
+        """Compute w_prior(t) — prior weight via sigmoid time-decay.
+
+        Returns a value in (0, 1):
+            - Near 1 when plenty of time remains (prior dominates).
+            - Near 0 when market is about to resolve (market price dominates).
+        """
+        if total_duration_days <= 0:
+            return 0.0  # market already expired → trust market price
+        t = max(0.0, min(1.0, days_to_resolution / total_duration_days))
+        # Sigmoid: 1 / (1 + exp(-γ(t - t_half)))
+        exponent = -gamma * (t - t_half)
+        # Clamp exponent to prevent overflow
+        exponent = max(-20.0, min(20.0, exponent))
+        return 1.0 / (1.0 + math.exp(exponent))
+
+    # ── L2 imbalance pseudo-counts ───────────────────────────────────
+
+    @staticmethod
+    def _l2_pseudo_counts(
+        book_depth_ratio: float,
+        kappa_eff: float,
+    ) -> tuple[float, float]:
+        """Convert book_depth_ratio to (α_delta, β_delta) pseudo-counts.
+
+        Uses ln(r) clamped to [-2, 2] to prevent outlier book states
+        from dominating.  The log-transform ensures symmetric treatment:
+        ratio 0.5 and 2.0 contribute equal-magnitude counts in opposite
+        directions.
+
+        Returns (alpha_delta, beta_delta) — both non-negative.
+        """
+        if book_depth_ratio <= 0 or kappa_eff <= 0:
+            return 0.0, 0.0
+
+        ln_r = math.log(book_depth_ratio)
+        ln_r = max(-2.0, min(2.0, ln_r))  # clamp
+
+        alpha_delta = kappa_eff * max(0.0, ln_r)   # r > 1 → YES support
+        beta_delta = kappa_eff * max(0.0, -ln_r)    # r < 1 → NO support
+        return alpha_delta, beta_delta
+
     def estimate(
         self,
         market: "MarketInfo",
         market_price: float,
         **kwargs: Any,
     ) -> ModelEstimate | None:
-        """Produce a Bayesian posterior estimate.
+        """Produce a Bayesian posterior estimate with dynamic priors.
 
         Parameters
         ----------
         market_price:
             Current YES token price on Polymarket (0–1).
         **kwargs:
-            Must include ``days_to_resolution: int``.
+            days_to_resolution : int
+                Days until market resolution.
+            total_duration_days : float
+                Total market lifespan in days (for theta normalisation).
+                Defaults to 90 if not provided.
+            book_depth_ratio : float | None
+                L2 bid/ask depth ratio.  None disables L2 update.
+            l2_reliable : bool
+                Whether the L2 book is in SYNCED state.
 
-        Returns None if market_price is outside (0, 1) — this would
-        indicate corrupt data, not a legitimate trading opportunity.
+        Returns None if market_price is outside (0, 1).
         """
         if market_price <= 0 or market_price >= 1:
             return None
 
         days = kwargs.get("days_to_resolution", 30)
+        total_duration = kwargs.get("total_duration_days", 90.0)
+        book_depth_ratio = kwargs.get("book_depth_ratio", None)
+        l2_reliable = kwargs.get("l2_reliable", False)
+
         n = self._n
         k = self._k
+        strat = settings.strategy
 
-        # Adaptive prior: anchor α₀, β₀ to market price so the prior
-        # does not create artificial divergence on tail markets.
-        # When k=0, fall back to the legacy fixed alpha0/beta0 constructor args.
-        if k > 0:
+        dynamic_enabled = strat.rpe_dynamic_prior_enabled
+        l2_kappa = strat.rpe_l2_kappa
+        theta_gamma = strat.rpe_theta_gamma
+        theta_half = strat.rpe_theta_half
+
+        # ── Step 1: Resolve prior ────────────────────────────────────
+        prior_source = "market_anchored"
+        if dynamic_enabled:
+            tag_alpha, tag_beta, prior_source = self._tag_registry.get_prior(
+                getattr(market, "tags", ""),
+            )
+            alpha0 = tag_alpha
+            beta0 = tag_beta
+        elif k > 0:
+            # Legacy market-anchored adaptive prior
             alpha0 = k * market_price
             beta0 = k * (1.0 - market_price)
+            prior_source = "market_anchored"
         else:
             alpha0 = self._alpha0
             beta0 = self._beta0
+            prior_source = "static_legacy"
 
-        # Observations are market-price pseudo-counts.  Combined with the
-        # market-anchored prior this yields posterior = market_price (divergence
-        # = 0).  That is the CORRECT behaviour for a model with no independent
-        # external signal: "I have no information beyond the market price, so
-        # my best estimate IS the market price."  The GenericBayesianModel
-        # therefore never fires RPE signals on its own — alpha comes only from
-        # models with real external data (e.g. CryptoPriceModel with BTC spot).
-        alpha_post = alpha0 + n * market_price
-        beta_post = beta0 + n * (1.0 - market_price)
+        # ── Step 2: Compute time-decay kernel ────────────────────────
+        w_prior = self._sigmoid_time_weight(
+            days_to_resolution=float(days),
+            total_duration_days=float(total_duration),
+            gamma=theta_gamma,
+            t_half=theta_half,
+        )
+        w_obs = 1.0 - w_prior
+        eps = 1e-6
+
+        # Scale observation weight: as w_obs → 1 (near expiry),
+        # n_eff → large, market price dominates posterior.
+        n_eff = n * (w_obs / (w_prior + eps))
+        # Cap to prevent numerical explosion in terminal hours
+        n_eff = min(n_eff, 200.0)
+
+        # Scale L2 kappa by w_prior so book noise is suppressed
+        # near expiry (when the market price is most informative).
+        kappa_eff = l2_kappa * w_prior
+
+        # ── Step 3: L2 imbalance pseudo-counts ───────────────────────
+        alpha_l2, beta_l2 = 0.0, 0.0
+        l2_active = False
+        if book_depth_ratio is not None and l2_reliable and kappa_eff > 0.01:
+            alpha_l2, beta_l2 = self._l2_pseudo_counts(book_depth_ratio, kappa_eff)
+            l2_active = True
+
+        # ── Step 4: Bayesian update ──────────────────────────────────
+        alpha_post = alpha0 + n_eff * market_price + alpha_l2
+        beta_post = beta0 + n_eff * (1.0 - market_price) + beta_l2
 
         # Posterior mean
         prob = alpha_post / (alpha_post + beta_post)
@@ -599,31 +702,24 @@ class GenericBayesianModel(ProbabilityModel):
         # Clamp
         prob = max(0.01, min(0.99, prob))
 
-        # ── Confidence estimation ────────────────────────────────────────
-        # Three factors:
-        #
-        # 1. Posterior concentration — higher α+β = tighter posterior.
-        #    We normalize to [0, 1] using a saturation function.
+        # ── Step 5: Confidence estimation ────────────────────────────
+        # Factor 1: Posterior concentration (tighter → more confident)
         total = alpha_post + beta_post
         concentration_conf = 1.0 - 1.0 / (1.0 + total / 10.0)
 
-        # 2. Entropy penalty — at p=0.5 the model is maximally uncertain
-        #    about the binary outcome.  Use binary entropy H(p):
-        #    H(0.5) = 1 (max uncertainty), H(p→0 or 1) → 0.
+        # Factor 2: Entropy penalty — at p=0.5 model is maximally
+        # uncertain about the binary outcome.
         if 0 < prob < 1:
             H = -(prob * math.log2(prob) + (1 - prob) * math.log2(1 - prob))
         else:
             H = 0.0
         entropy_penalty = H  # ∈ [0, 1]
 
-        # 3. Time factor — closer to resolution → more confident in
-        #    the market price signal.
-        if days >= 90:
-            time_factor = 0.7
-        elif days <= 0:
-            time_factor = 1.0
-        else:
-            time_factor = 1.0 - (days / 90.0) * 0.3
+        # Factor 3: Time factor — use sigmoid w_prior directly.
+        # High w_prior (early market) → high confidence in our prior.
+        # Low w_prior (near expiry) → low confidence (model defers
+        # to market, should NOT fire signals).
+        time_factor = max(0.05, w_prior)
 
         confidence = concentration_conf * (1.0 - 0.5 * entropy_penalty) * time_factor
         confidence = max(0.05, min(0.95, confidence))
@@ -635,11 +731,21 @@ class GenericBayesianModel(ProbabilityModel):
             metadata={
                 "alpha_post": round(alpha_post, 3),
                 "beta_post": round(beta_post, 3),
+                "alpha0": round(alpha0, 3),
+                "beta0": round(beta0, 3),
                 "market_price": market_price,
                 "days_to_resolution": days,
+                "total_duration_days": round(total_duration, 1),
                 "concentration_conf": round(concentration_conf, 3),
                 "entropy_penalty": round(entropy_penalty, 3),
                 "time_factor": round(time_factor, 3),
+                "w_prior": round(w_prior, 4),
+                "n_eff": round(n_eff, 2),
+                "kappa_eff": round(kappa_eff, 3),
+                "prior_source": prior_source,
+                "l2_active": l2_active,
+                "book_depth_ratio": round(book_depth_ratio, 3) if book_depth_ratio is not None else None,
+                "dynamic_prior_enabled": dynamic_enabled,
             },
         )
 
@@ -888,6 +994,10 @@ class _CalibrationEntry:
     timestamp: float
     shadow: bool = True
     resolution_price: float | None = None  # 0.0 or 1.0 once resolved
+    # Dynamic Prior Engine tracking fields
+    prior_source: str = ""          # tag category label (e.g. "politics", "default_fallback")
+    l2_active: bool = False         # whether L2 order book data contributed
+    theta_w_prior: float = 0.0     # time-decay prior weight at signal time
 
 
 class RPECalibrationTracker:
@@ -896,6 +1006,9 @@ class RPECalibrationTracker:
     Records every fired RPE signal (shadow or live) and, once a market
     resolves, computes Brier score, log-loss, and direction accuracy
     across resolved entries.
+
+    Supports per-tag Brier score slicing to identify miscalibrated priors
+    in the Dynamic Prior Generation Engine.
 
     Thread-safe via Python's GIL for single-writer patterns.
 
@@ -920,6 +1033,9 @@ class RPECalibrationTracker:
         timestamp: float,
         *,
         shadow: bool = True,
+        prior_source: str = "",
+        l2_active: bool = False,
+        theta_w_prior: float = 0.0,
     ) -> None:
         """Record a fired RPE signal for later calibration."""
         entry = _CalibrationEntry(
@@ -929,6 +1045,9 @@ class RPECalibrationTracker:
             direction=direction,
             timestamp=timestamp,
             shadow=shadow,
+            prior_source=prior_source,
+            l2_active=l2_active,
+            theta_w_prior=theta_w_prior,
         )
         self._entries.append(entry)
         self._by_market.setdefault(market_id, []).append(entry)
@@ -1031,4 +1150,43 @@ class RPECalibrationTracker:
             summary["direction_accuracy"] = (
                 round(accuracy, 4) if accuracy is not None else None
             )
+            # Per-tag Brier breakdown (Dynamic Prior Engine diagnostics)
+            summary["per_tag_brier"] = self.compute_per_tag_brier()
         return summary
+
+    def compute_per_tag_brier(self) -> dict[str, dict[str, Any]]:
+        """Per-tag Brier score breakdown for prior calibration diagnostics.
+
+        Returns a dict keyed by prior_source label with:
+            count: number of resolved signals
+            brier: mean Brier score for that tag
+            direction_accuracy: fraction of correct direction calls
+        """
+        resolved = self._resolved()
+        if not resolved:
+            return {}
+
+        from collections import defaultdict
+        by_tag: dict[str, list[_CalibrationEntry]] = defaultdict(list)
+        for e in resolved:
+            tag = e.prior_source or "unknown"
+            by_tag[tag].append(e)
+
+        result: dict[str, dict[str, Any]] = {}
+        for tag, entries in by_tag.items():
+            brier_sum = 0.0
+            correct = 0
+            for e in entries:
+                assert e.resolution_price is not None
+                brier_sum += (e.model_prob - e.resolution_price) ** 2
+                if e.direction == "buy_yes" and e.resolution_price == 1.0:
+                    correct += 1
+                elif e.direction == "buy_no" and e.resolution_price == 0.0:
+                    correct += 1
+            n = len(entries)
+            result[tag] = {
+                "count": n,
+                "brier": round(brier_sum / n, 4),
+                "direction_accuracy": round(correct / n, 4),
+            }
+        return result
