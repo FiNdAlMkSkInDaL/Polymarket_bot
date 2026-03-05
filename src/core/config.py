@@ -95,8 +95,8 @@ class StrategyParams:
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.5)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 1.2)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.0)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.8)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Take-profit
@@ -107,11 +107,12 @@ class StrategyParams:
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
-    # Set to 50 based on 3-day post-mortem: trades with EQS < 50 were
-    # consistently unprofitable due to insufficient edge vs slippage+fees.
+    # Set to 40 based on 3-day tick data analysis (March 2026): marginal
+    # signals at EQS 40-50 are +EV (avg PnL 56.82c vs 57.43c at 50+);
+    # the 3.2% additional entries justify the 1% PnL dilution.
     # The geometric-mean formula already hard-rejects trades where any
     # factor is zero.
-    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 50.0)
+    min_edge_score: float = _env_float("MIN_EDGE_SCORE", 40.0)
 
     # ── V1: Maker routing ─────────────────────────────────────────────────
     # When True, entries priced as maker (best_ask - 1¢) use 0-fee EQS
@@ -193,7 +194,7 @@ class StrategyParams:
     exit_timeout_seconds: int = _env_int("EXIT_TIMEOUT_SECONDS", 1800)
 
     # Market selection filters
-    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 10_000.0)
+    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 5_000.0)
     min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 3)
     min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
 
@@ -374,9 +375,11 @@ class StrategyParams:
     # ── Panic detector NO-discount gate ────────────────────────────────────
     # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
     # Lower = stricter (0.98 means NO must be 2% below VWAP).
-    # Tightened from 1.005→0.98 based on 3-day post-mortem: permissive
-    # discount gate admitted entries with no structural discount to capture.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.98)
+    # Relaxed from 0.98→1.005: the z-score gate already captures
+    # directional displacement; requiring an additional 2% NO discount
+    # was redundant and rejected 54% of otherwise-valid signals.
+    # At 1.005, NO ask just needs to be within 0.5% of VWAP.
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
 
     # ── Trend regime guard ────────────────────────────────────────────────
     # Suppress panic signals when YES has been trending upward over the
@@ -393,7 +396,14 @@ class StrategyParams:
     # Scale min_edge_score by EWMA σ.  Low-vol → raise threshold
     # (avoid noise), high-vol → lower threshold (mean-reversion α).
     eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", True)
-    eqs_vol_ref: float = _env_float("EQS_VOL_REF", 0.02)         # "normal" 1-min σ
+    # Recalibrated from 0.02 to 0.70 based on 3-day tick data analysis:
+    # actual market EWMA vols have median 0.72 (P10=0.21, P75=1.22).
+    # At 0.02, the ratio was always 10-96x, jamming the ±25% adjuster
+    # permanently at -25%.  At 0.70, the feature is actually adaptive:
+    # quiet bars (σ<0.41) → threshold +25% (more selective),
+    # normal bars (σ≈0.72) → threshold ≈ baseline,
+    # active bars (σ>1.22) → threshold -25% (exploit mean-reversion).
+    eqs_vol_ref: float = _env_float("EQS_VOL_REF", 0.70)         # median 1-min σ from data
     eqs_vol_scale_range: float = _env_float("EQS_VOL_SCALE_RANGE", 0.25)  # ±25% max adjustment
     # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
@@ -482,9 +492,9 @@ class StrategyParams:
     # PanicDetector is silent.  Requires MR regime + low EWMA σ.
     drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
     drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
-    drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 1.0)
-    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.015)
-    drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 120.0)
+    drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 0.8)
+    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.05)
+    drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 60.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)

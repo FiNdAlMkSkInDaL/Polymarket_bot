@@ -683,7 +683,7 @@ class TestSearchSpace:
         params = _suggest_params(mock_trial)
         sp = StrategyParams(**params)
 
-        assert sp.zscore_threshold == (1.5 + 3.5) / 2
+        assert sp.zscore_threshold == (0.8 + 3.0) / 2
         assert sp.kelly_fraction == (0.03 + 0.40) / 2
 
     def test_expanded_search_space_has_new_params(self):

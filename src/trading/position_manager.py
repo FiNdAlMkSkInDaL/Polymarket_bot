@@ -513,6 +513,19 @@ class PositionManager:
                     floor=strat.probe_eqs_floor,
                 )
             else:
+                log.info(
+                    "eqs_rejected",
+                    market_id=signal.market_id,
+                    score=round(edge.score, 4),
+                    threshold=round(eqs_threshold, 4),
+                    reason=edge.rejection_reason,
+                    is_drift=is_drift_signal,
+                    entry_price=entry_price,
+                    exec_mode=exec_mode,
+                    regime_q=round(edge.regime_quality, 4) if hasattr(edge, 'regime_quality') else None,
+                    fee_eff=round(edge.fee_efficiency, 4) if hasattr(edge, 'fee_efficiency') else None,
+                    signal_q=round(edge.signal_quality, 4) if hasattr(edge, 'signal_quality') else None,
+                )
                 return None
 
         # ── Depth-aware sizing (Pillar 2) ──────────────────────────────────

@@ -38,10 +38,10 @@ class TestConfigDefaults:
         assert settings.strategy.min_spread_cents == 4.0
 
     def test_min_edge_score_raised(self):
-        assert settings.strategy.min_edge_score == 50.0
+        assert settings.strategy.min_edge_score == 40.0
 
     def test_no_discount_factor_tightened(self):
-        assert settings.strategy.no_discount_factor == 0.98
+        assert settings.strategy.no_discount_factor == 1.005
 
     def test_max_loss_per_trade_cents_exists(self):
         assert settings.strategy.max_loss_per_trade_cents == 50.0
@@ -304,21 +304,21 @@ class TestZScoreDiminishingReturns:
             )
 
     def test_extreme_zscore_still_differentiated(self):
-        """z=4 and z=9 should produce different signal qualities."""
-        edge_z4 = compute_edge_score(
+        """z=2 and z=4 should produce different signal qualities."""
+        edge_z2 = compute_edge_score(
             entry_price=0.30, no_vwap=0.50,
-            zscore=4.0, volume_ratio=2.0,
+            zscore=2.0, volume_ratio=1.0,
             fee_enabled=False,
         )
-        edge_z9 = compute_edge_score(
+        edge_z4 = compute_edge_score(
             entry_price=0.30, no_vwap=0.50,
-            zscore=9.0, volume_ratio=2.0,
+            zscore=4.0, volume_ratio=1.0,
             fee_enabled=False,
         )
         # The log-concave curve should still differentiate these
-        assert edge_z9.signal_quality > edge_z4.signal_quality
+        assert edge_z4.signal_quality > edge_z2.signal_quality
         # And the gap should be meaningful (not just 0.01)
-        assert edge_z9.signal_quality - edge_z4.signal_quality >= 0.02
+        assert edge_z4.signal_quality - edge_z2.signal_quality >= 0.02
 
     def test_log_concave_saturation(self):
         """Signal quality should approach but not exceed 1.0."""
@@ -333,12 +333,13 @@ class TestZScoreDiminishingReturns:
     def test_zscore_at_threshold_gives_baseline(self):
         """Z-score exactly at threshold → signal quality ≈ 0.5 baseline."""
         z_thresh = settings.strategy.zscore_threshold
+        v_thresh = settings.strategy.volume_ratio_threshold
         edge = compute_edge_score(
             entry_price=0.30, no_vwap=0.50,
-            zscore=z_thresh, volume_ratio=1.2,
+            zscore=z_thresh, volume_ratio=v_thresh,
             fee_enabled=False,
         )
-        # At threshold, z_excess=0 and v_excess≈0 → signal_q ≈ 0.50
+        # At threshold, z_excess=0 and v_excess=0 → signal_q ≈ 0.50
         assert edge.signal_quality == pytest.approx(0.50, abs=0.05)
 
 

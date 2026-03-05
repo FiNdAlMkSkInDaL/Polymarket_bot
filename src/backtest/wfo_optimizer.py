@@ -288,9 +288,9 @@ class WfoReport:
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
 SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
     # Core signal parameters
-    "zscore_threshold": ("suggest_float", 1.5, 3.5),
+    "zscore_threshold": ("suggest_float", 0.8, 3.0),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
-    "volume_ratio_threshold": ("suggest_float", 2.0, 6.0),
+    "volume_ratio_threshold": ("suggest_float", 0.5, 4.0),
     # Risk management
     "stop_loss_cents": ("suggest_float", 2.0, 12.0),
     "trailing_stop_offset_cents": ("suggest_float", 0.5, 6.0),
@@ -305,6 +305,9 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
     "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),
     "rpe_crypto_vol_default": ("suggest_float", 0.50, 1.20),
+    # Drift signal
+    "drift_z_threshold": ("suggest_float", 0.5, 2.0),
+    "drift_vol_ceiling": ("suggest_float", 0.02, 0.15, True),     # log-scale
     # PCE (Pillar 15)
     "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
     "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),

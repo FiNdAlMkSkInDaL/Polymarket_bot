@@ -101,25 +101,45 @@ class MeanReversionDrift:
         DriftSignal or None
             A signal if all conditions are met, else ``None``.
         """
+        def _reject(gate: str, **kw):
+            """Log gate rejection and return None."""
+            log.debug(
+                "drift_eval",
+                market_id=self.market_id[:16],
+                gate=gate,
+                passed=False,
+                **kw,
+            )
+            return None
+
         # Gate 1: Regime must be mean-reverting
         if not regime_is_mean_revert:
-            return None
+            return _reject("regime", regime_is_mean_revert=False)
 
         # Gate 2: L2 book must be reliable
         if not l2_reliable:
-            return None
+            return _reject("l2_unreliable", l2_reliable=False)
 
         # Gate 3: Need enough bar history
         bars = list(no_aggregator.bars)
         if len(bars) < self.lookback_bars:
-            return None
+            return _reject(
+                "insufficient_history",
+                bars_available=len(bars),
+                lookback_required=self.lookback_bars,
+            )
 
         window = bars[-self.lookback_bars:]
 
         # Gate 4: EWMA volatility must be below ceiling (low-vol only)
         ewma_vol = no_aggregator.rolling_volatility_ewma or 0.0
         if ewma_vol <= 0 or ewma_vol >= self.vol_ceiling:
-            return None
+            return _reject(
+                "ewma_vol_bounds",
+                ewma_vol=round(ewma_vol, 8),
+                vol_ceiling=self.vol_ceiling,
+                vol_is_zero=(ewma_vol <= 0),
+            )
 
         # Gate 5: No bar in the window should have high volume ratio
         # (ensures this signal is uncorrelated with PanicDetector)
@@ -128,21 +148,33 @@ class MeanReversionDrift:
             for bar in window:
                 bar_vol_ratio = bar.volume / avg_vol
                 if bar_vol_ratio > self.max_bar_volume_ratio:
-                    return None
+                    return _reject(
+                        "high_volume_bar",
+                        bar_vol_ratio=round(bar_vol_ratio, 4),
+                        max_bar_volume_ratio=self.max_bar_volume_ratio,
+                    )
 
         # Compute cumulative displacement: how far is current price
         # from rolling VWAP, normalised by σ
         vwap = no_aggregator.rolling_vwap
         sigma = no_aggregator.rolling_volatility
         if sigma <= 0 or vwap <= 0:
-            return None
+            return _reject(
+                "sigma_vwap_invalid",
+                sigma=round(sigma, 8) if sigma else 0.0,
+                vwap=round(vwap, 8) if vwap else 0.0,
+            )
 
         current_price = window[-1].close
         displacement = (current_price - vwap) / sigma
 
         # Gate 6: Displacement must exceed threshold
         if abs(displacement) < self.z_threshold:
-            return None
+            return _reject(
+                "displacement_below_threshold",
+                displacement=round(displacement, 4),
+                z_threshold=self.z_threshold,
+            )
 
         # Direction: negative displacement = NO token is cheap → buy NO
         direction = "BUY_NO" if displacement < 0 else "SELL_NO"
@@ -160,6 +192,15 @@ class MeanReversionDrift:
             timestamp=time.time(),
         )
 
+        log.debug(
+            "drift_eval",
+            market_id=self.market_id[:16],
+            gate="all_passed",
+            passed=True,
+            displacement=signal.displacement,
+            ewma_vol=signal.ewma_vol,
+            direction=direction,
+        )
         log.info(
             "drift_signal_fired",
             market_id=self.market_id[:16],

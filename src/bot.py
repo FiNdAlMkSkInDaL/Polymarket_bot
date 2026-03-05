@@ -1254,9 +1254,16 @@ class TradingBot:
                         if drift_sig and drift_sig.direction == "BUY_NO":
                             self._drift_cooldowns[market_info.condition_id] = now_drift
                             # Synthesise a PanicSignal for the standard flow
+                            # Derive YES-side fields for PanicSignal compat
+                            yes_agg_drift = self._yes_aggs.get(market_info.yes_token_id)
+                            drift_yes_price = yes_agg_drift.current_price if yes_agg_drift else 0.0
+                            drift_yes_vwap = yes_agg_drift.rolling_vwap if yes_agg_drift else 0.0
                             drift_panic = PanicSignal(
                                 market_id=market_info.condition_id,
+                                yes_asset_id=market_info.yes_token_id,
                                 no_asset_id=market_info.no_token_id,
+                                yes_price=drift_yes_price,
+                                yes_vwap=drift_yes_vwap,
                                 zscore=abs(drift_sig.displacement),
                                 volume_ratio=1.0,
                                 no_best_ask=no_best_ask,

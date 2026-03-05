@@ -538,9 +538,9 @@ class TestConfigFields:
         params = StrategyParams()
         assert params.drift_signal_enabled is True
         assert params.drift_lookback_bars == 10
-        assert params.drift_z_threshold == 1.0
-        assert params.drift_vol_ceiling == 0.015
-        assert params.drift_cooldown_s == 120.0
+        assert params.drift_z_threshold == 0.8
+        assert params.drift_vol_ceiling == 0.05
+        assert params.drift_cooldown_s == 60.0
 
     def test_v4_probe_defaults(self):
         params = StrategyParams()
