@@ -285,8 +285,13 @@ class BotReplayAdapter(StrategyABC):
         if len(self._open_positions) >= self._params.max_open_positions:
             return
 
-        # ── NO best ask from the sim matching engine ───────────────────
-        best_ask = self.engine.matching_engine.best_ask
+        # ── NO best ask from per-asset BBO ────────────────────────────
+        # The unified matching engine reflects only the most recently
+        # processed token (the YES trade that just closed this bar in
+        # trade-only mode).  Use the NO-specific BBO instead so the
+        # PanicDetector's NO-discount check compares against the actual
+        # NO token price, not the YES token price.
+        best_ask = self.engine.get_asset_best_ask(self._no_asset_id)
         if best_ask <= 0:
             return
 
@@ -300,7 +305,7 @@ class BotReplayAdapter(StrategyABC):
         # Record signal time for cooldown
         self._last_signal_time = bar_time
 
-        best_bid = self.engine.matching_engine.best_bid
+        best_bid = self.engine.get_asset_best_bid(self._no_asset_id)
         if best_bid <= 0:
             return
 

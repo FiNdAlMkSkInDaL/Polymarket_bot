@@ -149,6 +149,10 @@ class BacktestEngine:
         # Set to True once a real L2 book event has been processed; used to
         # suppress synthetic BBO injection when real order-book data exists.
         self._has_real_book: bool = False
+        # Per-asset BBO so strategies can query bid/ask for a specific token
+        # rather than the unified matching-engine book (which reflects only the
+        # most recently processed asset in trade-only mode).
+        self._bbo_per_asset: dict[str, tuple[float, float]] = {}  # asset_id → (bid, ask)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Order submission API (called by strategies)
@@ -187,6 +191,24 @@ class BacktestEngine:
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by ID."""
         return self.matching_engine.cancel_order(order_id)
+
+    def get_asset_best_ask(self, asset_id: str) -> float:
+        """Return the best ask for a specific asset.
+
+        Falls back to the unified matching-engine best ask when no
+        per-asset BBO has been recorded yet.
+        """
+        bbo = self._bbo_per_asset.get(asset_id)
+        return bbo[1] if bbo else self.matching_engine.best_ask
+
+    def get_asset_best_bid(self, asset_id: str) -> float:
+        """Return the best bid for a specific asset.
+
+        Falls back to the unified matching-engine best bid when no
+        per-asset BBO has been recorded yet.
+        """
+        bbo = self._bbo_per_asset.get(asset_id)
+        return bbo[0] if bbo else self.matching_engine.best_bid
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Main replay loop
@@ -291,6 +313,12 @@ class BacktestEngine:
             "ask_levels": self.matching_engine.ask_levels(5),
         }
 
+        # Record per-asset BBO from real book data
+        self._bbo_per_asset[event.asset_id] = (
+            self.matching_engine.best_bid,
+            self.matching_engine.best_ask,
+        )
+
         self.strategy.on_book_update(event.asset_id, snapshot)
 
     # Half-spread used to synthesize a BBO when only trade data is available
@@ -323,6 +351,10 @@ class BacktestEngine:
                 "bids": [{"price": synth_bid, "size": 9999.0}],
                 "asks": [{"price": synth_ask, "size": 9999.0}],
             })
+            # Track per-asset synthetic BBO so strategies can query the
+            # correct bid/ask for a specific token, even when the shared
+            # matching engine reflects a different token's last trade.
+            self._bbo_per_asset[event.asset_id] = (synth_bid, synth_ask)
 
         # Check maker order queue drainage
         trade_fills = self.matching_engine.on_trade(
