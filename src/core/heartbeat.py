@@ -258,9 +258,11 @@ class BookHeartbeat:
 
         # ── Layer 3: Fallback — legacy per-tracker scan ───────────────
         #
-        # When no WS transport is wired (tests, non-L2 mode), fall back
-        # to the original freshest-tracker heuristic.
-        if self._ws_transport is None:
+        # When no WS transport is wired AND no process manager handles
+        # worker heartbeats (tests, non-L2 mode), fall back to the
+        # original freshest-tracker heuristic.  In multicore mode,
+        # Layer 1 already handles liveness via worker heartbeats.
+        if self._ws_transport is None and self._process_manager is None:
             best_gap = self._freshest_tracker_gap_ms(now)
             if best_gap is not None and best_gap > self._stale_ms:
                 if not self._is_suspended:

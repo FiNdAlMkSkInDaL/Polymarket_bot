@@ -416,16 +416,23 @@ class DataLoader:
                 self._skipped_events += 1
                 continue
 
-            # Apply asset filter
-            if self._asset_filter and asset_id not in self._asset_filter:
-                continue
-
             # Reconstruct payload dict from JSON string
             payload_str = col_payload[idx]
             try:
                 data = json.loads(payload_str)
             except (json.JSONDecodeError, TypeError):
                 self._skipped_events += 1
+                continue
+
+            # Prefer the per-token asset_id stored in the payload (decimal
+            # token id) over the top-level market-id (hex condition_id),
+            # matching the JSONL path behaviour.
+            payload_token_id = data.get("asset_id", "")
+            if payload_token_id:
+                asset_id = str(payload_token_id)
+
+            # Apply asset filter (evaluated after payload id resolution)
+            if self._asset_filter and asset_id not in self._asset_filter:
                 continue
 
             server_time = col_exchange_ts[idx]

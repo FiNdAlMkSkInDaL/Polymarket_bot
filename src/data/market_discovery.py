@@ -29,14 +29,57 @@ def _get_rate_sem() -> asyncio.Semaphore:
     return _rate_sem
 
 
+# Transient errors that should be retried automatically
+_TRANSIENT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
+
+_RETRY_ATTEMPTS = 5
+_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt
+
+# Split timeout: short connect, generous read (CLOB can be very slow)
+_DISCOVERY_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+
+
+async def _get_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict | None = None,
+    *,
+    attempts: int = _RETRY_ATTEMPTS,
+) -> httpx.Response:
+    """GET with exponential-backoff retry for transient network errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            return resp
+        except _TRANSIENT_ERRORS as exc:
+            if attempt == attempts:
+                raise
+            delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            log.warning(
+                "transient_http_error_retrying",
+                error=type(exc).__name__,
+                attempt=attempt,
+                max_attempts=attempts,
+                delay_s=delay,
+                url=url,
+            )
+            await asyncio.sleep(delay)
+    # Unreachable, but keeps type-checkers happy
+    raise RuntimeError("retry loop exited unexpectedly")  # pragma: no cover
+
+
 async def _rate_limited_get(
     client: httpx.AsyncClient, url: str, params: dict | None = None
 ) -> httpx.Response:
-    """GET with semaphore-based rate limiting."""
+    """GET with semaphore-based rate limiting and retry."""
     sem = _get_rate_sem()
     async with sem:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
+        resp = await _get_with_retries(client, url, params)
         await asyncio.sleep(1.0 / max(settings.strategy.api_rate_limit_per_sec, 1))
         return resp
 
@@ -84,26 +127,54 @@ async def fetch_active_markets(
     min_volume = min_volume or settings.strategy.min_daily_volume_usd
     min_days_to_resolution = min_days_to_resolution or settings.strategy.min_days_to_resolution
 
-    # Tier 1 — CLOB
-    markets = await _fetch_clob_markets(min_volume, min_days_to_resolution, limit)
-    if markets:
-        log.info("markets_fetched", count=len(markets), source="clob")
-        return markets[:limit]
+    # Retry the entire tiered discovery with backoff so transient outages
+    # (DNS hiccup, API momentary 5xx, read timeout) never crash the bot.
+    _DISCOVERY_ATTEMPTS = 3
+    _DISCOVERY_DELAY = 10.0  # seconds between full-cycle retries
 
-    # Tier 2 — Gamma /events (tag-based, best quality)
-    log.info("clob_returned_zero_trying_gamma_events")
-    markets = await _fetch_gamma_events(
-        min_volume, min_days_to_resolution, limit,
-    )
-    if markets:
-        log.info("markets_fetched", count=len(markets), source="gamma_events")
-        return markets[:limit]
+    last_exc: Exception | None = None
+    for attempt in range(1, _DISCOVERY_ATTEMPTS + 1):
+        try:
+            # Tier 1 — CLOB
+            markets = await _fetch_clob_markets(min_volume, min_days_to_resolution, limit)
+            if markets:
+                log.info("markets_fetched", count=len(markets), source="clob")
+                return markets[:limit]
 
-    # Tier 3 — Gamma /markets (catch-all fallback)
-    log.info("gamma_events_returned_zero_trying_gamma_markets")
-    markets = await _fetch_gamma_markets(min_volume, min_days_to_resolution, limit)
-    log.info("markets_fetched", count=len(markets), source="gamma_markets")
-    return markets[:limit]
+            # Tier 2 — Gamma /events (tag-based, best quality)
+            log.info("clob_returned_zero_trying_gamma_events")
+            markets = await _fetch_gamma_events(
+                min_volume, min_days_to_resolution, limit,
+            )
+            if markets:
+                log.info("markets_fetched", count=len(markets), source="gamma_events")
+                return markets[:limit]
+
+            # Tier 3 — Gamma /markets (catch-all fallback)
+            log.info("gamma_events_returned_zero_trying_gamma_markets")
+            markets = await _fetch_gamma_markets(min_volume, min_days_to_resolution, limit)
+            log.info("markets_fetched", count=len(markets), source="gamma_markets")
+            return markets[:limit]
+        except _TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt < _DISCOVERY_ATTEMPTS:
+                log.warning(
+                    "discovery_transient_error_retrying",
+                    error=type(exc).__name__,
+                    attempt=attempt,
+                    max_attempts=_DISCOVERY_ATTEMPTS,
+                    delay_s=_DISCOVERY_DELAY,
+                )
+                await asyncio.sleep(_DISCOVERY_DELAY)
+            else:
+                log.error(
+                    "discovery_all_attempts_failed",
+                    error=type(exc).__name__,
+                    attempts=_DISCOVERY_ATTEMPTS,
+                )
+
+    # All retries exhausted — return empty list rather than crashing
+    return []
 
 
 async def _fetch_clob_markets(
@@ -119,7 +190,7 @@ async def _fetch_clob_markets(
     _END_CURSORS = {"", "LTE=", "LTE%3D"}
     _MAX_PAGES = 20  # cap pagination to avoid scanning 1000+ pages
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
         next_cursor = ""
         page = 0
         while len(markets) < limit and page < _MAX_PAGES:
@@ -130,12 +201,12 @@ async def _fetch_clob_markets(
                 params["next_cursor"] = next_cursor
 
             try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
+                resp = await _get_with_retries(client, url, params)
+            except (*_TRANSIENT_ERRORS, httpx.HTTPStatusError) as exc:
                 log.warning(
                     "market_fetch_http_error",
-                    status=exc.response.status_code,
+                    error=type(exc).__name__,
+                    detail=str(exc),
                     cursor=next_cursor,
                     markets_so_far=len(markets),
                 )
@@ -183,7 +254,7 @@ async def _fetch_gamma_markets(
     _PAGE_SIZE = 100
     _MAX_PAGES = 10
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
         offset = 0
         for _page in range(_MAX_PAGES):
             if len(markets) >= limit:
@@ -199,8 +270,12 @@ async def _fetch_gamma_markets(
                         "offset": offset,
                     },
                 )
-            except httpx.HTTPStatusError as exc:
-                log.warning("gamma_fetch_http_error", status=exc.response.status_code)
+            except (*_TRANSIENT_ERRORS, httpx.HTTPStatusError) as exc:
+                log.warning(
+                    "gamma_fetch_http_error",
+                    error=type(exc).__name__,
+                    detail=str(exc),
+                )
                 break
 
             items = resp.json()
@@ -252,7 +327,7 @@ async def _fetch_gamma_events(
     _PAGE_SIZE = 100
     _MAX_PAGES = 10  # safety cap per tag (or total if no tags)
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
         tag_list = tags if tags else [""]  # empty string = no tag filter
         for tag in tag_list:
             if len(markets) >= limit:
@@ -274,10 +349,11 @@ async def _fetch_gamma_events(
 
                 try:
                     resp = await _rate_limited_get(client, gamma_url, params)
-                except httpx.HTTPStatusError as exc:
+                except (*_TRANSIENT_ERRORS, httpx.HTTPStatusError) as exc:
                     log.warning(
                         "gamma_events_http_error",
-                        status=exc.response.status_code,
+                        error=type(exc).__name__,
+                        detail=str(exc),
                         tag=tag or "all",
                     )
                     break

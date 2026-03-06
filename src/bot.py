@@ -315,8 +315,21 @@ class TradingBot:
         # 1. Init trade store
         await self.trade_store.init()
 
-        # 2. Discover eligible markets via lifecycle manager
-        self._markets = await self.lifecycle.initial_discovery()
+        # 2. Discover eligible markets via lifecycle manager (with retry)
+        _INIT_RETRIES = 5
+        _INIT_DELAY = 15.0  # seconds between retries
+        for _disc_attempt in range(1, _INIT_RETRIES + 1):
+            self._markets = await self.lifecycle.initial_discovery()
+            if self._markets:
+                break
+            if _disc_attempt < _INIT_RETRIES:
+                log.warning(
+                    "initial_discovery_empty_retrying",
+                    attempt=_disc_attempt,
+                    max_attempts=_INIT_RETRIES,
+                    delay_s=_INIT_DELAY,
+                )
+                await asyncio.sleep(_INIT_DELAY)
         if not self._markets:
             log.error("no_eligible_markets")
             await self.telegram.send(
