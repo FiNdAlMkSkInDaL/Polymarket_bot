@@ -406,6 +406,14 @@ Key parameter groups (~160 total):
     chaser_toxicity_p_value_ceil = 0.10  (Pillar 7 anti-toxicity: p-value ceiling)
     iceberg_peg_min_confidence = 0.50    (SI-2: min IcebergSignal confidence to peg)
 
+  SI-2 ICEBERG ALPHA MODIFIERS (added March 5th — dual-layer optimisation):
+    iceberg_eqs_bonus = 0.15     (fractional EQS bonus when iceberg confirms hidden
+                                  liquidity; raises effective edge score before the
+                                  min_edge_score gate — range explored: 0.00–0.30)
+    iceberg_tp_alpha = 0.05      (additive TP alpha adjustment when iceberg detected;
+                                  widens take-profit target from α_default by this
+                                  amount — range explored: 0.00–0.10)
+
   LATENCY GUARD:
     latency_block_ms = 1500
     latency_warn_ms = 800
@@ -1101,13 +1109,15 @@ Time-series cross-validation with Optuna hyperparameter optimisation.
 WfoConfig: train_days=30, test_days=7, step_days=7, embargo_days=1,
   n_trials=100, max_workers=cpu_count-1
 
-17-parameter search space:
+19-parameter search space:
   Core: zscore_threshold, spread_compression_pct, volume_ratio_threshold
   Risk: stop_loss_cents, trailing_stop, kelly_fraction, max_impact_pct
   TP: alpha_default, tp_vol_sensitivity
   Edge: min_edge_score
   RPE: confidence_threshold, bayesian_obs_weight, crypto_vol_default
+  Drift: drift_z_threshold, drift_vol_ceiling
   PCE: max_portfolio_var, haircut_threshold, prior_weight, holding_period
+  SI-2: iceberg_eqs_bonus, iceberg_tp_alpha
 
 Composite objective:
   Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
@@ -1145,7 +1155,13 @@ scripts/param_optimizer.py:
   Outputs: z-score distribution, volume ratio, P&L simulation, EWMA vol
   distribution, fee-efficiency curves, mean-reversion half-life analysis,
   EV surface, EQS viability, inter-arrival times.
-  Source of the March 2026 calibration changes to 9 parameters.
+  Section 13 (added March 5th): iceberg parameter sensitivity grid search
+    — evaluates iceberg_eqs_bonus ∈ [0.00, 0.30] (step 0.05) ×
+      iceberg_tp_alpha ∈ [0.00, 0.10] (step 0.01); simulates EV surface
+      for each combination and logs recommended WFO bounding constraints
+      based on highest EV without severe win-rate degradation (≥90% of
+      peak EV, ≤5pp win-rate drop).
+  Source of the March 2026 calibration changes to 9 parameters (+ iceberg bounds).
 
 scripts/counterfactual_analysis.py:
   Counterfactual scenario analysis
@@ -1452,13 +1468,18 @@ SI-1 — REGIME DETECTOR:
   Used as: DriftSignal Gate 1, EQS regime quality factor, confluence signal
   Config: regime_enabled=True, regime_threshold=0.40
 
-SI-2 — ICEBERG DETECTOR (WEAPONIZED):
+SI-2 — ICEBERG DETECTOR (WEAPONIZED + PRIMARY ALPHA FACTOR):
   L2 refill pattern detection via on_level_change callback.
   ≥3 refills at same price within 5s, size within ±30% tolerance.
   Intelligence now consumed by OrderChaser via iceberg_detector param.
   _optimal_quote() pegs behind the strongest qualifying iceberg (confidence
     ≥ iceberg_peg_min_confidence=0.50), clamped to BBO so POST_ONLY always valid.
-  Config: iceberg_enabled=True, iceberg_min_refills=3, iceberg_peg_min_confidence=0.50
+  As of March 5th, IcebergDetector is a PRIMARY alpha generation factor with
+  two new tunable modifiers wired into the dual-layer optimisation pipeline:
+    iceberg_eqs_bonus  — fractional bonus applied to EQS when iceberg detected
+    iceberg_tp_alpha   — additive alpha adjustment to TP when iceberg detected
+  Config: iceberg_enabled=True, iceberg_min_refills=3, iceberg_peg_min_confidence=0.50,
+          iceberg_eqs_bonus=0.15, iceberg_tp_alpha=0.05
 
 SI-3 — CROSS-MARKET SIGNAL:
   Correlated pairs stat-arb. Shadow mode by default.
@@ -1736,6 +1757,15 @@ March 5th — Crash Hardening & Bug Fixes:
   All changes: 1270 tests passing (excludes 3 pre-existing env-dependent
     failures in test_architecture_fixes, test_deployment_guard, test_e2e).
 
+March 5th — IcebergDetector (SI-2) as Primary Alpha Factor:
+  Integrated iceberg_eqs_bonus and iceberg_tp_alpha as the first two
+  iceberg-specific tunable modifiers, wired into both the short-term
+  exploration pipeline (param_optimizer.py Section 13) and the long-term
+  Optuna WFO search space (wfo_optimizer.py SEARCH_SPACE, now 19 params).
+  WFO bounds: iceberg_eqs_bonus [0.05, 0.25], iceberg_tp_alpha [0.02, 0.10].
+  Both parameters tracked in unstable_params diagnostics (CV > 0.50 flag).
+  Test delta: 73 WFO tests pass; 1326 total passing, 7 pre-existing failures.
+
 March 5th — Data-Driven Parameter Optimisation (Tick Data Analysis):
   Analysed 3.53M trade ticks across 80 assets over 3 days (March 1–3 2026)
   from data/vps_march2026/ticks/.  Built 133,198 1-min bars, computed z-score
@@ -1810,6 +1840,22 @@ March 5th — Data-Driven Parameter Optimisation (Tick Data Analysis):
   - drift_vol_ceiling: [0.02, 0.15] (log-scale)
 
   Total config changes: 9 parameters.  1270 tests passing.
+
+March 5th — SI-2 Iceberg Dual-Layer Optimisation:
+  Added iceberg_eqs_bonus (default 0.15) and iceberg_tp_alpha (default 0.05)
+  to StrategyParams as the first iceberg-specific alpha tuning parameters.
+  Both parameters feed into the dual-layer optimisation pipeline:
+    Layer 1 (short-term exploration): param_optimizer.py Section 13 runs a
+      7×11 grid search (77 evaluations) over the new parameters, computing
+      EV surface, win-rate, and Sharpe for each combination.  Outputs
+      recommended WFO bounding constraints.
+    Layer 2 (long-term WFO): wfo_optimizer.py SEARCH_SPACE expanded to 19
+      parameters.  Optuna studies now optimise iceberg_eqs_bonus ∈ [0.05, 0.25]
+      and iceberg_tp_alpha ∈ [0.02, 0.10] alongside existing params.  Both
+      are tracked in overfitting diagnostics (parameter_stability, unstable_params).
+  Config mutation pattern: test overrides use object.__setattr__() + try/finally
+  as required by the frozen StrategyParams dataclass.
+  Tests: 73 WFO tests pass; full suite 1326 passed, 7 pre-existing failures.
 
 
 ================================================================================

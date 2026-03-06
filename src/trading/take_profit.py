@@ -41,6 +41,7 @@ def compute_take_profit(
     realised_vol: float = 0.0,
     book_depth_ratio: float = 1.0,
     whale_confluence: bool = False,
+    iceberg_active: bool = False,
     days_to_resolution: int = 30,
     entry_fee_bps: int = 0,
     exit_fee_bps: int = 0,
@@ -62,6 +63,9 @@ def compute_take_profit(
         > 1.0 means deeper book → higher α.
     whale_confluence:
         If True, whale confirmation pushes α higher.
+    iceberg_active:
+        If True, a qualifying iceberg order is detected on our side of
+        the book, providing institutional L2 support.
     days_to_resolution:
         Days until market resolves.  Closer → lower α.
     entry_fee_bps:
@@ -109,6 +113,10 @@ def compute_take_profit(
     # 3. Whale confluence → conviction bump
     if whale_confluence:
         alpha += 0.08
+
+    # 3b. Iceberg presence → institutional L2 support widens TP
+    if iceberg_active:
+        alpha += 0.05
 
     # 4. Time decay: closer to resolution → less room for mean reversion
     if days_to_resolution < 14:

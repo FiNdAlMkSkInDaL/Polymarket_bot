@@ -238,6 +238,7 @@ def compute_edge_score(
     volume_ratio: float,
     *,
     whale_confluence: bool = False,
+    iceberg_active: bool = False,
     fee_enabled: bool = True,
     alpha: float | None = None,
     zscore_threshold: float | None = None,
@@ -262,6 +263,9 @@ def compute_edge_score(
         Volume ratio of the triggering bar.
     whale_confluence:
         Whether a whale bought NO recently.
+    iceberg_active:
+        Whether a qualifying iceberg order (confidence >= iceberg_peg_min_confidence)
+        is detected on our side of the book.
     fee_enabled:
         Whether this market charges dynamic fees.
     alpha:
@@ -403,6 +407,8 @@ def compute_edge_score(
         z_contribution = 0.35 * (1.0 - math.exp(-0.5 * z_excess)) if z_excess > 0 else 0.0
         signal_q = min(1.0, 0.5 + z_contribution + 0.20 * min(v_excess, 2.0))
     if whale_confluence:
+        signal_q = min(1.0, signal_q + 0.15)
+    if iceberg_active:
         signal_q = min(1.0, signal_q + 0.15)
 
     # ── Weighted geometric mean ────────────────────────────────────────

@@ -236,10 +236,12 @@ class MarketDataRecorder:
         data_dir: str | Path, date_str: str
     ) -> list[Path]:
         """List all JSONL tick files for a given date."""
-        tick_dir = Path(data_dir) / "raw_ticks" / date_str
-        if not tick_dir.exists():
-            return []
-        return sorted(tick_dir.glob("*.jsonl"))
+        base = Path(data_dir)
+        for subdir in ("raw_ticks", "ticks"):
+            tick_dir = base / subdir / date_str
+            if tick_dir.exists():
+                return sorted(tick_dir.glob("*.jsonl"))
+        return []
 
     @staticmethod
     def available_dates(data_dir: str | Path) -> list[str]:
@@ -252,12 +254,14 @@ class MarketDataRecorder:
         base = Path(data_dir)
         date_names: set[str] = set()
 
-        # Raw JSONL layout: <data_dir>/raw_ticks/YYYY-MM-DD/
-        tick_dir = base / "raw_ticks"
-        if tick_dir.exists():
-            for d in tick_dir.iterdir():
-                if d.is_dir() and len(d.name) == 10 and d.name[4] == "-":
-                    date_names.add(d.name)
+        # Raw JSONL layout: <data_dir>/raw_ticks/YYYY-MM-DD/ or <data_dir>/ticks/YYYY-MM-DD/
+        for subdir in ("raw_ticks", "ticks"):
+            tick_dir = base / subdir
+            if tick_dir.exists():
+                for d in tick_dir.iterdir():
+                    if d.is_dir() and len(d.name) == 10 and d.name[4] == "-":
+                        date_names.add(d.name)
+                break  # use first match; don't double-count if both exist
 
         # Processed Parquet layout: <data_dir>/YYYY-MM-DD/
         for d in base.iterdir():

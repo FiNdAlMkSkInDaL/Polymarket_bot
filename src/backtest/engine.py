@@ -146,6 +146,9 @@ class BacktestEngine:
         self._positions: dict[str, float] = {}  # asset_id → shares held
         self._aggregators: dict[str, OHLCVAggregator] = {}  # asset_id → agg
         self._events_processed: int = 0
+        # Set to True once a real L2 book event has been processed; used to
+        # suppress synthetic BBO injection when real order-book data exists.
+        self._has_real_book: bool = False
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Order submission API (called by strategies)
@@ -272,6 +275,7 @@ class BacktestEngine:
 
     def _process_book_event(self, event: MarketEvent) -> None:
         """Handle an L2 delta or snapshot."""
+        self._has_real_book = True
         # Update the matching engine's historical book mirror
         self.matching_engine.on_book_update(event.data)
 
@@ -289,6 +293,11 @@ class BacktestEngine:
 
         self.strategy.on_book_update(event.asset_id, snapshot)
 
+    # Half-spread used to synthesize a BBO when only trade data is available
+    # (no L2 book snapshots).  0.02 yields a 4-cent spread which passes the
+    # default min_spread_cents=4 gate while staying realistic for Polymarket.
+    _SYNTH_HALF_SPREAD: float = 0.02
+
     def _process_trade_event(self, event: MarketEvent) -> None:
         """Handle a public trade event."""
         data = event.data
@@ -300,6 +309,20 @@ class BacktestEngine:
 
         if trade_price <= 0 or trade_size <= 0:
             return
+
+        # When no L2 book data is available (trade-only replay) synthesize a
+        # one-level BBO centred on the trade price so that signal gates that
+        # require best_bid / best_ask can fire.  Update on every trade so the
+        # BBO tracks price movements; skip once real L2 data has arrived.
+        if not self._has_real_book:
+            half = self._SYNTH_HALF_SPREAD
+            synth_bid = max(0.01, trade_price - half)
+            synth_ask = min(0.99, trade_price + half)
+            self.matching_engine.on_book_update({
+                "event_type": "book_snapshot",
+                "bids": [{"price": synth_bid, "size": 9999.0}],
+                "asks": [{"price": synth_ask, "size": 9999.0}],
+            })
 
         # Check maker order queue drainage
         trade_fills = self.matching_engine.on_trade(

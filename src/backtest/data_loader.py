@@ -22,6 +22,7 @@ Usage
 
 from __future__ import annotations
 
+import datetime
 import heapq
 import json
 from dataclasses import dataclass
@@ -190,47 +191,114 @@ class DataLoader:
             skipped=self._skipped_events,
         )
 
-    def _file_stream(self, fpath: Path, file_idx: int) -> Iterator[MarketEvent]:
-        """Read a single JSONL file, yielding ``MarketEvent`` objects."""
-        line_no = 0
-        prev_ts = 0.0
+    # Maximum span (seconds) that triggers synthetic timestamp spreading.
+    # Backfilled data stored all trades at the backfill run time, so all
+    # events in a single day file may be compressed into < 60 seconds.
+    # When detected, we spread events evenly across the file's calendar date.
+    _SYNTH_TS_THRESHOLD: float = 60.0
 
+    @staticmethod
+    def _day_start_from_path(fpath: Path) -> float | None:
+        """Return midnight UTC (epoch seconds) for the date in the parent dir.
+
+        Expects a path like ``ticks/2025-12-05/<market>.jsonl``.
+        Returns ``None`` if the parent directory name is not a valid ISO date.
+        """
+        try:
+            d = datetime.date.fromisoformat(fpath.parent.name)
+            return datetime.datetime(d.year, d.month, d.day,
+                                     tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            return None
+
+    def _file_stream(self, fpath: Path, file_idx: int) -> Iterator[MarketEvent]:
+        """Read a single JSONL file, yielding ``MarketEvent`` objects.
+
+        When all timestamps in the file are compressed into a window smaller
+        than ``_SYNTH_TS_THRESHOLD`` seconds (a known artifact of the
+        Polymarket backfill script), timestamps are replaced with synthetic
+        values spread evenly across the file's calendar day so that OHLCV
+        bars can form correctly during backtest replay.
+        """
+        # --- Pass 1: buffer all valid records and check timestamp spread ---
+        raw_records: list[tuple[dict, int]] = []   # (record, line_no)
+        line_no = 0
         with open(fpath, "r", encoding="utf-8") as fh:
             for raw_line in fh:
                 line_no += 1
                 raw_line = raw_line.strip()
                 if not raw_line:
                     continue
-
                 try:
                     record = json.loads(raw_line)
                 except json.JSONDecodeError:
-                    log.warning(
-                        "dataloader_bad_line",
-                        file=str(fpath),
-                        line=line_no,
-                    )
+                    log.warning("dataloader_bad_line", file=str(fpath), line=line_no)
                     self._skipped_events += 1
                     continue
+                raw_records.append((record, line_no))
 
-                event = self._parse_record(record, fpath, line_no)
-                if event is None:
-                    self._skipped_events += 1
-                    continue
+        if not raw_records:
+            return
 
-                # Validate monotonicity
-                if event.timestamp < prev_ts:
-                    log.warning(
-                        "dataloader_non_monotonic",
+        # Determine if timestamps are collapsed (backfilled data artifact)
+        ts_vals = [float(r.get("local_ts", 0)) for r, _ in raw_records if r.get("local_ts") is not None]
+        ts_span = (max(ts_vals) - min(ts_vals)) if ts_vals else 0.0
+
+        synth_day_start: float | None = None
+        if ts_span < self._SYNTH_TS_THRESHOLD:
+            synth_day_start = self._day_start_from_path(fpath)
+            if synth_day_start is not None:
+                # Only spread if the stored timestamps are real modern Unix
+                # timestamps but mismatched from the file's calendar date
+                # (backfill artifact: local_ts is the backfill run time, not
+                # the historical date).  Test data typically uses small
+                # synthetic values (e.g. 1.0, 2.0) that are valid timestamps
+                # for near-epoch dates — we leave those unchanged.
+                # Threshold: 2020-01-01 (1577836800) distinguishes real vs
+                # synthetic test timestamps; 30-day tolerance for data
+                # legitimately written in the same period as the file.
+                _MIN_REAL_TS = 1_577_836_800.0   # 2020-01-01 UTC
+                median_ts = sorted(ts_vals)[len(ts_vals) // 2] if ts_vals else 0.0
+                ts_is_real = median_ts >= _MIN_REAL_TS
+                ts_far_from_date = abs(median_ts - synth_day_start) > 30 * 86400
+                if not (ts_is_real and ts_far_from_date):
+                    synth_day_start = None  # timestamps are fine as-is
+                else:
+                    log.debug(
+                        "dataloader_synth_ts",
                         file=str(fpath),
-                        line=line_no,
-                        ts=event.timestamp,
-                        prev_ts=prev_ts,
+                        original_span_s=round(ts_span, 1),
                     )
-                    # Still emit — heapq merge handles cross-file ordering
-                prev_ts = event.timestamp
 
-                yield event
+        # --- Pass 2: emit events with corrected timestamps ---
+        total = len(raw_records)
+        prev_ts = 0.0
+        for seq, (record, rec_line_no) in enumerate(raw_records):
+            event = self._parse_record(record, fpath, rec_line_no)
+            if event is None:
+                self._skipped_events += 1
+                continue
+
+            # Replace collapsed timestamp with synthetic one spread across the day
+            if synth_day_start is not None:
+                event = MarketEvent(
+                    timestamp=synth_day_start + seq * (86400.0 / max(total, 1)),
+                    event_type=event.event_type,
+                    asset_id=event.asset_id,
+                    data=event.data,
+                    server_time=event.server_time,
+                )
+
+            if event.timestamp < prev_ts:
+                log.warning(
+                    "dataloader_non_monotonic",
+                    file=str(fpath),
+                    line=rec_line_no,
+                    ts=event.timestamp,
+                    prev_ts=prev_ts,
+                )
+            prev_ts = event.timestamp
+            yield event
 
     def _parse_record(
         self, record: dict, fpath: Path, line_no: int
@@ -254,12 +322,20 @@ class DataLoader:
         if not asset_id:
             return None
 
-        # Apply asset filter
-        if self._asset_filter and asset_id not in self._asset_filter:
-            return None
-
         payload = record.get("payload")
         if not isinstance(payload, dict):
+            return None
+
+        # Prefer the per-token asset_id stored in the payload (decimal token
+        # id) over the top-level market-id (hex condition_id).  The live
+        # recorder stores the hex market_id at the top level but the
+        # Polymarket API returns the decimal token id inside the payload.
+        payload_token_id = payload.get("asset_id", "")
+        if payload_token_id:
+            asset_id = str(payload_token_id)
+
+        # Apply asset filter (evaluated after payload id resolution)
+        if self._asset_filter and asset_id not in self._asset_filter:
             return None
 
         # Reconcile event type using payload hints.

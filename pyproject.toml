@@ -24,6 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+perf = [
+    "uvloop>=0.19; sys_platform != 'win32'",
+]
 data = [
     "pandas>=2.1",
     "pyarrow>=15.0",
@@ -35,6 +38,7 @@ dev = [
     "ruff>=0.3",
     "pandas>=2.1",
     "pyarrow>=15.0",
+    "matplotlib>=3.8",
 ]
 
 [tool.setuptools.packages.find]

@@ -207,6 +207,8 @@ class BotReplayAdapter(StrategyABC):
             no_aggregator=self._no_agg,
             zscore_threshold=self._params.zscore_threshold,
             volume_ratio_threshold=self._params.volume_ratio_threshold,
+            trend_guard_pct=self._params.trend_guard_pct,
+            trend_guard_bars=self._params.trend_guard_bars,
         )
 
         # Register market with PCE if enabled

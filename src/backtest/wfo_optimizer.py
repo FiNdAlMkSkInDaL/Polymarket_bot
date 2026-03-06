@@ -35,6 +35,7 @@ Public API
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -147,6 +148,16 @@ class WfoConfig:
     sortino_weight: float = 0.30
     profit_factor_weight: float = 0.20
 
+    # sqrt(n_trades) bonus — continuous reward for statistical significance
+    trade_bonus_weight: float = 0.05
+
+    # Data-quality gate: abort fold if gap ratio exceeds this threshold
+    gap_threshold: float = 0.01       # 1% of events with >5-min gap → abort
+    gap_max_interval_s: float = 300.0  # 5-minute gap definition
+
+    # Output path for champion parameters JSON (None = no export)
+    output_params_path: str | None = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Fold definition
@@ -207,6 +218,11 @@ class WfoReport:
     avg_sharpe_decay_pct: float = 0.0      # mean IS→OOS Sharpe decay %
     overfit_probability: float = 0.0       # fraction of folds where OOS < 0
     unstable_params: list[str] = field(default_factory=list)  # params with CV > 0.50
+
+    # ── Champion selection (lowest OOS degradation) ────────────────────
+    champion_params: dict[str, float] = field(default_factory=dict)
+    champion_fold_index: int = -1
+    champion_degradation_pct: float = 0.0
 
     def summary(self) -> str:
         """Human-readable WFO report with IS-vs-OOS comparison."""
@@ -274,6 +290,17 @@ class WfoReport:
                     lines.append(f"    {pname:<30s}  value={vals[0]:.4f}")
             lines.append("")
 
+        # Champion params
+        if self.champion_params:
+            lines.append("  Champion Parameter Set")
+            lines.append("  ──────────────────────")
+            lines.append(f"    Selected Fold:             {self.champion_fold_index}")
+            lines.append(f"    OOS Degradation:           {self.champion_degradation_pct:.1f}%")
+            lines.append("    Parameters:")
+            for pname, pval in sorted(self.champion_params.items()):
+                lines.append(f"      {pname:<30s}  {pval:.6f}")
+            lines.append("")
+
         lines.append("═" * 80)
         return "\n".join(lines)
 
@@ -291,6 +318,8 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     "zscore_threshold": ("suggest_float", 0.8, 3.0),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
     "volume_ratio_threshold": ("suggest_float", 0.5, 4.0),
+    # Trend regime guard (wide range so WFO can find the right threshold)
+    "trend_guard_pct": ("suggest_float", 0.05, 1.0),
     # Risk management
     "stop_loss_cents": ("suggest_float", 2.0, 12.0),
     "trailing_stop_offset_cents": ("suggest_float", 0.5, 6.0),
@@ -313,6 +342,9 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),
     "pce_structural_prior_weight": ("suggest_int", 5, 30),
     "pce_holding_period_minutes": ("suggest_int", 30, 360),
+    # SI-2: Iceberg detector alpha modifiers
+    "iceberg_eqs_bonus": ("suggest_float", 0.05, 0.25),
+    "iceberg_tp_alpha": ("suggest_float", 0.02, 0.10),
 }
 
 
@@ -461,6 +493,118 @@ def _build_data_loader(
     return DataLoader(files, asset_ids=asset_ids)
 
 
+def _compute_gap_ratio(
+    data_dir: str,
+    dates: list[str],
+    asset_ids: set[str],
+    max_interval_s: float,
+) -> float:
+    """Scan tick files for the given dates and return the fraction of events
+    where the timestamp gap from the previous event exceeds ``max_interval_s``.
+
+    This is a lightweight pre-scan — it reads timestamps only (no full
+    backtest replay) to decide whether the data window is too sparse.
+    """
+    from src.backtest.data_loader import DataLoader
+
+    files = _collect_files_for_dates(data_dir, dates)
+    if not files:
+        return 0.0
+
+    loader = DataLoader(files, asset_ids=asset_ids)
+
+    total = 0
+    gaps = 0
+    prev_ts = 0.0
+    for event in loader:
+        total += 1
+        if prev_ts > 0 and (event.timestamp - prev_ts) > max_interval_s:
+            gaps += 1
+        prev_ts = event.timestamp
+
+    return gaps / total if total > 0 else 0.0
+
+
+def _load_market_configs(data_dir: str) -> list[dict]:
+    """Load market_map.json and return a list of {market_id, yes_asset_id, no_asset_id}.
+
+    Searches ``data_dir``, its parent, and the ``data/`` directory relative to
+    the current working directory.  Returns an empty list when not found.
+    """
+    import json
+
+    base = Path(data_dir)
+    candidates = [base / "market_map.json", base.parent / "market_map.json", Path("data") / "market_map.json"]
+    for candidate in candidates:
+        if candidate.exists():
+            with open(candidate, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            configs = []
+            for entry in raw:
+                mid = entry.get("market_id", "")
+                yid = str(entry.get("yes_id", ""))
+                nid = str(entry.get("no_id", ""))
+                if mid and yid and nid:
+                    configs.append({"market_id": mid, "yes_asset_id": yid, "no_asset_id": nid})
+            if configs:
+                log.info("wfo_market_configs_loaded", n_markets=len(configs), path=str(candidate))
+            return configs
+    return []
+
+
+def _run_multi_market_backtest(
+    data_dir: str,
+    dates: list[str],
+    param_overrides: dict,
+    market_configs: list[dict],
+    initial_cash: float,
+    latency_ms: float,
+    fee_max_pct: float,
+    fee_enabled: bool,
+    gap_threshold: float = 0.01,
+    gap_max_interval_s: float = 300.0,
+) -> dict | None:
+    """Run one backtest per market config and return averaged metrics.
+
+    Markets that produce zero fills are excluded from the average.
+    Returns ``None`` when no market yields any fills.
+    """
+    all_metrics = []
+    for mc in market_configs:
+        result = _run_single_backtest(
+            data_dir=data_dir,
+            dates=dates,
+            param_overrides=param_overrides,
+            market_id=mc["market_id"],
+            yes_asset_id=mc["yes_asset_id"],
+            no_asset_id=mc["no_asset_id"],
+            initial_cash=initial_cash,
+            latency_ms=latency_ms,
+            fee_max_pct=fee_max_pct,
+            fee_enabled=fee_enabled,
+            gap_threshold=gap_threshold,
+            gap_max_interval_s=gap_max_interval_s,
+        )
+        if result is not None and result.get("total_fills", 0) >= 1:
+            all_metrics.append(result)
+
+    if not all_metrics:
+        return None
+
+    # Average scalar metrics across active markets; sum additive counters
+    ref = all_metrics[0]
+    avg: dict = {}
+    for key, val in ref.items():
+        if key == "total_fills":
+            avg[key] = sum(m.get(key, 0) for m in all_metrics)
+        elif isinstance(val, (int, float)):
+            values = [m.get(key, 0) for m in all_metrics]
+            avg[key] = sum(values) / len(values)
+        else:
+            avg[key] = val  # non-numeric (e.g. equity_curve) → first market's value
+    return avg
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Single-backtest runner (must be picklable → top-level function)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -476,6 +620,8 @@ def _run_single_backtest(
     latency_ms: float,
     fee_max_pct: float,
     fee_enabled: bool,
+    gap_threshold: float = 0.01,
+    gap_max_interval_s: float = 300.0,
 ) -> dict[str, Any] | None:
     """Run one backtest and return serialised metrics.
 
@@ -483,7 +629,8 @@ def _run_single_backtest(
     ``ProcessPoolExecutor``.  It returns a plain dict (JSON-safe) so
     that results can cross the process boundary without pickling issues.
 
-    Returns ``None`` if the data loader cannot find any files.
+    Returns ``None`` if the data loader cannot find any files or if
+    the gap/stale-data ratio exceeds ``gap_threshold``.
     """
     from src.backtest.engine import BacktestConfig, BacktestEngine
     from src.backtest.strategy import BotReplayAdapter
@@ -494,6 +641,18 @@ def _run_single_backtest(
     )
     if loader is None:
         return None
+
+    # ── Pre-scan for gap/stale data quality ─────────────────────────
+    if gap_threshold > 0:
+        gap_ratio = _compute_gap_ratio(data_dir, dates, {yes_asset_id, no_asset_id}, gap_max_interval_s)
+        if gap_ratio > gap_threshold:
+            log.warning(
+                "wfo_data_quality_abort",
+                dates=f"{dates[0]}..{dates[-1]}",
+                gap_ratio=round(gap_ratio, 4),
+                threshold=gap_threshold,
+            )
+            return None
 
     params = StrategyParams(**param_overrides)
 
@@ -535,14 +694,17 @@ def compute_wfo_score(
     sharpe_weight: float = 0.50,
     sortino_weight: float = 0.30,
     profit_factor_weight: float = 0.20,
+    trade_bonus_weight: float = 0.05,
 ) -> float:
-    """Multi-metric composite objective with drawdown penalty and trade gate.
+    """Multi-metric composite objective with drawdown penalty, trade gate,
+    and sqrt(n_trades) bonus.
 
     .. math::
 
         \\text{Composite} = w_S \\cdot \\text{Sharpe} +
                             w_{So} \\cdot \\text{Sortino} +
-                            w_{PF} \\cdot \\ln(1 + \\text{PF})
+                            w_{PF} \\cdot \\ln(1 + \\text{PF}) +
+                            w_T \\cdot \\sqrt{\\text{fills}}
 
         \\text{Score} = \\text{Composite} \\times \\max\\!\\left(0,\\;
         1 - \\frac{\\text{MaxDD}}{\\text{MaxAcceptableDD}}\\right)
@@ -553,7 +715,9 @@ def compute_wfo_score(
 
     ``profit_factor`` is transformed via ``ln(1 + PF)`` to normalise
     its scale relative to Sharpe/Sortino (PF > 2 is excellent, PF=1
-    is breakeven).
+    is breakeven).  ``trade_bonus_weight * sqrt(fills)`` continuously
+    rewards parameter sets that generate more trades for statistical
+    significance.
     """
     # Gate: reject parameter sets that produce too few trades
     if total_fills < min_trades:
@@ -565,11 +729,12 @@ def compute_wfo_score(
     # Normalised profit factor via log transform
     pf_score = math.log(1.0 + max(profit_factor, 0.0))
 
-    # Weighted composite
+    # Weighted composite with sqrt(n_trades) bonus
     composite = (
         sharpe_weight * sharpe_ratio
         + sortino_weight * sortino_ratio
         + profit_factor_weight * pf_score
+        + trade_bonus_weight * math.sqrt(total_fills)
     )
 
     return composite * dd_penalty
@@ -579,22 +744,32 @@ def _objective(
     trial: Any,
     train_dates: list[str],
     wfo_cfg: WfoConfig,
+    market_configs: list[dict] | None = None,
 ) -> float:
     """Optuna objective — runs an IS backtest and returns the WFO score."""
     suggested = _suggest_params(trial)
 
-    metrics = _run_single_backtest(
+    _common = dict(
         data_dir=wfo_cfg.data_dir,
         dates=train_dates,
         param_overrides=suggested,
-        market_id=wfo_cfg.market_id,
-        yes_asset_id=wfo_cfg.yes_asset_id,
-        no_asset_id=wfo_cfg.no_asset_id,
         initial_cash=wfo_cfg.initial_cash,
         latency_ms=wfo_cfg.latency_ms,
         fee_max_pct=wfo_cfg.fee_max_pct,
         fee_enabled=wfo_cfg.fee_enabled,
+        gap_threshold=wfo_cfg.gap_threshold,
+        gap_max_interval_s=wfo_cfg.gap_max_interval_s,
     )
+
+    if market_configs:
+        metrics = _run_multi_market_backtest(market_configs=market_configs, **_common)
+    else:
+        metrics = _run_single_backtest(
+            market_id=wfo_cfg.market_id,
+            yes_asset_id=wfo_cfg.yes_asset_id,
+            no_asset_id=wfo_cfg.no_asset_id,
+            **_common,
+        )
 
     if metrics is None:
         return float("-inf")
@@ -616,6 +791,7 @@ def _objective(
         sharpe_weight=wfo_cfg.sharpe_weight,
         sortino_weight=wfo_cfg.sortino_weight,
         profit_factor_weight=wfo_cfg.profit_factor_weight,
+        trade_bonus_weight=wfo_cfg.trade_bonus_weight,
     )
 
     # Log trial outcome
@@ -644,6 +820,7 @@ def _worker(
     train_dates: list[str],
     wfo_cfg_dict: dict[str, Any],
     n_trials: int,
+    market_configs: list[dict] | None = None,
 ) -> None:
     """Optuna worker — loads the shared study and runs ``n_trials``.
 
@@ -657,7 +834,7 @@ def _worker(
     wfo_cfg = WfoConfig(**wfo_cfg_dict)
     study = optuna.load_study(study_name=study_name, storage=storage)
     study.optimize(
-        lambda trial: _objective(trial, train_dates, wfo_cfg),
+        lambda trial: _objective(trial, train_dates, wfo_cfg, market_configs),
         n_trials=n_trials,
         n_jobs=1,  # single-threaded inside each process (avoid GIL)
     )
@@ -789,6 +966,18 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
     log.info("wfo_folds_generated", n_folds=len(folds))
 
+    # ── Load market configs (auto-detect from market_map.json) ─────────
+    market_configs: list[dict] | None = None
+    _SYNTH_PLACEHOLDERS = {"YES_TOKEN", "0x" + "a1" * 16}
+    if cfg.yes_asset_id in _SYNTH_PLACEHOLDERS:
+        # No specific market provided → multi-market mode
+        loaded = _load_market_configs(cfg.data_dir)
+        if loaded:
+            market_configs = loaded
+            log.info("wfo_multi_market_mode", n_markets=len(market_configs))
+        else:
+            log.warning("wfo_no_market_configs", msg="market_map.json not found; using placeholder IDs")
+
     # ── Serialise config for child processes ───────────────────────────
     cfg_dict = {
         "data_dir": cfg.data_dir,
@@ -814,6 +1003,10 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         "sharpe_weight": cfg.sharpe_weight,
         "sortino_weight": cfg.sortino_weight,
         "profit_factor_weight": cfg.profit_factor_weight,
+        "trade_bonus_weight": cfg.trade_bonus_weight,
+        "gap_threshold": cfg.gap_threshold,
+        "gap_max_interval_s": cfg.gap_max_interval_s,
+        "output_params_path": cfg.output_params_path,
     }
 
     fold_results: list[FoldResult] = []
@@ -867,6 +1060,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
                         fold.train_dates,
                         cfg_dict,
                         trials_per_worker,
+                        market_configs,
                     )
                     for _ in range(cfg.max_workers)
                 ]
@@ -875,7 +1069,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         else:
             # Single-process mode (simpler debugging / testing)
             study.optimize(
-                lambda trial: _objective(trial, fold.train_dates, cfg),
+                lambda trial: _objective(trial, fold.train_dates, cfg, market_configs),
                 n_trials=cfg.n_trials,
                 n_jobs=1,
             )
@@ -898,33 +1092,34 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             params=best_params,
         )
 
-        # ── Replay IS with best params (for decay comparison) ─────────
-        is_metrics = _run_single_backtest(
+        # ── Helper to dispatch single vs multi-market replay ──────────
+        _replay_kwargs = dict(
             data_dir=cfg.data_dir,
-            dates=fold.train_dates,
             param_overrides=best_params,
-            market_id=cfg.market_id,
-            yes_asset_id=cfg.yes_asset_id,
-            no_asset_id=cfg.no_asset_id,
             initial_cash=cfg.initial_cash,
             latency_ms=cfg.latency_ms,
             fee_max_pct=cfg.fee_max_pct,
             fee_enabled=cfg.fee_enabled,
+            gap_threshold=cfg.gap_threshold,
+            gap_max_interval_s=cfg.gap_max_interval_s,
         )
 
+        def _replay(dates: list[str]) -> dict | None:
+            if market_configs:
+                return _run_multi_market_backtest(dates=dates, market_configs=market_configs, **_replay_kwargs)
+            return _run_single_backtest(
+                dates=dates,
+                market_id=cfg.market_id,
+                yes_asset_id=cfg.yes_asset_id,
+                no_asset_id=cfg.no_asset_id,
+                **_replay_kwargs,
+            )
+
+        # ── Replay IS with best params (for decay comparison) ─────────
+        is_metrics = _replay(fold.train_dates)
+
         # ── Replay OOS with best params ───────────────────────────────
-        oos_metrics = _run_single_backtest(
-            data_dir=cfg.data_dir,
-            dates=fold.test_dates,
-            param_overrides=best_params,
-            market_id=cfg.market_id,
-            yes_asset_id=cfg.yes_asset_id,
-            no_asset_id=cfg.no_asset_id,
-            initial_cash=cfg.initial_cash,
-            latency_ms=cfg.latency_ms,
-            fee_max_pct=cfg.fee_max_pct,
-            fee_enabled=cfg.fee_enabled,
-        )
+        oos_metrics = _replay(fold.test_dates)
 
         fr = FoldResult(
             fold_index=fold.index,
@@ -1002,6 +1197,56 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
     elapsed = time.monotonic() - t0
 
+    # ── Champion selection: lowest OOS degradation ────────────────────
+    champion_params: dict[str, float] = {}
+    champion_fold_idx = -1
+    champion_degradation = float("inf")
+
+    for fr in fold_results:
+        if fr.oos_sharpe <= 0:
+            continue  # require positive OOS Sharpe
+
+        # Compute IS composite score for this fold's best params
+        is_composite = compute_wfo_score(
+            sharpe_ratio=fr.is_sharpe,
+            max_drawdown=fr.is_max_drawdown,
+            max_acceptable_drawdown=cfg.max_acceptable_drawdown,
+            sortino_ratio=fr.is_sortino,
+            profit_factor=fr.is_profit_factor,
+            total_fills=fr.is_total_fills,
+            min_trades=1,  # don't gate — already validated
+            sharpe_weight=cfg.sharpe_weight,
+            sortino_weight=cfg.sortino_weight,
+            profit_factor_weight=cfg.profit_factor_weight,
+            trade_bonus_weight=cfg.trade_bonus_weight,
+        )
+        oos_composite = compute_wfo_score(
+            sharpe_ratio=fr.oos_sharpe,
+            max_drawdown=fr.oos_max_drawdown,
+            max_acceptable_drawdown=cfg.max_acceptable_drawdown,
+            sortino_ratio=fr.oos_sortino,
+            profit_factor=fr.oos_profit_factor,
+            total_fills=fr.oos_total_fills,
+            min_trades=1,
+            sharpe_weight=cfg.sharpe_weight,
+            sortino_weight=cfg.sortino_weight,
+            profit_factor_weight=cfg.profit_factor_weight,
+            trade_bonus_weight=cfg.trade_bonus_weight,
+        )
+
+        degradation = abs(is_composite - oos_composite) / max(abs(is_composite), 1e-6)
+        if degradation < champion_degradation:
+            champion_degradation = degradation
+            champion_fold_idx = fr.fold_index
+            champion_params = dict(fr.best_params)
+
+    # Fallback: if no fold has positive OOS Sharpe, pick lowest abs-decay
+    if not champion_params and fold_results:
+        best_fr = min(fold_results, key=lambda f: abs(f.sharpe_decay_pct))
+        champion_params = dict(best_fr.best_params)
+        champion_fold_idx = best_fr.fold_index
+        champion_degradation = abs(best_fr.sharpe_decay_pct) / 100.0
+
     report = WfoReport(
         folds=fold_results,
         stitched_equity_curve=stitched,
@@ -1013,7 +1258,14 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         avg_sharpe_decay_pct=avg_decay,
         overfit_probability=overfit_prob,
         unstable_params=unstable,
+        champion_params=champion_params,
+        champion_fold_index=champion_fold_idx,
+        champion_degradation_pct=champion_degradation * 100,
     )
+
+    # ── Export champion params to JSON ────────────────────────────────
+    if cfg.output_params_path and champion_params:
+        _export_champion_params(cfg, report)
 
     log.info(
         "wfo_complete",
@@ -1024,7 +1276,43 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         avg_decay_pct=round(avg_decay, 1),
         overfit_prob=round(overfit_prob, 2),
         unstable_params=unstable,
+        champion_fold=champion_fold_idx,
+        champion_degradation_pct=round(champion_degradation * 100, 1),
         elapsed_s=round(elapsed, 1),
     )
 
     return report
+
+
+def _export_champion_params(cfg: WfoConfig, report: WfoReport) -> None:
+    """Write champion parameters to a JSON file with metadata."""
+    data_dates = []
+    for fr in report.folds:
+        data_dates.extend(fr.train_dates)
+        data_dates.extend(fr.test_dates)
+
+    date_range = ""
+    if data_dates:
+        date_range = f"{min(data_dates)} to {max(data_dates)}"
+
+    output = {
+        "params": report.champion_params,
+        "meta": {
+            "champion_fold": report.champion_fold_index,
+            "oos_sharpe": round(report.aggregate_oos_sharpe, 4),
+            "oos_degradation_pct": round(report.champion_degradation_pct, 2),
+            "n_folds": len(report.folds),
+            "n_trials_per_fold": cfg.n_trials,
+            "data_range": date_range,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "avg_sharpe_decay_pct": round(report.avg_sharpe_decay_pct, 2),
+            "overfit_probability": round(report.overfit_probability, 4),
+            "unstable_params": report.unstable_params,
+        },
+    }
+
+    out_path = Path(cfg.output_params_path)  # type: ignore[arg-type]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, sort_keys=False), encoding="utf-8")
+
+    log.info("wfo_params_exported", path=str(out_path))

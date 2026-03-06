@@ -306,6 +306,63 @@ class TestSignalQuality:
         )
         assert ea.signal_quality == pytest.approx(1.0)
 
+    def test_iceberg_active_adds_bonus(self):
+        """Iceberg active adds 0.15 to signal quality, raising EQS."""
+        base = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=1.2,
+            volume_ratio=1.5,
+            iceberg_active=False,
+            min_score=0.0,
+        )
+        iceberg = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=1.2,
+            volume_ratio=1.5,
+            iceberg_active=True,
+            min_score=0.0,
+        )
+        assert iceberg.signal_quality > base.signal_quality
+        assert iceberg.signal_quality == pytest.approx(
+            base.signal_quality + 0.15, abs=0.01
+        )
+        assert iceberg.score > base.score
+
+    def test_iceberg_and_whale_stack(self):
+        """Iceberg + whale bonuses stack but cap at 1.0."""
+        both = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=4.0,
+            volume_ratio=6.0,
+            whale_confluence=True,
+            iceberg_active=True,
+            min_score=0.0,
+        )
+        assert both.signal_quality == pytest.approx(1.0)
+
+    def test_iceberg_defaults_false(self):
+        """iceberg_active defaults to False — no change from baseline."""
+        without = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=3.0,
+            volume_ratio=5.0,
+            min_score=0.0,
+        )
+        explicit_false = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=3.0,
+            volume_ratio=5.0,
+            iceberg_active=False,
+            min_score=0.0,
+        )
+        assert without.signal_quality == explicit_false.signal_quality
+        assert without.score == explicit_false.score
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Fee-disabled markets (political)

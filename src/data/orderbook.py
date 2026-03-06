@@ -463,3 +463,145 @@ class L2OrderBookAdapter(OrderbookTracker):
 
     def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
         return self._l2.depth_near_mid_usd(cents, max_levels)
+
+
+class SharedBookReaderAdapter(OrderbookTracker):
+    """Adapter that wraps a ``SharedBookReader`` (cross-process shared memory)
+    behind the ``OrderbookTracker`` interface so all existing consumers work
+    without modification.
+
+    The underlying ``SharedBookReader`` reads from a shared memory segment
+    written by an L2 worker process — no in-process L2OrderBook exists.
+    """
+
+    def __init__(self, reader: "Any") -> None:
+        # Do NOT call super().__init__()
+        self._reader = reader
+        self.asset_id = reader.asset_id
+        self.__last_update: float = 0.0
+
+    # ── Write ops are no-ops (workers write via shared memory) ─────────
+    def on_price_change(self, data: dict) -> None:
+        pass
+
+    def on_book_snapshot(self, data: dict) -> None:
+        pass
+
+    # ── Read ops delegate to SharedBookReader ──────────────────────────
+    def snapshot(self, *, fresh: bool = True) -> OrderbookSnapshot:
+        snap = self._reader.read_header()
+        self.__last_update = snap.timestamp
+        return OrderbookSnapshot(
+            asset_id=snap.asset_id,
+            best_bid=snap.best_bid,
+            best_ask=snap.best_ask,
+            spread=snap.spread,
+            bid_depth_usd=snap.bid_depth_usd,
+            ask_depth_usd=snap.ask_depth_usd,
+            mid_price=snap.mid_price,
+            timestamp=snap.timestamp,
+            server_time=snap.server_time,
+            fresh=snap.fresh if fresh else False,
+            spread_score=snap.spread_score,
+        )
+
+    def levels(self, side: str, n: int = 5) -> list[_Level]:
+        snap = self._reader.read_full()
+        if side.lower() in ("bid", "buy"):
+            raw = snap.bid_levels or []
+            return [_Level(p, s) for p, s in raw[:n]]
+        raw = snap.ask_levels or []
+        return [_Level(p, s) for p, s in raw[:n]]
+
+    @property
+    def spread_cents(self) -> float:
+        snap = self._reader.read_header()
+        bb, ba = snap.best_bid, snap.best_ask
+        if bb <= 0 or ba <= 0:
+            return 0.0
+        return round((ba - bb) * 100, 2)
+
+    @property
+    def best_bid(self) -> float:
+        return self._reader.read_header().best_bid
+
+    @property
+    def best_ask(self) -> float:
+        return self._reader.read_header().best_ask
+
+    @property
+    def book_depth_ratio(self) -> float:
+        snap = self._reader.read_header()
+        if snap.ask_depth_usd <= 0:
+            return 1.0
+        return round(snap.bid_depth_usd / snap.ask_depth_usd, 2)
+
+    @property
+    def has_data(self) -> bool:
+        return self._reader.read_header().timestamp > 0
+
+    @property
+    def is_reliable(self) -> bool:
+        return self._reader.read_header().is_reliable
+
+    @property
+    def seq_gap_rate(self) -> float:
+        snap = self._reader.read_header()
+        if snap.delta_count <= 0:
+            return 0.0
+        return snap.desync_total / snap.delta_count
+
+    @property
+    def delta_count(self) -> int:
+        return self._reader.read_header().delta_count
+
+    @property
+    def desync_total(self) -> int:
+        return self._reader.read_header().desync_total
+
+    @property
+    def _last_update(self) -> float:
+        snap = self._reader.read_header()
+        self.__last_update = snap.timestamp
+        return snap.timestamp
+
+    @_last_update.setter
+    def _last_update(self, value: float) -> None:
+        pass  # read-only
+
+    @property
+    def _last_server_time(self) -> float:
+        return self._reader.read_header().server_time
+
+    @_last_server_time.setter
+    def _last_server_time(self, value: float) -> None:
+        pass  # read-only
+
+    def current_total_depth(self) -> float:
+        snap = self._reader.read_header()
+        return round(snap.bid_depth_usd + snap.ask_depth_usd, 2)
+
+    def depth_velocity(self, window_s: float = 2.0) -> float | None:
+        # Depth history is maintained in-process by L2OrderBook —
+        # not available via shared memory.  Return None (safe default:
+        # consumers treat None as "insufficient data, skip check").
+        return None
+
+    def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
+        # Use the pre-computed value from the worker (1-cent default).
+        # For the fast 50ms ASG loop, this avoids reading all 50 levels.
+        if abs(cents - 1.0) < 0.01:
+            return self._reader.read_header().depth_near_mid
+        # For non-standard cent values, fall back to level-by-level calc.
+        snap = self._reader.read_full()
+        bb, ba = snap.best_bid, snap.best_ask
+        if bb <= 0 or ba <= 0:
+            return 0.0
+        mid = (bb + ba) / 2.0
+        threshold = cents / 100.0
+        depth = 0.0
+        for levels in (snap.bid_levels or [], snap.ask_levels or []):
+            for price, size in levels[:max_levels]:
+                if abs(price - mid) <= threshold:
+                    depth += price * size
+        return depth

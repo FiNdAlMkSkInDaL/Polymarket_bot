@@ -15,7 +15,10 @@ Risk controls:
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import queue as _queue_mod
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,6 +30,7 @@ from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
 from src.signals.edge_filter import ConfluenceContext, compute_confluence_discount, compute_edge_score
+from src.signals.iceberg_detector import IcebergDetector
 from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
 from src.signals.signal_framework import BaseSignal
@@ -138,14 +142,19 @@ class PositionManager:
         pce: Any | None = None,
         book_trackers: dict[str, Any] | None = None,
         maker_monitor: Any | None = None,
+        iceberg_detectors: dict[str, IcebergDetector] | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
         self._trade_store = trade_store
         self._guard = guard
         self._pce = pce  # PortfolioCorrelationEngine (Pillar 15)
+        # Multicore: VaR gate via PCE worker queues (set by bot.py)
+        self._var_request_q: multiprocessing.Queue | None = None
+        self._var_response_q: multiprocessing.Queue | None = None
         self._book_trackers = book_trackers or {}  # asset_id → OrderbookTracker
         self._maker_monitor = maker_monitor  # AdverseSelectionMonitor (V1/V4)
+        self._iceberg_detectors = iceberg_detectors or {}  # asset_id → IcebergDetector
         self._stealth = None  # StealthExecutor — injected by bot.py when stealth_enabled
         self._positions: dict[str, Position] = {}
         self._next_id = 1
@@ -170,6 +179,8 @@ class PositionManager:
         self._probe_scaled_set: set[str] = set()
         # V4 Probe harvesting: track which probes have been scaled in already
         self._probe_scaled_set: set[str] = set()
+        # Per-market cooldown after stop-loss to prevent rapid re-entry
+        self._stop_loss_cooldowns: dict[str, float] = {}
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -185,6 +196,13 @@ class PositionManager:
         self._daily_pnl_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._circuit_breaker_tripped = False
         log.info("daily_pnl_reset")
+
+    def is_stop_loss_cooled_down(self, market_id: str) -> bool:
+        """Return True if enough time has passed since the last stop-loss on this market."""
+        last_sl = self._stop_loss_cooldowns.get(market_id)
+        if last_sl is None:
+            return True
+        return (time.time() - last_sl) >= settings.strategy.stop_loss_cooldown_s
 
     # ── Cached trade-store stats ───────────────────────────────────────────
     async def _get_cached_stats(self) -> dict[str, Any]:
@@ -215,8 +233,68 @@ class PositionManager:
         self._stats_cache = None
         self._stats_cache_time = 0.0
 
+    # ── Multicore VaR gate wiring ────────────────────────────────────────
+    def set_var_gate_queues(
+        self,
+        request_q: multiprocessing.Queue,
+        response_q: multiprocessing.Queue,
+    ) -> None:
+        """Wire the PCE worker queues for remote VaR gating."""
+        self._var_request_q = request_q
+        self._var_response_q = response_q
+
+    async def _check_var_remote(
+        self,
+        open_positions: list,
+        market_id: str,
+        max_trade: float,
+        trade_direction: str,
+    ) -> tuple[bool, float, bool]:
+        """Send VaR check to PCE worker and await response (50ms timeout).
+
+        Fail-closed: if the worker doesn't respond, block the trade.
+        Returns (allowed, max_trade, var_was_bisected).
+        """
+        req_id = uuid.uuid4().hex[:12]
+        positions_data = [
+            (p.market_id, p.entry_price * p.entry_size, p.entry_side)
+            for p in open_positions
+        ]
+        try:
+            self._var_request_q.put_nowait(
+                ("check_var", req_id, positions_data, market_id, max_trade, trade_direction),
+            )
+        except _queue_mod.Full:
+            log.warning("var_request_queue_full", market_id=market_id)
+            return False, 0.0, False  # fail-closed
+        # Poll response queue with 50ms total timeout
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            try:
+                msg = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._var_response_q.get(timeout=0.01),
+                )
+                if msg[0] == "var_result" and msg[1] == req_id:
+                    allowed = msg[2]
+                    result_dict = msg[3]
+                    if not allowed:
+                        log.warning(
+                            "pce_var_gate_blocked",
+                            market=market_id,
+                            portfolio_var=result_dict.get("portfolio_var_usd", 0),
+                        )
+                        return False, 0.0, False
+                    capped = result_dict.get("capped_size", max_trade)
+                    bisected = result_dict.get("bisected", False)
+                    return True, capped, bisected
+            except Exception:
+                pass
+        # Timeout: fail-closed
+        log.warning("pce_var_gate_timeout", market=market_id)
+        return False, 0.0, False
+
     # ── Shared risk gates ──────────────────────────────────────────────────
-    def _check_risk_gates(
+    async def _check_risk_gates(
         self, market_id: str, event_id: str = "", *, trade_direction: str = "NO"
     ) -> tuple[bool, float, bool]:
         """Run all risk gates shared between panic and RPE entries.
@@ -317,7 +395,14 @@ class PositionManager:
 
         # ── Risk gate: Portfolio Correlation Engine (PCE) VaR ──────────────
         var_was_bisected = False
-        if self._pce is not None:
+        if self._var_request_q is not None:
+            # Multicore: VaR gate via PCE worker queue
+            allowed, max_trade, var_was_bisected = await self._check_var_remote(
+                open_positions, market_id, max_trade, trade_direction,
+            )
+            if not allowed:
+                return False, 0.0, False
+        elif self._pce is not None:
             if self._pce.var_soft_cap:
                 # Soft cap: skip check_var_gate(); compute_var_sizing_cap
                 # already evaluates VaR internally (avoids redundant O(N²))
@@ -412,7 +497,7 @@ class PositionManager:
         """Inner implementation of open_position (runs under _entry_lock)."""
         strat = settings.strategy
 
-        passed, max_trade, var_was_bisected = self._check_risk_gates(
+        passed, max_trade, var_was_bisected = await self._check_risk_gates(
             signal.market_id, event_id,
         )
         if not passed:
@@ -431,6 +516,14 @@ class PositionManager:
             _zscore = abs(signal.displacement) if hasattr(signal, "displacement") else 0.0
             _volume_ratio = 1.0
             _whale_confluence = False
+
+        # ── SI-2: Query iceberg detector for alpha signal ──────────────
+        _iceberg_active = False
+        ice_det = self._iceberg_detectors.get(signal.no_asset_id)
+        if ice_det is not None:
+            strongest = ice_det.strongest_iceberg("BUY")
+            if strongest is not None and strongest.confidence >= strat.iceberg_peg_min_confidence:
+                _iceberg_active = True
 
         # Entry price: undercut the best ask by 1¢ to ensure maker
         entry_price = round(signal.no_best_ask - 0.01, 2)
@@ -492,6 +585,7 @@ class PositionManager:
             zscore=_zscore,
             volume_ratio=_volume_ratio,
             whale_confluence=_whale_confluence,
+            iceberg_active=_iceberg_active,
             fee_enabled=fee_enabled,
             current_ewma_vol=no_aggregator.rolling_volatility_ewma or None,
             execution_mode=exec_mode,
@@ -713,6 +807,7 @@ class PositionManager:
             no_vwap=no_aggregator.rolling_vwap,
             realised_vol=no_aggregator.rolling_volatility,
             whale_confluence=_whale_confluence,
+            iceberg_active=_iceberg_active,
             book_depth_ratio=actual_depth_ratio,
             days_to_resolution=days_to_resolution,
             entry_fee_bps=entry_fee_bps,
@@ -915,7 +1010,7 @@ class PositionManager:
         # Determine trade direction before risk gates for PCE directional awareness
         trade_direction = "YES" if direction == "buy_yes" else "NO"
 
-        passed, max_trade, var_was_bisected = self._check_risk_gates(
+        passed, max_trade, var_was_bisected = await self._check_risk_gates(
             market_id, event_id, trade_direction=trade_direction,
         )
         if not passed:
@@ -1257,6 +1352,10 @@ class PositionManager:
             self._max_drawdown_cents,
             self._peak_pnl_cents - self._cumulative_pnl_cents,
         )
+
+        # Record stop-loss cooldown to prevent rapid re-entry on same market
+        if reason == "stop_loss":
+            self._stop_loss_cooldowns[pos.market_id] = pos.exit_time
 
         log.info(
             "position_closed",

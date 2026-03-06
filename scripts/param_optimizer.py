@@ -709,6 +709,108 @@ def main():
             print(f"\n  Time span: {total_minutes/60:.1f} hours")
             print(f"  Minutes with ≥1 trade: {len(min_buckets):,} / {int(total_minutes):,} ({active_pct:.1f}%)")
 
+    # ────────────────────────────────────────────────────────────────────
+    # 13. ICEBERG PARAMETER SENSITIVITY (iceberg_eqs_bonus, iceberg_tp_alpha)
+    # ────────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 80)
+    print("  13. ICEBERG PARAMETER SENSITIVITY ANALYSIS")
+    print("=" * 80)
+
+    if reversion_events:
+        # Grid search: iceberg_eqs_bonus ∈ [0.00, 0.30] step 0.05
+        #              iceberg_tp_alpha  ∈ [0.00, 0.10] step 0.01
+        # For each (bonus, tp_alpha) pair, simulate the effect on EV surface:
+        #   - EQS bonus raises effective edge score, admitting more entries
+        #   - TP alpha adjustment modifies the reversion target
+        eqs_bonuses = [round(x * 0.05, 2) for x in range(7)]   # 0.00 .. 0.30
+        tp_alphas   = [round(x * 0.01, 2) for x in range(11)]  # 0.00 .. 0.10
+
+        z_filtered = [e for e in reversion_events if e['zscore'] >= 1.0]
+        hours = max(1.0, 48.0)
+
+        print(f"\n  Grid: iceberg_eqs_bonus × iceberg_tp_alpha")
+        print(f"  Base events (z>=1.0): {len(z_filtered)}")
+        print(f"\n  {'EQS Bonus':>10}  {'TP Alpha':>9}  {'Entries':>8}  "
+              f"{'WinRate%':>8}  {'AvgPnL¢':>9}  {'EV¢/hr':>8}")
+
+        best_ev = -999.0
+        best_combo = (0.0, 0.0)
+        best_wr = 0.0
+        results_grid: list[tuple[float, float, float, float, float]] = []
+
+        for bonus in eqs_bonuses:
+            for tp_a in tp_alphas:
+                # Simulate: bonus lowers EQS threshold → more entries
+                # tp_alpha adjusts the reversion target from 0.50 to (0.50 + tp_a)
+                alpha_adj = 0.50 + tp_a
+                accepted = []
+                for e in z_filtered:
+                    p = e['entry']
+                    if p <= 0 or p >= 1:
+                        continue
+                    r = binary_entropy(p)
+                    vwap_val = e['vwap']
+                    gross = abs(vwap_val - p) * alpha_adj * 100
+                    rt_fee = fee_rate(p) * p * 100
+                    f_eff = max(0.10, 1.0 - rt_fee / gross) if gross > 0 else 0.0
+                    net = gross - rt_fee
+                    tick_v = min(1.0, net / 3.0) if net > 0 else 0.0
+                    z_ex = max(0, e['zscore'] - 1.5)
+                    v_ex = max(0, e['vol_ratio'] - 1.2)
+                    s_q = 0.5 + 0.35 * (1 - math.exp(-0.5 * z_ex)) + 0.20 * min(v_ex, 2.0)
+                    if r > 0 and f_eff > 0 and tick_v > 0 and s_q > 0:
+                        eqs = 100 * (r ** 0.35) * (f_eff ** 0.30) * (tick_v ** 0.20) * (s_q ** 0.15)
+                    else:
+                        eqs = 0.0
+                    # Apply iceberg EQS bonus
+                    eqs_adj = eqs + bonus * 100
+                    if eqs_adj >= 40.0:  # min_edge_score default
+                        # Adjusted PnL using modified alpha target
+                        pnl = e['pnl_cents'] * (alpha_adj / 0.50)
+                        accepted.append((pnl, e['reverted']))
+
+                if not accepted:
+                    continue
+                pnls = [a[0] for a in accepted]
+                avg_pnl = statistics.mean(pnls)
+                win_rate = 100.0 * sum(1 for a in accepted if a[0] > 0) / len(accepted)
+                ev_per_hr = (len(accepted) / hours) * avg_pnl
+                results_grid.append((bonus, tp_a, ev_per_hr, win_rate, avg_pnl))
+
+                if ev_per_hr > best_ev:
+                    best_ev = ev_per_hr
+                    best_combo = (bonus, tp_a)
+                    best_wr = win_rate
+
+                print(f"  {bonus:>10.2f}  {tp_a:>9.2f}  {len(accepted):>8}  "
+                      f"{win_rate:>7.1f}%  {avg_pnl:>9.2f}  {ev_per_hr:>8.2f}")
+
+        print(f"\n  ★ Best EV combo: iceberg_eqs_bonus={best_combo[0]:.2f}, "
+              f"iceberg_tp_alpha={best_combo[1]:.2f}  "
+              f"(EV={best_ev:.2f}¢/hr, WR={best_wr:.1f}%)")
+
+        # Recommend bounding constraints for WFO
+        # Find all combos within 90% of best EV without severe win-rate drop
+        if results_grid and best_ev > 0:
+            viable = [(b, t, ev, wr) for b, t, ev, wr, _ in results_grid
+                      if ev >= best_ev * 0.90 and wr >= best_wr - 5.0]
+            if viable:
+                bonus_lo = min(v[0] for v in viable)
+                bonus_hi = max(v[0] for v in viable)
+                tp_lo = min(v[1] for v in viable)
+                tp_hi = max(v[1] for v in viable)
+                print(f"\n  Recommended WFO bounds (≥90% EV, WR drop <5pp):")
+                print(f"    iceberg_eqs_bonus: [{bonus_lo:.2f}, {bonus_hi:.2f}]")
+                print(f"    iceberg_tp_alpha:  [{tp_lo:.2f}, {tp_hi:.2f}]")
+            else:
+                print(f"\n  Recommended WFO bounds (defaults):")
+                print(f"    iceberg_eqs_bonus: [0.05, 0.25]")
+                print(f"    iceberg_tp_alpha:  [0.02, 0.10]")
+        else:
+            print(f"\n  Recommended WFO bounds (defaults):")
+            print(f"    iceberg_eqs_bonus: [0.05, 0.25]")
+            print(f"    iceberg_tp_alpha:  [0.02, 0.10]")
+
     print("\n" + "=" * 80)
     print("  ANALYSIS COMPLETE")
     print("=" * 80)

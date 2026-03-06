@@ -75,3 +75,25 @@ scp -i $KEY -r `
     "${VPS}:/home/botuser/polymarket-bot/data/raw_ticks/2026-03-03" `
     "$DEST\ticks\"
 ```
+
+---
+
+## Historical Data Backfill
+
+Use `scripts/backfill_data.py` to download 60–90 days of historical trade data (and L2 deltas when a source adapter is available) for all tracked markets.
+
+```bash
+# Install dependencies
+pip install -r scripts/requirements-backfill.txt
+
+# Default 90-day backfill
+python scripts/backfill_data.py
+
+# Custom date range
+python scripts/backfill_data.py --start-date 2025-12-06 --end-date 2026-03-04
+
+# Force re-download with Parquet conversion
+python scripts/backfill_data.py --lookback-days 30 --force --parquet
+```
+
+Output goes to `vps_march2026/ticks/YYYY-MM-DD/<market_id>.jsonl` — same format as live recorded ticks. Run `python scripts/backfill_data.py --help` for full options.

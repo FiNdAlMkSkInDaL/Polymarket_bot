@@ -99,6 +99,12 @@ class StrategyParams:
     volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.8)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
+    # Trend regime guard (suppress signals during sustained up-trends).
+    # Wide default (0.99) so WFO can explore the full range without the
+    # guard silently blocking all signals during parameter search.
+    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.99)
+    trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
+
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
     alpha_min: float = _env_float("ALPHA_MIN", 0.40)
@@ -217,6 +223,7 @@ class StrategyParams:
     daily_loss_limit_usd: float = _env_float("DAILY_LOSS_LIMIT_USD", 25.0)
     max_drawdown_cents: float = _env_float("MAX_DRAWDOWN_CENTS", 2500.0)
     stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 4.0)
+    stop_loss_cooldown_s: float = _env_float("STOP_LOSS_COOLDOWN_S", 300.0)
     signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
@@ -552,6 +559,10 @@ class StrategyParams:
     iceberg_size_tolerance_pct: float = _env_float("ICEBERG_SIZE_TOLERANCE_PCT", 0.30)
     # Minimum iceberg confidence to activate peg routing in the chaser.
     iceberg_peg_min_confidence: float = _env_float("ICEBERG_PEG_MIN_CONFIDENCE", 0.50)
+    # EQS bonus applied when iceberg detection confirms hidden liquidity.
+    iceberg_eqs_bonus: float = _env_float("ICEBERG_EQS_BONUS", 0.15)
+    # Take-profit alpha adjustment when iceberg is detected.
+    iceberg_tp_alpha: float = _env_float("ICEBERG_TP_ALPHA", 0.05)
 
     # ── SI-3: Cross-Market Signal Generator ────────────────────────────────
     # Offensive pairs-style alpha from correlated market lag divergences.

@@ -306,6 +306,7 @@ class TestWfoScore:
             sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             sortino_ratio=0.0, profit_factor=2.0, total_fills=10,
             sharpe_weight=0.0, sortino_weight=0.0, profit_factor_weight=1.0,
+            trade_bonus_weight=0.0,
         )
         expected = math.log(1.0 + 2.0)  # ln(3) ≈ 1.0986
         assert abs(score - expected) < 1e-6
@@ -317,6 +318,7 @@ class TestWfoScore:
             sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             sortino_ratio=5.0, profit_factor=3.0, total_fills=10,
             sharpe_weight=1.0, sortino_weight=0.0, profit_factor_weight=0.0,
+            trade_bonus_weight=0.0,
         )
         assert abs(sharpe_only - 2.0) < 1e-9
 
@@ -695,6 +697,8 @@ class TestSearchSpace:
             "alpha_default",
             "tp_vol_sensitivity",
             "min_edge_score",
+            "iceberg_eqs_bonus",
+            "iceberg_tp_alpha",
         ]
         for p in new_params:
             assert p in SEARCH_SPACE, f"Missing new param: {p}"

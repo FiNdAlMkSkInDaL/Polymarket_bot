@@ -55,6 +55,7 @@ from src.core.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.latency_guard import LatencyGuard
+    from src.core.process_manager import ProcessManager
     from src.data.orderbook import OrderbookTracker
     from src.trading.executor import OrderExecutor
 
@@ -111,6 +112,7 @@ class BookHeartbeat:
         get_position_assets: Callable[[], set[str]] | None = None,
         telegram: object | None = None,
         polygon_checker: "PolygonHeadLagChecker | None" = None,
+        process_manager: "ProcessManager | None" = None,
     ):
         strat = settings.strategy
         self._books = book_trackers
@@ -121,6 +123,7 @@ class BookHeartbeat:
         self._ws_transport = ws_transport
         self._get_position_assets = get_position_assets or _no_positions
         self._polygon_checker = polygon_checker
+        self._process_manager = process_manager
 
         self._check_interval_s = strat.heartbeat_check_ms / 1000.0
         self._stale_ms = strat.heartbeat_stale_ms
@@ -277,13 +280,36 @@ class BookHeartbeat:
     # ── Transport layer ────────────────────────────────────────────────────
 
     def _transport_gap_ms(self, now: float) -> float | None:
-        """Milliseconds since the last WS frame, or None if no transport."""
-        if self._ws_transport is None:
-            return None
-        last = getattr(self._ws_transport, "_last_message_time", 0.0)
-        if last <= 0:
-            return None  # no messages received yet (still connecting)
-        return (now - last) * 1000
+        """Milliseconds since the last WS frame, or None if no transport.
+
+        In multicore mode (process_manager set, no ws_transport), uses
+        the worker heartbeat checker to determine the stalest worker's
+        last heartbeat relative to monotonic time.
+        """
+        if self._ws_transport is not None:
+            last = getattr(self._ws_transport, "_last_message_time", 0.0)
+            if last <= 0:
+                return None  # no messages received yet (still connecting)
+            return (now - last) * 1000
+
+        # Multicore mode: check worker heartbeats via ProcessManager
+        if self._process_manager is not None:
+            checker = self._process_manager.heartbeat_checker
+            if checker is None:
+                return None
+            healths = checker.check_all()
+            if not healths:
+                return None
+            # Return the worst (stalest) worker gap
+            worst_gap_ms = 0.0
+            mono = time.monotonic()
+            for h in healths:
+                gap = (mono - h.last_heartbeat) * 1000 if h.last_heartbeat > 0 else float("inf")
+                if gap > worst_gap_ms:
+                    worst_gap_ms = gap
+            return worst_gap_ms if worst_gap_ms < float("inf") else None
+
+        return None
 
     # ── Freshest tracker (legacy fallback) ─────────────────────────────────
 

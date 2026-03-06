@@ -687,16 +687,8 @@ def _bucket_by_zscore(trades: list[TheoreticalTrade]) -> dict[str, list[Theoreti
 # ─── Metrics ─────────────────────────────────────────────────────────
 
 def _percentile(data: list[float], p: int) -> float:
-    """Simple percentile without numpy dependency."""
-    if not data:
-        return 0.0
-    sorted_data = sorted(data)
-    k = (len(sorted_data) - 1) * (p / 100)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_data[int(k)]
-    return sorted_data[f] * (c - k) + sorted_data[c] * (k - f)
+    """Return the p-th percentile of data using the standard library."""
+    return statistics.quantiles(data, n=100)[p - 1] if data else 0.0
 
 
 def _compute_bucket_stats(trades: list[TheoreticalTrade]) -> dict:
@@ -1258,7 +1250,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Override module-level defaults from CLI args
-    _cfg = _RuntimeConfig()
+    global _cfg
     if args.f_max is not None:
         _cfg.f_max = args.f_max
     if args.hold_minutes is not None:

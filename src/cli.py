@@ -168,6 +168,13 @@ def run(
         # Windows: ProactorEventLoop is the default on 3.10+ and supports
         # subprocesses.  Only override if running an older Python.
         pass
+    else:
+        # On Linux/macOS, install uvloop for ~2-4x event loop throughput.
+        try:
+            import uvloop  # type: ignore[import-untyped]
+            uvloop.install()
+        except ImportError:
+            pass
 
     asyncio.run(bot.start())
 
@@ -313,7 +320,7 @@ def backtest(
 @click.option("--test-days", default=7, help="Out-of-Sample testing window (days).")
 @click.option("--step-days", default=7, help="Step size between folds (days).")
 @click.option("--n-trials", default=100, help="Optuna trials per fold.")
-@click.option("--max-workers", default=None, type=int, help="Parallel processes (default: cpu_count - 1).")
+@click.option("--max-workers", default=None, type=int, help="Parallel processes (default: cpu_count - 1). Use -1 for all cores.")
 @click.option("--max-drawdown", default=0.15, help="Max acceptable drawdown (fraction).")
 @click.option("--initial-cash", default=1000.0, help="Starting cash balance (USD).")
 @click.option("--market-id", default="BACKTEST", help="Market condition ID.")
@@ -323,6 +330,9 @@ def backtest(
 @click.option("--fee-max-pct", default=1.56, help="Max fee rate percentage.")
 @click.option("--no-fees", is_flag=True, help="Disable dynamic fee curve.")
 @click.option("--storage", default="sqlite:///wfo_optuna.db", help="Optuna RDB storage URL.")
+@click.option("--anchored", is_flag=True, help="Use expanding (anchored) IS window.")
+@click.option("--embargo-days", default=1, help="Gap in calendar days between IS/OOS windows.")
+@click.option("--output-params", default=None, type=str, help="Path to export champion parameters JSON.")
 def wfo(
     data_dir: str,
     train_days: int,
@@ -339,11 +349,20 @@ def wfo(
     fee_max_pct: float,
     no_fees: bool,
     storage: str,
+    anchored: bool,
+    embargo_days: int,
+    output_params: str | None,
 ) -> None:
     """Run Walk-Forward Optimization on recorded historical data."""
     import os
 
     from src.backtest.wfo_optimizer import WfoConfig, run_wfo
+
+    # Resolve max_workers: -1 means all cores, None means cpu_count - 1
+    if max_workers is not None and max_workers == -1:
+        resolved_workers = os.cpu_count() or 1
+    else:
+        resolved_workers = max_workers or max((os.cpu_count() or 2) - 1, 1)
 
     cfg = WfoConfig(
         data_dir=data_dir,
@@ -354,13 +373,16 @@ def wfo(
         test_days=test_days,
         step_days=step_days,
         n_trials=n_trials,
-        max_workers=max_workers or max((os.cpu_count() or 2) - 1, 1),
+        max_workers=resolved_workers,
         max_acceptable_drawdown=max_drawdown,
         initial_cash=initial_cash,
         storage_url=storage,
         latency_ms=latency_ms,
         fee_max_pct=fee_max_pct,
         fee_enabled=not no_fees,
+        anchored=anchored,
+        embargo_days=embargo_days,
+        output_params_path=output_params,
     )
 
     report = run_wfo(cfg)

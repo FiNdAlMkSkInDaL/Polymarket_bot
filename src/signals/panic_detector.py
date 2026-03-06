@@ -49,6 +49,8 @@ class PanicDetector:
         *,
         zscore_threshold: float | None = None,
         volume_ratio_threshold: float | None = None,
+        trend_guard_pct: float | None = None,
+        trend_guard_bars: int | None = None,
     ):
         self.market_id = market_id
         self.yes_asset_id = yes_asset_id
@@ -58,6 +60,8 @@ class PanicDetector:
 
         self.z_thresh = zscore_threshold if zscore_threshold is not None else settings.strategy.zscore_threshold
         self.v_thresh = volume_ratio_threshold if volume_ratio_threshold is not None else settings.strategy.volume_ratio_threshold
+        self._trend_guard_pct = trend_guard_pct if trend_guard_pct is not None else settings.strategy.trend_guard_pct
+        self._trend_guard_bars = trend_guard_bars if trend_guard_bars is not None else settings.strategy.trend_guard_bars
 
     # ── public ──────────────────────────────────────────────────────────────
     def evaluate(
@@ -155,8 +159,8 @@ class PanicDetector:
         # ── Trend regime guard ─────────────────────────────────────────────
         # Suppress signals when the YES token has been trending steadily
         # upward — this is a regime shift, not a panic spike.
-        trend_bars = settings.strategy.trend_guard_bars
-        trend_pct = settings.strategy.trend_guard_pct
+        trend_bars = self._trend_guard_bars
+        trend_pct = self._trend_guard_pct
         if len(self.yes_agg.bars) >= trend_bars:
             bars_list = self.yes_agg.bars
             recent_close = bars_list[-1].close

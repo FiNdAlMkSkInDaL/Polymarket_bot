@@ -15,6 +15,7 @@ V2 — Institutional-grade lifecycle:
 from __future__ import annotations
 
 import asyncio
+import queue as _queue_mod
 import signal
 import sys
 import time
@@ -27,11 +28,12 @@ from src.core.guard import DeploymentGuard
 from src.core.heartbeat import BookHeartbeat, PolygonHeadLagChecker
 from src.core.latency_guard import LatencyGuard, LatencyState
 from src.core.logger import get_logger, setup_logging
+from src.core.process_manager import ProcessManager
 from src.data.market_discovery import MarketInfo, fetch_active_markets
 from src.data.market_lifecycle import MarketLifecycleManager
 from src.data.market_scorer import compute_score
 from src.data.ohlcv import OHLCVAggregator
-from src.data.orderbook import L2OrderBookAdapter, OrderbookTracker
+from src.data.orderbook import L2OrderBookAdapter, OrderbookTracker, SharedBookReaderAdapter
 from src.data.websocket_client import MarketWebSocket, TradeEvent
 from src.data.l2_book import BookState, L2OrderBook
 from src.data.l2_websocket import L2WebSocket
@@ -150,10 +152,15 @@ class TradingBot:
         # fill simulation) sees subsequent additions.
         self._book_trackers: dict[str, OrderbookTracker] = {}  # asset_id → tracker
 
+        # SI-2: Per-asset iceberg detectors (initialised before PositionManager
+        # so the dict reference is shared — new detectors added later are visible).
+        self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
+
         self.positions = PositionManager(
             self.executor, trade_store=self.trade_store, guard=self.guard,
             pce=self.pce,
             book_trackers=self._book_trackers,
+            iceberg_detectors=self._iceberg_detectors,
         )
         self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
@@ -191,8 +198,7 @@ class TradingBot:
         # Maker adverse-selection monitor (V1/V4 calibration)
         self._maker_monitor: AdverseSelectionMonitor | None = None
 
-        # SI-2: Per-asset iceberg detectors
-        self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
+        # SI-2: _iceberg_detectors initialised above (before PositionManager)
 
         # SI-3: Cross-market signal generator
         self._cross_market = CrossMarketSignalGenerator(self.pce) if settings.strategy.cross_mkt_enabled else None
@@ -209,6 +215,11 @@ class TradingBot:
         self._ws: MarketWebSocket | None = None
         self._l2_ws: L2WebSocket | None = None
         self._tasks: list[asyncio.Task] = []
+
+        # Multi-core ProcessManager — orchestrates L2 and PCE workers
+        self._process_manager: ProcessManager | None = None
+        self._multicore_enabled: bool = settings.strategy.l2_enabled  # gate on L2
+        self._pce_queue_drops: int = 0  # rate-limited counter for PCE input queue drops
 
         # Singleton RPE (Pillar 14) — shared across all markets.
         # The CryptoPriceModel and GenericBayesianModel are stateless
@@ -364,8 +375,37 @@ class TradingBot:
         )
 
         # L2 WebSocket (Pillar 11) — dedicated connection for L2 book data
-        if settings.strategy.l2_enabled and self._l2_books:
-            # Register desync callbacks for all L2 books
+        # In multi-core mode, L2 processing is offloaded to worker processes
+        # managed by the ProcessManager.  In single-process fallback, the
+        # original L2WebSocket runs inside the main asyncio loop.
+        if self._multicore_enabled and self._l2_books:
+            self._process_manager = ProcessManager(
+                on_emergency_stop=self.stop,
+            )
+            l2_asset_ids = list(self._l2_books.keys())
+            self._process_manager.start_l2_workers(l2_asset_ids)
+            # Replace in-process L2 book trackers with shared-memory readers
+            for aid in l2_asset_ids:
+                reader = self._process_manager.get_reader(aid)
+                if reader is not None:
+                    self._book_trackers[aid] = SharedBookReaderAdapter(reader)
+            # Start PCE worker
+            self._process_manager.start_pce_worker(
+                data_dir=settings.record_data_dir,
+            )
+            # Wire VaR gate queues to position manager for remote PCE checks
+            self.positions.set_var_gate_queues(
+                self._process_manager.pce_var_request_queue,
+                self._process_manager.pce_var_response_queue,
+            )
+            self._l2_ws = None
+            log.info(
+                "multicore_enabled",
+                l2_workers=self._process_manager.n_l2_workers,
+                l2_assets=len(l2_asset_ids),
+            )
+        elif settings.strategy.l2_enabled and self._l2_books:
+            # Fallback: single-process L2 (original path)
             for l2_book in self._l2_books.values():
                 l2_book._on_desync = self._on_l2_desync
             self._l2_ws = L2WebSocket(self._l2_books, recorder=self._recorder)
@@ -405,6 +445,7 @@ class TradingBot:
             get_position_assets=self._positioned_asset_ids,
             telegram=self.telegram,
             polygon_checker=polygon_checker,
+            process_manager=self._process_manager,
         )
 
         # Order status poller (Pillar 10) — live mode only
@@ -480,10 +521,28 @@ class TradingBot:
             asyncio.create_task(self._order_poller.run(), name="order_status_poller"),
             asyncio.create_task(self._health_reporter(), name="health_reporter"),
             asyncio.create_task(self._rpe_crypto_retrigger_loop(), name="rpe_retrigger"),
-            asyncio.create_task(self._pce_refresh_loop(), name="pce_refresh"),
             asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
+
+        # Multi-core mode: add worker consumer tasks, skip in-process PCE loop
+        if self._process_manager is not None:
+            self._tasks.append(
+                asyncio.create_task(self._consume_bbo_events(), name="bbo_consumer")
+            )
+            self._tasks.append(
+                asyncio.create_task(self._consume_pce_results(), name="pce_consumer")
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._process_manager.health_check_loop(), name="worker_health"
+                )
+            )
+        else:
+            # Single-process fallback: PCE refresh runs in-process
+            self._tasks.append(
+                asyncio.create_task(self._pce_refresh_loop(), name="pce_refresh")
+            )
 
         # Launch data recorder if enabled
         if self._recorder is not None:
@@ -713,6 +772,11 @@ class TradingBot:
             await self._ws.stop()
         if self._l2_ws:
             await self._l2_ws.stop()
+
+        # Stop multi-core worker processes
+        if self._process_manager is not None:
+            await asyncio.to_thread(self._process_manager.stop_all)
+            self._process_manager = None
 
         await self.whale_monitor.stop()
 
@@ -949,6 +1013,93 @@ class TradingBot:
                     exc_info=True,
                 )
 
+    # ── Multi-core consumer loops ─────────────────────────────────────────
+    async def _consume_bbo_events(self) -> None:
+        """Consume BBO change notifications from L2 worker processes.
+
+        Reads ``(\"bbo\", asset_id, seq)`` tuples from the shared
+        ``multiprocessing.Queue``, then drives the same callbacks the
+        in-process ``_on_l2_bbo_change`` would have fired.
+        """
+        if self._process_manager is None:
+            return
+        bbo_queue = self._process_manager.bbo_queue
+
+        while self._running:
+            try:
+                # Poll the multiprocessing Queue from a thread to avoid
+                # blocking the event loop.
+                try:
+                    msg = await asyncio.to_thread(bbo_queue.get, timeout=0.5)
+                except Exception:
+                    # Empty queue or timeout
+                    continue
+
+                if msg is None:
+                    continue
+
+                cmd = msg[0]
+                if cmd == "bbo":
+                    _, asset_id, seq = msg
+                    # Read spread score from shared memory for the callback
+                    reader = self._process_manager.get_reader(asset_id)
+                    if reader is None:
+                        continue
+                    snap = reader.read_header()
+                    # Build a minimal SpreadScore-like object
+                    from src.data.spread_score import SpreadScore
+                    score = SpreadScore(
+                        raw_spread_cents=round(snap.spread * 100, 2) if snap.spread else 0.0,
+                        depth_weighted_spread_cents=0.0,
+                        score=snap.spread_score,
+                        timestamp=snap.timestamp,
+                    )
+                    await self._on_l2_bbo_change(asset_id, score)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.error("bbo_consumer_error", exc_info=True)
+
+    async def _consume_pce_results(self) -> None:
+        """Consume results from the PCE computation worker.
+
+        Dispatches dashboard data, cross-market signals, etc.
+        """
+        if self._process_manager is None:
+            return
+        output_queue = self._process_manager.pce_output_queue
+
+        while self._running:
+            try:
+                try:
+                    msg = await asyncio.to_thread(output_queue.get, timeout=1.0)
+                except Exception:
+                    continue
+
+                if msg is None:
+                    continue
+
+                cmd = msg[0]
+                if cmd == "pce_refreshed":
+                    _, dashboard = msg
+                    await self.telegram.notify_pce_dashboard(dashboard)
+                    log.info(
+                        "pce_dashboard_received",
+                        portfolio_var=dashboard.get("portfolio_var", 0.0),
+                        pairs_tracked=dashboard.get("total_pairs_tracked", 0),
+                    )
+                elif cmd == "cm_signals":
+                    _, signal_dicts = msg
+                    if signal_dicts:
+                        log.info("cross_market_signals_received", count=len(signal_dicts))
+                elif cmd == "prior_validation":
+                    _, summary = msg
+                    log.info("pce_prior_validation_received", **summary)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.error("pce_consumer_error", exc_info=True)
+
     # ── L2 callbacks ──────────────────────────────────────────────────────
     async def _on_l2_bbo_change(self, asset_id: str, score: Any) -> None:
         """Callback from L2OrderBook when the BBO changes.
@@ -1004,6 +1155,10 @@ class TradingBot:
 
         # Signal cooldown check (lifecycle cooldown)
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            return
+
+        # Stop-loss cooldown — prevent re-entry into recently stopped-out markets
+        if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
             return
 
         # Per-signal-source cooldown (configurable, default 30s)
@@ -1231,7 +1386,17 @@ class TradingBot:
                     ew_vol=yes_agg_regime.rolling_volatility,
                 )
                 # SI-3: record return for cross-market signal generator
-                if self._cross_market is not None:
+                if self._multicore_enabled and self._process_manager is not None:
+                    try:
+                        self._process_manager.pce_input_queue.put_nowait(
+                            ("bar_return", market_info.condition_id, lr,
+                             market_info.yes_token_id, market_info.no_token_id),
+                        )
+                    except _queue_mod.Full:
+                        self._pce_queue_drops += 1
+                        if self._pce_queue_drops % 100 == 1:
+                            log.warning("queue_full_drop", queue="pce_input", total_drops=self._pce_queue_drops)
+                elif self._cross_market is not None:
                     self._cross_market.record_return(
                         market_info.condition_id,
                         lr,
@@ -1247,6 +1412,11 @@ class TradingBot:
                         "regime_gate_suppressed",
                         market_id=market_info.condition_id[:16],
                         regime_score=round(regime_det.regime_score, 3),
+                    )
+                elif not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+                    log.info(
+                        "stop_loss_cooldown_suppressed",
+                        market_id=market_info.condition_id[:16],
                     )
                 else:
                     self._latest_z = sig.zscore
@@ -1284,18 +1454,24 @@ class TradingBot:
                             l2_reliable=l2_ok,
                         )
                         if drift_sig and drift_sig.direction == "BUY_NO":
-                            self._drift_cooldowns[market_info.condition_id] = now_drift
-                            self.lifecycle.record_signal(market_info.condition_id)
-                            await self._on_panic_signal(
-                                drift_sig, no_agg, market_info,
-                                signal_metadata={
-                                    "signal_source": "drift",  # Flaw 2: suppresses regime discount
-                                    "source": "drift",         # legacy compat
-                                    "drift_score": drift_sig.score,
-                                    "regime_mean_revert": True,
-                                    "spread_compressed": False,
-                                },
-                            )
+                            if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+                                log.info(
+                                    "stop_loss_cooldown_suppressed_drift",
+                                    market_id=market_info.condition_id[:16],
+                                )
+                            else:
+                                self._drift_cooldowns[market_info.condition_id] = now_drift
+                                self.lifecycle.record_signal(market_info.condition_id)
+                                await self._on_panic_signal(
+                                    drift_sig, no_agg, market_info,
+                                    signal_metadata={
+                                        "signal_source": "drift",  # Flaw 2: suppresses regime discount
+                                        "source": "drift",         # legacy compat
+                                        "drift_score": drift_sig.score,
+                                        "regime_mean_revert": True,
+                                        "spread_compressed": False,
+                                    },
+                                )
 
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
@@ -1914,6 +2090,8 @@ class TradingBot:
     def _handle_exit_fill(self, pos: Any) -> None:
         """Exit order filled — close position and record."""
         self.positions.on_exit_filled(pos, reason="target")
+        # Refresh lifecycle cooldown from close time (not signal fire time)
+        self.lifecycle.record_signal(pos.market_id)
         _safe_fire_and_forget(
             self._record_and_notify_exit(pos),
             name=f"record_exit_{pos.id}",
@@ -2363,7 +2541,8 @@ class TradingBot:
                     no_agg.flush_stale_bar(now)
 
                 # SI-3: Cross-market divergence scan after all bars updated
-                if self._cross_market is not None:
+                # In multicore mode, PCE worker handles scanning autonomously
+                if not self._multicore_enabled and self._cross_market is not None:
                     cm_signals = self._cross_market.scan()
                     if cm_signals:
                         log.info("cross_market_scan", signals=len(cm_signals))
