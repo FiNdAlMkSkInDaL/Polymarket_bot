@@ -315,9 +315,9 @@ class WfoReport:
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
 SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
     # Core signal parameters
-    "zscore_threshold": ("suggest_float", 0.8, 3.0),
+    "zscore_threshold": ("suggest_float", 0.5, 3.0),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
-    "volume_ratio_threshold": ("suggest_float", 0.5, 4.0),
+    "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
     "trend_guard_pct": ("suggest_float", 0.05, 1.0),
     # Risk management
