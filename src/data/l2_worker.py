@@ -229,11 +229,13 @@ async def _l2_worker_async(
 
     # ── Heartbeat loop ────────────────────────────────────────────────
     async def _heartbeat_loop() -> None:
-        while not shutdown_event.is_set():            # Detect orphaned worker (parent died)
+        while not shutdown_event.is_set():
+            # Detect orphaned worker (parent died)
             if os.getppid() != _original_ppid:
                 log.warning("parent_died_orphan_exit", worker_id=worker_id)
                 shutdown_event.set()
-                return            heartbeat.beat()
+                return
+            heartbeat.beat()
             await asyncio.sleep(0.5)
 
     # ── Shutdown watcher ──────────────────────────────────────────────

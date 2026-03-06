@@ -224,8 +224,19 @@ class ParquetConverter:
         latencies: list[float] = []
         seqs_per_asset: dict[str, list[int]] = defaultdict(list)
 
+        _DATE_RE = __import__("re").compile(r"^\d{4}-\d{2}-\d{2}$")
+
         # Stream through all JSONL files and buffer by partition
         for fpath in jsonl_files:
+            # If the file lives in a YYYY-MM-DD directory (backfill layout),
+            # use that directory name as the partition date so that historical
+            # data is bucketed by trade date rather than download timestamp.
+            dir_date: str | None = (
+                fpath.parent.name
+                if _DATE_RE.match(fpath.parent.name)
+                else None
+            )
+
             with open(fpath, "r", encoding="utf-8") as fh:
                 for line_no, raw_line in enumerate(fh, 1):
                     report.total_rows += 1
@@ -260,8 +271,9 @@ class ParquetConverter:
                     if row["sequence_id"] is not None:
                         seqs_per_asset[row["asset_id"]].append(row["sequence_id"])
 
-                    # Derive partition key
-                    date_str = datetime.fromtimestamp(
+                    # Derive partition key: prefer directory-name date for
+                    # backfill data (local_ts = download time, not trade time).
+                    date_str = dir_date or datetime.fromtimestamp(
                         row["local_ts"], tz=timezone.utc
                     ).strftime("%Y-%m-%d")
                     category = self._category_map.get(row["asset_id"], "general")

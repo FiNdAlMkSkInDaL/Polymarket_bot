@@ -215,6 +215,8 @@ class TradingBot:
         self._ws: MarketWebSocket | None = None
         self._l2_ws: L2WebSocket | None = None
         self._tasks: list[asyncio.Task] = []
+        self._stop_task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Multi-core ProcessManager — orchestrates L2 and PCE workers
         self._process_manager: ProcessManager | None = None
@@ -380,7 +382,7 @@ class TradingBot:
         # original L2WebSocket runs inside the main asyncio loop.
         if self._multicore_enabled and self._l2_books:
             self._process_manager = ProcessManager(
-                on_emergency_stop=self.stop,
+                on_emergency_stop=self._schedule_stop,
             )
             l2_asset_ids = list(self._l2_books.keys())
             self._process_manager.start_l2_workers(l2_asset_ids)
@@ -562,17 +564,16 @@ class TradingBot:
         loop.set_exception_handler(self._asyncio_exception_handler)
 
         # Handle graceful shutdown via SIGINT / SIGTERM
+        self._loop = loop
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+                loop.add_signal_handler(sig, self._schedule_stop)
         else:
             # On Windows, loop.add_signal_handler is not supported.
             # Register via the signal module instead (handles Ctrl-C).
             signal.signal(
                 signal.SIGINT,
-                lambda *_: loop.call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(self.stop())
-                ),
+                lambda *_: loop.call_soon_threadsafe(self._schedule_stop),
             )
 
         log.info("bot_running", markets=len(self._markets), mode=mode_label)
@@ -582,6 +583,12 @@ class TradingBot:
             await asyncio.gather(*self._tasks, return_exceptions=False)
         except asyncio.CancelledError:
             pass
+
+        # Ensure stop() runs to completion before start() returns
+        # (otherwise asyncio.run() tears down the loop while stop()
+        #  is still doing cleanup — the real cause of the hang).
+        if self._stop_task is not None and not self._stop_task.done():
+            await self._stop_task
 
     # ── Global asyncio exception handler ────────────────────────────────────
     def _asyncio_exception_handler(self, loop: asyncio.AbstractEventLoop, context: dict) -> None:
@@ -751,6 +758,18 @@ class TradingBot:
             return fn()
         return None
 
+    def _schedule_stop(self) -> None:
+        """Schedule stop() as an independent task (idempotent).
+
+        MUST be used instead of calling stop() directly from within any
+        of self._tasks — calling stop() inline creates a circular future
+        chain (task → stop → gather(tasks) → task) that causes
+        RecursionError on cancellation.
+        """
+        if self._stop_task is None:
+            loop = self._loop or asyncio.get_running_loop()
+            self._stop_task = loop.create_task(self.stop())
+
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
         if not self._running:
@@ -773,7 +792,26 @@ class TradingBot:
         if self._l2_ws:
             await self._l2_ws.stop()
 
-        # Stop multi-core worker processes
+        # Cancel all tasks BEFORE stopping process manager so that
+        # queue-consumer threads (bbo_consumer, pce_consumer) exit
+        # before their underlying queues are closed.
+        for task in self._tasks:
+            task.cancel()
+        # Allow cancelled tasks (especially to_thread consumers) to
+        # observe the cancellation and finish their current iteration.
+        # Timeout prevents hanging if a thread is stuck on a closed queue.
+        if self._tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                log.warning("task_cancel_timeout", stuck_tasks=[
+                    t.get_name() for t in self._tasks if not t.done()
+                ])
+
+        # Stop multi-core worker processes (queues safe to close now)
         if self._process_manager is not None:
             await asyncio.to_thread(self._process_manager.stop_all)
             self._process_manager = None
@@ -790,14 +828,17 @@ class TradingBot:
         if hasattr(self, "_stop_loss_monitor"):
             self._stop_loss_monitor.stop()
 
-        for task in self._tasks:
-            task.cancel()
-
-        stats = await self.trade_store.get_stats()
-        log.info("final_stats", **stats)
-        await self.telegram.notify_stats(stats)
-        await self.trade_store.clear_live_state()
-        await self.trade_store.close()
+        try:
+            stats = await asyncio.wait_for(self.trade_store.get_stats(), timeout=5)
+            log.info("final_stats", **stats)
+            await asyncio.wait_for(self.telegram.notify_stats(stats), timeout=5)
+        except Exception:
+            log.warning("final_stats_skipped")
+        try:
+            await asyncio.wait_for(self.trade_store.clear_live_state(), timeout=5)
+            await asyncio.wait_for(self.trade_store.close(), timeout=5)
+        except Exception:
+            log.warning("trade_store_close_error", exc_info=True)
 
         log.info("bot_stopped")
 
@@ -963,7 +1004,7 @@ class TradingBot:
                         "🔴 <b>CIRCUIT BREAKER</b>: trade_processor tripped "
                         "(5 unexpected errors in 60s) — shutting down."
                     )
-                    asyncio.ensure_future(self.stop())
+                    self._schedule_stop()
                     return
 
     async def _process_book_updates(self) -> None:
