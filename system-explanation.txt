@@ -2564,6 +2564,25 @@ March 8th — 3-Stage WFO Optimization Pipeline:
   Smoke-tested locally (--smoke-test flag): exit code 0, all 5 artefacts
   produced, 0 bounds violations, 73/73 WFO unit tests pass.
 
+March 9th — Forensic Trace: Last 5 PanicSignal Events:
+  Deep audit of the 5 most recent PanicSignals on VPS (18:20–18:26 UTC).
+  Log source: bot_console.log (8.8MB, primary source for signal pipeline
+  events). bot.jsonl files (.1–.5) contain only WebSocket/l2_synced events
+  in multicore mode — signal pipeline events are NOT written there.
+  Results:
+    Signal 1: position opened, order placed, timed out after 300s (no fill).
+    Signals 2–3: crashed in _check_var_remote() on entry_side AttributeError
+      (Bug #1), swallowed by _stale_bar_flush_loop broad except clause.
+    Signals 4–5: suppressed by trend_guard at threshold=0.10 (Bug #2,
+      duplicate field in StrategyParams).
+  Five sub-audits (handshake, POST_ONLY, fast-kill, asset_id, PCE VaR):
+    all passed — no issues outside the two known bugs.
+  Architectural concern: _stale_bar_flush_loop (bot.py ~line 2726) silently
+    swallows all exceptions. Bug #1 crashes produced only a buried JSON line
+    with no Telegram alert. Recommend adding notification on consecutive errors.
+  Both bugs patched and deployed earlier in this session. No code changes
+  resulted from this forensic audit.
+
 
 ================================================================================
 END OF DOCUMENT

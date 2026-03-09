@@ -44,7 +44,7 @@ class TestConfigDefaults:
         assert settings.strategy.no_discount_factor == 1.005
 
     def test_max_loss_per_trade_cents_exists(self):
-        assert settings.strategy.max_loss_per_trade_cents == 50.0
+        assert settings.strategy.max_loss_per_trade_cents == 1500.0
 
     def test_cold_start_halt_window_exists(self):
         assert settings.strategy.cold_start_halt_window == 10
@@ -148,7 +148,7 @@ class TestDollarRiskCap:
         no_agg = OHLCVAggregator("NO_T", lookback_minutes=10)
         build_bar_history(no_agg, [0.55] * 10, base_vol=10.0)
 
-        # Entry at 0.44, max_loss=50¢ → max shares = 50/(44) ≈ 1.14
+        # Entry at 0.44, max_loss=1500¢ → max shares = 1500/(44) ≈ 34.1
         signal = PanicSignal(
             market_id="MKT", yes_asset_id="YES_T", no_asset_id="NO_T",
             yes_price=0.75, yes_vwap=0.50, zscore=3.0, volume_ratio=5.0,
@@ -170,9 +170,9 @@ class TestDollarRiskCap:
         no_agg = OHLCVAggregator("NO_T", lookback_minutes=10)
         build_bar_history(no_agg, [0.30] * 10, base_vol=10.0)
 
-        # Entry at 0.14, max_loss=50¢ → max shares = 50/(14) ≈ 3.57
-        # Kelly cold-start at 50% of $15 = $7.50 → 53.57 shares
-        # Dollar cap at 3.57 shares → still > 1, passes
+        # Entry at 0.14, max_loss=1500¢ → max shares = 1500/(14) ≈ 107
+        # Kelly cold-start at 50% of $15 = $7.50 → 53 shares
+        # Dollar cap at 107 shares → not binding, passes
         signal = PanicSignal(
             market_id="MKT", yes_asset_id="YES_T", no_asset_id="NO_T",
             yes_price=0.85, yes_vwap=0.40, zscore=4.0, volume_ratio=5.0,

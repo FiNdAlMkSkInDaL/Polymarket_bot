@@ -3815,3 +3815,348 @@ Post-restart health:
 
 ================================================================================
 
+
+================================================================================
+CHANGE REPORT — Forensic Trace: Last 5 PanicSignal Events (Deep Audit)
+Date: 2026-03-09
+================================================================================
+
+OBJECTIVE
+=========
+Step-by-step forensic trace of the last 5 PanicSignal events on VPS
+(botuser@135.181.85.32, --paper mode) to determine why each failed to result
+in an Order or Fill. Distinguish between logic rejections (intentional) and
+execution failures (bugs). Five sub-audits: Handshake Verification, POST_ONLY
+Pricing Audit, Fast-Kill Circuit Audit, asset_id Validity Check, PCE VaR
+Zero-Cap Check.
+
+All events extracted from bot_console.log (8.8MB). The running process at
+event time was started BEFORE the Bug #1 (entry_side) and Bug #2
+(trend_guard_pct) fixes were deployed.
+
+================================================================================
+LOG ARCHITECTURE DISCOVERY
+================================================================================
+
+bot_console.log (8.8MB) is the PRIMARY log source — captures ALL events via
+  `tee` redirection from the tmux session. Contains signal pipeline events,
+  gate evaluations, position lifecycle, and error tracebacks.
+
+bot.jsonl (.1–.5) are per-process structured log files. In multicore mode
+  these predominantly contain WebSocket and l2_synced events from L2 worker
+  subprocesses. Signal pipeline events (panic_signal_fired, pce_var_gate,
+  position_opened, etc.) appear ONLY in bot_console.log.
+
+This split means: grepping only bot.jsonl misses signal pipeline events.
+Always use bot_console.log for signal forensics.
+
+================================================================================
+SIGNAL PIPELINE PATH (code reference)
+================================================================================
+
+  PanicDetector.evaluate()
+    → bot.py._on_yes_bar_closed()         [line 1429]
+      → bot.py._on_panic_signal()         [line 1678]
+        → PositionManager.open_position() [position_manager.py]
+          → _open_position_inner()
+            → _check_risk_gates()
+              → _check_var_remote()       [line ~305] ← Bug #1 crash point
+            → EQS scoring
+            → Kelly sizing
+            → executor.place_limit_order()
+        → bot.py._entry_chaser_flow()     [line 2289]
+          → OrderChaser.run()             [chaser.py]
+
+================================================================================
+SIGNAL 1 — 18:20:34.215Z — Market 0x7054a1f2
+Classification: PARTIAL EXECUTION / MARKET-CONDITION FAILURE
+================================================================================
+
+  T+0ms       panic_signal_fired   zscore=1.124 v_ratio=8.89 yes=0.489
+                                   no_ask=0.512
+
+  T+8ms       pce_var_gate         shadow_mode=true exceeds=false
+                                   portfolio_var=0.0 — PASSED
+
+  T+12ms      position_opened      POS-1 entry=0.50 size=1.0 target=0.556
+                                   signal_type=panic
+
+  T+12ms      order_placed_paper   PAPER-1 BUY @ 0.50 (PositionManager)
+
+  T+14ms      order_placed_paper   PAPER-2 BUY @ 0.51 (OrderChaser initial,
+                                   pegged to best_bid)
+
+  T+14ms–     OrderChaser requoting  PAPER-3 through PAPER-99 at 0.51
+  T+24.4s                           ~251ms intervals (chase_interval_ms)
+
+  T+24.4s     latency_force_blocked  reason="heartbeat_stale"
+
+  T+300s      entry_timeout          POS-1 timed out, entry_chaser_cancelled
+
+  VERDICT: Order placed successfully but never filled.  The maker order at
+  0.50–0.51 had no counterparty selling NO within the 300s timeout.  All gates
+  passed correctly.  The OrderChaser requoted at the same 0.51 price 97 times
+  (paper-mode artifact — no real BBO movement to chase).
+
+================================================================================
+SIGNAL 2 — 18:22:34.241Z — Market 0xc6ddb19f
+Classification: EXECUTION FAILURE (Bug #1: entry_side AttributeError)
+================================================================================
+
+  T+0ms       panic_signal_fired   zscore=1.479 v_ratio=3.91 yes=0.386
+                                   no_ask=0.637
+
+  T+0.7ms     stale_bar_flush_error  "'Position' object has no attribute
+                                      'entry_side'"
+
+  VERDICT: POS-1 from Signal 1 was still open (entry-pending, within its 300s
+  timeout window).  When _check_var_remote() serialized open positions for the
+  PCE worker queue, it referenced p.entry_side — the old attribute name renamed
+  to p.trade_side in the March 5 Signal Decoupling refactor.
+
+  The AttributeError was SWALLOWED by _stale_bar_flush_loop's broad
+  `except Exception` clause (bot.py line ~2726).  Only a single JSON line
+  tagged "stale_bar_flush_error" was logged — no Telegram alert, no restart.
+
+================================================================================
+SIGNAL 3 — 18:23:34.247Z — Market 0xc6ddb19f
+Classification: EXECUTION FAILURE (Bug #1: entry_side AttributeError)
+================================================================================
+
+  T+0ms       panic_signal_fired   zscore=1.365 v_ratio=1.66 yes=0.386
+                                   no_ask=0.636
+
+  T+0.5ms     stale_bar_flush_error  "'Position' object has no attribute
+                                      'entry_side'"
+
+  VERDICT: Identical to Signal 2.  POS-1 still open, same crash point.
+
+================================================================================
+SIGNAL 4 — 18:24:34.253Z — Market 0xc6ddb19f
+Classification: LOGIC REJECTION — INCORRECT THRESHOLD (Bug #2)
+================================================================================
+
+  T+0ms       trend_guard_suppressed  trend_pct=0.1017 threshold=0.10
+                                      zscore=1.12
+
+  VERDICT: The trend guard correctly blocked the signal — but the threshold was
+  WRONG.  StrategyParams defined trend_guard_pct twice: line 105 (default=0.99)
+  and line 410 (default=0.10).  Python dataclass field resolution uses the last
+  definition, so the live threshold was 0.10.  A 10.17% uptrend rightfully
+  exceeds 10%, but should NOT exceed the intended 99% threshold.
+
+  This signal WOULD HAVE FIRED with the correct config (0.99).
+
+================================================================================
+SIGNAL 5 — 18:25:34.259Z — Market 0xc6ddb19f
+Classification: LOGIC REJECTION — INCORRECT THRESHOLD (Bug #2)
+================================================================================
+
+  T+0ms       trend_guard_suppressed  trend_pct=0.1155 threshold=0.10
+                                      zscore=2.013
+
+  VERDICT: Same misconfigured threshold as Signal 4.  A strong zscore of 2.013
+  was blocked.  Would have passed with the correct 0.99 threshold.
+
+================================================================================
+PRE-SIGNAL BONUS EVENT — 17:48:34Z — Market 0x7054a1f2
+Classification: LOGIC REJECTION (intentional)
+================================================================================
+
+  T+0ms       panic_signal_fired
+  T+4ms       pce_var_gate           passed (shadow_mode)
+  T+6ms       eqs_rejected           reason=sub_tick_spread entry_price=0.52
+                                     score=0.0
+
+  VERDICT: Spread too narrow for profitable round-trip.  EQS correctly blocked.
+
+================================================================================
+FORENSIC SUB-AUDIT RESULTS
+================================================================================
+
+1. HANDSHAKE VERIFICATION — PASSED
+   PositionManager.open_position() is called inside _on_panic_signal() for all
+   fired signals.  Confirmed by pce_var_gate and position_opened events
+   following panic_signal_fired.  Signals 2–3 completed the handshake but
+   crashed mid-execution inside _check_var_remote().
+
+2. POST_ONLY PRICING AUDIT — NO ISSUES
+   OrderChaser pegs to best_bid (0.51) for BUY orders.  All 99 paper orders
+   placed successfully.  No ORDER_ALREADY_REJECTED or PRICE_OUT_OF_BOUNDS
+   errors.  The no-fill was due to market conditions (no counterparty), not
+   pricing logic.
+
+3. FAST-KILL CIRCUIT AUDIT — NO ADVERSE SELECTION KILLS
+   Zero adverse_sel or kill_switch_active events in logs.  The
+   latency_force_blocked at T+24.4s is from heartbeat stale detection
+   (network), not adverse selection.  Signal-to-order latency = 11ms — well
+   under the 100ms threshold.
+
+4. ASSET_ID VALIDITY CHECK — NO MISMATCH
+   Orders placed successfully with the correct asset ID.  No 404/Invalid Asset
+   errors.  Paper mode orders all returned LIVE status.
+
+5. PCE VAR ZERO-CAP CHECK — NO ZERO-CAP
+   All pce_var_gate events show exceeds_threshold=false, portfolio_var=0.0,
+   shadow_mode=true.  PCE is in shadow mode — it logs but does NOT block
+   trades.  No max_size=0.0 events found.
+
+================================================================================
+ROOT CAUSE MATRIX
+================================================================================
+
+  Signal  Outcome              Classification              Root Cause
+  ------  -------------------  --------------------------  ---------------------------
+  1       Timeout (no fill)    Market condition            No counterparty at 0.50–0.51
+  2       Crash (silent)       Execution failure (Bug #1)  entry_side → trade_side miss
+  3       Crash (silent)       Execution failure (Bug #1)  Same
+  4       Suppressed           Logic rejection (Bug #2)    trend_guard_pct dup: 0.10
+  5       Suppressed           Logic rejection (Bug #2)    Same
+
+================================================================================
+ARCHITECTURAL CONCERN: SILENT-FAILURE MODE
+================================================================================
+
+  _stale_bar_flush_loop (bot.py ~line 2726) uses a broad `except Exception`
+  that swallows ALL errors and logs them as stale_bar_flush_error.  Bug #1
+  crashes were only visible as buried JSON lines — not surfaced via Telegram
+  or any alert channel.
+
+  Recommendation: add Telegram notification for stale_bar_flush_error events,
+  or at minimum re-raise after N consecutive failures.
+
+================================================================================
+DEPLOYMENT STATUS
+================================================================================
+
+  Both bugs were patched and deployed earlier this session:
+    Bug #1: position_manager.py line 311 — p.entry_side → p.trade_side
+    Bug #2: config.py — removed duplicate trend_guard_pct (lines 406–410)
+
+  Bot restarted at 18:54 UTC.  Post-restart:
+    - trend_guard_pct = 0.99 (correct)
+    - trade_side attribute present
+    - Zero errors observed
+    - Drift signals flowing correctly
+    - No panic signals fired post-restart (market conditions)
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+  None — this is a forensic investigation report only.
+  Patches were applied in the earlier "VPS Panic Signal Zero-Fill Audit" entry.
+
+================================================================================
+
+
+================================================================================
+CHANGE REPORT — Zero-Trade Root Cause: Dollar Risk Cap + PCE Matrix Corruption
+Date: 2026-03-09
+================================================================================
+
+BACKGROUND
+----------
+Despite deploying Bug #1 (entry_side → trade_side) and Bug #2 (duplicate
+trend_guard_pct) fixes, the bot continued producing zero trades while firing
+10+ PanicSignal Telegram notifications between 20:28–20:36 UTC on market
+0x9352c559e9648ab4cab236087b64ca85c5b7123a4c7d9d7d4efde4a39c.
+
+Live VPS log forensics revealed TWO additional blockers:
+
+================================================================================
+BUG #3 — max_loss_per_trade_cents Too Restrictive
+================================================================================
+
+SYMPTOM:
+  Every panic signal passed the PCE VaR gate (pce_var_ok) but immediately hit
+  skip_entry_risk_cap_too_small in position_manager.py.
+
+CHAIN:
+  1. kelly_cold_start: bankroll=$10, kelly_frac=0.25, cold_start_frac=0.50
+     → size_usd = $5.0 → shares = 5.0 / 0.73 = 6.85
+  2. dollar_risk_cap_applied: max_loss_cents=50.0, entry_price=0.73
+     → max_shares = 50 / (73 × 1) = 0.68
+  3. 0.68 < 1.0 minimum → skip_entry_risk_cap_too_small → return None
+
+ROOT CAUSE:
+  max_loss_per_trade_cents defaulted to 50.0 ($0.50), making it impossible
+  to trade ANY market with entry_price > $0.50. At the NO-side ask of $0.73,
+  the cap reduced sizing to 0.68 shares — below the 1-share minimum.
+
+FIX:
+  src/core/config.py line 248:
+    max_loss_per_trade_cents: 50.0 → 1500.0 ($15, aligned with
+    max_trade_size_usd=15.0)
+
+  At entry_price=$0.73: max_shares = 1500 / 73 = 20.5 → well above 1.
+
+TEST:
+  tests/test_alpha_evolution.py: assertion updated 50.0 → 1500.0, comments
+  updated in TestDollarRiskCap tests. 23/23 passed.
+
+================================================================================
+BUG #4 — Corrupted PCE Correlation Matrix (Crash Loop)
+================================================================================
+
+SYMPTOM:
+  After deploying config fix to VPS, the bot entered a crash-restart loop:
+  starts → bootstraps 150 markets → multicore enables → workers start →
+  orderly shutdown after 6–20 seconds. Repeated 4+ cycles.
+
+CHAIN:
+  1. PCE worker (subprocess) loads data/pce_correlation.json
+  2. JSON parse fails: "Expecting ':' delimiter: line 29717 column 7"
+  3. Worker returns empty matrix, becomes non-responsive (stale)
+  4. Main process watchdog detects: "Critically stale workers: ['pce_worker']"
+  5. emergency_stop_triggered → orderly bot_stopped
+  6. systemd Restart=always → cycle repeats
+
+ROOT CAUSE:
+  data/pce_correlation.json had 19,607 (of ~23,000) pair keys corrupted with
+  a leading double-quote: ""0x9345..." instead of "0x9345...". This produced
+  invalid JSON (empty string followed by unexpected token).
+
+  Corruption is inconsistent with json.dump output (which would produce \"
+  not ""), suggesting an I/O-level event (process kill during buffered write,
+  overlapping file access, or filesystem-level corruption).
+
+FIX:
+  Remote Python script replaced all ""0x → "0x in the file.
+  Validated: json.loads() succeeded, 23,199 pairs loaded.
+  Backup preserved at data/pce_correlation.json.bak.
+
+  On the next systemd restart, the PCE worker loaded the fixed file
+  successfully (pce_matrix_loaded, 23,199 pairs). Bot has been stable since.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+  src/core/config.py
+    - max_loss_per_trade_cents default: 50.0 → 1500.0
+
+  tests/test_alpha_evolution.py
+    - Updated assertion and comments for new default
+
+  VPS: data/pce_correlation.json
+    - Fixed 19,607 corrupted pair keys (""0x → "0x)
+
+================================================================================
+DEPLOYMENT
+================================================================================
+
+  1. SCP'd src/core/config.py to VPS
+  2. Fixed data/pce_correlation.json via remote Python script
+  3. Cleaned /dev/shm/pmb_* (stale SHM segments from crash-loop)
+  4. systemd auto-restarted bot (PID 191608)
+  5. Verified:
+     - PCE matrix loaded: 23,199 pairs ✓
+     - All workers healthy: l2_worker, pce_worker ✓
+     - WebSocket connections established (7 sockets) ✓
+     - Whale monitor active ✓
+     - No emergency_stop events since restart ✓
+     - Bot stable for 9+ minutes and counting ✓
+
+================================================================================
+

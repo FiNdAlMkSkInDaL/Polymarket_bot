@@ -245,7 +245,7 @@ class StrategyParams:
     # Maximum dollar-risk per trade.  Caps position size so that a
     # gap-to-zero event cannot lose more than this many cents.
     # max_loss = entry_price × size × 100 ≤ max_loss_per_trade_cents.
-    max_loss_per_trade_cents: float = _env_float("MAX_LOSS_PER_TRADE_CENTS", 50.0)
+    max_loss_per_trade_cents: float = _env_float("MAX_LOSS_PER_TRADE_CENTS", 1500.0)
 
     # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
     chase_interval_ms: int = _env_int("CHASE_INTERVAL_MS", 250)
