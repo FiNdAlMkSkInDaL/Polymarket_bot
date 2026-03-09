@@ -467,3 +467,120 @@ class TestChaserToxicityGuard:
 
         # 0.08 < 0.10 but 0.08 is NOT < 0.09 * 0.50 = 0.045
         assert chaser._should_abort_toxicity() is False
+
+
+class TestChaserPreemptiveExit:
+    """SI-5 — OFI-based preemptive exit when iceberg wall is near exhaustion."""
+
+    @pytest.fixture
+    def setup(self):
+        executor = OrderExecutor(paper_mode=True)
+        book = OrderbookTracker("ASSET_A")
+        _seed_book(book, bid=0.47, ask=0.53)
+        return executor, book
+
+    def _make_iceberg_detector(self, side, price, confidence, estimated_total):
+        signal = SimpleNamespace(
+            side=side, price=price, confidence=confidence,
+            refill_count=int(estimated_total / 100),
+            avg_slice_size=100.0,
+            estimated_total=estimated_total,
+        )
+
+        class FakeDetector:
+            def strongest_iceberg(self, s):
+                return signal if s == side else None
+
+        return FakeDetector()
+
+    @pytest.mark.asyncio
+    async def test_preemptive_exit_on_wall_exhaustion(self, setup):
+        """Chaser cancels peg and exits when sell burst exceeds 80% of
+        a 1000-unit iceberg."""
+        executor, book = setup
+
+        detector = self._make_iceberg_detector(
+            "BUY", 0.47, confidence=0.80, estimated_total=1000.0,
+        )
+
+        # Monkey-patch opposing_ofi_at_price onto the simple tracker so
+        # the chaser can query per-price OFI without a full L2OrderBook.
+        book.opposing_ofi_at_price = lambda price, side: 900.0  # 90% > 80%
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+
+        # Simulate active iceberg peg
+        chaser._iceberg_peg_active = True
+        chaser._iceberg_peg_price = 0.47
+
+        # Place a resting order so there is something to cancel
+        await chaser._place(0.47)
+        assert chaser.resting_order is not None
+
+        # Wall pressure check should fire
+        assert chaser._should_preemptive_exit() is True
+
+        # Execute preemptive exit
+        await chaser._preemptive_exit()
+
+        assert chaser.state == ChaserState.ABANDONED
+        assert chaser._iceberg_peg_active is False
+        assert chaser.resting_order is None
+
+    @pytest.mark.asyncio
+    async def test_no_exit_when_ofi_below_threshold(self, setup):
+        """Chaser stays pegged when OFI is well below the 80% threshold."""
+        executor, book = setup
+
+        detector = self._make_iceberg_detector(
+            "BUY", 0.47, confidence=0.80, estimated_total=1000.0,
+        )
+        book.opposing_ofi_at_price = lambda price, side: 200.0  # 20% < 80%
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+        chaser._iceberg_peg_active = True
+        chaser._iceberg_peg_price = 0.47
+
+        assert chaser._should_preemptive_exit() is False
+
+    @pytest.mark.asyncio
+    async def test_depth_ratio_floor_triggers_exit(self, setup):
+        """Chaser exits when book_depth_ratio drops below 0.15."""
+        executor, book = setup
+
+        detector = self._make_iceberg_detector(
+            "BUY", 0.47, confidence=0.80, estimated_total=1000.0,
+        )
+        book.opposing_ofi_at_price = lambda price, side: 0.0  # no OFI
+
+        # Skew the book so bid depth is tiny relative to ask depth
+        book.on_book_snapshot({
+            "asset_id": "ASSET_A",
+            "bids": [{"price": "0.47", "size": "1"}],
+            "asks": [{"price": "0.53", "size": "1000"}],
+        })
+        assert book.book_depth_ratio < 0.15
+
+        chaser = OrderChaser(
+            executor=executor, book=book,
+            market_id="MKT_1", asset_id="ASSET_A",
+            side=OrderSide.BUY, target_size=10.0,
+            anchor_price=0.47,
+            iceberg_detector=detector,
+        )
+        chaser._iceberg_peg_active = True
+        chaser._iceberg_peg_price = 0.47
+
+        assert chaser._should_preemptive_exit() is True

@@ -138,6 +138,15 @@ class L2OrderBook:
         # ── Depth history for ghost liquidity detection ───────────────
         self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
 
+        # ── SI-5: Order Flow Imbalance (OFI) ─────────────────────────
+        # Rolling 2-second window of (timestamp, delta_bid_qty, delta_ask_qty)
+        self._ofi_window: deque[tuple[float, float, float]] = deque(maxlen=500)
+        self._ofi_window_sec: float = 2.0
+        # SI-5 per-price: (timestamp, side, price, delta_qty) for wall
+        # pressure monitoring.  Tracks every per-level size change so
+        # ``opposing_ofi_at_price`` can measure consumption at a specific
+        # wall price.
+        self._ofi_price_window: deque[tuple[float, str, float, float]] = deque(maxlen=1000)
         # ── Snapshot fetch lock (prevents concurrent fetches) ─────────
         self._snapshot_lock = asyncio.Lock()
 
@@ -203,6 +212,43 @@ class L2OrderBook:
         if self._delta_count < 50:
             return True  # not enough samples to judge
         return self.seq_gap_rate < settings.strategy.l2_max_seq_gap_rate
+
+    @property
+    def ofi(self) -> float:
+        """Rolling 2-second Order Flow Imbalance (SI-5).
+
+        OFI = ΣΔBidQty − ΣΔAskQty over the trailing window.
+        Positive → net bid-side pressure (buying); negative → net selling.
+        """
+        if not self._ofi_window:
+            return 0.0
+        cutoff = time.time() - self._ofi_window_sec
+        # Prune expired entries from the left
+        while self._ofi_window and self._ofi_window[0][0] < cutoff:
+            self._ofi_window.popleft()
+        total_bid = sum(entry[1] for entry in self._ofi_window)
+        total_ask = sum(entry[2] for entry in self._ofi_window)
+        return total_bid - total_ask
+
+    def opposing_ofi_at_price(self, price: float, side: str) -> float:
+        """Total volume consumed from a wall at *price* over the rolling window.
+
+        For a BUY wall: sums the absolute value of negative bid-qty deltas
+        at *price* (each represents a chunk eaten from the bid wall).
+        For a SELL wall: sums the absolute value of negative ask-qty deltas.
+
+        Returns 0.0 if no consumption detected.
+        """
+        cutoff = time.time() - self._ofi_window_sec
+        while self._ofi_price_window and self._ofi_price_window[0][0] < cutoff:
+            self._ofi_price_window.popleft()
+
+        consumed = 0.0
+        target_side = side.upper()
+        for ts, s, p, delta in self._ofi_price_window:
+            if s == target_side and abs(p - price) < 1e-6 and delta < 0:
+                consumed += abs(delta)
+        return consumed
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Snapshot loading (called by L2WebSocket on connect/desync)
@@ -407,6 +453,9 @@ class L2OrderBook:
         if not changes and data.get("price"):
             changes = [data]
 
+        delta_bid_qty = 0.0
+        delta_ask_qty = 0.0
+
         for ch in changes:
             try:
                 price = float(ch.get("price", 0))
@@ -425,6 +474,13 @@ class L2OrderBook:
                     self._bids.pop(neg_price, None)
                 else:
                     self._bids[neg_price] = size
+                level_delta = size - old_size
+                delta_bid_qty += level_delta
+                # SI-5: per-price OFI for wall pressure monitoring
+                if level_delta != 0.0:
+                    self._ofi_price_window.append(
+                        (time.time(), "BUY", price, level_delta)
+                    )
                 # SI-2: Fire level-change callback for iceberg detection
                 if self._on_level_change is not None and old_size != size:
                     self._on_level_change("BUY", price, old_size, size)
@@ -434,9 +490,20 @@ class L2OrderBook:
                     self._asks.pop(price, None)
                 else:
                     self._asks[price] = size
+                level_delta = size - old_size
+                delta_ask_qty += level_delta
+                # SI-5: per-price OFI for wall pressure monitoring
+                if level_delta != 0.0:
+                    self._ofi_price_window.append(
+                        (time.time(), "SELL", price, level_delta)
+                    )
                 # SI-2: Fire level-change callback for iceberg detection
                 if self._on_level_change is not None and old_size != size:
                     self._on_level_change("SELL", price, old_size, size)
+
+        # SI-5: record OFI deltas
+        if delta_bid_qty != 0.0 or delta_ask_qty != 0.0:
+            self._ofi_window.append((time.time(), delta_bid_qty, delta_ask_qty))
 
         # Trim if over max levels
         self._trim_side(self._bids)
@@ -708,6 +775,49 @@ class L2OrderBook:
         current_depth = self.current_total_depth()
         return (current_depth - past_depth) / past_depth
 
+    # ── Liquidity gap detection ─────────────────────────────────────────
+    def find_liquidity_gaps(self, min_depth_usd: float = 0.0) -> list[_Level]:
+        """Find ask-side price levels where cumulative depth is thin.
+
+        Iterates the ask side of the book and returns levels where the
+        running cumulative depth (in USD) is less than 10% of the
+        5-minute average total depth.  These "liquidity gaps" are
+        prices where a stop-loss cascade could push the market through
+        with minimal resistance.
+
+        Parameters
+        ----------
+        min_depth_usd:
+            Optional absolute floor — levels with cumulative depth
+            above this value are never flagged regardless of the
+            percentage test.
+
+        Returns
+        -------
+        list[Level]
+            Levels (price, cumulative_depth_usd) that qualify as gaps,
+            ordered by ascending price.
+        """
+        # Compute 5-minute average depth from the depth history
+        now = time.time()
+        cutoff = now - 300.0  # 5 minutes
+        samples = [d for ts, d in self._depth_history if ts >= cutoff]
+        avg_depth = (sum(samples) / len(samples)) if samples else 0.0
+
+        threshold = max(min_depth_usd, avg_depth * 0.10)
+        if threshold <= 0:
+            return []
+
+        gaps: list[_Level] = []
+        cumulative = 0.0
+        for price in self._asks.islice(stop=self._max_levels):
+            size = self._asks[price]
+            cumulative += price * size
+            if cumulative < threshold:
+                gaps.append(_Level(price, round(cumulative, 4)))
+
+        return gaps
+
     # ── Internal helpers ───────────────────────────────────────────────
     def _trim_side(self, side: SortedDict) -> None:
         """Keep only the top ``_max_levels`` entries."""
@@ -741,6 +851,7 @@ class L2OrderBook:
         self._last_update = 0.0
         self._last_server_time = 0.0
         self._depth_history.clear()
+        self._ofi_price_window.clear()
         self._desync_count = 0
         self._delta_count = 0
 

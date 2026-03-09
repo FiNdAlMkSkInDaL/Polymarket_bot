@@ -118,6 +118,9 @@ class OHLCVAggregator:
         self.rolling_volatility_ewma: float = 0.0  # EWMA σ (fast-reacting)
         self._ewma_variance: float = 0.0  # internal EWMA variance state
         self._ewma_initialised: bool = False
+        self.rolling_downside_vol_ewma: float = 0.0  # Downside semi-variance EWMA σ
+        self._downside_ewma_variance: float = 0.0
+        self._downside_ewma_initialised: bool = False
         self.avg_bar_volume: float = 0.0
 
         # Most recent trade timestamp — used for data freshness checks.
@@ -168,6 +171,11 @@ class OHLCVAggregator:
         closed = self._close_bar()
         self._bar_start = now
         return closed
+
+    @property
+    def current_bar_volume(self) -> float:
+        """Volume accumulated in the current (not yet closed) bar."""
+        return self._builder._total_volume
 
     @property
     def current_price(self) -> float:
@@ -233,6 +241,21 @@ class OHLCVAggregator:
                     + (1.0 - lam) * latest_return * latest_return
                 )
             self.rolling_volatility_ewma = self._ewma_variance ** 0.5
+
+            # ── Downside semi-variance EWMA (adverse returns only) ─────
+            #   downside_r = min(r, 0.0)  — only negative moves count
+            #   σ²_down_t = λ · σ²_down_{t-1} + (1-λ) · downside_r²
+            downside_r = min(latest_return, 0.0)
+            if not self._downside_ewma_initialised:
+                ds_returns = np.minimum(log_returns, 0.0)
+                self._downside_ewma_variance = float((ds_returns ** 2).mean())
+                self._downside_ewma_initialised = True
+            else:
+                self._downside_ewma_variance = (
+                    lam * self._downside_ewma_variance
+                    + (1.0 - lam) * downside_r * downside_r
+                )
+            self.rolling_downside_vol_ewma = self._downside_ewma_variance ** 0.5
 
         # ── 30-minute short-window volatility for TP rescaling ─────────
         n30 = len(self.bars)

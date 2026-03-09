@@ -14,6 +14,8 @@ HTTP 429 rate-limit risk entirely.
 
 from __future__ import annotations
 
+import math
+import time
 from typing import TYPE_CHECKING, Any
 
 from src.core.config import settings
@@ -168,6 +170,40 @@ class StopLossMonitor:
                 except Exception:
                     log.error("probe_breakeven_callback_error", pos_id=pos.id, exc_info=True)
 
+        # ── Pillar 11.3: Preemptive Liquidity Drain ──────────────────
+        # If the support side of the book has evaporated relative to
+        # resistance AND the position is underwater, exit preemptively
+        # before slippage makes a standard stop-loss too expensive.
+        strat = settings.strategy
+        obi_threshold = strat.sl_preemptive_obi_threshold
+        if obi_threshold > 0:
+            unrealised_pnl = (mid - pos.entry_price) * 100  # cents
+            if unrealised_pnl < 0:
+                book = self._books.get(eval_asset)
+                if book and book.has_data:
+                    bdr = book.book_depth_ratio  # bid/ask
+                    # For BUY_NO positions our support is the bid side:
+                    # bdr = bid/ask.  For typical BUY_NO, we already hold
+                    # NO tokens; our exit is a SELL whose fill quality
+                    # depends on bid depth.
+                    # Convention: our_support_ratio = 1/bdr
+                    # inverts to ask/bid — if bdr is high our support
+                    # is fine.  When bdr → 0 support vanishes.
+                    our_support_ratio = (1.0 / bdr) if bdr > 0 else 0.0
+                    if our_support_ratio < obi_threshold:
+                        log.warning(
+                            "preemptive_liquidity_drain",
+                            pos_id=pos.id,
+                            support_ratio=round(our_support_ratio, 4),
+                            threshold=obi_threshold,
+                            unrealised_pnl=round(unrealised_pnl, 2),
+                        )
+                        await self._trigger_stop(
+                            pos, mid, 0.0,
+                            reason="preemptive_liquidity_drain",
+                        )
+                        return
+
         # Determine effective stop-loss threshold
         base_sl = (
             pos.sl_trigger_cents
@@ -175,14 +211,44 @@ class StopLossMonitor:
             else self._stop_loss_cents
         )
 
-        if self._trailing_offset > 0 and hwm > pos.entry_price:
+        # ── Pillar 11.3: Time-Decay Stop Tightening ──────────────────
+        # If the trade has been open longer than sl_decay_start_minutes,
+        # exponentially decay the vol multiplier back toward 1.0,
+        # tightening the stop to exit stale positions.
+        decay_start = strat.sl_decay_start_minutes
+        decay_hl = strat.sl_decay_half_life_minutes
+        sl_vol_mult = getattr(pos, "sl_vol_multiplier", 1.0)
+        if sl_vol_mult > 1.0 and decay_start > 0 and decay_hl > 0:
+            elapsed_mins = (time.time() - pos.entry_time) / 60.0
+            if elapsed_mins > decay_start:
+                decay_factor = math.exp(
+                    -(elapsed_mins - decay_start) / decay_hl
+                )
+                current_mult = 1.0 + (sl_vol_mult - 1.0) * decay_factor
+                # Fee drag is the difference between the stretched stop
+                # and the stored trigger (constant over the trade's life).
+                fee_drag = self._stop_loss_cents * sl_vol_mult - base_sl
+                base_sl = max(
+                    1.0,
+                    self._stop_loss_cents * current_mult - fee_drag,
+                )
+
+        # Use per-position adaptive trailing offset if set, else fall back
+        # to the monitor-level default (from config or constructor arg).
+        effective_trailing = (
+            pos.trailing_offset_cents
+            if getattr(pos, "trailing_offset_cents", 0.0) > 0
+            else self._trailing_offset
+        )
+
+        if effective_trailing > 0 and hwm > pos.entry_price:
             # Trailing stop: only activate after the position has been
             # profitable by at least _be_activation_cents.  This prevents
             # ratcheting during the initial adverse move from cutting
             # winners before they reach target.
             profit_from_entry = (hwm - pos.entry_price) * 100
             if profit_from_entry >= self._be_activation_cents:
-                trail_floor_price = hwm - self._trailing_offset / 100.0
+                trail_floor_price = hwm - effective_trailing / 100.0
                 trail_loss = (trail_floor_price - mid) * 100
                 entry_loss = (pos.entry_price - mid) * 100
                 unrealised_loss = max(trail_loss, entry_loss)
@@ -193,7 +259,7 @@ class StopLossMonitor:
             unrealised_loss = (pos.entry_price - mid) * 100
 
         if unrealised_loss >= base_sl:
-            await self._trigger_stop(pos, mid, base_sl)
+            await self._trigger_stop(pos, mid, base_sl, reason="stop_loss")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Backward-compatible batch check (used by tests)
@@ -246,7 +312,7 @@ class StopLossMonitor:
 
         return 0.0
 
-    async def _trigger_stop(self, pos, mid: float, threshold: float) -> None:
+    async def _trigger_stop(self, pos, mid: float, threshold: float, *, reason: str = "stop_loss") -> None:
         if pos.state != PositionState.EXIT_PENDING:
             return  # may have been closed between check and trigger
 
@@ -257,11 +323,12 @@ class StopLossMonitor:
             mid=mid,
             threshold=threshold,
             hwm=self._hwm.get(pos.id, 0.0),
+            reason=reason,
         )
 
-        await self._pm.force_stop_loss(pos)
+        await self._pm.force_stop_loss(pos, reason=reason)
         await self._store.record(pos)
         await self._telegram.notify_exit(
             pos.id, pos.entry_price, pos.exit_price,
-            pos.pnl_cents, "stop_loss",
+            pos.pnl_cents, reason,
         )

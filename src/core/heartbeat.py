@@ -217,9 +217,9 @@ class BookHeartbeat:
                     stalest_asset = asset_id
 
             # Position-level stale: the book we are actively trading
-            # against hasn't updated.  Use a larger multiplier (3×)
+            # against hasn't updated.  Use a larger multiplier (6×)
             # since individual markets are naturally less frequent.
-            position_stale_ms = self._stale_ms * 3
+            position_stale_ms = self._stale_ms * 6
             if stalest_ms > position_stale_ms:
                 if not self._is_suspended:
                     await self._suspend(

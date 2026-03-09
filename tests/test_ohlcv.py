@@ -85,3 +85,65 @@ class TestOHLCVAggregator:
         assert agg.current_price == 0.0
         assert agg.rolling_vwap == 0.0
         assert agg.rolling_volatility == 0.0
+
+
+# ── Pillar 11.2: Downside Semi-Variance EWMA ────────────────────────────
+
+
+class TestDownsideSemiVariance:
+    """Prove that rolling_downside_vol_ewma only reacts to adverse moves."""
+
+    def test_uptrend_downside_vol_near_zero(self):
+        """Winning Trade Invariant: purely positive returns → total EWMA vol
+        increases significantly, but downside vol remains practically 0."""
+        agg = OHLCVAggregator("NO_TOKEN", lookback_minutes=60)
+        t0 = 1000.0
+
+        # Monotonically increasing prices: every log-return is positive
+        prices = [0.50 + 0.01 * i for i in range(15)]  # 0.50 → 0.64
+        for i, p in enumerate(prices):
+            agg.on_trade(_make_trade(p, 10, t0 + i * BAR_INTERVAL))
+            agg.on_trade(_make_trade(p + 0.001, 1, t0 + (i + 1) * BAR_INTERVAL + 0.1))
+
+        assert len(agg.bars) >= 5
+        # Total vol increases significantly (prices are moving)
+        assert agg.rolling_volatility_ewma > 0.005
+        # Downside vol remains practically zero (no negative returns)
+        # All downside_r = min(r, 0) = 0 → EWMA decays seed toward 0
+        assert agg.rolling_downside_vol_ewma < 0.001
+        # Ratio must be negligible: downside is < 10% of total
+        assert agg.rolling_downside_vol_ewma < agg.rolling_volatility_ewma * 0.1
+
+    def test_downtrend_downside_vol_tracks_total(self):
+        """If the market only goes DOWN, downside vol ≈ total vol."""
+        agg = OHLCVAggregator("NO_TOKEN", lookback_minutes=60)
+        t0 = 1000.0
+
+        # Monotonically decreasing prices: every log-return is negative
+        prices = [0.70 - 0.01 * i for i in range(15)]  # 0.70 → 0.56
+        for i, p in enumerate(prices):
+            agg.on_trade(_make_trade(p, 10, t0 + i * BAR_INTERVAL))
+            agg.on_trade(_make_trade(p - 0.001, 1, t0 + (i + 1) * BAR_INTERVAL + 0.1))
+
+        assert len(agg.bars) >= 5
+        assert agg.rolling_volatility_ewma > 0
+        # In a pure downtrend, downside vol should closely track total vol
+        assert agg.rolling_downside_vol_ewma > agg.rolling_volatility_ewma * 0.5
+
+    def test_cold_start_zero(self):
+        """Before any bars close, downside vol is 0."""
+        agg = OHLCVAggregator("NO_TOKEN")
+        assert agg.rolling_downside_vol_ewma == 0.0
+
+    def test_downside_vol_initialised_on_first_bar(self):
+        """After the first bar close, downside vol state is seeded."""
+        agg = OHLCVAggregator("NO_TOKEN", lookback_minutes=60)
+        t0 = 1000.0
+
+        # Create 3 bars to get enough log returns
+        for i, p in enumerate([0.50, 0.48, 0.46]):
+            agg.on_trade(_make_trade(p, 10, t0 + i * BAR_INTERVAL))
+            agg.on_trade(_make_trade(p - 0.005, 1, t0 + (i + 1) * BAR_INTERVAL + 0.1))
+
+        assert agg._downside_ewma_initialised is True
+        assert agg.rolling_downside_vol_ewma > 0

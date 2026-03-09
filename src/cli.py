@@ -333,6 +333,8 @@ def backtest(
 @click.option("--anchored", is_flag=True, help="Use expanding (anchored) IS window.")
 @click.option("--embargo-days", default=1, help="Gap in calendar days between IS/OOS windows.")
 @click.option("--output-params", default=None, type=str, help="Path to export champion parameters JSON.")
+@click.option("--max-markets", default=None, type=int, help="Limit multi-market universe to N markets (default: all).")
+@click.option("--search-space-bounds", default=None, type=str, help="Path to JSON file with narrowed search-space bounds.")
 def wfo(
     data_dir: str,
     train_days: int,
@@ -352,6 +354,8 @@ def wfo(
     anchored: bool,
     embargo_days: int,
     output_params: str | None,
+    max_markets: int | None,
+    search_space_bounds: str | None,
 ) -> None:
     """Run Walk-Forward Optimization on recorded historical data."""
     import os
@@ -383,10 +387,16 @@ def wfo(
         anchored=anchored,
         embargo_days=embargo_days,
         output_params_path=output_params,
+        max_markets=max_markets,
+        search_space_bounds_path=search_space_bounds,
     )
 
     report = run_wfo(cfg)
-    click.echo(report.summary())
+    try:
+        click.echo(report.summary())
+    except UnicodeEncodeError:
+        # Windows console may choke on box-drawing chars when piped
+        click.echo(report.summary().encode("ascii", errors="replace").decode())
 
 
 # ═══════════════════════════════════════════════════════════════════════════

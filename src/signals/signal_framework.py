@@ -376,3 +376,108 @@ class CompositeSignalEvaluator:
                 u_spread = 0.0  # zero spread = very tight = low uncertainty
 
         return min(1.0, w_spread * u_spread + w_conf * u_conf)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SI-6 — Meta-Strategy Hybrid Controller
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class MetaDecision:
+    """Output of the MetaStrategyController."""
+
+    signal_type: str          # "panic", "drift", or "rpe"
+    weight: float             # multiplier applied to entry size
+    vetoed: bool              # True → entry should be skipped
+    veto_reason: str          # human-readable reason (empty if not vetoed)
+    regime_score: float       # snapshot of the regime score used
+
+
+class MetaStrategyController:
+    """Regime-aware master switch that scales or vetoes entries.
+
+    Regime score semantics (from :class:`RegimeDetector`):
+        - ``> 0.8``  → deep mean-reversion regime
+        - ``< 0.3``  → trending regime
+        - ``0.3–0.8`` → neutral / mixed
+
+    Decision matrix
+    ---------------
+    +-----------+------------------+-----------+-----------+
+    | Regime    | Panic / Drift    |    RPE    |   Veto?   |
+    +-----------+------------------+-----------+-----------+
+    | Deep MR   | 1.5× weight      |  0.5×     |    —      |
+    | Neutral   | 1.0×             |  1.0×     |    —      |
+    | Trending  | veto             | 1.0×      | panic/dft |
+    +-----------+------------------+-----------+-----------+
+    """
+
+    # Thresholds (configurable via constructor for testability)
+    DEEP_MR_THRESHOLD: float = 0.8
+    TRENDING_THRESHOLD: float = 0.3
+
+    def evaluate(
+        self,
+        signal_type: str,
+        regime_score: float,
+    ) -> MetaDecision:
+        """Return a sizing weight and possible veto for the given signal.
+
+        Parameters
+        ----------
+        signal_type:
+            One of ``"panic"``, ``"drift"``, or ``"rpe"``.
+        regime_score:
+            Current regime score from :class:`RegimeDetector` (0–1).
+
+        Returns
+        -------
+        MetaDecision
+        """
+        # ── Deep mean-reversion regime ──────────────────────────────────
+        if regime_score >= self.DEEP_MR_THRESHOLD:
+            if signal_type in ("panic", "drift"):
+                return MetaDecision(
+                    signal_type=signal_type,
+                    weight=1.5,
+                    vetoed=False,
+                    veto_reason="",
+                    regime_score=regime_score,
+                )
+            # RPE gets halved in deep MR — panic alpha dominates
+            return MetaDecision(
+                signal_type=signal_type,
+                weight=0.5,
+                vetoed=False,
+                veto_reason="",
+                regime_score=regime_score,
+            )
+
+        # ── Trending regime ─────────────────────────────────────────────
+        if regime_score < self.TRENDING_THRESHOLD:
+            if signal_type in ("panic", "drift"):
+                return MetaDecision(
+                    signal_type=signal_type,
+                    weight=0.0,
+                    vetoed=True,
+                    veto_reason="regime_trend_veto",
+                    regime_score=regime_score,
+                )
+            # RPE keeps full weight in trends
+            return MetaDecision(
+                signal_type=signal_type,
+                weight=1.0,
+                vetoed=False,
+                veto_reason="",
+                regime_score=regime_score,
+            )
+
+        # ── Neutral regime ──────────────────────────────────────────────
+        return MetaDecision(
+            signal_type=signal_type,
+            weight=1.0,
+            vetoed=False,
+            veto_reason="",
+            regime_score=regime_score,
+        )

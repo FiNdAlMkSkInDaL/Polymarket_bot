@@ -34,6 +34,7 @@ Usage (in bot.py or position_manager.py)::
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -112,6 +113,9 @@ class StealthExecutor:
         post_only: bool = False,
         fee_rate_bps: int = 0,
         get_mid_fn: Callable[[], float | None] | None = None,
+        recent_volume_usd: float = 0.0,
+        book_depth_ratio: float = 1.0,
+        opposing_iceberg_detected: bool = False,
     ) -> list[Order]:
         """Place a parent order as time-sliced child orders.
 
@@ -125,6 +129,13 @@ class StealthExecutor:
             supplied, the executor checks for adverse drift between
             slices and abandons remaining slices if the mid has moved
             more than ``stealth_abandon_drift_cents`` from *price*.
+        book_depth_ratio:
+            L2 bid_depth / ask_depth ratio (default 1.0 = balanced).
+            Used for Order-Book Imbalance Pacing: hollowed book slows
+            down, heavy support speeds up.  See ``_obi_delay_ms``.
+        opposing_iceberg_detected:
+            If True, a hidden iceberg was detected on the opposite side.
+            Forces max-delay pacing to avoid feeding the whale.
 
         Returns the list of all child Order objects.
         """
@@ -136,7 +147,7 @@ class StealthExecutor:
             )
             return [order]
 
-        plan = self._build_plan(total_size, price)
+        plan = self._build_plan(total_size, price, recent_volume_usd)
 
         log.info(
             "stealth_exec_start",
@@ -150,6 +161,7 @@ class StealthExecutor:
 
         orders: list[Order] = []
         filled_size = 0.0
+        prev_slippage_choke = False  # SI-4.3: slippage-adaptive flag
         for i, (slice_size, delay_ms) in enumerate(
             zip(plan.slice_sizes, plan.delays_ms)
         ):
@@ -171,6 +183,18 @@ class StealthExecutor:
             if order.status == OrderStatus.FILLED:
                 filled_size += order.size
 
+            # ── SI-4.3: Slippage-Adaptive Pacing ──────────────────
+            # Compare the slice's fill price to target to detect
+            # thin/toxic liquidity.  If slippage > 0.5 ticks,
+            # force the *next* slice to use max_delay.
+            slippage_ticks = 0.0
+            if (
+                order.status == OrderStatus.FILLED
+                and order.filled_avg_price > 0
+            ):
+                slippage_ticks = abs(order.filled_avg_price - price) / 0.01
+            prev_slippage_choke = slippage_ticks > 0.5
+
             # Delay before next slice (skip delay after last slice)
             if i < plan.num_slices - 1:
                 # ── Abandonment check: filled-pct ─────────────────
@@ -189,7 +213,12 @@ class StealthExecutor:
                     )
                     break
 
-                await asyncio.sleep(delay_ms / 1000.0)
+                obi_delay = self._obi_delay_ms(
+                    delay_ms, side, book_depth_ratio,
+                    opposing_iceberg=opposing_iceberg_detected,
+                    slippage_choke=prev_slippage_choke,
+                )
+                await asyncio.sleep(obi_delay / 1000.0)
 
                 # ── Abandonment check: mid-price drift ────────────
                 if get_mid_fn is not None:
@@ -223,12 +252,50 @@ class StealthExecutor:
 
         return orders
 
-    def _build_plan(self, total_size: float, price: float) -> StealthPlan:
-        """Compute slice sizes and delays for a stealth execution plan."""
+    def _build_plan(
+        self,
+        total_size: float,
+        price: float,
+        recent_volume_usd: float = 0.0,
+    ) -> StealthPlan:
+        """Compute slice sizes and delays for a stealth execution plan.
+
+        POV / VWAP-aware resizing
+        ────────────────────────
+        max_slice_usd = recent_volume_usd × stealth_max_participation_pct
+
+        If the parent notional exceeds max_slice_usd × default_slices,
+        the engine dynamically increases the slice count so that no
+        individual child order exceeds the participation cap.
+
+        Edge cases:
+          - Zero / None volume → assume $10 floor to avoid div-by-zero.
+          - max_slice_usd < stealth_min_size_usd → clamp up to prevent
+            sub-minimum API rejections.
+        """
         # Determine number of slices (proportional to notional)
         notional = total_size * price
         # 1 slice per $3, capped at max_slices, min 2
         n = max(2, min(self._max_slices, int(notional / 3.0) + 1))
+
+        # ── POV participation cap ─────────────────────────────────────
+        strat = settings.strategy
+        safe_volume = recent_volume_usd if recent_volume_usd and recent_volume_usd > 0 else 10.0
+        max_slice_usd = safe_volume * strat.stealth_max_participation_pct
+        # Never go below the exchange minimum to avoid API rejections
+        max_slice_usd = max(max_slice_usd, self._min_size)
+
+        required_slices = math.ceil(notional / max_slice_usd)
+        if required_slices > n:
+            log.info(
+                "vwap_stealth_resliced",
+                default_slices=n,
+                actual_slices=required_slices,
+                notional=round(notional, 2),
+                recent_volume_usd=round(safe_volume, 2),
+                max_slice_usd=round(max_slice_usd, 2),
+            )
+            n = required_slices
 
         # Build slice sizes with jitter
         base_size = total_size / n
@@ -265,6 +332,48 @@ class StealthExecutor:
             delays_ms=delays_ms,
             price=price,
         )
+
+    # ── OBI pacing ─────────────────────────────────────────────────────
+
+    def _obi_delay_ms(
+        self,
+        base_delay_ms: float,
+        side: OrderSide,
+        book_depth_ratio: float,
+        *,
+        opposing_iceberg: bool = False,
+        slippage_choke: bool = False,
+    ) -> float:
+        """Bias the inter-slice delay based on L2 order-book imbalance.
+
+        ``book_depth_ratio`` is always bid_depth / ask_depth.
+        We translate it to *our_ratio* = our-side depth / opposite-side depth:
+          - BUY  → our_ratio = bid / ask  = book_depth_ratio
+          - SELL → our_ratio = ask / bid  = 1 / book_depth_ratio
+
+        Pacing rules (evaluated in priority order):
+          1. slippage_choke=True   → previous slice had >0.5 tick friction
+                                     → force max delay (market is thinner than L2 suggests)
+          2. opposing_iceberg=True → whale hidden on opposite side
+                                     → force max delay (avoid feeding the iceberg)
+          3. our_ratio < 0.5       → hollowed book → max delay (wait for refill)
+          4. our_ratio > 2.0       → heavy support → min delay (execute fast)
+          5. otherwise              → balanced → keep the base random delay
+        """
+        # SI-4.3: Hard overrides take priority over OBI math
+        if slippage_choke:
+            return self._max_delay
+        if opposing_iceberg:
+            return self._max_delay
+
+        ratio = book_depth_ratio if book_depth_ratio and book_depth_ratio > 0 else 1.0
+        our_ratio = ratio if side == OrderSide.BUY else 1.0 / ratio
+
+        if our_ratio < 0.5:
+            return self._max_delay
+        if our_ratio > 2.0:
+            return self._min_delay
+        return base_delay_ms
 
     @property
     def executor(self) -> OrderExecutor:

@@ -1408,3 +1408,117 @@ class TestConfigAdditions:
     def test_rpe_tail_veto_threshold(self) -> None:
         from src.core.config import settings
         assert settings.strategy.rpe_tail_veto_threshold == 0.10
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Fast-Strike taker path (Pillar 14 divergence)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFastStrikeTakerPath:
+    """Verify RPE fires a taker order when fair value diverges >2¢ from CLOB."""
+
+    @pytest.fixture
+    def pm(self, paper_executor, trade_store):
+        from src.trading.position_manager import PositionManager
+        pm = PositionManager(
+            paper_executor, trade_store=trade_store, max_open_positions=5
+        )
+        pm.set_wallet_balance(1000.0)
+        return pm
+
+    @pytest.mark.asyncio
+    async def test_fast_strike_fires_taker_on_divergence(self, pm) -> None:
+        """Spot jump moves RPE fair value to $0.55 while NO best_ask=$0.49.
+
+        YES fair_value = 0.55 → buy YES.
+        Simulated YES entry_price = 0.49 (CLOB best ask).
+        Divergence = |0.55 - 0.49| = 0.06 > 0.02 → fast-strike.
+        With latency_healthy=True the order crosses the spread as a taker.
+        """
+        import src.core.config as cfg
+        original = cfg.settings.strategy
+        params = cfg.StrategyParams(
+            rpe_shadow_mode=False,
+            max_trade_size_usd=100.0,
+            min_edge_score=0.0,
+            stop_loss_cents=8.0,
+        )
+        object.__setattr__(cfg.settings, "strategy", params)
+        try:
+            pos = await pm.open_rpe_position(
+                market_id="MKT_FS",
+                yes_asset_id="YES_FS",
+                no_asset_id="NO_FS",
+                direction="buy_yes",
+                model_probability=0.55,
+                confidence=0.70,
+                entry_price=0.49,       # stale CLOB ask
+                fee_enabled=False,
+                latency_healthy=True,   # LatencyGuard is HEALTHY
+            )
+            assert pos is not None, "Fast-strike should open a position"
+            # Entry price should be bumped +1¢ to cross the spread
+            assert pos.entry_price == 0.50
+            # Position should be tagged so the chaser is skipped
+            assert getattr(pos, "fast_strike", False) is True
+        finally:
+            object.__setattr__(cfg.settings, "strategy", original)
+
+    @pytest.mark.asyncio
+    async def test_no_fast_strike_when_divergence_small(self, pm) -> None:
+        """Divergence ≤ 2¢ → normal maker path, no fast_strike tag."""
+        import src.core.config as cfg
+        original = cfg.settings.strategy
+        params = cfg.StrategyParams(
+            rpe_shadow_mode=False,
+            max_trade_size_usd=100.0,
+            min_edge_score=0.0,
+            stop_loss_cents=8.0,
+        )
+        object.__setattr__(cfg.settings, "strategy", params)
+        try:
+            pos = await pm.open_rpe_position(
+                market_id="MKT_FS2",
+                yes_asset_id="YES_FS2",
+                no_asset_id="NO_FS2",
+                direction="buy_yes",
+                model_probability=0.51,
+                confidence=0.70,
+                entry_price=0.50,       # only 1¢ divergence
+                fee_enabled=False,
+                latency_healthy=True,
+            )
+            if pos is not None:
+                assert getattr(pos, "fast_strike", False) is False
+        finally:
+            object.__setattr__(cfg.settings, "strategy", original)
+
+    @pytest.mark.asyncio
+    async def test_no_fast_strike_when_latency_unhealthy(self, pm) -> None:
+        """Divergence > 2¢ but latency NOT healthy → normal maker path."""
+        import src.core.config as cfg
+        original = cfg.settings.strategy
+        params = cfg.StrategyParams(
+            rpe_shadow_mode=False,
+            max_trade_size_usd=100.0,
+            min_edge_score=0.0,
+            stop_loss_cents=8.0,
+        )
+        object.__setattr__(cfg.settings, "strategy", params)
+        try:
+            pos = await pm.open_rpe_position(
+                market_id="MKT_FS3",
+                yes_asset_id="YES_FS3",
+                no_asset_id="NO_FS3",
+                direction="buy_yes",
+                model_probability=0.55,
+                confidence=0.70,
+                entry_price=0.49,
+                fee_enabled=False,
+                latency_healthy=False,  # NOT healthy
+            )
+            if pos is not None:
+                assert getattr(pos, "fast_strike", False) is False
+        finally:
+            object.__setattr__(cfg.settings, "strategy", original)

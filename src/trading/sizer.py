@@ -15,10 +15,14 @@ Together they enforce:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.orderbook import OrderbookSnapshot, OrderbookTracker
+
+if TYPE_CHECKING:
+    from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 
 log = get_logger(__name__)
 
@@ -182,6 +186,68 @@ class KellyResult:
     estimated_p: float = 0.0   # raw estimated win probability (before discounting)
     adjusted_p: float = 0.0    # discounted win probability used in Kelly formula
     uncertainty_penalty: float = 0.0  # applied uncertainty discount
+    mcpv_penalty: float = 0.0  # marginal contribution to portfolio variance penalty
+
+
+def compute_mcpv_penalty(
+    pce: "PortfolioCorrelationEngine",
+    proposed_market_id: str,
+    open_positions: list[Any],
+    corr_threshold: float = 0.65,
+) -> float:
+    """Compute the Marginal Contribution to Portfolio Variance (MCPV) penalty.
+
+    Returns a multiplier in (0, 1] that scales down Kelly sizing for
+    trades that are highly correlated with existing portfolio positions.
+
+    For uncorrelated or first trades, returns 1.0 (no penalty).
+    For maximally correlated trades, returns a small positive floor (0.05).
+
+    The MCPV is the exposure-weighted average pairwise correlation
+    between the proposed market and all currently held markets.
+
+    Penalty only activates when weighted correlation exceeds
+    ``corr_threshold`` (default 0.65) to avoid penalising mildly
+    correlated diversified positions.
+    """
+    if not open_positions:
+        return 1.0
+
+    peer_exposures: list[tuple[str, float]] = []
+    for pos in open_positions:
+        if pos.market_id != proposed_market_id:
+            exposure = pos.entry_price * pos.entry_size
+            peer_exposures.append((pos.market_id, exposure))
+
+    if not peer_exposures:
+        return 1.0
+
+    total_weight = sum(exp for _, exp in peer_exposures)
+    if total_weight <= 0:
+        return 1.0
+
+    weighted_corr = sum(
+        exp * pce.corr_matrix.get(proposed_market_id, mid)
+        for mid, exp in peer_exposures
+    ) / total_weight
+
+    # MCPV ∈ [0, 1]; only penalise above threshold
+    mcpv = max(0.0, min(1.0, weighted_corr))
+    if mcpv <= corr_threshold:
+        return 1.0
+
+    penalty_mult = max(0.05, 1.0 - mcpv)
+
+    if penalty_mult < 1.0:
+        log.info(
+            "mcpv_penalty_applied",
+            proposed_market=proposed_market_id,
+            weighted_corr=round(weighted_corr, 4),
+            mcpv=round(mcpv, 4),
+            penalty_mult=round(penalty_mult, 4),
+        )
+
+    return penalty_mult
 
 
 def compute_kelly_size(
@@ -199,6 +265,10 @@ def compute_kelly_size(
     signal_metadata: dict | None = None,
     total_trades: int = 0,
     _precomputed_depth_result: SizingResult | None = None,
+    pce: "PortfolioCorrelationEngine | None" = None,
+    proposed_market_id: str = "",
+    open_positions: list[Any] | None = None,
+    strategy_multiplier: float = 1.0,
 ) -> KellyResult:
     """Compute position size using fractional Kelly criterion with
     **edge discounting** and **probability capping**.
@@ -321,6 +391,7 @@ def compute_kelly_size(
             estimated_p=0.0,
             adjusted_p=0.0,
             uncertainty_penalty=0.0,
+            mcpv_penalty=0.0,
         )
 
     # ── Estimate win probability ────────────────────────────────────────
@@ -376,10 +447,23 @@ def compute_kelly_size(
             estimated_p=round(raw_p, 4),
             adjusted_p=round(p_adj, 4),
             uncertainty_penalty=round(uncertainty_penalty, 4),
+            mcpv_penalty=0.0,
         )
 
     full_kelly = edge / b  # f*
     adj_kelly = full_kelly * k_mult
+
+    # ── Pillar 16.2: Self-healing alpha throttle ────────────────────────
+    if strategy_multiplier < 1.0:
+        adj_kelly *= strategy_multiplier
+
+    # ── Pillar 15.1: Covariance penalty ─────────────────────────────────
+    mcpv_mult = 1.0
+    if pce is not None and proposed_market_id:
+        mcpv_mult = compute_mcpv_penalty(
+            pce, proposed_market_id, open_positions or [],
+        )
+        adj_kelly *= mcpv_mult
 
     # ── Capital caps ────────────────────────────────────────────────────
     kelly_usd = adj_kelly * bankroll_usd
@@ -437,4 +521,5 @@ def compute_kelly_size(
         estimated_p=round(raw_p, 4),
         adjusted_p=round(p_adj, 4),
         uncertainty_penalty=round(uncertainty_penalty, 4),
+        mcpv_penalty=round(1.0 - mcpv_mult, 4),
     )

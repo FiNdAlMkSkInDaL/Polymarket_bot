@@ -224,6 +224,21 @@ class StrategyParams:
     max_drawdown_cents: float = _env_float("MAX_DRAWDOWN_CENTS", 2500.0)
     stop_loss_cents: float = _env_float("STOP_LOSS_CENTS", 4.0)
     stop_loss_cooldown_s: float = _env_float("STOP_LOSS_COOLDOWN_S", 300.0)
+    sl_vol_adaptive: bool = _env_bool("SL_VOL_ADAPTIVE", True)
+    sl_vol_ref: float = _env_float("SL_VOL_REF", 0.70)
+    sl_vol_multiplier_max: float = _env_float("SL_VOL_MULTIPLIER_MAX", 1.5)
+
+    # ── Pillar 11.3: Preemptive Liquidity & Time-Decay Stop ────────────
+    # Preemptive liquidity drain: trigger stop when support-side depth
+    # is < threshold fraction of resistance-side depth AND position
+    # is underwater.  Prevents slippage bleed on a "hollow book".
+    sl_preemptive_obi_threshold: float = _env_float("SL_PREEMPTIVE_OBI_THRESHOLD", 0.20)
+    # Time-decay: after sl_decay_start_minutes the vol multiplier
+    # decays exponentially back toward 1.0 (tightening the stop)
+    # with a half-life of sl_decay_half_life_minutes.
+    sl_decay_start_minutes: float = _env_float("SL_DECAY_START_MINUTES", 5.0)
+    sl_decay_half_life_minutes: float = _env_float("SL_DECAY_HALF_LIFE_MINUTES", 15.0)
+
     signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
@@ -580,6 +595,8 @@ class StrategyParams:
     stealth_min_delay_ms: float = _env_float("STEALTH_MIN_DELAY_MS", 200.0)
     stealth_max_delay_ms: float = _env_float("STEALTH_MAX_DELAY_MS", 1500.0)
     stealth_size_jitter_pct: float = _env_float("STEALTH_SIZE_JITTER_PCT", 0.15)
+    # POV cap: max fraction of recent volume a single slice may represent.
+    stealth_max_participation_pct: float = _env_float("STEALTH_MAX_PARTICIPATION_PCT", 0.05)
     # Abandonment: abort remaining slices if mid drifts adversely.
     stealth_abandon_drift_cents: float = _env_float("STEALTH_ABANDON_DRIFT_CENTS", 2.0)
     # Abandonment: skip remaining slices if this fraction already filled.
@@ -600,6 +617,9 @@ class Settings:
 
     # Polygon RPC
     polygon_rpc_url: str = field(default_factory=lambda: _env("POLYGON_RPC_URL"))
+    polygon_rpc_wss_url: str = field(
+        default_factory=lambda: _env("POLYGON_RPC_WSS_URL")
+    )
 
     # Polygonscan
     polygonscan_api_key: str = field(default_factory=lambda: _env("POLYGONSCAN_API_KEY"))
@@ -665,6 +685,12 @@ class Settings:
     whale_lookback_seconds: int = field(
         default_factory=lambda: _env_int("WHALE_LOOKBACK_S", 600)
     )  # 10 min window for confluence
+    whale_threshold_shares: float = field(
+        default_factory=lambda: _env_float("WHALE_THRESHOLD_SHARES", 50_000.0)
+    )
+    whale_ws_heartbeat_s: float = field(
+        default_factory=lambda: _env_float("WHALE_WS_HEARTBEAT_S", 30.0)
+    )
 
     # Logging
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))

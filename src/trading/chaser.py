@@ -173,6 +173,16 @@ class OrderChaser:
             if _stats is not None:
                 self._initial_p_value = _stats.last_p_value
 
+        # SI-5: Preemptive exit — wall exhaustion detection
+        self._iceberg_peg_active: bool = False
+        self._iceberg_peg_price: float | None = None
+        self._ofi_wall_threshold: float = getattr(
+            strat, "ofi_wall_threshold", 0.80
+        )
+        self._ofi_depth_floor: float = getattr(
+            strat, "ofi_depth_ratio_floor", 0.15
+        )
+
         # State
         self.state = ChaserState.QUOTING
         self.resting_order: Order | None = None
@@ -241,7 +251,10 @@ class OrderChaser:
             # ── Check partial fill ────────────────────────────────
             if self.resting_order and self.resting_order.status == OrderStatus.PARTIALLY_FILLED:
                 self._accumulate_partial(self.resting_order)
-
+            # ── SI-5: Wall pressure monitor (preemptive exit) ───
+            if self._iceberg_peg_active and self._should_preemptive_exit():
+                await self._preemptive_exit()
+                return self.resting_order
             # ── Check if BBO moved ────────────────────────────────
             optimal = self._optimal_quote()
             if optimal is None:
@@ -339,8 +352,14 @@ class OrderChaser:
                     peg=peg,
                     asset=self.asset_id[:16],
                 )
+                # SI-5: track peg state for wall pressure monitoring
+                self._iceberg_peg_active = True
+                self._iceberg_peg_price = peg
                 return peg
 
+        # Not pegged to any iceberg
+        self._iceberg_peg_active = False
+        self._iceberg_peg_price = None
         return bbo
 
     def _drift_cents(self, current_quote: float) -> float:
@@ -383,6 +402,75 @@ class OrderChaser:
             )
             return True
         return False
+
+    def _should_preemptive_exit(self) -> bool:
+        """Check if the iceberg wall is about to be exhausted.
+
+        Triggers when:
+          1. Opposing OFI at the peg price exceeds ``ofi_wall_threshold``
+             (default 80%) of the whale's estimated remaining iceberg
+             size, **OR**
+          2. ``book_depth_ratio`` drops below ``ofi_depth_ratio_floor``
+             (default 0.15), indicating the wall side is critically thin.
+        """
+        # Condition 2: depth ratio floor
+        depth_ratio = self.book.book_depth_ratio
+        if self.side == OrderSide.BUY and depth_ratio < self._ofi_depth_floor:
+            return True
+        if self.side == OrderSide.SELL and depth_ratio > (1.0 / self._ofi_depth_floor):
+            return True
+
+        # Condition 1: OFI consumption at the wall price
+        ofi_fn = getattr(self.book, "opposing_ofi_at_price", None)
+        if ofi_fn is None or self._iceberg is None:
+            return False
+
+        our_side = "BUY" if self.side == OrderSide.BUY else "SELL"
+        iceberg = self._iceberg.strongest_iceberg(our_side)
+        if iceberg is None:
+            return False
+
+        opposing = ofi_fn(self._iceberg_peg_price, our_side)
+        if opposing > self._ofi_wall_threshold * iceberg.estimated_total:
+            return True
+
+        return False
+
+    async def _preemptive_exit(self) -> None:
+        """Cancel the iceberg peg and, if partially filled, place an exit
+        order 1 tick above/below the wall to unwind before slippage."""
+        peg_price = self._iceberg_peg_price
+        log.warning(
+            "chaser_preemptive_exit",
+            side=self.side.value,
+            asset=self.asset_id[:16],
+            peg_price=peg_price,
+            book_depth_ratio=self.book.book_depth_ratio,
+        )
+        await self._cancel_resting()
+
+        # Unwind any partial fills 1 tick from the wall
+        if self.filled_size > 0 and peg_price is not None:
+            tick = 0.01
+            if self.side == OrderSide.BUY:
+                exit_price = peg_price + tick
+                exit_side = OrderSide.SELL
+            else:
+                exit_price = peg_price - tick
+                exit_side = OrderSide.BUY
+
+            await self.executor.place_limit_order(
+                market_id=self.market_id,
+                asset_id=self.asset_id,
+                side=exit_side,
+                price=round(exit_price, 2),
+                size=round(self.filled_size, 2),
+                post_only=False,
+            )
+
+        self._iceberg_peg_active = False
+        self._iceberg_peg_price = None
+        self.state = ChaserState.ABANDONED
 
     async def _place(self, price: float) -> None:
         """Place a new resting order at *price*."""

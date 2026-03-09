@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS trades (
     volume_ratio    REAL,
     whale           INTEGER,
     created_at      REAL,
-    is_probe        INTEGER DEFAULT 0
+    is_probe        INTEGER DEFAULT 0,
+    signal_type     TEXT DEFAULT '',
+    meta_weight     REAL DEFAULT 1.0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_state ON trades(state);
 
@@ -121,6 +123,23 @@ class TradeStore:
 
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+
+        # ── Schema migration: add attribution columns if missing ─────────
+        try:
+            cursor = await self._db.execute("PRAGMA table_info(trades)")
+            cols = {row[1] for row in await cursor.fetchall()}
+            if "signal_type" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT ''"
+                )
+            if "meta_weight" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN meta_weight REAL DEFAULT 1.0"
+                )
+            await self._db.commit()
+        except Exception:
+            log.warning("schema_migration_skipped", exc_info=True)
+
         log.info("trade_store_initialised", path=str(self.db_path))
 
     async def _ensure_db(self) -> None:
@@ -150,8 +169,8 @@ class TradeStore:
             (id, market_id, state, entry_price, entry_size, entry_time,
              target_price, exit_price, exit_time, exit_reason, pnl_cents,
              hold_seconds, alpha, zscore, volume_ratio, whale, created_at,
-             is_probe)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             is_probe, signal_type, meta_weight)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos.id,
@@ -172,6 +191,8 @@ class TradeStore:
                 int(signal.whale_confluence) if signal else 0,
                 pos.created_at,
                 int(getattr(pos, 'is_probe', False)),
+                getattr(pos, 'signal_type', ''),
+                getattr(pos, 'meta_weight', 1.0),
             ),
         )
         await self._db.commit()
@@ -305,6 +326,32 @@ class TradeStore:
         if len(rows) < window:
             return 0.0
         return sum(r[0] for r in rows) / len(rows)
+
+    async def get_strategy_expectancy(
+        self, signal_type: str, window: int = 50,
+    ) -> tuple[float, int]:
+        """Return (avg_pnl_cents, n_trades) for the last *window* closed
+        trades of a specific *signal_type*.
+
+        Probe trades (``is_probe=1``) are excluded so the expectancy
+        reflects full-sized execution quality only.
+
+        Returns ``(0.0, 0)`` when fewer than 1 qualifying trade exists.
+        """
+        await self._ensure_db()
+        cursor = await self._db.execute(
+            "SELECT pnl_cents FROM trades "
+            "WHERE state = ? AND signal_type = ? "
+            "AND COALESCE(is_probe, 0) = 0 "
+            "ORDER BY exit_time DESC LIMIT ?",
+            (PositionState.CLOSED.value, signal_type, window),
+        )
+        rows = await cursor.fetchall()
+        n = len(rows)
+        if n == 0:
+            return 0.0, 0
+        avg = sum(r[0] for r in rows) / n
+        return avg, n
 
     # ═══════════════════════════════════════════════════════════════════════
     #  State Persistence — checkpoint / restore for crash recovery

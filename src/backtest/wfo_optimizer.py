@@ -41,7 +41,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -157,6 +157,12 @@ class WfoConfig:
 
     # Output path for champion parameters JSON (None = no export)
     output_params_path: str | None = None
+
+    # Limit multi-market universe to N markets (None = use all)
+    max_markets: int | None = None
+
+    # Optional JSON file with narrowed search-space bounds (overrides SEARCH_SPACE)
+    search_space_bounds_path: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -315,21 +321,25 @@ class WfoReport:
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
 SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
     # Core signal parameters
-    "zscore_threshold": ("suggest_float", 0.5, 3.0),
+    # Hardened bounds (March 9 WFO Reset): admit only statistically
+    # significant panics.  Prior [0.15, 1.5] allowed sub-σ noise entries.
+    "zscore_threshold": ("suggest_float", 1.0, 2.5),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
     "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
     "trend_guard_pct": ("suggest_float", 0.05, 1.0),
     # Risk management
-    "stop_loss_cents": ("suggest_float", 2.0, 12.0),
+    # Hardened: SL must be ≥ min_spread_cents (4.0) to survive the spread.
+    # Prior [2.0, 12.0] allowed Chop Trap: positive Sharpe, negative PnL.
+    "stop_loss_cents": ("suggest_float", 4.0, 12.0),
     "trailing_stop_offset_cents": ("suggest_float", 0.5, 6.0),
     "kelly_fraction": ("suggest_float", 0.03, 0.40, True),             # log-scale
     "max_impact_pct": ("suggest_float", 0.03, 0.30, True),             # log-scale
     # Take-profit
     "alpha_default": ("suggest_float", 0.25, 0.75),
     "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
-    # Edge quality
-    "min_edge_score": ("suggest_float", 30.0, 60.0),
+    # Edge quality — institutional filter (hardened March 9)
+    "min_edge_score": ("suggest_float", 50.0, 85.0),
     # RPE (Pillar 14)
     "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
     "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),
@@ -348,9 +358,43 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
 }
 
 
-def _suggest_params(trial: Any) -> dict[str, float]:
+def _load_search_space_bounds(path: str | None) -> dict[str, tuple[float, float]] | None:
+    """Load narrowed search-space bounds from a JSON file.
+
+    Expected format::
+
+        {
+          "zscore_threshold": [0.20, 0.60],
+          "kelly_fraction": [0.05, 0.15],
+          ...
+        }
+
+    Returns ``None`` if *path* is falsy or the file doesn't exist.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        log.warning("search_space_bounds_not_found", path=path)
+        return None
+    with open(p, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    bounds: dict[str, tuple[float, float]] = {}
+    for name, pair in raw.items():
+        if name in SEARCH_SPACE and isinstance(pair, (list, tuple)) and len(pair) == 2:
+            bounds[name] = (float(pair[0]), float(pair[1]))
+    log.info("search_space_bounds_loaded", path=path, n_overrides=len(bounds))
+    return bounds
+
+
+def _suggest_params(
+    trial: Any,
+    bounds_override: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, float]:
     """Sample hyperparameters from the Optuna trial.
 
+    If *bounds_override* is provided, its ``(lo, hi)`` values replace the
+    defaults in ``SEARCH_SPACE`` for the matching parameter names.
     Supports optional 4th element ``log=True`` for log-uniform sampling.
     """
     params: dict[str, float] = {}
@@ -358,6 +402,9 @@ def _suggest_params(trial: Any) -> dict[str, float]:
         method = spec[0]
         lo, hi = spec[1], spec[2]
         log_scale = spec[3] if len(spec) > 3 else False  # type: ignore[arg-type]
+        # Apply bounds override if available
+        if bounds_override and name in bounds_override:
+            lo, hi = bounds_override[name]
         if method == "suggest_int":
             params[name] = trial.suggest_int(name, int(lo), int(hi))
         else:
@@ -745,9 +792,10 @@ def _objective(
     train_dates: list[str],
     wfo_cfg: WfoConfig,
     market_configs: list[dict] | None = None,
+    bounds_override: dict[str, tuple[float, float]] | None = None,
 ) -> float:
     """Optuna objective — runs an IS backtest and returns the WFO score."""
-    suggested = _suggest_params(trial)
+    suggested = _suggest_params(trial, bounds_override=bounds_override)
 
     _common = dict(
         data_dir=wfo_cfg.data_dir,
@@ -821,6 +869,7 @@ def _worker(
     wfo_cfg_dict: dict[str, Any],
     n_trials: int,
     market_configs: list[dict] | None = None,
+    bounds_override: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """Optuna worker — loads the shared study and runs ``n_trials``.
 
@@ -833,11 +882,35 @@ def _worker(
 
     wfo_cfg = WfoConfig(**wfo_cfg_dict)
     study = optuna.load_study(study_name=study_name, storage=storage)
-    study.optimize(
-        lambda trial: _objective(trial, train_dates, wfo_cfg, market_configs),
-        n_trials=n_trials,
-        n_jobs=1,  # single-threaded inside each process (avoid GIL)
-    )
+
+    # Manual ask/tell loop instead of study.optimize() to handle race
+    # conditions on the warm-start enqueued trial shared across workers.
+    for _ in range(n_trials):
+        trial = None
+        try:
+            trial = study.ask()
+            value = _objective(trial, train_dates, wfo_cfg, market_configs, bounds_override)
+            study.tell(trial, value)
+        except ValueError as exc:
+            if "COMPLETE" in str(exc):
+                # Race: another worker already completed this trial — skip it.
+                log.warning("wfo_worker_trial_race", error=str(exc))
+            else:
+                # Unexpected ValueError: mark trial failed so it doesn't stay RUNNING.
+                if trial is not None:
+                    try:
+                        study.tell(trial, float("-inf"))
+                    except Exception:
+                        pass
+                raise
+        except Exception:
+            # Any other error: mark trial failed before re-raising.
+            if trial is not None:
+                try:
+                    study.tell(trial, float("-inf"))
+                except Exception:
+                    pass
+            raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -937,6 +1010,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
     t0 = time.monotonic()
 
+    # ── Load search-space bounds override (if provided) ────────────────
+    bounds_override = _load_search_space_bounds(cfg.search_space_bounds_path)
+
     # ── Discover available dates ───────────────────────────────────────
     from src.backtest.data_recorder import MarketDataRecorder
 
@@ -973,6 +1049,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         # No specific market provided → multi-market mode
         loaded = _load_market_configs(cfg.data_dir)
         if loaded:
+            if cfg.max_markets is not None and cfg.max_markets < len(loaded):
+                loaded = loaded[:cfg.max_markets]
+                log.info("wfo_market_universe_capped", max_markets=cfg.max_markets)
             market_configs = loaded
             log.info("wfo_multi_market_mode", n_markets=len(market_configs))
         else:
@@ -1007,6 +1086,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         "gap_threshold": cfg.gap_threshold,
         "gap_max_interval_s": cfg.gap_max_interval_s,
         "output_params_path": cfg.output_params_path,
+        "search_space_bounds_path": cfg.search_space_bounds_path,
     }
 
     fold_results: list[FoldResult] = []
@@ -1061,6 +1141,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
                         cfg_dict,
                         trials_per_worker,
                         market_configs,
+                        bounds_override,
                     )
                     for _ in range(cfg.max_workers)
                 ]
@@ -1069,7 +1150,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         else:
             # Single-process mode (simpler debugging / testing)
             study.optimize(
-                lambda trial: _objective(trial, fold.train_dates, cfg, market_configs),
+                lambda trial: _objective(trial, fold.train_dates, cfg, market_configs, bounds_override),
                 n_trials=cfg.n_trials,
                 n_jobs=1,
             )
@@ -1304,7 +1385,7 @@ def _export_champion_params(cfg: WfoConfig, report: WfoReport) -> None:
             "n_folds": len(report.folds),
             "n_trials_per_fold": cfg.n_trials,
             "data_range": date_range,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
             "avg_sharpe_decay_pct": round(report.avg_sharpe_decay_pct, 2),
             "overfit_probability": round(report.overfit_probability, 4),
             "unstable_params": report.unstable_params,

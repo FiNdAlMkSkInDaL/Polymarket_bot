@@ -83,6 +83,7 @@ DEFAULT_CONCURRENCY = 10
 REQUEST_TIMEOUT_S = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2.0
+COALESCE_WINDOW_S = 0.050  # 50 ms bucket for delta coalescing
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -138,6 +139,84 @@ def normalize_ts(raw: Any) -> float:
     elif ts > 1e12:
         ts /= 1_000
     return ts
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Delta coalescing (50 ms buckets)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def coalesce_deltas(
+    records: list[dict],
+    window_s: float = COALESCE_WINDOW_S,
+) -> list[dict]:
+    """Merge L2 delta records within the same *window_s* time bucket.
+
+    Snapshot records (``event_type`` in {"book", "snapshot", "book_snapshot"})
+    are always emitted individually.  Delta records whose ``local_ts`` values
+    fall within the same ``window_s`` bucket are merged into a single record
+    with a combined ``changes`` array.  This preserves 50 ms fidelity while
+    reducing JSONL line count (and disk I/O) by ~5-10×.
+
+    The merged record inherits the *earliest* timestamp in the bucket
+    so that downstream replay remains monotonic.
+    """
+    if not records:
+        return []
+
+    out: list[dict] = []
+    bucket: list[dict] | None = None
+    bucket_edge: float = 0.0
+
+    for rec in records:
+        payload = rec.get("payload", {})
+        etype = payload.get("event_type", "")
+
+        # Snapshots pass through un-merged
+        if etype in ("book", "snapshot", "book_snapshot"):
+            if bucket:
+                out.append(_flush_bucket(bucket))
+                bucket = None
+            out.append(rec)
+            continue
+
+        ts = rec.get("local_ts", 0.0)
+
+        if bucket is None or ts >= bucket_edge:
+            # Start a new bucket
+            if bucket:
+                out.append(_flush_bucket(bucket))
+            bucket = [rec]
+            bucket_edge = ts + window_s
+        else:
+            bucket.append(rec)
+
+    if bucket:
+        out.append(_flush_bucket(bucket))
+
+    return out
+
+
+def _flush_bucket(bucket: list[dict]) -> dict:
+    """Merge a bucket of delta records into a single record."""
+    if len(bucket) == 1:
+        return bucket[0]
+
+    base = bucket[0]
+    merged_changes: list[dict] = []
+    for rec in bucket:
+        changes = rec.get("payload", {}).get("changes", [])
+        merged_changes.extend(changes)
+
+    merged = {
+        "local_ts": base["local_ts"],
+        "source": base["source"],
+        "asset_id": base["asset_id"],
+        "payload": {
+            **base["payload"],
+            "changes": merged_changes,
+        },
+    }
+    return merged
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -348,26 +427,49 @@ class PolymarketTradesAdapter(DataSourceAdapter):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class PMXTArchiveAdapter(DataSourceAdapter):
-    """Skeleton adapter for the PMXT Open-Source Archive (archive.pmxt.dev).
+    """Adapter for the PMXT Open-Source Archive (archive.pmxt.dev).
 
-    Expected workflow (to be implemented when API docs are available):
-      1. GET archive.pmxt.dev/v1/l2/{asset_id}/{YYYY-MM-DD}.parquet
-      2. Read Parquet into memory via pyarrow
-      3. Convert each row to canonical JSONL record with source="l2"
-         and payload matching the price_changes format:
-         {
-           "event_type": "price_change",
-           "market": "<market_id>",
-           "timestamp": "<ms>",
-           "price_changes": [
-             {"asset_id": "...", "price": "0.50", "size": "100",
-              "side": "BUY", "best_bid": "0.49", "best_ask": "0.51"}
-           ]
-         }
+    PMXT distributes hourly Parquet snapshots of *all* Polymarket L2 deltas
+    via Cloudflare R2:
+
+        https://r2.pmxt.dev/polymarket_orderbook_{YYYY-MM-DD}T{HH}.parquet
+
+    Each file is 500-700 MB (26 M rows) covering every market for that hour.
+
+    Parquet schema:
+        timestamp_received   timestamp[ms, tz=UTC]   (when PMXT ingested)
+        timestamp_created_at timestamp[ms, tz=UTC]   (exchange timestamp)
+        market_id            string                  (hex condition ID, e.g. 0x06b0…)
+        update_type          string                  (always "price_change")
+        data                 string                  (JSON blob, see below)
+
+    data JSON keys:
+        update_type, market_id, token_id, side, best_bid, best_ask,
+        timestamp, change_price, change_size, change_side
+
+    Batch strategy:
+        Because each hourly file contains ALL Polymarket markets, we use
+        a batch-mode approach: download the file once per (day, hour) and
+        extract records for all tracked markets in a single pass.  This
+        avoids re-downloading ~500 MB per market.
+
+        The orchestrator detects ``supports_batch = True`` and uses
+        ``fetch_l2_day_batch()`` instead of per-market ``fetch_l2()``.
     """
 
-    def __init__(self, base_url: str = "https://archive.pmxt.dev") -> None:
-        self._base_url = base_url
+    _R2_BASE = "https://r2.pmxt.dev"
+    _FILE_TEMPLATE = "polymarket_orderbook_{date}T{hour:02d}.parquet"
+    supports_batch: bool = True
+
+    def __init__(
+        self,
+        r2_base: str | None = None,
+        rate_limit_per_sec: float = 2.0,
+    ) -> None:
+        self._r2_base = (r2_base or self._R2_BASE).rstrip("/")
+        self._rate_delay = 1.0 / max(rate_limit_per_sec, 0.1)
+
+    # ── ABC implementation (per-market, used as fallback) ─────────────
 
     async def fetch_trades(
         self,
@@ -375,7 +477,7 @@ class PMXTArchiveAdapter(DataSourceAdapter):
         day: date,
         client: httpx.AsyncClient,
     ) -> AsyncIterator[dict]:
-        """PMXT primarily provides L2 data; trades may not be available."""
+        """PMXT provides L2 data only; trades are not available."""
         return
         yield
 
@@ -385,25 +487,331 @@ class PMXTArchiveAdapter(DataSourceAdapter):
         day: date,
         client: httpx.AsyncClient,
     ) -> AsyncIterator[dict]:
-        """TODO: Implement when PMXT API docs are available.
-
-        Expected steps:
-          1. Download Parquet file for (market_id, date)
-          2. Read with pyarrow: pf = pq.read_table(buffer)
-          3. Iterate rows, building canonical records:
-             {
-               "local_ts": row["timestamp_s"],
-               "source": "l2",
-               "asset_id": market.market_id,
-               "payload": { ... price_changes ... }
-             }
-        """
-        raise NotImplementedError(
-            "PMXTArchiveAdapter.fetch_l2() is a skeleton — "
-            "implement once archive.pmxt.dev API docs are available. "
-            "See class docstring for expected payload format."
+        """Per-market fallback — prefer ``fetch_l2_day_batch()``."""
+        result = await self._fetch_hour_batch(
+            [market], day, 0, client,
         )
-        yield  # pragma: no cover
+        for rec in result.get(market.market_id, []):
+            yield rec
+        return
+        yield
+
+    # ── Batch mode: one file read → all markets ──────────────────────
+
+    async def fetch_l2_day_batch(
+        self,
+        markets: list[MarketEntry],
+        day: date,
+        client: httpx.AsyncClient,
+    ) -> dict[str, list[dict]]:
+        """Download all 24 hourly files for *day* and return L2 records
+        grouped by market_id.
+
+        Returns ``{market_id: [records]}`` for every market in *markets*
+        that has data on this day.
+        """
+        all_records: dict[str, list[dict]] = {m.market_id: [] for m in markets}
+
+        for hour in range(24):
+            hour_result = await self._fetch_hour_batch(
+                markets, day, hour, client,
+            )
+            for mid, recs in hour_result.items():
+                all_records[mid].extend(recs)
+
+        # Sort each market's records by timestamp, then coalesce 50 ms buckets
+        for mid in all_records:
+            all_records[mid].sort(key=lambda r: r.get("local_ts", 0.0))
+            all_records[mid] = coalesce_deltas(all_records[mid])
+
+        return all_records
+
+    async def _fetch_hour_batch(
+        self,
+        markets: list[MarketEntry],
+        day: date,
+        hour: int,
+        client: httpx.AsyncClient,
+    ) -> dict[str, list[dict]]:
+        """Read one hourly Parquet file and extract records for all *markets*."""
+        filename = self._FILE_TEMPLATE.format(
+            date=day.isoformat(), hour=hour,
+        )
+        url = f"{self._r2_base}/{filename}"
+
+        try:
+            import pyarrow.parquet as pq  # noqa: F811
+            import fsspec  # noqa: F811
+        except ImportError:
+            log.error(
+                "pmxt_missing_deps",
+                msg="Install pyarrow and fsspec: pip install pyarrow fsspec",
+            )
+            return {}
+
+        # Quick existence check before heavy I/O
+        exists = await self._head_check(client, url)
+        if not exists:
+            log.debug("pmxt_hour_missing", file=filename)
+            return {}
+
+        # Build lookup structures
+        market_id_set = {m.market_id for m in markets}
+        token_map: dict[str, MarketEntry] = {}
+        for m in markets:
+            token_map[m.yes_id] = m
+            token_map[m.no_id] = m
+
+        # Run blocking Parquet I/O in a thread
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                self._read_parquet_batch,
+                url,
+                market_id_set,
+            )
+        except Exception as exc:
+            log.warning(
+                "pmxt_read_error",
+                file=filename,
+                error=str(exc),
+            )
+            return {}
+
+        log.debug(
+            "pmxt_hour_done",
+            file=filename,
+            markets_found=len([m for m, r in result.items() if r]),
+            total_records=sum(len(r) for r in result.values()),
+        )
+
+        await asyncio.sleep(self._rate_delay)
+        return result
+
+    # ── Synchronous Parquet I/O (runs in thread pool) ─────────────────
+
+    def _read_parquet_batch(
+        self,
+        url: str,
+        market_id_set: set[str],
+    ) -> dict[str, list[dict]]:
+        """Open remote Parquet via fsspec, filter by market_ids, convert.
+
+        Reads only ``timestamp_received``, ``market_id``, and ``data``
+        columns.  Skips row groups whose market_id statistics don't
+        overlap with any tracked market.
+
+        Emits a synthetic ``l2_snapshot`` as the first record per market
+        from the BBO (best_bid / best_ask) of the earliest delta, then
+        all subsequent deltas.  Downstream, ``DataLoader._parse_record``
+        classifies ``event_type="book"`` as ``l2_snapshot``.
+        """
+        import pyarrow.parquet as pq
+        import fsspec
+
+        fs = fsspec.filesystem("https")
+        result: dict[str, list[dict]] = {mid: [] for mid in market_id_set}
+        snapshot_emitted: set[str] = set()  # track per-market snapshot emission
+
+        with fs.open(url, "rb") as f:
+            pf = pq.ParquetFile(f)
+
+            for rg_idx in range(pf.metadata.num_row_groups):
+                if self._can_skip_row_group_batch(pf, rg_idx, market_id_set):
+                    continue
+
+                table = pf.read_row_group(
+                    rg_idx,
+                    columns=["timestamp_received", "market_id", "data"],
+                )
+
+                mid_col = table.column("market_id").to_pylist()
+                ts_col = table.column("timestamp_received").to_pylist()
+                data_col = table.column("data").to_pylist()
+
+                for i, mid in enumerate(mid_col):
+                    if mid not in market_id_set:
+                        continue
+
+                    ts_recv = ts_col[i]
+                    if hasattr(ts_recv, "timestamp"):
+                        ts = ts_recv.timestamp()
+                    else:
+                        ts = normalize_ts(ts_recv)
+                    if ts <= 0:
+                        continue
+
+                    # Try to emit a synthetic snapshot before the first delta
+                    if mid not in snapshot_emitted:
+                        snap = self._data_to_snapshot(data_col[i], ts, mid)
+                        if snap is not None:
+                            result[mid].append(snap)
+                            snapshot_emitted.add(mid)
+
+                    rec = self._data_to_record(data_col[i], ts, mid)
+                    if rec is not None:
+                        result[mid].append(rec)
+
+        return result
+
+    @staticmethod
+    def _can_skip_row_group_batch(
+        pf,
+        rg_idx: int,
+        market_id_set: set[str],
+    ) -> bool:
+        """Skip a row group if none of our market IDs fall within its
+        min/max range for the market_id column."""
+        try:
+            rg = pf.metadata.row_group(rg_idx)
+            for col_idx in range(rg.num_columns):
+                col = rg.column(col_idx)
+                if col.path_in_schema != "market_id":
+                    continue
+                if not col.statistics or not col.statistics.has_min_max:
+                    return False
+                smin = col.statistics.min
+                smax = col.statistics.max
+                # Check if ANY of our market_ids could be in [smin, smax]
+                for mid in market_id_set:
+                    if smin <= mid <= smax:
+                        return False
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _data_to_record(
+        self,
+        data_raw: str,
+        ts: float,
+        market_id: str,
+    ) -> dict | None:
+        """Parse the JSON ``data`` column and build a canonical L2 record.
+
+        PMXT data JSON:
+            {
+                "update_type": "price_change",
+                "token_id": "<decimal>",
+                "change_price": float,
+                "change_size": int,
+                "change_side": "BUY"|"SELL",
+                "timestamp": float,
+                ...
+            }
+
+        Mapped to canonical:
+            source="l2", payload.event_type="price_change",
+            payload.changes=[{side, price, size}]
+        """
+        try:
+            d = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        token_id = str(d.get("token_id", ""))
+        change_side = str(d.get("change_side", "BUY")).upper()
+        change_price = d.get("change_price", 0)
+        change_size = d.get("change_size", 0)
+        data_ts = d.get("timestamp", ts)
+
+        # Use the more precise timestamp from the data payload
+        precise_ts = normalize_ts(data_ts) if data_ts else ts
+
+        return {
+            "local_ts": precise_ts,
+            "source": "l2",
+            "asset_id": market_id,
+            "payload": {
+                "event_type": "price_change",
+                "asset_id": token_id,
+                "market": market_id,
+                "timestamp": precise_ts,
+                "changes": [
+                    {
+                        "side": change_side,
+                        "price": str(change_price),
+                        "size": str(change_size),
+                    },
+                ],
+            },
+        }
+
+    def _data_to_snapshot(
+        self,
+        data_raw: str,
+        ts: float,
+        market_id: str,
+    ) -> dict | None:
+        """Synthesize an L2 snapshot record from the BBO fields in a PMXT row.
+
+        Uses ``best_bid`` and ``best_ask`` from the data JSON to create a
+        minimal snapshot that ``DataLoader._parse_record()`` will classify
+        as ``l2_snapshot`` (via ``event_type="book"``).
+
+        This anchors the delta stream for downstream ``L2OrderBook.load_snapshot()``.
+        """
+        try:
+            d = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        best_bid = d.get("best_bid")
+        best_ask = d.get("best_ask")
+        if best_bid is None or best_ask is None:
+            return None
+
+        try:
+            bid_price = float(best_bid)
+            ask_price = float(best_ask)
+        except (TypeError, ValueError):
+            return None
+
+        if bid_price <= 0 and ask_price <= 0:
+            return None
+
+        token_id = str(d.get("token_id", ""))
+
+        return {
+            "local_ts": ts,
+            "source": "l2",
+            "asset_id": market_id,
+            "payload": {
+                "event_type": "book",
+                "asset_id": token_id,
+                "market": market_id,
+                "timestamp": ts,
+                "bids": [{"price": str(bid_price), "size": "1"}],
+                "asks": [{"price": str(ask_price), "size": "1"}],
+            },
+        }
+
+    # ── HTTP helper ───────────────────────────────────────────────────
+
+    async def _head_check(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> bool:
+        """Return True if the URL exists (HEAD 200)."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = await client.head(url, follow_redirects=True)
+                if resp.status_code == 200:
+                    return True
+                if resp.status_code in (404, 403):
+                    return False
+                if resp.status_code == 429:
+                    await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt + 1))
+                    continue
+                if resp.status_code >= 500:
+                    await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt + 1))
+                    continue
+                return False
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt + 1))
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -522,6 +930,21 @@ class JSONLWriter:
         if dirpath not in self._known_dirs:
             dirpath.mkdir(parents=True, exist_ok=True)
             self._known_dirs.add(dirpath)
+
+    def open_stream(self, day: date, market_id: str):
+        """Return an open file handle for streaming writes.
+
+        Caller is responsible for closing the handle (use as context manager).
+        """
+        path = self._file_path(day, market_id)
+        self._ensure_dir(path.parent)
+        return open(path, "w", encoding="utf-8")
+
+    def finalize_stream(self, count: int) -> None:
+        """Update internal stats after a streaming write session."""
+        if count > 0:
+            self._files_written += 1
+            self._records_written += count
 
     @property
     def stats(self) -> dict[str, int]:
@@ -769,6 +1192,9 @@ async def download_market_day(
 ) -> tuple[str, str, int]:
     """Download and write data for a single (market, day) pair.
 
+    Uses streaming writes so that L2-heavy adapters don't need to
+    buffer millions of records in memory before flushing to disk.
+
     Returns (market_id, date_str, records_written).
     """
     async with semaphore:
@@ -776,15 +1202,18 @@ async def download_market_day(
             log.debug("skipping_existing", market=market.market_id[:16], date=day.isoformat())
             return (market.market_id, day.isoformat(), 0)
 
-        records: list[dict] = []
+        count = 0
         try:
-            async for rec in adapter.fetch_all(market, day, client):
-                records.append(rec)
+            with writer.open_stream(day, market.market_id) as fh:
+                async for rec in adapter.fetch_all(market, day, client):
+                    fh.write(json.dumps(rec, separators=(",", ":"), default=str))
+                    fh.write("\n")
+                    count += 1
         except NotImplementedError as exc:
             log.warning("adapter_not_implemented", error=str(exc))
             return (market.market_id, day.isoformat(), 0)
 
-        count = writer.write_records(day, market.market_id, records)
+        writer.finalize_stream(count)
         if count > 0:
             log.info(
                 "downloaded",
@@ -795,6 +1224,60 @@ async def download_market_day(
         return (market.market_id, day.isoformat(), count)
 
 
+async def download_pmxt_day(
+    adapter: PMXTArchiveAdapter,
+    markets: list[MarketEntry],
+    day: date,
+    writer: JSONLWriter,
+    semaphore: asyncio.Semaphore,
+    client: httpx.AsyncClient,
+) -> list[tuple[str, str, int]]:
+    """Batch download: one pass over 24 hourly files → all markets.
+
+    PMXT hourly files contain every market, so reading once and splitting
+    locally is far more efficient than reading the same file N times.
+
+    Returns a list of (market_id, date_str, records_written) tuples.
+    """
+    async with semaphore:
+        # Determine which markets still need data
+        needed = [m for m in markets if not writer.should_skip(day, m.market_id)]
+        if not needed:
+            return [
+                (m.market_id, day.isoformat(), 0) for m in markets
+            ]
+
+        log.info(
+            "pmxt_batch_start",
+            date=day.isoformat(),
+            markets=len(needed),
+        )
+
+        try:
+            records_by_market = await adapter.fetch_l2_day_batch(
+                needed, day, client,
+            )
+        except Exception as exc:
+            log.error("pmxt_batch_error", date=day.isoformat(), error=str(exc))
+            return [(m.market_id, day.isoformat(), 0) for m in needed]
+
+        results: list[tuple[str, str, int]] = []
+        for market in needed:
+            recs = records_by_market.get(market.market_id, [])
+            count = writer.write_records(day, market.market_id, recs)
+            writer.finalize_stream(count)
+            if count > 0:
+                log.info(
+                    "downloaded",
+                    market=market.market_id[:16],
+                    date=day.isoformat(),
+                    records=count,
+                )
+            results.append((market.market_id, day.isoformat(), count))
+
+        return results
+
+
 async def run_backfill(
     adapter: DataSourceAdapter,
     markets: list[MarketEntry],
@@ -803,42 +1286,75 @@ async def run_backfill(
     concurrency: int,
     force: bool,
 ) -> JSONLWriter:
-    """Orchestrate parallel downloads across all (market, date) pairs."""
+    """Orchestrate parallel downloads across all (market, date) pairs.
+
+    If the adapter declares ``supports_batch = True`` (e.g. PMXTArchiveAdapter),
+    the orchestrator groups work by (day) instead of (market, day) to avoid
+    re-downloading the same hourly files for every market.
+    """
     writer = JSONLWriter(output_dir, force=force)
     semaphore = asyncio.Semaphore(concurrency)
 
-    total_pairs = len(markets) * len(dates)
-    log.info(
-        "backfill_start",
-        markets=len(markets),
-        dates=len(dates),
-        total_pairs=total_pairs,
-        concurrency=concurrency,
-    )
+    use_batch = getattr(adapter, "supports_batch", False)
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        tasks = []
-        for market in markets:
+    if use_batch:
+        total_tasks = len(dates)
+        log.info(
+            "backfill_start",
+            mode="batch",
+            markets=len(markets),
+            dates=len(dates),
+            total_day_tasks=total_tasks,
+            concurrency=concurrency,
+        )
+    else:
+        total_tasks = len(markets) * len(dates)
+        log.info(
+            "backfill_start",
+            markets=len(markets),
+            dates=len(dates),
+            total_pairs=total_tasks,
+            concurrency=concurrency,
+        )
+
+    # Increase timeout for PMXT — remote Parquet reads are slow
+    timeout = 600 if use_batch else REQUEST_TIMEOUT_S
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if use_batch:
+            # ── Batch mode: one task per day, all markets per file ────
+            completed = 0
             for day in dates:
-                task = download_market_day(
-                    adapter, market, day, writer, semaphore, client,
+                results = await download_pmxt_day(
+                    adapter, markets, day, writer, semaphore, client,
                 )
-                tasks.append(task)
+                for mid, day_str, count in results:
+                    pass  # stats already updated via writer
+                completed += 1
+                log.info("progress", completed=completed, total=total_tasks)
+        else:
+            # ── Standard mode: one task per (market, day) ────────────
+            tasks = []
+            for market in markets:
+                for day in dates:
+                    task = download_market_day(
+                        adapter, market, day, writer, semaphore, client,
+                    )
+                    tasks.append(task)
 
-        # Process in batches to avoid overwhelming memory
-        batch_size = concurrency * 10
-        completed = 0
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i : i + batch_size]
-            results = await asyncio.gather(*batch, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    log.error("task_error", error=str(result))
-                else:
-                    mid, day_str, count = result
-                    completed += 1
-            if completed % 50 == 0 or completed == total_pairs:
-                log.info("progress", completed=completed, total=total_pairs)
+            batch_size = concurrency * 10
+            completed = 0
+            for i in range(0, len(tasks), batch_size):
+                batch = tasks[i : i + batch_size]
+                results = await asyncio.gather(*batch, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        log.error("task_error", error=str(result))
+                    else:
+                        mid, day_str, count = result
+                        completed += 1
+                if completed % 50 == 0 or completed == total_tasks:
+                    log.info("progress", completed=completed, total=total_tasks)
 
     return writer
 

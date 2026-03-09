@@ -35,7 +35,11 @@ from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
 from src.signals.signal_framework import BaseSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
-from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents
+from src.trading.fees import (
+    compute_adaptive_stop_loss_cents,
+    compute_adaptive_trailing_offset_cents,
+    compute_net_pnl_cents,
+)
 from src.trading.sizer import (
     KellyResult,
     SizingResult,
@@ -107,9 +111,18 @@ class Position:
     # Fee tracking
     fee_enabled: bool = True
     sl_trigger_cents: float = 0.0     # fee-adaptive stop-loss threshold
+    trailing_offset_cents: float = 0.0  # vol-adaptive trailing stop offset
 
     # V4: Probe sizing flag
     is_probe: bool = False
+
+    # Pillar 16: Alpha-source attribution
+    signal_type: str = ""         # "panic", "drift", "rpe", "stink_bid"
+    meta_weight: float = 1.0     # SI-6 MetaStrategyController weight at entry
+
+    # Pillar 11.3: initial vol multiplier used at open time so the
+    # stop-loss monitor can decay it back toward 1.0 for stale trades.
+    sl_vol_multiplier: float = 1.0
 
     created_at: float = field(default_factory=time.time)
 
@@ -156,6 +169,7 @@ class PositionManager:
         self._maker_monitor = maker_monitor  # AdverseSelectionMonitor (V1/V4)
         self._iceberg_detectors = iceberg_detectors or {}  # asset_id → IcebergDetector
         self._stealth = None  # StealthExecutor — injected by bot.py when stealth_enabled
+        self._ohlcv_aggs: dict[str, OHLCVAggregator] | None = None  # asset_id → aggregator; injected by bot.py
         self._positions: dict[str, Position] = {}
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
@@ -232,6 +246,43 @@ class PositionManager:
         """Invalidate the stats cache (call after recording a trade)."""
         self._stats_cache = None
         self._stats_cache_time = 0.0
+
+    # ── Pillar 16.2: Self-healing alpha throttle ─────────────────────────
+    async def _compute_strategy_multiplier(self, signal_type: str) -> float:
+        """Return a Kelly multiplier in (0, 1] based on rolling strategy EV.
+
+        Penalty scale (requires ≥ 20 trades for activation):
+          - rolling_ev < -2.0¢ (significant bleed) → 0.1  (90% reduction)
+          - rolling_ev < 0                          → 0.5  (50% reduction)
+          - otherwise                               → 1.0  (no penalty)
+        """
+        if self._trade_store is None or not signal_type:
+            return 1.0
+        try:
+            rolling_ev, n_trades = await self._trade_store.get_strategy_expectancy(
+                signal_type, window=50,
+            )
+        except Exception:
+            return 1.0
+
+        if n_trades < 20:
+            return 1.0
+
+        if rolling_ev < -2.0:
+            mult = 0.1
+        elif rolling_ev < 0:
+            mult = 0.5
+        else:
+            return 1.0
+
+        log.warning(
+            "alpha_source_throttled",
+            signal_type=signal_type,
+            rolling_ev=round(rolling_ev, 3),
+            n_trades=n_trades,
+            strategy_mult=mult,
+        )
+        return mult
 
     # ── Multicore VaR gate wiring ────────────────────────────────────────
     def set_var_gate_queues(
@@ -674,6 +725,12 @@ class PositionManager:
         avg_win_cents = 0.0
         avg_loss_cents = 0.0
         total_trades = 0
+
+        # ── Pillar 16: Derive signal type early for throttle gate ─────────
+        _meta = signal_metadata or {}
+        _signal_type = "drift" if _meta.get("signal_source") == "drift" else "panic"
+        _meta_weight = float(_meta.get("meta_weight", 1.0))
+
         stats = await self._get_cached_stats()
         if stats:
             win_rate = stats.get("win_rate", 0.0)
@@ -702,6 +759,9 @@ class PositionManager:
             except Exception:
                 pass
 
+        # ── Pillar 16.2: Self-healing alpha throttle ──────────────────────
+        strategy_mult = await self._compute_strategy_multiplier(_signal_type)
+
         kelly_result = compute_kelly_size(
             signal_score=signal_score,
             win_rate=win_rate,
@@ -714,6 +774,10 @@ class PositionManager:
             signal_metadata=kelly_meta,
             total_trades=total_trades,
             _precomputed_depth_result=sizing,
+            pce=self._pce,
+            proposed_market_id=signal.market_id,
+            open_positions=self.get_open_positions(),
+            strategy_multiplier=strategy_mult,
         )
 
         # Reject if Kelly finds no edge (cold-start is allowed through)
@@ -867,11 +931,31 @@ class PositionManager:
         pos_id = f"POS-{self._next_id}"
         self._next_id += 1
 
-        # Compute fee-adaptive stop-loss
+        # Compute volatility- and fee-adaptive stop-loss (downside semi-variance)
+        _downside_vol: float | None = no_aggregator.rolling_downside_vol_ewma or None
         sl_trigger = compute_adaptive_stop_loss_cents(
             sl_base_cents=strat.stop_loss_cents,
             entry_price=entry_price,
             fee_enabled=fee_enabled,
+            ewma_vol=_downside_vol,
+            ref_vol=strat.sl_vol_ref,
+            is_adaptive=strat.sl_vol_adaptive,
+            max_multiplier=strat.sl_vol_multiplier_max,
+        )
+
+        # Pillar 11.3: record the vol multiplier used at open time
+        if strat.sl_vol_adaptive and _downside_vol and _downside_vol > 0 and strat.sl_vol_ref > 0:
+            _sl_vol_mult = max(1.0, min(_downside_vol / strat.sl_vol_ref, strat.sl_vol_multiplier_max))
+        else:
+            _sl_vol_mult = 1.0
+
+        # Compute volatility-adaptive trailing stop offset
+        _trailing_offset = compute_adaptive_trailing_offset_cents(
+            base_offset_cents=strat.trailing_stop_offset_cents,
+            ewma_downside_vol=_downside_vol,
+            ref_vol=strat.sl_vol_ref,
+            is_adaptive=strat.sl_vol_adaptive,
+            max_multiplier=strat.sl_vol_multiplier_max,
         )
 
         order = await self.executor.place_limit_order(
@@ -899,9 +983,13 @@ class PositionManager:
             kelly_result=kelly_result,
             fee_enabled=fee_enabled,
             sl_trigger_cents=sl_trigger,
+            trailing_offset_cents=_trailing_offset,
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=exit_fee_bps,
             is_probe=is_probe,
+            sl_vol_multiplier=_sl_vol_mult,
+            signal_type=_signal_type,
+            meta_weight=_meta_weight,
         )
 
         self._positions[pos.id] = pos
@@ -919,6 +1007,7 @@ class PositionManager:
             fee_enabled=fee_enabled,
             is_probe=is_probe,
             exec_mode=exec_mode,
+            signal_type=_signal_type,
         )
 
         return pos
@@ -939,6 +1028,7 @@ class PositionManager:
         fee_enabled: bool = True,
         book: OrderbookTracker | None = None,
         signal_metadata: dict | None = None,
+        latency_healthy: bool = False,
     ) -> Position | None:
         """Open a position driven by the Resolution Probability Engine.
 
@@ -964,6 +1054,9 @@ class PositionManager:
             for Kelly sizing.
         entry_price:
             Price to place the limit BUY order at.
+        latency_healthy:
+            True when LatencyGuard is HEALTHY — enables the fast-strike
+            taker path when divergence exceeds 2¢.
         """
         async with self._entry_lock:
             return await self._open_rpe_position_inner(
@@ -974,6 +1067,7 @@ class PositionManager:
                 days_to_resolution=days_to_resolution,
                 fee_enabled=fee_enabled, book=book,
                 signal_metadata=signal_metadata,
+                latency_healthy=latency_healthy,
             )
 
     async def _open_rpe_position_inner(
@@ -991,6 +1085,7 @@ class PositionManager:
         fee_enabled: bool = True,
         book: OrderbookTracker | None = None,
         signal_metadata: dict | None = None,
+        latency_healthy: bool = False,
     ) -> Position | None:
         """Inner implementation of open_rpe_position (runs under _entry_lock)."""
         strat = settings.strategy
@@ -1052,6 +1147,27 @@ class PositionManager:
             )
             return None
 
+        # ── Fast-Strike taker path (Pillar 14) ────────────────────────
+        # When RPE fair value diverges by >2¢ from the CLOB price and
+        # LatencyGuard is HEALTHY, adjust entry to cross the spread and
+        # take stale liquidity immediately.  The position is tagged so
+        # the bot skips the OrderChaser.
+        if direction == "buy_yes":
+            _fair_vs_clob = abs(model_probability - entry_price)
+        else:
+            _fair_vs_clob = abs((1.0 - model_probability) - entry_price)
+
+        fast_strike = _fair_vs_clob > 0.02 and latency_healthy
+        if fast_strike:
+            entry_price = round(entry_price + 0.01, 2)
+            log.info(
+                "rpe_fast_strike_triggered",
+                market=market_id,
+                divergence=round(_fair_vs_clob, 4),
+                taker_price=entry_price,
+                direction=direction,
+            )
+
         # ── Depth-aware sizing ─────────────────────────────────────────
         if book is not None:
             sizing = compute_depth_aware_size(
@@ -1095,6 +1211,9 @@ class PositionManager:
         # Half Kelly for RPE entries — lower conviction than panic signals
         rpe_kelly_fraction = (strat.kelly_fraction * 0.5)
 
+        # ── Pillar 16.2: Self-healing alpha throttle ──────────────────────
+        strategy_mult = await self._compute_strategy_multiplier("rpe")
+
         kelly_result = compute_kelly_size(
             signal_score=signal_score,
             win_rate=win_rate,
@@ -1107,6 +1226,10 @@ class PositionManager:
             kelly_fraction_mult=rpe_kelly_fraction,
             signal_metadata=rpe_metadata,
             total_trades=total_trades_rpe,
+            pce=self._pce,
+            proposed_market_id=market_id,
+            open_positions=self.get_open_positions(),
+            strategy_multiplier=strategy_mult,
         )
 
         if kelly_result.method == "kelly_no_edge":
@@ -1210,11 +1333,24 @@ class PositionManager:
             )
             target_price = max(target_price, entry_price + 0.01)
 
-        # Fee-adaptive stop-loss
+        # Fee-adaptive stop-loss (RPE path — no aggregator available)
         sl_trigger = compute_adaptive_stop_loss_cents(
             sl_base_cents=strat.stop_loss_cents,
             entry_price=entry_price,
             fee_enabled=fee_enabled,
+            ewma_vol=None,
+            ref_vol=strat.sl_vol_ref,
+            is_adaptive=strat.sl_vol_adaptive,
+            max_multiplier=strat.sl_vol_multiplier_max,
+        )
+
+        # Trailing offset (RPE path — no downside vol, defaults to 1.0×)
+        _trailing_offset = compute_adaptive_trailing_offset_cents(
+            base_offset_cents=strat.trailing_stop_offset_cents,
+            ewma_downside_vol=None,
+            ref_vol=strat.sl_vol_ref,
+            is_adaptive=strat.sl_vol_adaptive,
+            max_multiplier=strat.sl_vol_multiplier_max,
         )
 
         from src.trading.fees import get_fee_rate
@@ -1232,6 +1368,9 @@ class PositionManager:
             price=entry_price,
             size=entry_size,
         )
+
+        # ── Pillar 16: Alpha-source attribution ──────────────────────
+        _rpe_meta_weight = float(rpe_metadata.get("meta_weight", 1.0))
 
         pos = Position(
             id=pos_id,
@@ -1251,8 +1390,11 @@ class PositionManager:
             kelly_result=kelly_result,
             fee_enabled=fee_enabled,
             sl_trigger_cents=sl_trigger,
+            trailing_offset_cents=_trailing_offset,
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=0,
+            signal_type="rpe",
+            meta_weight=_rpe_meta_weight,
         )
 
         self._positions[pos.id] = pos
@@ -1261,6 +1403,10 @@ class PositionManager:
         # scale_probe_to_full() on breakeven.
         if is_model_probe:
             pos.is_probe = True
+
+        # Tag fast-strike positions so bot.py skips the OrderChaser.
+        if fast_strike:
+            pos.fast_strike = True
 
         log.info(
             "rpe_position_opened",
@@ -1275,6 +1421,7 @@ class PositionManager:
             confidence=round(confidence, 3),
             sl_trigger=sl_trigger,
             is_model_probe=is_model_probe,
+            fast_strike=fast_strike,
         )
 
         return pos
@@ -1467,7 +1614,7 @@ class PositionManager:
         fill_price = best_bid - slippage
         return max(0.01, round(fill_price, 4))
 
-    async def force_stop_loss(self, pos: Position) -> None:
+    async def force_stop_loss(self, pos: Position, *, reason: str = "stop_loss") -> None:
         """Force-close a position via market sell due to stop-loss trigger."""
         if pos.state != PositionState.EXIT_PENDING:
             return
@@ -1495,9 +1642,9 @@ class PositionManager:
             exit_order.filled_avg_price = fill_price
             exit_order.filled_size = pos.effective_size
             exit_order.status = OrderStatus.FILLED
-            self.on_exit_filled(pos, reason="stop_loss")
+            self.on_exit_filled(pos, reason=reason)
         else:
-            pos.exit_reason = "stop_loss"
+            pos.exit_reason = reason
             log.info(
                 "stop_loss_exit_placed",
                 pos_id=pos.id,
@@ -1653,6 +1800,31 @@ class PositionManager:
             def _get_mid() -> float | None:
                 return _mid_fn(_asset)
 
+            # Fetch recent volume from OHLCV aggregator for POV cap
+            # Burst-volume acceleration: use max(avg, current) so volume
+            # spikes allow faster execution instead of over-slicing.
+            _recent_vol = 0.0
+            if self._ohlcv_aggs is not None:
+                _agg = self._ohlcv_aggs.get(asset_id)
+                if _agg is not None:
+                    _eff_vol = max(_agg.avg_bar_volume, _agg.current_bar_volume)
+                    _recent_vol = _eff_vol * max(scale_price, 0.01)
+
+            # Fetch L2 book depth ratio for OBI pacing
+            _depth_ratio = 1.0
+            _tracker = self._book_trackers.get(asset_id)
+            if _tracker is not None and getattr(_tracker, 'is_reliable', False):
+                _depth_ratio = _tracker.book_depth_ratio
+
+            # SI-4.3: Detect opposing icebergs for delay skewing
+            _opposing_iceberg = False
+            _ice_det = self._iceberg_detectors.get(asset_id)
+            if _ice_det is not None:
+                _opp_side = "SELL"  # we are BUYing, so opposing is SELL
+                _strongest = _ice_det.strongest_iceberg(_opp_side)
+                if _strongest is not None and _strongest.confidence >= 0.50:
+                    _opposing_iceberg = True
+
             stealth_orders = await self._stealth.place_stealth_order(
                 market_id=pos.market_id,
                 asset_id=asset_id,
@@ -1661,6 +1833,9 @@ class PositionManager:
                 total_size=scale_shares,
                 post_only=True,
                 get_mid_fn=_get_mid,
+                recent_volume_usd=_recent_vol,
+                book_depth_ratio=_depth_ratio,
+                opposing_iceberg_detected=_opposing_iceberg,
             )
             order = stealth_orders[0] if stealth_orders else None
         else:
@@ -1733,3 +1908,114 @@ class PositionManager:
 
     def get_closed_positions(self) -> list[Position]:
         return [p for p in self._positions.values() if p.state == PositionState.CLOSED]
+
+    # ── Stink-bid cascade harvesting ───────────────────────────────────
+    async def harvest_cascades(
+        self,
+        signal: PanicSignal,
+        l2_book: Any,
+        *,
+        event_id: str = "",
+        min_depth_usd: float = 0.0,
+        tick_offset_range: tuple[int, int] = (2, 4),
+    ) -> list[Position]:
+        """Place passive stink bids at liquidity-gap levels during a panic.
+
+        When a :class:`PanicSignal` fires, this method queries the L2
+        book for thin-depth gaps 2–4 ticks below the current best ask
+        and places limit BUY orders at those levels.  These orders are
+        designed to fill only when a stop-loss cascade pushes through
+        the gap.
+
+        Parameters
+        ----------
+        signal:
+            The PanicSignal that triggered this call.
+        l2_book:
+            An :class:`~src.data.l2_book.L2OrderBook` with a
+            ``find_liquidity_gaps()`` method.
+        event_id:
+            Market event id for risk-gate checks.
+        min_depth_usd:
+            Forwarded to ``find_liquidity_gaps()``.
+        tick_offset_range:
+            Inclusive (lo, hi) tick offsets below best_ask to consider.
+            Default is (2, 4) → prices 0.02–0.04 below best ask.
+
+        Returns
+        -------
+        list[Position]
+            Positions created for each stink bid placed.
+        """
+        best_ask = signal.no_best_ask
+        if best_ask <= 0:
+            return []
+
+        gaps = l2_book.find_liquidity_gaps(min_depth_usd=min_depth_usd)
+        if not gaps:
+            return []
+
+        lo, hi = tick_offset_range
+        tick = 0.01
+        lower_bound = round(best_ask - hi * tick, 2)
+        upper_bound = round(best_ask - lo * tick, 2)
+
+        # Filter gaps to only those within the offset window
+        target_levels = [
+            g for g in gaps
+            if lower_bound <= g.price <= upper_bound and g.price > 0
+        ]
+        if not target_levels:
+            return []
+
+        positions: list[Position] = []
+        async with self._entry_lock:
+            for gap in target_levels:
+                # Recheck risk gates for each order
+                passed, max_trade, _ = await self._check_risk_gates(
+                    signal.market_id, event_id,
+                )
+                if not passed:
+                    break
+
+                entry_price = gap.price
+                # Conservative fixed sizing: 25 % of max trade, min 1 share
+                entry_size = max(1.0, round((max_trade * 0.25) / entry_price, 2))
+
+                order = await self.executor.place_limit_order(
+                    market_id=signal.market_id,
+                    asset_id=signal.no_asset_id,
+                    side=OrderSide.BUY,
+                    price=entry_price,
+                    size=entry_size,
+                )
+
+                pos_id = f"STINK-{self._next_id}"
+                self._next_id += 1
+
+                pos = Position(
+                    id=pos_id,
+                    market_id=signal.market_id,
+                    no_asset_id=signal.no_asset_id,
+                    event_id=event_id,
+                    state=PositionState.ENTRY_PENDING,
+                    entry_order=order,
+                    entry_price=entry_price,
+                    entry_size=entry_size,
+                    entry_time=time.time(),
+                    signal=signal,
+                    signal_type="stink_bid",
+                )
+                self._positions[pos.id] = pos
+                positions.append(pos)
+
+                log.info(
+                    "stink_bid_placed",
+                    pos_id=pos.id,
+                    market=signal.market_id,
+                    price=entry_price,
+                    size=entry_size,
+                    gap_depth=gap.size,
+                )
+
+        return positions

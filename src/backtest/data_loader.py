@@ -195,6 +195,11 @@ class DataLoader:
     # Backfilled data stored all trades at the backfill run time, so all
     # events in a single day file may be compressed into < 60 seconds.
     # When detected, we spread events evenly across the file's calendar date.
+    #
+    # NOTE: Backfill artifacts can produce per-asset spans of only 14-16s
+    # even when the overall file span exceeds this threshold (YES and NO
+    # trades cluster at different backfill instants).  The date-mismatch
+    # check below now fires independently of this span gate.
     _SYNTH_TS_THRESHOLD: float = 60.0
 
     @staticmethod
@@ -245,30 +250,42 @@ class DataLoader:
         ts_span = (max(ts_vals) - min(ts_vals)) if ts_vals else 0.0
 
         synth_day_start: float | None = None
-        if ts_span < self._SYNTH_TS_THRESHOLD:
-            synth_day_start = self._day_start_from_path(fpath)
-            if synth_day_start is not None:
-                # Only spread if the stored timestamps are real modern Unix
-                # timestamps but mismatched from the file's calendar date
-                # (backfill artifact: local_ts is the backfill run time, not
-                # the historical date).  Test data typically uses small
-                # synthetic values (e.g. 1.0, 2.0) that are valid timestamps
-                # for near-epoch dates — we leave those unchanged.
-                # Threshold: 2020-01-01 (1577836800) distinguishes real vs
-                # synthetic test timestamps; 30-day tolerance for data
-                # legitimately written in the same period as the file.
-                _MIN_REAL_TS = 1_577_836_800.0   # 2020-01-01 UTC
-                median_ts = sorted(ts_vals)[len(ts_vals) // 2] if ts_vals else 0.0
-                ts_is_real = median_ts >= _MIN_REAL_TS
-                ts_far_from_date = abs(median_ts - synth_day_start) > 30 * 86400
-                if not (ts_is_real and ts_far_from_date):
-                    synth_day_start = None  # timestamps are fine as-is
-                else:
-                    log.debug(
-                        "dataloader_synth_ts",
-                        file=str(fpath),
-                        original_span_s=round(ts_span, 1),
-                    )
+        # Two independent triggers for synthetic timestamp spreading:
+        #   (a) Overall span < threshold (original detection), OR
+        #   (b) Timestamps are real but date-mismatched (backfill artifact
+        #       where YES/NO clusters inflate the overall span beyond the
+        #       threshold while per-asset spans remain << 60s)
+        _day_start = self._day_start_from_path(fpath)
+        _MIN_REAL_TS = 1_577_836_800.0   # 2020-01-01 UTC
+        median_ts = sorted(ts_vals)[len(ts_vals) // 2] if ts_vals else 0.0
+        ts_is_real = median_ts >= _MIN_REAL_TS
+        ts_far_from_date = (
+            _day_start is not None
+            and abs(median_ts - _day_start) > 30 * 86400
+        )
+
+        if ts_is_real and ts_far_from_date and _day_start is not None:
+            # Date-mismatch detection: timestamps are from a different date
+            # than the file's directory name — this is backfilled data.
+            synth_day_start = _day_start
+            log.debug(
+                "dataloader_synth_ts",
+                file=str(fpath),
+                original_span_s=round(ts_span, 1),
+                trigger="date_mismatch",
+            )
+        elif ts_span < self._SYNTH_TS_THRESHOLD and _day_start is not None:
+            # Span-based detection (original): entire file compressed into
+            # a narrow window — only activate for real timestamps that are
+            # far from the file date.
+            if ts_is_real and ts_far_from_date:
+                synth_day_start = _day_start
+                log.debug(
+                    "dataloader_synth_ts",
+                    file=str(fpath),
+                    original_span_s=round(ts_span, 1),
+                    trigger="span_compressed",
+                )
 
         # --- Pass 2: emit events with corrected timestamps ---
         total = len(raw_records)
@@ -384,7 +401,12 @@ class DataLoader:
     ) -> Iterator[MarketEvent]:
         """Read a Parquet file (from ``ParquetConverter``) and yield
         ``MarketEvent`` objects.  The file is assumed to be pre-sorted
-        by ``local_ts``."""
+        by ``local_ts``.
+
+        Includes backfill detection: if the median timestamp is far from
+        the file's parent-directory date, timestamps are replaced with
+        synthetic values spread evenly across the calendar day.
+        """
         try:
             import pyarrow.parquet as pq  # noqa: F811
         except ImportError:
@@ -401,7 +423,29 @@ class DataLoader:
         col_payload = table.column("payload").to_pylist()
         col_exchange_ts = table.column("exchange_ts").to_pylist()
 
-        for idx in range(table.num_rows):
+        # ── Backfill detection for Parquet files ───────────────────────
+        synth_day_start: float | None = None
+        if col_local_ts:
+            _MIN_REAL_TS = 1_577_836_800.0  # 2020-01-01 UTC
+            sorted_ts = sorted(col_local_ts)
+            median_ts = sorted_ts[len(sorted_ts) // 2]
+            if median_ts >= _MIN_REAL_TS:
+                _day_start = self._day_start_from_path(fpath)
+                if (
+                    _day_start is not None
+                    and abs(median_ts - _day_start) > 30 * 86400
+                ):
+                    synth_day_start = _day_start
+                    log.debug(
+                        "dataloader_parquet_synth_ts",
+                        file=str(fpath),
+                        rows=table.num_rows,
+                        trigger="date_mismatch",
+                    )
+
+        total_rows = table.num_rows
+
+        for idx in range(total_rows):
             local_ts = col_local_ts[idx]
 
             # Map msg_type back to canonical EventType
@@ -439,8 +483,13 @@ class DataLoader:
             if server_time is None or server_time != server_time:  # NaN check
                 server_time = 0.0
 
+            # Replace backfilled timestamp with synthetic one
+            effective_ts = float(local_ts)
+            if synth_day_start is not None:
+                effective_ts = synth_day_start + idx * (86400.0 / max(total_rows, 1))
+
             yield MarketEvent(
-                timestamp=float(local_ts),
+                timestamp=effective_ts,
                 event_type=event_type,
                 asset_id=asset_id,
                 data=data,

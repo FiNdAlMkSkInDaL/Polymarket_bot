@@ -51,6 +51,7 @@ class PanicDetector:
         volume_ratio_threshold: float | None = None,
         trend_guard_pct: float | None = None,
         trend_guard_bars: int | None = None,
+        ofi_veto_threshold: float = 50.0,
     ):
         self.market_id = market_id
         self.yes_asset_id = yes_asset_id
@@ -62,6 +63,7 @@ class PanicDetector:
         self.v_thresh = volume_ratio_threshold if volume_ratio_threshold is not None else settings.strategy.volume_ratio_threshold
         self._trend_guard_pct = trend_guard_pct if trend_guard_pct is not None else settings.strategy.trend_guard_pct
         self._trend_guard_bars = trend_guard_bars if trend_guard_bars is not None else settings.strategy.trend_guard_bars
+        self._ofi_veto_threshold = ofi_veto_threshold
 
     # ── public ──────────────────────────────────────────────────────────────
     def evaluate(
@@ -69,8 +71,18 @@ class PanicDetector:
         bar: OHLCVBar,
         no_best_ask: float,
         whale_confluence: bool = False,
+        yes_ofi: float = 0.0,
     ) -> PanicSignal | None:
-        """Check a newly closed YES bar.  Returns a signal or None."""
+        """Check a newly closed YES bar.  Returns a signal or None.
+
+        Parameters
+        ----------
+        yes_ofi:
+            SI-5 Order Flow Imbalance on the YES token L2 book.
+            Positive → net bid-side accumulation.  If strongly positive
+            while we're about to BUY_NO (sell YES), the spike is likely
+            institutional momentum, not retail panic — veto the entry.
+        """
 
         # Need enough history to compute meaningful stats.
         # With < 5 bars, rolling VWAP/σ are dominated by noise.
@@ -177,6 +189,20 @@ class PanicDetector:
                         zscore=round(zscore, 3),
                     )
                     return None
+
+        # ── SI-5: Order Flow Imbalance veto ────────────────────────────────
+        # A BUY_NO signal fires on a YES spike.  If the YES-token OFI is
+        # strongly positive (institutional bid accumulation), the spike is
+        # momentum — not panic — and the NO discount will evaporate.
+        if yes_ofi > self._ofi_veto_threshold:
+            log.info(
+                "ofi_veto_institutional_momentum",
+                market=self.market_id,
+                yes_ofi=round(yes_ofi, 2),
+                threshold=self._ofi_veto_threshold,
+                zscore=round(zscore, 3),
+            )
+            return None
 
         # All conditions met
         signal = PanicSignal(

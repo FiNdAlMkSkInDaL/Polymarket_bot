@@ -338,14 +338,14 @@ class TestPositionLayer:
 
     @pytest.mark.asyncio
     async def test_position_on_stale_book_suspends(self, components):
-        """Open position on a book that hasn't updated for 3× threshold → suspend.
-        Default threshold is 5000ms, so position threshold is 15000ms."""
+        """Open position on a book that hasn't updated for 6× threshold → suspend.
+        Default threshold is 5000ms, so position threshold is 30000ms."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)  # WS is healthy
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 16.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 31.0),
         }
 
         hb = BookHeartbeat(
@@ -358,14 +358,14 @@ class TestPositionLayer:
         assert hb.is_suspended is True
 
     @pytest.mark.asyncio
-    async def test_position_within_3x_threshold_no_suspend(self, components):
-        """Position book stale by 10s (< 3× 5s = 15s) → NOT suspended."""
+    async def test_position_within_6x_threshold_no_suspend(self, components):
+        """Position book stale by 25s (< 6× 5s = 30s) → NOT suspended."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 10.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 25.0),
         }
 
         hb = BookHeartbeat(
