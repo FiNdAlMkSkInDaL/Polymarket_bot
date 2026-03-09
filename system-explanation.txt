@@ -26,7 +26,7 @@ Table of Contents:
   15. Important Design Patterns & Gotchas
   16. Pillar System (Feature Numbering)
   17. Volume Expansion Architecture (V1-V4)
-  18. Signal Intelligence (SI-1 through SI-6)
+  18. Signal Intelligence (SI-1 through SI-7)
   19. Cross-Module Dependencies Graph
   20. Change History Evolution
 
@@ -91,20 +91,25 @@ Root:
 
 src/                      — main bot package
   __init__.py             — "Polymarket Mean-Reversion Market Maker PoC"
-  bot.py                  — TradingBot class (main entry, ~2750 lines)
+  bot.py                  — TradingBot class (main entry, ~2712 lines)
   cli.py                  — Click CLI: run, stats, kill, scores, backtest, wfo, data
 
   core/                   — foundational infrastructure
     config.py             — StrategyParams (~160 fields), Settings, DeploymentEnv (~705 lines)
+    exception_circuit_breaker.py — ExceptionCircuitBreaker (rolling-window deque, 5 errors/60s, latching; hot-path loop protection)
     guard.py              — DeploymentGuard (PAPER/PENNY_LIVE/PRODUCTION caps)
     heartbeat.py          — BookHeartbeat (3-layer staleness detection)
+    ipc.py                — SharedBookWriter + SharedBookReader; double-buffered Seqlock shared memory for cross-process L2 exchange (~454 lines)
     latency_guard.py      — LatencyGuard (HEALTHY→DEGRADED→BLOCKED state machine)
     logger.py             — structlog JSON logging with async-safe QueueHandler
+    process_manager.py    — ProcessManager; spawns/monitors L2 worker shards + PCE worker; allocates shared memory; health loop via WorkerHeartbeatChecker
+    worker_heartbeat.py   — WorkerHealth, WorkerHeartbeatSender (worker side), WorkerHeartbeatChecker (main side); process liveness protocol (separate from Pillar 8 BookHeartbeat)
 
   data/                   — market data pipeline
     types.py              — Level dataclass (price, size)
       websocket_client.py   — MarketWebSocket + MarketWebSocketPool (sharded trade/book events)
     l2_websocket.py       — L2WebSocket (dedicated L2 delta stream)
+    l2_worker.py          — l2_worker_main() subprocess entry; handles L2WebSocket + L2OrderBook for an asset shard; publishes via SharedBookWriter; heartbeat + circuit-breaker events
     l2_book.py            — L2OrderBook (full-depth reconstruction, seq tracking, liquidity-gap detection ~840 lines)
     orderbook.py          — OrderbookTracker (top-of-book), L2OrderBookAdapter
     ohlcv.py              — OHLCVAggregator (1-min bars, VWAP, EWMA vol ~240 lines)
@@ -126,7 +131,7 @@ src/                      — main bot package
     iceberg_detector.py   — IcebergDetector (L2 refill pattern detection, SI-2)
     tag_prior_registry.py — TagPriorRegistry (stateless tag→Beta(α,β) routing, DPGE)
     resolution_probability.py — RPE (CryptoPriceModel + GenericBayesianModel/DPGE, Pillar 14)
-    signal_framework.py   — SignalGenerator ABC, CompositeSignalEvaluator
+    signal_framework.py   — BaseSignal dataclass (market_id, no_asset_id, no_best_ask), SignalGenerator ABC, CompositeSignalEvaluator, MetaStrategyController (SI-6)
 
   trading/                — execution and risk
     executor.py           — OrderExecutor (paper/live), OrderStatusPoller
@@ -139,6 +144,7 @@ src/                      — main bot package
     stop_loss.py          — StopLossMonitor (event-driven, trailing, probe breakeven)
     take_profit.py        — TP computation (alpha with 6 adjustments, fee floor)
     adverse_selection_monitor.py — AdverseSelectionMonitor (Welch t-test, dynamic α)
+    pce_worker.py         — pce_worker_main() subprocess; O(N²) PCE matrix math isolated from main asyncio loop; communicates via multiprocessing.Queue (input/output/var-gate queues)
     portfolio_correlation.py — PCE (N×N correlation, VaR, bisection sizing ~1400 lines)
 
   monitoring/
@@ -190,7 +196,7 @@ tests/
   helpers.py              — make_trade, build_bar_history, make_position
   test_whale_wss.py       — 24 tests for topic decoding, TransferSingle/Batch ABI
                             parsing, start-mode selection, REST fallback, and stale trim
-  ~41 test files          — ~1278 tests total
+  51 test files           — 1536 tests total
 
 data/
   market_map.json         — 31 actionable markets with YES/NO token IDs
@@ -213,7 +219,7 @@ INITIALIZATION SEQUENCE:
   4. Create TradeStore (SQLite)
   5. Create PortfolioCorrelationEngine (Pillar 15)
   6. Create PositionManager (receives executor, store, guard, PCE, book_trackers)
-  8. Create WhaleMonitor (Polygon CTF log streaming via WSS, REST fallback if no WSS URL)
+  7. Create WhaleMonitor (Polygon CTF log streaming via WSS, REST fallback if no WSS URL)
   8. Create TelegramAlerter
   9. Create MarketLifecycleManager
   10. Create LatencyGuard
@@ -225,12 +231,15 @@ _run() SEQUENCE:
   3. Set wallet balance
   4. Fee model validation (live only)
   5. Create WebSocket connections (MarketWebSocketPool for trades/books + L2)
+  5a. Multi-core mode: create ProcessManager → start_l2_workers() → start_pce_worker()
+      Replace in-process L2 trackers with SharedBookReaderAdapters; wire VaR gate queues.
+      Fallback: single-process L2WebSocket (if multicore_enabled=False).
   6. Create AdverseSelectionGuard
   7. Create BookHeartbeat
   8. Create OrderStatusPoller
   9. Create StopLossMonitor
   10. Create AdverseSelectionMonitor (maker fill tracking)
-  11. Launch 18+ asyncio tasks
+  11. Launch 19+ asyncio tasks
   12. Install signal handlers
   13. await asyncio.gather(*tasks)
 
@@ -271,7 +280,10 @@ CONCURRENT TASKS (18+):
   stale_bar_flush     — Flush stale OHLCV bars (30s)
   paper_summary       — Paper trade summary (30 min)
   data_recorder       — (conditional) Data recording
-  l2_ws              — (conditional) L2 WebSocket
+  l2_ws              — (conditional) L2 WebSocket (single-process fallback only)
+  worker_health       — (conditional) ProcessManager.health_check_loop() — monitors
+                        L2 + PCE worker liveness via WorkerHeartbeatChecker;
+                        triggers emergency stop on stale/dead workers
 
 THE THREE SIGNAL PATHS:
 
@@ -282,7 +294,8 @@ THE THREE SIGNAL PATHS:
   Path 2: DriftSignal (V3, secondary)
     Only fires when PanicDetector is SILENT (signals are uncorrelated).
     YES bar close → drift cooldown → MeanReversionDrift.evaluate() → DriftSignal
-    → synthesize PanicSignal → PositionManager.open_position()
+    (DriftSignal inherits BaseSignal; no PanicSignal wrapping)
+    → PositionManager.open_position() [accepts BaseSignal polymorphically]
 
   Path 3: RPE (Pillar 14, independent)
     YES bar close → data freshness → RPE.evaluate() → SignalResult
@@ -1271,16 +1284,16 @@ WfoConfig: train_days=30, test_days=7, step_days=7, embargo_days=1,
   n_trials=100, max_workers=cpu_count-1, max_markets=None (optional universe cap),
   search_space_bounds_path=None (optional external per-parameter bounds JSON)
 
-24-parameter search space:
-  Core: zscore_threshold, spread_compression_pct, volume_ratio_threshold
-  Risk: stop_loss_cents, trailing_stop, kelly_fraction, max_impact_pct
+22-parameter search space:
+  Core: zscore_threshold, spread_compression_pct, volume_ratio_threshold, trend_guard_pct
+  Risk: stop_loss_cents, trailing_stop_offset_cents, kelly_fraction, max_impact_pct
   TP: alpha_default, tp_vol_sensitivity
   Edge: min_edge_score
-  RPE: confidence_threshold, bayesian_obs_weight, crypto_vol_default
+  RPE: rpe_confidence_threshold, rpe_bayesian_obs_weight, rpe_crypto_vol_default
   Drift: drift_z_threshold, drift_vol_ceiling
-  PCE: max_portfolio_var, haircut_threshold, prior_weight, holding_period
+  PCE: pce_max_portfolio_var_usd, pce_correlation_haircut_threshold, pce_structural_prior_weight, pce_holding_period_minutes
   SI-2: iceberg_eqs_bonus, iceberg_tp_alpha
-  (24 total: 22 suggest_float, 2 suggest_int; 4 log-scaled)
+  (22 total: 20 suggest_float, 2 suggest_int; 4 log-scaled)
 
 External bounds injection (search_space_bounds_path):
   Optional JSON file: {"param": [lo, hi], ...}
@@ -1335,20 +1348,24 @@ Universe cap (--max-markets):
   (72 Optuna trials), full 11-fold run estimated ~3.5–4 hours.
 
 Operational status as of March 9, 2026:
-  - The production VPS pipeline was fully wiped and restarted from scratch at
-    2026-03-09T13:29Z.
-  - Deleted before restart: logs/wfo_phase1.db, logs/wfo_phase2.db,
-    logs/wfo_phase3.db, logs/phase1_champion.json, logs/phase2_bounds.json,
-    logs/phase2_champion.json, logs/final_validation_tearsheet.json,
-    and logs/pipeline.log.
-  - The live run therefore does not reuse any prior phase artefacts.
+  - SECOND CLEAN RESTART at 2026-03-09T16:31:48Z.
+  - Reason: post-deployment git diff revealed strategy.py grew from 354 → 573+
+    lines (BotReplayAdapter fully rewired for SI-4–SI-7, RPE fast-strike, OFI
+    veto, stealth executor, stop-loss engine). The 212 trials accrued since
+    13:29Z used the old adapter; objective values were incomparable with the
+    new code path.
+  - Old DBs backed up as wfo_phase1.db.bak_pre_clean_restart and
+    wfo_phase2.db.bak_pre_clean_restart before deletion.
+  - Deleted before second restart: logs/wfo_phase1.db, logs/wfo_phase2.db.
+  - The live run therefore starts with 0 prior trials and does not reuse any
+    pre-deployment artefacts.
 
 3-Stage Optimization Pipeline (scripts/run_optimization_pipeline.py):
   Automates the full discovery → refinement → validation workflow.
   See Section 12 for details. Smoke-tested locally on 2026-03-08:
     - All 3 phases completed, exit code 0.
     - 5 artefacts produced and verified.
-    - Bounds-narrowing math: 0 errors, 22/24 params at 30% domain width,
+    - Bounds-narrowing math: 0 errors, 22/22 params at 30% domain width,
       8 boundary-clamped correctly, 0 Phase 2 champion out-of-bounds violations.
     - WFO unit suite: 73/73 passed.
 
@@ -1486,7 +1503,7 @@ SECTION 13: TEST INFRASTRUCTURE
 ================================================================================
 
 Framework: pytest 8.0+, pytest-asyncio 0.23+ (asyncio_mode = "auto")
-Total: ~1270 tests across ~40 test files
+Total: 1536 tests across 51 test files
 
 conftest.py fixtures (all function-scoped):
   paper_executor  — OrderExecutor(paper_mode=True)
@@ -1532,6 +1549,13 @@ Key test files:
   test_e2e_integration.py        — Full E2E with mocked WS
   test_backtest/                 — Backtest engine tests
   test_position_manager.py       — PositionManager cascade harvesting (8 tests)
+  test_stealth_executor.py       — StealthExecutor VWAP/POV slicing, OBI pacing, slippage
+                                     adaptive, iceberg-aware skewing (69 tests)
+  test_ofi_veto.py               — OFI panic veto and wall pressure tests
+  test_whale_wss.py              — WhaleMonitor WSS topic decoding, TransferSingle/Batch
+                                     ABI parsing, start-mode, REST fallback, stale trim (24 tests)
+  test_backfill_data.py          — PMXTArchiveAdapter, snapshot synthesis, delta coalescing,
+                                     book resilience (56 tests)
 
 
 ================================================================================
@@ -1844,7 +1868,7 @@ FLAW GUARDS (discovered and patched post-V1-V4):
 
 
 ================================================================================
-SECTION 18: SIGNAL INTELLIGENCE (SI-1 through SI-6)
+SECTION 18: SIGNAL INTELLIGENCE (SI-1 through SI-7)
 ================================================================================
 
 SI-1 — REGIME DETECTOR:
@@ -1987,14 +2011,21 @@ SECTION 19: CROSS-MODULE DEPENDENCY GRAPH
 
 bot.py (orchestrator)
   ├── core/config.py (settings singleton — referenced by ALL modules)
+  ├── core/exception_circuit_breaker.py (ExceptionCircuitBreaker → used by _process_trades, AdverseSelectionGuard)
   ├── core/guard.py (DeploymentGuard → used by PositionManager)
   ├── core/heartbeat.py (BookHeartbeat → uses LatencyGuard, OrderbookTrackers)
+  ├── core/ipc.py (SharedBookWriter/Reader → used by l2_worker + ProcessManager)
   ├── core/latency_guard.py (LatencyGuard → used by bot + chaser)
   ├── core/logger.py (structlog → used by ALL modules)
+  ├── core/process_manager.py (ProcessManager → spawns l2_worker shards + pce_worker;
+  │                            health_check_loop task in bot; emergency stop on worker failure)
+  ├── core/worker_heartbeat.py (WorkerHeartbeatSender in workers; WorkerHeartbeatChecker in ProcessManager)
   │
   ├── data/websocket_client.py (MarketWebSocketPool → feeds trade_queue,
   │                             book_queue via sharded MarketWebSocket children)
-  ├── data/l2_websocket.py (L2WebSocket → feeds L2OrderBooks)
+  ├── data/l2_websocket.py (L2WebSocket → feeds L2OrderBooks; used by l2_worker subprocess)
+  ├── data/l2_worker.py (l2_worker_main subprocess → WebSocket+L2OrderBook per asset shard;
+  │                      publishes via SharedBookWriter → SharedBookReader in main process)
   ├── data/l2_book.py (L2OrderBook → feeds OrderbookTracker via Adapter)
   ├── data/orderbook.py (OrderbookTracker, L2OrderBookAdapter)
   ├── data/ohlcv.py (OHLCVAggregator → feeds PanicDetector, RegimeDetector, DriftSignal)
@@ -2003,7 +2034,7 @@ bot.py (orchestrator)
   ├── data/market_scorer.py (scoring → drives lifecycle decisions)
   │
   ├── signals/panic_detector.py (PanicSignal → triggers open_position)
-  ├── signals/drift_signal.py (DriftSignal → synthesized as PanicSignal → open_position)
+  ├── signals/drift_signal.py (DriftSignal → inherits BaseSignal → open_position directly)
   ├── signals/edge_filter.py (EQS → gates ALL entries)
   ├── signals/adverse_selection_guard.py (fast-kill → cancels orders)
   ├── signals/regime_detector.py (regime → DriftSignal gate, EQS factor, confluence)
@@ -2024,6 +2055,8 @@ bot.py (orchestrator)
   ├── trading/take_profit.py (TP computation → targets exit)
   ├── trading/adverse_selection_monitor.py (fill tracking → maker downgrade)
   ├── trading/portfolio_correlation.py (PCE → VaR gate, concentration haircut)
+  ├── trading/pce_worker.py (pce_worker_main subprocess → O(N²) PCE math;
+  │                          input/output/var-gate queues wired through ProcessManager)
   │
   ├── monitoring/trade_store.py (SQLite → stats, crash recovery)
   └── monitoring/telegram.py (notifications)
