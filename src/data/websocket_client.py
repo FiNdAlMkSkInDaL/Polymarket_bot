@@ -300,3 +300,149 @@ class MarketWebSocket:
         except (ValueError, TypeError) as exc:
             log.debug("trade_parse_error", error=str(exc), data=data)
             return None
+
+
+# ── Connection-pool wrapper ────────────────────────────────────────────────
+MAX_SUBSCRIPTIONS_PER_SOCKET = 50
+
+
+class MarketWebSocketPool:
+    """Multiplexed WebSocket pool that shards asset subscriptions across
+    multiple physical connections to avoid overloading any single socket.
+
+    Drop-in replacement for ``MarketWebSocket`` — exposes the same public
+    API (``start``, ``stop``, ``add_assets``, ``remove_assets``,
+    ``reconnect_count``, ``book_queue``).
+    """
+
+    def __init__(
+        self,
+        asset_ids: list[str],
+        trade_queue: asyncio.Queue[TradeEvent],
+        *,
+        book_queue: asyncio.Queue | None = None,
+        ws_url: str | None = None,
+        queue_maxsize: int = 1000,
+        recorder: Any | None = None,
+    ):
+        self._trade_queue = trade_queue
+        self._book_queue: asyncio.Queue = book_queue or asyncio.Queue(maxsize=2000)
+        self._ws_url = ws_url
+        self._queue_maxsize = queue_maxsize
+        self._recorder = recorder
+
+        # Shard assets into chunks of MAX_SUBSCRIPTIONS_PER_SOCKET
+        self._sockets: list[MarketWebSocket] = []
+        self._tasks: list[asyncio.Task] = []
+        self._asset_to_socket: dict[str, MarketWebSocket] = {}
+
+        chunks = [
+            asset_ids[i : i + MAX_SUBSCRIPTIONS_PER_SOCKET]
+            for i in range(0, max(len(asset_ids), 1), MAX_SUBSCRIPTIONS_PER_SOCKET)
+        ]
+        # Ensure at least one socket even if asset_ids is empty
+        if not chunks:
+            chunks = [[]]
+
+        for idx, chunk in enumerate(chunks):
+            sock = self._make_socket(chunk, idx)
+            self._sockets.append(sock)
+            for aid in chunk:
+                self._asset_to_socket[aid] = sock
+
+        log.info(
+            "ws_pool_created",
+            total_assets=len(asset_ids),
+            num_sockets=len(self._sockets),
+            max_per_socket=MAX_SUBSCRIPTIONS_PER_SOCKET,
+        )
+
+    # ── Expose book_queue for bot.py compatibility ─────────────────────────
+    @property
+    def book_queue(self) -> asyncio.Queue:
+        return self._book_queue
+
+    @property
+    def reconnect_count(self) -> int:
+        return sum(s.reconnect_count for s in self._sockets)
+
+    # Forward asset_ids for code that reads it directly
+    @property
+    def asset_ids(self) -> list[str]:
+        return list(self._asset_to_socket.keys())
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+    async def start(self) -> None:
+        """Start all sharded sockets concurrently."""
+        self._tasks = [
+            asyncio.create_task(
+                sock.start(),
+                name=f"ws_pool_sock_{i}",
+            )
+            for i, sock in enumerate(self._sockets)
+        ]
+        # Await all — if any raises (CancelledError), the others keep running
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def stop(self) -> None:
+        """Stop all sharded sockets."""
+        for sock in self._sockets:
+            await sock.stop()
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    # ── dynamic subscription ──────────────────────────────────────────────
+    async def add_assets(self, new_ids: list[str]) -> None:
+        """Subscribe to additional asset IDs, distributing across sockets."""
+        truly_new = [aid for aid in new_ids if aid not in self._asset_to_socket]
+        if not truly_new:
+            return
+
+        for aid in truly_new:
+            # Find a socket with capacity
+            target = None
+            for sock in self._sockets:
+                if len(sock.asset_ids) < MAX_SUBSCRIPTIONS_PER_SOCKET:
+                    target = sock
+                    break
+
+            if target is None:
+                # All sockets full — spin up a new one
+                idx = len(self._sockets)
+                target = self._make_socket([], idx)
+                self._sockets.append(target)
+                task = asyncio.create_task(
+                    target.start(), name=f"ws_pool_sock_{idx}"
+                )
+                self._tasks.append(task)
+                log.info("ws_pool_new_socket", socket_index=idx)
+
+            await target.add_assets([aid])
+            self._asset_to_socket[aid] = target
+
+    async def remove_assets(self, ids_to_remove: list[str]) -> None:
+        """Unsubscribe from asset IDs on their respective sockets."""
+        for aid in ids_to_remove:
+            sock = self._asset_to_socket.pop(aid, None)
+            if sock is not None:
+                await sock.remove_assets([aid])
+
+    # ── internal helpers ───────────────────────────────────────────────────
+    def _make_socket(self, asset_ids: list[str], index: int) -> MarketWebSocket:
+        """Create a single MarketWebSocket that feeds the shared queues."""
+        sock = MarketWebSocket(
+            asset_ids,
+            self._trade_queue,
+            book_queue=self._book_queue,
+            ws_url=self._ws_url,
+            queue_maxsize=self._queue_maxsize,
+            recorder=self._recorder,
+        )
+        log.info(
+            "ws_pool_socket_init",
+            socket_index=index,
+            num_assets=len(asset_ids),
+        )
+        return sock

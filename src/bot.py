@@ -34,7 +34,7 @@ from src.data.market_lifecycle import MarketLifecycleManager
 from src.data.market_scorer import compute_score
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import L2OrderBookAdapter, OrderbookTracker, SharedBookReaderAdapter
-from src.data.websocket_client import MarketWebSocket, TradeEvent
+from src.data.websocket_client import MarketWebSocket, MarketWebSocketPool, TradeEvent
 from src.data.l2_book import BookState, L2OrderBook
 from src.data.l2_websocket import L2WebSocket
 from src.monitoring.telegram import TelegramAlerter
@@ -51,6 +51,7 @@ from src.signals.resolution_probability import (
 from src.signals.signal_framework import (
     BaseSignal,
     CompositeSignalEvaluator,
+    MetaStrategyController,
     OrderbookImbalanceSignal,
     SignalResult,
     SpreadCompressionSignal,
@@ -191,6 +192,9 @@ class TradingBot:
         # SI-1: Per-market regime detectors
         self._regime_detectors: dict[str, RegimeDetector] = {}  # condition_id → detector
 
+        # SI-6: Meta-strategy hybrid controller (regime-weighted master switch)
+        self._meta_controller = MetaStrategyController()
+
         # V3: Per-market drift signal detectors
         self._drift_detectors: dict[str, MeanReversionDrift] = {}  # condition_id → detector
         self._drift_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
@@ -212,7 +216,7 @@ class TradingBot:
         self._latest_z: float = 0.0        # tracks most recent panic Z-score
         self._trade_queue: asyncio.Queue[TradeEvent] = asyncio.Queue(maxsize=1000)
         self._book_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
-        self._ws: MarketWebSocket | None = None
+        self._ws: MarketWebSocketPool | None = None
         self._l2_ws: L2WebSocket | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop_task: asyncio.Task | None = None
@@ -384,7 +388,7 @@ class TradingBot:
 
         # 5. Launch concurrent tasks
         self._running = True
-        self._ws = MarketWebSocket(
+        self._ws = MarketWebSocketPool(
             all_asset_ids, self._trade_queue, book_queue=self._book_queue,
             recorder=self._recorder,
         )
@@ -519,6 +523,8 @@ class TradingBot:
         # Wire stealth executor into PositionManager for sliced probe scale-ups
         if self._stealth is not None:
             self.positions._stealth = self._stealth
+        # Wire OHLCV aggregators for POV volume lookups in scale_probe_to_full
+        self.positions._ohlcv_aggs = self._no_aggs
 
         self._tasks = [
             asyncio.create_task(self._ws.start(), name="ws"),
@@ -1459,13 +1465,17 @@ class TradingBot:
                     )
 
             sig = detector.evaluate(bar, no_best_ask=no_best_ask, whale_confluence=whale)
+            _regime_score = regime_det.regime_score if regime_det else 0.5
             if sig:
-                # SI-1: Regime gate — suppress panic in trending regime
-                if regime_det and not regime_det.is_mean_revert:
+                # SI-6: Meta-strategy controller — regime-weighted master switch
+                meta_decision = self._meta_controller.evaluate("panic", _regime_score)
+                if meta_decision.vetoed:
                     log.info(
-                        "regime_gate_suppressed",
+                        "meta_controller_veto",
                         market_id=market_info.condition_id[:16],
-                        regime_score=round(regime_det.regime_score, 3),
+                        signal_type="panic",
+                        regime_score=round(_regime_score, 3),
+                        reason=meta_decision.veto_reason,
                     )
                 elif not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
                     log.info(
@@ -1481,6 +1491,7 @@ class TradingBot:
                             "regime_mean_revert": (
                                 regime_det.is_mean_revert if regime_det else False
                             ),
+                            "meta_weight": meta_decision.weight,
                         },
                     )
 
@@ -1508,7 +1519,18 @@ class TradingBot:
                             l2_reliable=l2_ok,
                         )
                         if drift_sig and drift_sig.direction == "BUY_NO":
-                            if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+                            drift_meta = self._meta_controller.evaluate(
+                                "drift", _regime_score,
+                            )
+                            if drift_meta.vetoed:
+                                log.info(
+                                    "meta_controller_veto",
+                                    market_id=market_info.condition_id[:16],
+                                    signal_type="drift",
+                                    regime_score=round(_regime_score, 3),
+                                    reason=drift_meta.veto_reason,
+                                )
+                            elif not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
                                 log.info(
                                     "stop_loss_cooldown_suppressed_drift",
                                     market_id=market_info.condition_id[:16],
@@ -1519,11 +1541,12 @@ class TradingBot:
                                 await self._on_panic_signal(
                                     drift_sig, no_agg, market_info,
                                     signal_metadata={
-                                        "signal_source": "drift",  # Flaw 2: suppresses regime discount
-                                        "source": "drift",         # legacy compat
+                                        "signal_source": "drift",
+                                        "source": "drift",
                                         "drift_score": drift_sig.score,
                                         "regime_mean_revert": True,
                                         "spread_compressed": False,
+                                        "meta_weight": drift_meta.weight,
                                     },
                                 )
 
@@ -1895,6 +1918,28 @@ class TradingBot:
                 )
                 return
 
+        # ── SI-6: Meta-strategy controller for RPE ───────────────────
+        rpe_regime_det = self._regime_detectors.get(market.condition_id)
+        _rpe_regime_score = rpe_regime_det.regime_score if rpe_regime_det else 0.5
+        rpe_meta = self._meta_controller.evaluate("rpe", _rpe_regime_score)
+        if rpe_meta.vetoed:
+            log.info(
+                "meta_controller_veto",
+                market_id=market.condition_id[:16],
+                signal_type="rpe",
+                regime_score=round(_rpe_regime_score, 3),
+                reason=rpe_meta.veto_reason,
+            )
+            return
+
+        rpe_signal_meta = dict(meta)
+        rpe_signal_meta["meta_weight"] = rpe_meta.weight
+
+        # ── Fast-Strike: pass latency health for taker path ──────
+        _lat_healthy = (
+            self.latency_guard.state == LatencyState.HEALTHY
+        )
+
         pos = await self.positions.open_rpe_position(
             market_id=market.condition_id,
             yes_asset_id=market.yes_token_id,
@@ -1907,7 +1952,8 @@ class TradingBot:
             days_to_resolution=days_to_resolution,
             fee_enabled=fee_enabled,
             book=book,
-            signal_metadata=meta,
+            signal_metadata=rpe_signal_meta,
+            latency_healthy=_lat_healthy,
         )
 
         # ── Model-only probe routing (Dynamic Prior Engine) ──────────
@@ -1966,7 +2012,15 @@ class TradingBot:
                 )
 
         if pos:
-            if book and book.has_data:
+            # Fast-strike positions skip the chaser — order was placed
+            # as a taker to immediately hit stale liquidity.
+            if getattr(pos, 'fast_strike', False):
+                log.info(
+                    "rpe_fast_strike_no_chaser",
+                    pos_id=pos.id,
+                    market=market.condition_id,
+                )
+            elif book and book.has_data:
                 chaser_task = asyncio.create_task(
                     self._entry_chaser_flow(pos, book),
                     name=f"chaser_entry_{pos.id}",
@@ -1977,7 +2031,8 @@ class TradingBot:
     async def _rpe_crypto_retrigger_loop(self) -> None:
         """Periodically check if BTC spot has moved enough to re-evaluate RPE.
 
-        Runs every 5 seconds.  When the spot price changes by more than
+        Runs every 200ms to maximise latency edge against stale CLOB
+        orders.  When the spot price changes by more than
         ``rpe_crypto_retrigger_cents`` since the last evaluation, re-runs
         the RPE for all active crypto-tagged markets.  This catches
         mispricings that appear between 1-minute bar closes.
@@ -1985,7 +2040,7 @@ class TradingBot:
         Does NOT open a new WebSocket — reuses the same ``price_fn``
         that the CryptoPriceModel already reads from.
         """
-        interval_s = 5.0
+        interval_s = 0.2
         while self._running:
             await asyncio.sleep(interval_s)
             try:
