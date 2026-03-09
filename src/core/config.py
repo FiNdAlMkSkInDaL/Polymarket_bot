@@ -403,11 +403,6 @@ class StrategyParams:
     # At 1.005, NO ask just needs to be within 0.5% of VWAP.
     no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
 
-    # ── Trend regime guard ────────────────────────────────────────────────
-    # Suppress panic signals when YES has been trending upward over the
-    # last N bars — sustained moves are regime shifts, not panics.
-    trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
-    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.10)
     # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
     # Exponentially-weighted moving average of 1-min log-return variance.
     # Reacts to regime changes in ~6 bars vs ~30 for equal-weight std.

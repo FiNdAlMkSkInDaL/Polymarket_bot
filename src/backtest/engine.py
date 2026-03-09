@@ -299,7 +299,7 @@ class BacktestEngine:
         """Handle an L2 delta or snapshot."""
         self._has_real_book = True
         # Update the matching engine's historical book mirror
-        self.matching_engine.on_book_update(event.data)
+        self.matching_engine.on_book_update(event.data, current_time=event.timestamp)
 
         # Check if resting maker orders are still viable
         self.matching_engine.check_maker_viability()
@@ -350,7 +350,7 @@ class BacktestEngine:
                 "event_type": "book_snapshot",
                 "bids": [{"price": synth_bid, "size": 9999.0}],
                 "asks": [{"price": synth_ask, "size": 9999.0}],
-            })
+            }, current_time=event.timestamp)
             # Track per-asset synthetic BBO so strategies can query the
             # correct bid/ask for a specific token, even when the shared
             # matching engine reflects a different token's last trade.

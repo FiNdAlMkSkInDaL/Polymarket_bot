@@ -286,15 +286,14 @@ def test_process_resilience() -> bool:
 
     t0 = time.monotonic()
     try:
-        # First read with no cached snapshot should raise IPCReadError
+        # First read with no cached snapshot returns empty SharedBookSnapshot
         snap = reader.read_header()
-        # If it returned, check it's valid (from before the crash)
         hung = False
-        got_data = True
+        got_data = snap.seq > 0
     except Exception as e:
         hung = False
         got_data = False
-        print(f"  Reader raised (expected on first read): {type(e).__name__}: {e}")
+        print(f"  Reader raised (unexpected): {type(e).__name__}: {e}")
 
     elapsed = time.monotonic() - t0
     print(f"  Reader returned in {elapsed*1000:.2f} ms (did not hang)")

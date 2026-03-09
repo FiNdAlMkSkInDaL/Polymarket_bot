@@ -308,7 +308,7 @@ class PositionManager:
         """
         req_id = uuid.uuid4().hex[:12]
         positions_data = [
-            (p.market_id, p.entry_price * p.entry_size, p.entry_side)
+            (p.market_id, p.entry_price * p.entry_size, p.trade_side)
             for p in open_positions
         ]
         try:

@@ -577,3 +577,119 @@ class TestAccessors:
         assert me.best_ask == 0.0
         assert me.get_all_orders() == []
         assert me.get_open_orders() == []
+
+
+class TestVirtualLiquidityDebt:
+    """Synthetic market impact — consumed volume persists across book updates."""
+
+    def setup_method(self):
+        # Short recovery so decay is testable at small time deltas
+        self.me = MatchingEngine(
+            latency_ms=0.0, fee_max_pct=1.56, impact_recovery_ms=5000.0,
+        )
+        self._snapshot = {
+            "event_type": "snapshot",
+            "bids": [{"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "100"}, {"price": "0.56", "size": "200"}],
+        }
+        self.me.on_book_update(self._snapshot, current_time=0.0)
+
+    def test_debt_reduces_available_on_next_update(self):
+        """After a taker fill, the next book update should show reduced liquidity."""
+        # Consume 60 of the 100 at 0.55
+        order = self.me.submit_order(
+            OrderSide.BUY, 0.55, 60.0, order_type="market", current_time=1.0,
+        )
+        fills = self.me.activate_pending_orders(1.0)
+        assert len(fills) == 1
+        assert fills[0].size == 60.0
+
+        # Re-apply the same historical snapshot at t=1.5 (500ms later, minimal decay)
+        self.me.on_book_update(self._snapshot, current_time=1.5)
+
+        # The book should show ~40 at 0.55 (100 - 60 * exp(-0.5/5) ≈ 100 - 54.3 = 45.7)
+        avail = self.me.depth_at_price(OrderSide.SELL, 0.55)
+        assert avail < 100.0, "Debt should reduce available liquidity"
+        assert avail > 30.0, "Debt hasn't fully decayed yet"
+
+    def test_debt_decays_over_time(self):
+        """Virtual debt should decay exponentially toward zero."""
+        import math
+
+        # Consume all 100 at 0.55
+        self.me.submit_order(
+            OrderSide.BUY, 0.55, 100.0, order_type="market", current_time=1.0,
+        )
+        self.me.activate_pending_orders(1.0)
+
+        # Re-apply after 25 seconds (5 × tau) — debt decayed to ~0.7%
+        self.me.on_book_update(self._snapshot, current_time=26.0)
+        avail = self.me.depth_at_price(OrderSide.SELL, 0.55)
+        # exp(-25/5) = exp(-5) ≈ 0.0067 → debt ≈ 0.67 → avail ≈ 99.3
+        assert avail > 95.0, f"Debt should be nearly gone after 5τ, got {avail}"
+
+    def test_debt_accumulates_across_fills(self):
+        """Multiple fills at the same level stack their debt."""
+        # First fill: consume 30
+        self.me.submit_order(
+            OrderSide.BUY, 0.55, 30.0, order_type="market", current_time=1.0,
+        )
+        self.me.activate_pending_orders(1.0)
+
+        # Re-apply book and fill again at t=2
+        self.me.on_book_update(self._snapshot, current_time=2.0)
+        self.me.submit_order(
+            OrderSide.BUY, 0.55, 30.0, order_type="market", current_time=2.0,
+        )
+        self.me.activate_pending_orders(2.0)
+
+        # Re-apply at t=2.5
+        self.me.on_book_update(self._snapshot, current_time=2.5)
+        avail = self.me.depth_at_price(OrderSide.SELL, 0.55)
+        # Total debt ~ 30*exp(-1.5/5) + 30*exp(-0.5/5) ≈ 22.2 + 27.1 = 49.3
+        assert avail < 60.0, f"Accumulated debt should reduce level significantly, got {avail}"
+
+    def test_sell_side_debt(self):
+        """Debt works symmetrically for sell-side fills."""
+        self.me.submit_order(
+            OrderSide.SELL, 0.45, 50.0, order_type="market", current_time=1.0,
+        )
+        self.me.activate_pending_orders(1.0)
+
+        # Re-apply same snapshot
+        self.me.on_book_update(self._snapshot, current_time=1.5)
+        avail = self.me.depth_at_price(OrderSide.BUY, 0.45)
+        assert avail < 100.0, "Sell-side debt should reduce bid liquidity"
+
+    def test_reset_clears_debt(self):
+        """reset() must wipe liquidity debt."""
+        self.me.submit_order(
+            OrderSide.BUY, 0.55, 50.0, order_type="market", current_time=1.0,
+        )
+        self.me.activate_pending_orders(1.0)
+        self.me.reset()
+
+        self.me.on_book_update(self._snapshot, current_time=2.0)
+        avail = self.me.depth_at_price(OrderSide.SELL, 0.55)
+        assert avail == 100.0, "After reset, no debt should remain"
+
+    def test_impact_skips_exhausted_level(self):
+        """When debt exceeds level size, taker should skip to next level."""
+        # Consume all 100 at 0.55
+        self.me.submit_order(
+            OrderSide.BUY, 0.56, 100.0, order_type="market", current_time=1.0,
+        )
+        self.me.activate_pending_orders(1.0)
+
+        # Re-apply book immediately (no decay)
+        self.me.on_book_update(self._snapshot, current_time=1.001)
+
+        # Submit another buy — should skip exhausted 0.55 and fill at 0.56
+        order2 = self.me.submit_order(
+            OrderSide.BUY, 0.56, 10.0, order_type="market", current_time=1.001,
+        )
+        fills = self.me.activate_pending_orders(1.001)
+        assert len(fills) >= 1
+        # First fill should NOT be at 0.55 (exhausted by debt)
+        for f in fills:
+            assert f.price >= 0.55

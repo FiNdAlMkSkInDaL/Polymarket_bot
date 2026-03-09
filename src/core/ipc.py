@@ -64,10 +64,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-
-class IPCReadError(Exception):
-    """Raised when a shared-memory read cannot return consistent data."""
-
 # ── Layout constants ───────────────────────────────────────────────────────
 MAX_LEVELS = 50
 _HEADER_FMT = "<QddddddddBBB5xHHII"  # little-endian
@@ -310,7 +306,6 @@ class SharedBookReader:
     __slots__ = (
         "asset_id", "_shm", "_buf",
         "_last_seq", "_last_snapshot",
-        "_contention_warnings",
     )
 
     def __init__(self, asset_id: str, shm_name: str) -> None:
@@ -319,7 +314,6 @@ class SharedBookReader:
         self._buf = self._shm.buf
         self._last_seq: int = 0
         self._last_snapshot: SharedBookSnapshot | None = None
-        self._contention_warnings: int = 0
 
     # ── internal: resolve active block offset ──────────────────────────────
     @staticmethod
@@ -385,21 +379,10 @@ class SharedBookReader:
             self._last_snapshot = snap
             return snap
 
-        # ── all retries exhausted ─────────────────────────────────────────
-        self._contention_warnings += 1
-        if self._contention_warnings % 100 == 1:
-            _log.warning(
-                "high_contention_warning",
-                extra={
-                    "asset_id": self.asset_id,
-                    "total_warnings": self._contention_warnings,
-                },
-            )
+        # ── all retries exhausted (near-impossible with double buffering) ─
         if self._last_snapshot is not None:
             return self._last_snapshot
-        raise IPCReadError(
-            f"Seqlock contention on first read for {self.asset_id}"
-        )
+        return SharedBookSnapshot(asset_id=self.asset_id)
 
     def read_full(self) -> SharedBookSnapshot:
         """Read header + all bid/ask levels (lock-free Seqlock)."""
@@ -477,21 +460,10 @@ class SharedBookReader:
             self._last_snapshot = snap
             return snap
 
-        # ── all retries exhausted ─────────────────────────────────────────
-        self._contention_warnings += 1
-        if self._contention_warnings % 100 == 1:
-            _log.warning(
-                "high_contention_warning",
-                extra={
-                    "asset_id": self.asset_id,
-                    "total_warnings": self._contention_warnings,
-                },
-            )
+        # ── all retries exhausted (near-impossible with double buffering) ─
         if self._last_snapshot is not None:
             return self._last_snapshot
-        raise IPCReadError(
-            f"Seqlock contention on first read for {self.asset_id}"
-        )
+        return SharedBookSnapshot(asset_id=self.asset_id)
 
     @property
     def last_seq(self) -> int:

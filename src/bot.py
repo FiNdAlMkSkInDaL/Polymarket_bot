@@ -789,6 +789,71 @@ class TradingBot:
             loop = self._loop or asyncio.get_running_loop()
             self._stop_task = loop.create_task(self.stop())
 
+    async def _suspend_and_reset(self) -> None:
+        """Non-fatal circuit-breaker response: pause chasers, reset WS, resume.
+
+        Unlike ``stop()``, this keeps the main process and all risk-management
+        state alive.  Only the WebSocket transport is torn down and rebuilt
+        after a 30-second cooldown.
+        """
+        log.warning("suspend_and_reset_begin")
+
+        # 1. Pause order chasers via the fast-kill event
+        self._fast_kill_event.clear()
+
+        # 2. Cleanly stop the WebSocket pool
+        if self._ws is not None:
+            try:
+                await self._ws.stop()
+            except Exception:
+                log.warning("ws_stop_error_during_reset", exc_info=True)
+
+        # Cancel the WS task from self._tasks (if present)
+        for task in list(self._tasks):
+            if task.get_name() == "ws" and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=3,
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+
+        # 3. Cooldown penalty
+        log.info("suspend_cooldown_start", cooldown_s=30)
+        await asyncio.sleep(30)
+
+        # 4. Re-initialise WebSocket connections with the same asset set
+        if self._ws is not None:
+            asset_ids = self._ws.asset_ids
+            self._ws = MarketWebSocketPool(
+                asset_ids,
+                self._trade_queue,
+                book_queue=self._book_queue,
+                recorder=self._recorder,
+            )
+            ws_task = asyncio.create_task(self._ws.start(), name="ws")
+            # Replace the old WS task in self._tasks
+            self._tasks = [
+                t for t in self._tasks if t.get_name() != "ws" or not t.done()
+            ]
+            self._tasks.append(ws_task)
+
+        # 5. Reset the circuit breaker so it can trip again on new errors
+        self._trade_loop_breaker.reset()
+
+        # 6. Resume chasers
+        self._fast_kill_event.set()
+
+        log.warning("suspend_and_reset_complete")
+        try:
+            await self.telegram.send(
+                "✅ <b>WS Hard-Reset complete</b> — chasers resumed, "
+                "risk state preserved."
+            )
+        except Exception:
+            pass
+
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
         if not self._running:
@@ -1017,14 +1082,14 @@ class TradingBot:
                     log.critical(
                         "trade_processor_circuit_breaker_tripped",
                         errors_in_window=self._trade_loop_breaker.recent_errors,
-                        msg="Too many unexpected errors in trade processor — initiating shutdown",
+                        msg="Too many unexpected errors in trade processor — suspending & resetting WS",
                     )
                     await self.telegram.send(
-                        "🔴 <b>CIRCUIT BREAKER</b>: trade_processor tripped "
-                        "(5 unexpected errors in 60s) — shutting down."
+                        "🟡 <b>CIRCUIT BREAKER</b>: trade_processor tripped "
+                        "(5 unexpected errors in 60s) — suspend & hard-reset WS."
                     )
-                    self._schedule_stop()
-                    return
+                    await self._suspend_and_reset()
+                    # After reset, continue processing
 
     async def _process_book_updates(self) -> None:
         """Consume orderbook WS events and update trackers.

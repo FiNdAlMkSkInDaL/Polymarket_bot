@@ -22,6 +22,7 @@ Uses Polymarket's dynamic fee curve:  ``f = f_max × 4 × p × (1 − p)``
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -49,6 +50,13 @@ class Fill:
     timestamp: float
     is_maker: bool
     side: OrderSide
+
+
+@dataclass(slots=True)
+class _LiquidityDebt:
+    """Consumed volume at a price level, subject to exponential decay."""
+    volume: float
+    timestamp: float
 
 
 @dataclass
@@ -139,16 +147,25 @@ class MatchingEngine:
         latency_ms: float = 150.0,
         fee_max_pct: float = 1.56,
         fee_enabled: bool = True,
+        impact_recovery_ms: float = 5000.0,
     ) -> None:
         self._latency_s = latency_ms / 1000.0
         self._f_max = fee_max_pct / 100.0
         self._fee_enabled = fee_enabled
+        self._impact_tau = impact_recovery_ms / 1000.0  # decay time constant
 
-        # ── Historical book mirror ─────────────────────────────────────
+        # ── Historical book mirror ─────────────────────────────
         # Uses plain SortedDict directly (lighter than full L2OrderBook
         # since we don't need async callbacks/desync machinery).
         self._bids: SortedDict = SortedDict()   # neg_price → size
         self._asks: SortedDict = SortedDict()   # price → size
+
+        # ── Virtual Liquidity Debt (Synthetic Market Impact) ───────────
+        # Tracks volume consumed by simulated orders, persists across book
+        # updates, and decays exponentially to simulate MM replenishment.
+        self._ask_debt: dict[float, list[_LiquidityDebt]] = {}  # price → debts
+        self._bid_debt: dict[float, list[_LiquidityDebt]] = {}  # price → debts
+        self._last_time: float = 0.0
 
         # ── Simulated orders ───────────────────────────────────────────
         self._pending: dict[str, SimOrder] = {}   # not yet past latency
@@ -209,11 +226,14 @@ class MatchingEngine:
     #  Book updates (fed from historical data)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def on_book_update(self, event_data: dict) -> None:
+    def on_book_update(self, event_data: dict, *, current_time: float | None = None) -> None:
         """Apply an L2 delta or snapshot to the historical book mirror.
 
         Accepts the same payload format as ``L2OrderBook.on_delta()`` or
         ``L2OrderBook._apply_snapshot()``.
+
+        After applying historical data the virtual liquidity debt is
+        subtracted so that subsequent reads see impact-adjusted levels.
         """
         event_type = event_data.get("event_type", "")
 
@@ -222,6 +242,8 @@ class MatchingEngine:
         else:
             self._apply_delta(event_data)
 
+        ts = current_time if current_time is not None else self._last_time
+        self._apply_liquidity_debt(ts)
         self._refresh_bbo()
 
     def _apply_snapshot(self, data: dict) -> None:
@@ -423,8 +445,11 @@ class MatchingEngine:
         """Walk the opposite side of the book to fill a taker order.
 
         Computes realistic VWAP slippage by consuming liquidity level-by-level.
+        Virtual liquidity debt is subtracted from available size and new
+        debt is recorded for each fill.
         """
         fills: list[Fill] = []
+        self._last_time = current_time
 
         if order.side == OrderSide.BUY:
             # Walk the asks (ascending)
@@ -436,7 +461,10 @@ class MatchingEngine:
                 if order.order_type == "limit" and ask_price > order.price:
                     break  # can't fill above our limit
 
-                avail = self._asks[ask_price]
+                raw = self._asks[ask_price]
+                avail = max(0.0, raw - self._decayed_debt(self._ask_debt.get(ask_price), current_time))
+                if avail < 1e-9:
+                    continue  # level fully consumed by prior impact
                 fill_qty = min(order.remaining, avail)
 
                 fee = self._compute_fee(ask_price, fill_qty)
@@ -453,8 +481,11 @@ class MatchingEngine:
                 order.fills.append(fill)
                 order.remaining -= fill_qty
 
-                # Reduce book liquidity
-                remaining_at_level = avail - fill_qty
+                # Record synthetic market impact debt
+                self._record_debt(self._ask_debt, ask_price, fill_qty, current_time)
+
+                # Reduce book liquidity (for within-tick consistency)
+                remaining_at_level = raw - fill_qty
                 if remaining_at_level <= 1e-9:
                     levels_to_remove.append(ask_price)
                 else:
@@ -474,7 +505,10 @@ class MatchingEngine:
                 if order.order_type == "limit" and bid_price < order.price:
                     break  # can't fill below our limit
 
-                avail = self._bids[neg_price]
+                raw = self._bids[neg_price]
+                avail = max(0.0, raw - self._decayed_debt(self._bid_debt.get(bid_price), current_time))
+                if avail < 1e-9:
+                    continue  # level fully consumed by prior impact
                 fill_qty = min(order.remaining, avail)
 
                 fee = self._compute_fee(bid_price, fill_qty)
@@ -491,7 +525,10 @@ class MatchingEngine:
                 order.fills.append(fill)
                 order.remaining -= fill_qty
 
-                remaining_at_level = avail - fill_qty
+                # Record synthetic market impact debt
+                self._record_debt(self._bid_debt, bid_price, fill_qty, current_time)
+
+                remaining_at_level = raw - fill_qty
                 if remaining_at_level <= 1e-9:
                     levels_to_remove.append(neg_price)
                 else:
@@ -705,7 +742,87 @@ class MatchingEngine:
             fill_price, fee_enabled=self._fee_enabled, f_max=self._f_max
         )
         return fill_size * fill_price * rate
+    # ═════════════════════════════════════════════════════════════════════
+    #  Virtual Liquidity Debt (Synthetic Market Impact)
+    # ═════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _record_debt(
+        debt_map: dict[float, list[_LiquidityDebt]],
+        price: float,
+        volume: float,
+        timestamp: float,
+    ) -> None:
+        """Record consumed volume as liquidity debt at *price*."""
+        if volume <= 0:
+            return
+        if price not in debt_map:
+            debt_map[price] = []
+        debt_map[price].append(_LiquidityDebt(volume=volume, timestamp=timestamp))
+
+    def _decayed_debt(self, debts: list[_LiquidityDebt] | None, now: float) -> float:
+        """Sum decayed debt entries at a single price level."""
+        if not debts:
+            return 0.0
+        tau = self._impact_tau
+        if tau <= 0:
+            return 0.0
+        total = 0.0
+        for d in debts:
+            elapsed = now - d.timestamp
+            if elapsed < 0:
+                elapsed = 0.0
+            total += d.volume * math.exp(-elapsed / tau)
+        return total
+
+    def _apply_liquidity_debt(self, current_time: float) -> None:
+        """Subtract decayed virtual debt from the book after a historical update.
+
+        Called inside ``on_book_update`` so that the book levels seen by
+        subsequent order activations reflect our simulated market impact.
+        Expired debt entries are pruned.
+        """
+        tau = self._impact_tau
+        # Ask debt
+        for price in list(self._ask_debt):
+            debt = self._decayed_debt(self._ask_debt[price], current_time)
+            if debt < 1e-9:
+                del self._ask_debt[price]
+                continue
+            if price in self._asks:
+                adjusted = self._asks[price] - debt
+                if adjusted < 1e-9:
+                    del self._asks[price]
+                else:
+                    self._asks[price] = adjusted
+            # Prune entries decayed below 1% of original
+            self._ask_debt[price] = [
+                d for d in self._ask_debt[price]
+                if d.volume * math.exp(-(current_time - d.timestamp) / tau) > d.volume * 0.01
+            ] if tau > 0 else []
+            if not self._ask_debt[price]:
+                del self._ask_debt[price]
+
+        # Bid debt
+        for price in list(self._bid_debt):
+            debt = self._decayed_debt(self._bid_debt[price], current_time)
+            if debt < 1e-9:
+                del self._bid_debt[price]
+                continue
+            neg_price = -price
+            if neg_price in self._bids:
+                adjusted = self._bids[neg_price] - debt
+                if adjusted < 1e-9:
+                    del self._bids[neg_price]
+                else:
+                    self._bids[neg_price] = adjusted
+            # Prune entries decayed below 1% of original
+            self._bid_debt[price] = [
+                d for d in self._bid_debt[price]
+                if d.volume * math.exp(-(current_time - d.timestamp) / tau) > d.volume * 0.01
+            ] if tau > 0 else []
+            if not self._bid_debt[price]:
+                del self._bid_debt[price]
     # ═══════════════════════════════════════════════════════════════════════
     #  Accessors
     # ═══════════════════════════════════════════════════════════════════════
@@ -734,12 +851,14 @@ class MatchingEngine:
         return sorted(fills, key=lambda f: f.timestamp)
 
     def reset(self) -> None:
-        """Wipe all state (book + orders)."""
+        """Wipe all state (book + orders + liquidity debt)."""
         self._bids.clear()
         self._asks.clear()
         self._pending.clear()
         self._active_makers.clear()
         self._all_orders.clear()
+        self._ask_debt.clear()
+        self._bid_debt.clear()
         self._best_bid = 0.0
         self._best_ask = 0.0
         self._id_counter = itertools.count(1)

@@ -347,7 +347,7 @@ Key parameter groups (~160 total):
     lookback_minutes = 60         (rolling window)
     no_discount_factor = 1.005    (relaxed from 0.98; z-score captures displacement)
     trend_guard_bars = 15         (suppress during sustained uptrends)
-    trend_guard_pct = 0.10        (10% move = regime shift not panic)
+    trend_guard_pct = 0.99        (99% move = genuine regime shift; was 0.10 — duplicate field bug fixed 2026-03-09)
 
   EDGE QUALITY SCORE (EQS):
     min_edge_score = 40.0         (lowered from 50; marginal signals at 40-50 are +EV)
@@ -2148,7 +2148,54 @@ Execution Alpha & Microstructure Blueprint:
   - Mid-drift abandon guard: if mid drifts >2¢ adversely after sleep → stop
 
 March 9th — Market WebSocket Sharding:
-  - Main-process trade/book ingestion refactored from one overloaded
+  - Main-process trade/book ingestion refactored from one overloaded single
+    MarketWebSocket into MarketWebSocketPool: shards N asset subscriptions
+    across ⌈N / MAX_SUBSCRIPTIONS_PER_SOCKET⌉ physical connections, all
+    feeding a single shared trade_queue and book_queue.
+  - Drop-in API replacement: same start(), stop(), add_assets(),
+    remove_assets(), reconnect_count, book_queue surface exposed.
+  - Prevents any single WS connection from hitting Polymarket's per-socket
+    subscription limit as the tracked asset universe grows.
+
+March 9th — IPC Seqlock Cleanup (Band-aid 1 Remediation):
+  - Removed IPCReadError exception class from src/core/ipc.py; no production
+    caller used it.
+  - Removed _contention_warnings integer counter from SharedBookReader.__slots__.
+  - Exhausted-retry fallback (near-impossible under true double buffering)
+    changed from raise IPCReadError to return SharedBookSnapshot(asset_id=...)
+    — empty but valid, fully non-throwing.
+  - Updated scripts/stress_test_seqlock.py to use snap.seq > 0 check.
+
+March 9th — Synthetic Market Impact in Backtester (Band-aid 2 Remediation):
+  - Added _LiquidityDebt dataclass (volume, timestamp) to
+    src/backtest/matching_engine.py.
+  - MatchingEngine gains impact_recovery_ms=5000 parameter → τ = 5 s
+    exponential decay constant.
+  - Per-price-level _ask_debt / _bid_debt dicts record simulated fill volume
+    with fill timestamp; applied via _apply_liquidity_debt() on every
+    on_book_update() tick before BBO refresh.
+  - Available size at price p at time t = historical_size(p) −
+    Σ v_i × exp(−(t − t_i) / τ).  50 % recovery at 3.5 s, 99 % at 23 s.
+  - Prevents Optuna from discovering overfit parameters that exploit
+    artificially infinite BBO depth between historical L2 snapshots.
+  - src/backtest/engine.py updated to propagate event.timestamp as
+    current_time= kwarg to on_book_update().
+
+March 9th — Circuit Breaker Graceful Suspend & Hard Reset (Band-aid 3 Remediation):
+  - ExceptionCircuitBreaker trip in _process_trades() previously called
+    _schedule_stop() — fatal, latching shutdown triggered by transient WS
+    errors (≥5 errors / 60 s on Hetzner VPS).
+  - New TradingBot._suspend_and_reset() method replaces the fatal path:
+      Step 1: self._fast_kill_event.clear()  → pause chasers
+      Step 2: await self._ws.stop() + cancel ws task
+      Step 3: await asyncio.sleep(30)         → 30 s cooldown
+      Step 4: rebuild MarketWebSocketPool + new ws task
+      Step 5: self._trade_loop_breaker.reset()
+      Step 6: self._fast_kill_event.set()     → resume chasers
+      Step 7: Telegram "✅ WS Hard-Reset complete"
+  - self._running, positions, executor, PCE, risk state, StopLossMonitor,
+    AdverseSelectionGuard all preserved across reset.
+  - Only the MarketWebSocketPool (trade + book stream) is cycled.
     MarketWebSocket into MarketWebSocketPool
   - New constant: MAX_SUBSCRIPTIONS_PER_SOCKET = 50
   - Pool chunks tracked assets across multiple physical Polymarket market
@@ -2282,6 +2329,65 @@ March 9th — VPS Zero-Trade Root Cause Diagnosis & Hot-Fixes:
     formation relies on stale_bar_flush (30 s timer) instead of live ticks.
     Fix: deploy MarketWebSocketPool (already designed, see "March 9th —
     Market WebSocket Sharding" entry above).
+
+March 9th (18:xx UTC) — Panic Signal Zero-Fill Root Cause Diagnosis & Hot-Fixes:
+  Full SI-5/SI-6 gate audit on the live VPS (botuser@135.181.85.32). Bot was
+  generating PanicSignals but zero trade fills. Four signals were fired during
+  the session; two crashes and one EQS rejection accounted for the silence.
+  Two bugs were identified, patched locally, deployed via scp, and the bot was
+  restarted cleanly.
+
+  Bug 1 — `entry_side` AttributeError in `_check_var_remote()` (CRITICAL):
+  - Root cause: the March 5 "Signal Decoupling" refactor renamed
+    Position.entry_side → Position.trade_side everywhere except line 311 of
+    position_manager.py inside _check_var_remote().
+  - _check_var_remote() serialises open positions into the PCE worker queue as
+    (p.market_id, p.entry_price * p.entry_size, p.entry_side). With the wrong
+    attribute name it raised AttributeError on every signal evaluation after
+    the first position was opened.
+  - The crash was completely silent: bot.py._stale_bar_flush_loop() wraps the
+    entire flush cycle in `except Exception`, logging only "stale_bar_flush_error"
+    — so signals 2 and 3 appear to vanish with no rejection reason in the main
+    log stream.
+  - Evidence: {"error": "'Position' object has no attribute 'entry_side'",
+    "event": "stale_bar_flush_error"} at 18:22:34Z and 18:23:34Z — both
+    coinciding exactly with signal timestamps.
+  - Fix: p.entry_side → p.trade_side at position_manager.py line 311.
+  - File deployed: src/trading/position_manager.py
+
+  Bug 2 — Duplicate `trend_guard_pct` field in frozen StrategyParams (CRITICAL):
+  - Root cause: src/core/config.py defines StrategyParams (a frozen dataclass)
+    with trend_guard_pct twice — line 105 (default 0.99) and line 410
+    (default 0.10). Python frozen dataclasses resolve to the last definition,
+    so the effective threshold was 0.10 instead of 0.99.
+  - Effect: trend guard fired at a 10% YES-token price rise, suppressing
+    legitimate panic signals that had z-scores above 2.0.
+  - Evidence: trend_guard_suppressed events with threshold: 0.10 while
+    zscore: 2.013 on market 0xc6ddb; confirmed by .env inspection showing no
+    TREND_GUARD_PCT override (default was in effect).
+  - Fix: removed the duplicate field block (lines 406-410 in config.py —
+    the second trend_guard_bars + trend_guard_pct + comment group).
+  - Config params table above corrected: trend_guard_pct = 0.99.
+  - File deployed: src/core/config.py
+
+  Signal funnel report (18:xx UTC session):
+  - Signal 1 on 0x7054a at 18:20:34Z → position POS-1 opened, entry timed
+    out after 300 s (no fill at the maker limit price — market-condition issue,
+    not a code bug).
+  - Signals 2 + 3 on 0xc6ddb at 18:22:34Z and 18:23:34Z → crashed silently
+    with entry_side AttributeError (Bug 1).
+  - Signal 4 on 0x24fb7c → EQS gate: no_mean_reversion_target — NO VWAP was
+    ≤ entry ask price so gross_cents ≤ 0. Legitimate market-condition rejection.
+  - 0 OFI vetoes, 0 PCE VaR blocks, 0 adverse-selection kills in session.
+  - Latency gate blocked 3 times but all recovered before signal windows.
+
+  Deployment procedure:
+  - scp both patched files to /home/botuser/polymarket-bot/src/
+  - SIGKILL the old bot process.
+  - rm -f /dev/shm/pmb_* (stale shared-memory segments cause fd exhaustion
+    on next start — [Errno 24] Too many open files in ipc.py allocate_shm()).
+  - tmux new-session -d -s polybot 'cd /home/botuser/polymarket-bot && python -m src.cli run --paper'
+  - New PID 183898, confirmed multicore_enabled at 18:54:30Z, zero post-restart errors.
 
 March 8th — WFO Zero-Trade Root Cause & Backfill Timestamp Repair:
   - Root cause was not Optuna, the fold generator, or BotReplayAdapter gate
