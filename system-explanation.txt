@@ -103,7 +103,7 @@ src/                      — main bot package
 
   data/                   — market data pipeline
     types.py              — Level dataclass (price, size)
-    websocket_client.py   — MarketWebSocket (trade + book events)
+      websocket_client.py   — MarketWebSocket + MarketWebSocketPool (sharded trade/book events)
     l2_websocket.py       — L2WebSocket (dedicated L2 delta stream)
     l2_book.py            — L2OrderBook (full-depth reconstruction, seq tracking, liquidity-gap detection ~840 lines)
     orderbook.py          — OrderbookTracker (top-of-book), L2OrderBookAdapter
@@ -121,7 +121,7 @@ src/                      — main bot package
     edge_filter.py        — EQS scoring (geometric mean), ConfluenceContext, confluence discount
     adverse_selection_guard.py — Fast-kill (4 microstructure signals, 2-of-4 composite)
     regime_detector.py    — RegimeDetector (autocorr/vol-ratio/persistence → MR/trending)
-    whale_monitor.py      — WhaleMonitor (Polygonscan CTF transfers, wallet clustering)
+      whale_monitor.py      — WhaleMonitor (Polygon CTF WebSocket log streaming, ABI decoding, wallet clustering, REST fallback)
     cross_market.py       — CrossMarketSignalGenerator (correlated pairs stat-arb, SI-3)
     iceberg_detector.py   — IcebergDetector (L2 refill pattern detection, SI-2)
     tag_prior_registry.py — TagPriorRegistry (stateless tag→Beta(α,β) routing, DPGE)
@@ -178,6 +178,9 @@ scripts/
                               Supports: auto-discovery, glob patterns, stdin,
                               --after/--before time filters, --recommend, --json output.
                               Parses both legacy drift_signal_fired and new drift_eval events.
+  test_whale_wss.py          — Live Polygon CTF WebSocket verification tool; subscribes
+                               to ERC-1155 transfer logs, decodes events in real time,
+                               and prints activity summary after a timed run.
   vps_setup.sh              — VPS provisioning
   decrypt_secrets.sh        — Secret decryption
   watchdog.sh               — Process watchdog
@@ -185,6 +188,8 @@ scripts/
 tests/
   conftest.py             — 5 fixtures (executor, aggregators, trade_store, detector)
   helpers.py              — make_trade, build_bar_history, make_position
+  test_whale_wss.py       — 24 tests for topic decoding, TransferSingle/Batch ABI
+                            parsing, start-mode selection, REST fallback, and stale trim
   ~41 test files          — ~1278 tests total
 
 data/
@@ -208,7 +213,7 @@ INITIALIZATION SEQUENCE:
   4. Create TradeStore (SQLite)
   5. Create PortfolioCorrelationEngine (Pillar 15)
   6. Create PositionManager (receives executor, store, guard, PCE, book_trackers)
-  7. Create WhaleMonitor (Polygonscan polling)
+  8. Create WhaleMonitor (Polygon CTF log streaming via WSS, REST fallback if no WSS URL)
   8. Create TelegramAlerter
   9. Create MarketLifecycleManager
   10. Create LatencyGuard
@@ -219,7 +224,7 @@ _run() SEQUENCE:
   2. Discover markets → wire each market (create aggregators, detectors, books)
   3. Set wallet balance
   4. Fee model validation (live only)
-  5. Create WebSocket connections (trade + L2)
+  5. Create WebSocket connections (MarketWebSocketPool for trades/books + L2)
   6. Create AdverseSelectionGuard
   7. Create BookHeartbeat
   8. Create OrderStatusPoller
@@ -241,14 +246,16 @@ MARKET WIRING (_wire_market):
   - PCE market registration
 
 CONCURRENT TASKS (18+):
-  ws                  — Trade/book WebSocket
+  ws                  — MarketWebSocketPool supervisor; spawns one async
+                        listener task per 50 subscribed assets while keeping
+                        all trade/book events on the same in-process queues
   trade_processor     — Main trade consumption loop (signals fire here)
                         Exception circuit breaker: 5 unexpected errors in
                         60s → CRITICAL log + graceful shutdown via stop()
   book_processor      — Orderbook update consumption
   timeout_loop        — Position timeout checks (10s)
   stats_loop          — Stats broadcast (15 min)
-  whale_monitor       — Polygonscan polling
+  whale_monitor       — Polygon CTF WebSocket log stream (REST fallback)
   market_refresh      — Re-discovery/re-scoring (10 min)
   cleanup             — Stale cleanup + daily PnL reset (5 min)
   tp_rescale          — Adaptive TP target rescaling (15s)
@@ -493,10 +500,11 @@ Key parameter groups (~160 total):
 
 Settings dataclass (outer wrapper):
   - API credentials: polymarket_api_key/secret/passphrase, eoa_private_key
-  - RPC: polygon_rpc_url, polygonscan_api_key
+  - RPC: polygon_rpc_url, polygon_rpc_wss_url, polygonscan_api_key
   - Telegram: bot_token, chat_id
   - URLs: clob_http_url, clob_ws_url, clob_l2_ws_url, clob_book_url
-  - Whale: whale_poll_interval_seconds=30, whale_lookback_seconds=600
+  - Whale: whale_poll_interval_seconds=30, whale_lookback_seconds=600,
+           whale_threshold_shares=50000, whale_ws_heartbeat_s=30
   - validate_credentials() → list[str] (missing fields for live modes)
   - __repr__ masks secrets: shows first 4 chars + ***
 
@@ -531,15 +539,32 @@ The share clamping loop runs up to 100 iterations for float edge cases.
 SECTION 6: DATA LAYER (Market Data Pipeline)
 ================================================================================
 
-Two parallel WebSocket connections:
+Two parallel market-data transport paths:
 
-  A) MarketWebSocket (src/data/websocket_client.py)
-     - Subscribes to "market" channel for all tracked assets
-     - Routes: trades → trade_queue, book events → book_queue
+  A) MarketWebSocketPool (src/data/websocket_client.py)
+     - Main-process trade/book multiplexer built from many MarketWebSocket
+       instances behind one logical interface
+     - MAX_SUBSCRIPTIONS_PER_SOCKET = 50
+     - Chunks tracked asset_ids into groups of 50 and starts one physical
+       WebSocket listener per chunk
+     - Routes ALL sockets: trades → shared trade_queue,
+       book events → shared book_queue
+     - Downstream consumers (_process_trades, OHLCVAggregator,
+       _process_book_updates) are unaware of sharding
+     - add_assets() fills existing sockets first, then spins up a new socket
+       when all existing sockets are full
+     - remove_assets() unsubscribes on the owning socket via asset→socket map
+     - Pool reconnect_count = sum of per-socket reconnect counters
+
+  A1) MarketWebSocket (src/data/websocket_client.py)
+     - Single physical "market" channel connection used by the pool
      - TradeEvent dataclass: timestamp, market_id, asset_id, side, price, size
      - Auto-reconnect with exponential backoff (1s to 60s) + jitter
+       on a per-socket basis
      - Silence watchdog: closes WS if no messages for ws_silence_timeout_s
      - Bounded queues: drops OLDEST on overflow (preserves latest state)
+     - Failure domain is isolated: if one shard disconnects, only that shard
+       reconnects; sibling shards remain live
 
   B) L2WebSocket (src/data/l2_websocket.py)
      - Dedicated connection for L2 deltas (separated to prevent delta storms
@@ -719,12 +744,27 @@ RegimeDetector (src/signals/regime_detector.py):
   Score smoothed via EWMA: score = λ·score + (1-λ)·raw
 
 WhaleMonitor (src/signals/whale_monitor.py):
-  Polls Polygonscan for CTF ERC-1155 transfers by known whale wallets.
-  10 default wallets (Theo, PredictionKing, PolyWhale, vitalik.eth, GCR, etc.)
+  Primary mode: subscribes to Polygon mainnet WSS with eth_subscribe(logs)
+  against the Polymarket CTF ERC-1155 contract
+  0x4D9702590A32765052304E32E116992d00a71943.
+  Fallback mode: if polygon_rpc_wss_url is unset, reverts to legacy REST polling.
 
-  Adaptive polling: z-score > threshold → 2s, otherwise → 15-30s baseline
-  Wallet cluster detection: groups wallets funded from same address
-  O(1) tx hash dedup via _recent_tx_hashes set
+  Tracks TransferSingle and TransferBatch topics, decodes ABI payloads locally,
+  and emits whale activity with lower latency than Polygonscan polling.
+  10 default wallets (Theo, PredictionKing, PolyWhale, vitalik.eth, GCR, etc.)
+  are still tracked, but large anonymous transfers also count when share size
+  exceeds whale_threshold_shares.
+
+  Connection management:
+    - exponential backoff reconnect with jitter
+    - WebSocket heartbeat watchdog using ping/pong before declaring the stream stale
+    - periodic wallet-cluster rebuild loop
+    - REST fallback preserved for degraded or unset WSS environments
+
+  Data handling:
+    - wallet cluster detection groups wallets funded from same address
+    - dedup key includes tx_hash + token_id + wallet for ERC-1155 fan-out safety
+    - stale activity trimmed from rolling windows shared by confluence checks
 
   Public API:
     has_confluence(no_token, lookback) → any whale bought NO
@@ -1215,7 +1255,7 @@ Telemetry (src/backtest/telemetry.py):
 SECTION 11: WALK-FORWARD OPTIMIZATION (WFO)
 ================================================================================
 
-File: src/backtest/wfo_optimizer.py (~1030 lines)
+File: src/backtest/wfo_optimizer.py (~1050 lines)
 
 Time-series cross-validation with Optuna hyperparameter optimisation.
 
@@ -1258,7 +1298,14 @@ Composite objective:
 
 Fold generation: rolling/anchored IS window with embargo gap
 Warm-start: seeds from previous fold's best params
-Parallel: ProcessPoolExecutor with shared Optuna study
+Parallel: ProcessPoolExecutor with shared Optuna SQLite study
+  Worker execution no longer uses study.optimize() directly in multi-process
+  mode. Each worker now runs a manual ask/tell loop so the shared warm-start
+  enqueued trial cannot crash the fold with Optuna's
+  "Cannot tell a COMPLETE trial" race.
+  Unexpected worker exceptions now attempt to mark the in-flight trial as
+  failed (-inf) before re-raising, preventing zombie RUNNING trials from
+  skewing later TPE sampling after a restart.
 
 Overfitting diagnostics:
   avg_sharpe_decay_pct: (OOS - IS) / |IS| × 100
@@ -1286,6 +1333,15 @@ Universe cap (--max-markets):
        in a single non-Optuna pass
   Live March 8 run with --max-markets 5: fold 0 IS completed in ~8 min
   (72 Optuna trials), full 11-fold run estimated ~3.5–4 hours.
+
+Operational status as of March 9, 2026:
+  - The production VPS pipeline was fully wiped and restarted from scratch at
+    2026-03-09T13:29Z.
+  - Deleted before restart: logs/wfo_phase1.db, logs/wfo_phase2.db,
+    logs/wfo_phase3.db, logs/phase1_champion.json, logs/phase2_bounds.json,
+    logs/phase2_champion.json, logs/final_validation_tearsheet.json,
+    and logs/pipeline.log.
+  - The live run therefore does not reuse any prior phase artefacts.
 
 3-Stage Optimization Pipeline (scripts/run_optimization_pipeline.py):
   Automates the full discovery → refinement → validation workflow.
@@ -1330,10 +1386,10 @@ scripts/run_optimization_pipeline.py:
   as subprocesses with phase-appropriate arguments, manages JSON artefact
   handoffs, and computes the search-space narrowing between phases.
 
-  Phase 1 — Discovery: 5 markets, 14 days, 50 trials.
+  Phase 1 — Discovery: 5 markets, 14 days, 50 trials, 2 workers on the VPS.
     Output: logs/phase1_champion.json
 
-  Phase 2 — Refinement: 10 markets, 30 days, 100 trials.
+  Phase 2 — Refinement: 10 markets, 30 days, 100 trials, 2 workers on the VPS.
     Search space narrowed to ±15% around Phase 1 champion via
     compute_narrowed_bounds(). Warm-started from Phase 1 output.
     Outputs: logs/phase2_champion.json, logs/phase2_bounds.json
@@ -1351,6 +1407,16 @@ scripts/run_optimization_pipeline.py:
     --data-dir     Path to tick data (required)
     --smoke-test   Use SMOKE_OVERRIDES: 1 market, 2 days, 2 trials, 1 worker
     --skip-to      Resume at {"phase1", "narrowing", "phase2", "phase3"}
+
+  March 9, 2026 operational fixes:
+    - Phase 1 and Phase 2 defaults were pinned to 2 workers on the 2-core VPS
+      instead of relying on generic WfoConfig defaults through ad hoc manual
+      invocation patterns.
+    - Parallel workers use the race-safe manual ask/tell loop in
+      src/backtest/wfo_optimizer.py.
+    - A full production rerun was explicitly restarted from Phase 1 after
+      deleting all per-phase DBs, champion/bounds JSON artefacts, and the
+      prior pipeline log to guarantee no carry-over from earlier attempts.
 
   Smoke test validated 2026-03-08: exit code 0, all 5 artefacts produced.
   See change-report.txt "3-Stage WFO Optimization Pipeline" entry for
@@ -1658,19 +1724,27 @@ SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
   first; the adapter never reached PanicDetector because no bars closed.
   After repair, the real blocking gate was visible: zscore_low.
 
-14. BOOTSTRAP FACTOR AUDIT RESULTS
+16. PARALLEL OPTUNA WFO MUST KEEP THE MANUAL ASK/TELL WORKER LOOP
+  With max_workers > 1 and warm_start=True, multiple workers can race on the
+  same enqueued seed trial. Using study.optimize() directly in each child
+  process can surface Optuna's "Cannot tell a COMPLETE trial" error.
+  The current worker implementation avoids this by using study.ask()/tell(),
+  ignoring the duplicate COMPLETE-trial race, and marking unexpected failures
+  as failed trials so they do not remain RUNNING in SQLite.
+
+17. BOOTSTRAP FACTOR AUDIT RESULTS
     Whale (p=0.041): justified, weight 5→4
     Spread (p=0.023): justified, unchanged at 4
     L2 (p=0.38): NOT justified, zeroed → hard gate
     Regime (p=0.52): NOT justified, zeroed
     These p-values from scripts/confluence_sensitivity.py with B=2000.
 
-15. THREE FLAW GUARDS
+18. THREE FLAW GUARDS
     Flaw 1: Maker + confluence amplification → combined floor 40.0
     Flaw 2: Drift + regime double-count → suppress regime for drift
     Flaw 3: Stale whale in probes → suppress confluence for probes
 
-16. EXCEPTION CIRCUIT BREAKER (src/core/exception_circuit_breaker.py)
+19. EXCEPTION CIRCUIT BREAKER (src/core/exception_circuit_breaker.py)
     Critical async loops (_process_trades, AdverseSelectionGuard._decision_loop)
     MUST NOT use blanket `except Exception: pass/continue`.  Instead:
     a. Targeted catches for expected, non-fatal exceptions (KeyError on stale
@@ -1682,6 +1756,21 @@ SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
     loop must instantiate its own ExceptionCircuitBreaker and wire the
     shutdown path.  The breaker uses time.monotonic() with a deque of
     timestamps; once tripped it latches (always returns True).
+
+20. VARIABLE SCOPE IN CONDITIONAL SIGNAL PATHS (UnboundLocalError trap)
+    Variables assigned INSIDE `if sig:` (panic fires) that are also read in
+    the `if not sig:` (drift fires) branch cause UnboundLocalError when only
+    a drift signal arrives.  The `_regime_score` variable in
+    `_on_yes_bar_closed` was an instance of this: assigned only when
+    PanicDetector returned a signal, but referenced on the drift code path.
+    The silent failure propagated into `_stale_bar_flush_loop` because that
+    loop calls `_on_yes_bar_closed` inside a broad except clause → crash is
+    swallowed, loop continues, zero signal evaluations ever occur despite
+    bars closing normally.
+    FIX PATTERN: assign a safe default (e.g. `_regime_score = 0.5`) BEFORE
+    the conditional, then override inside each branch as needed.
+    Verified fix on March 9 VPS audit: stale_bar_flush_error dropped from
+    27 events (old bot) to 0 after restart with the patch applied.
 
 
 ================================================================================
@@ -1903,7 +1992,8 @@ bot.py (orchestrator)
   ├── core/latency_guard.py (LatencyGuard → used by bot + chaser)
   ├── core/logger.py (structlog → used by ALL modules)
   │
-  ├── data/websocket_client.py (MarketWebSocket → feeds trade_queue, book_queue)
+  ├── data/websocket_client.py (MarketWebSocketPool → feeds trade_queue,
+  │                             book_queue via sharded MarketWebSocket children)
   ├── data/l2_websocket.py (L2WebSocket → feeds L2OrderBooks)
   ├── data/l2_book.py (L2OrderBook → feeds OrderbookTracker via Adapter)
   ├── data/orderbook.py (OrderbookTracker, L2OrderBookAdapter)
@@ -1948,7 +2038,7 @@ Key data flows:
     → AdverseSelectionMonitor.tick
     → CompositeSignalEvaluator → spread-compression entries
 
-  WhaleMonitor → Polygonscan → has_strong_confluence → PanicDetector.evaluate
+  WhaleMonitor → Polygon WSS logs / REST fallback → has_strong_confluence → PanicDetector.evaluate
     → compute_confluence_discount → EQS threshold reduction
 
   AdverseSelectionGuard → 50ms polling → 2-of-4 signals → clear fast_kill_event
@@ -2023,6 +2113,17 @@ Execution Alpha & Microstructure Blueprint:
   - place_stealth_order() gains get_mid_fn callback for real-time drift detection
   - Fill-pct abandon guard: if ≥75% filled between slices → stop, preserve partial fill
   - Mid-drift abandon guard: if mid drifts >2¢ adversely after sleep → stop
+
+March 9th — Market WebSocket Sharding:
+  - Main-process trade/book ingestion refactored from one overloaded
+    MarketWebSocket into MarketWebSocketPool
+  - New constant: MAX_SUBSCRIPTIONS_PER_SOCKET = 50
+  - Pool chunks tracked assets across multiple physical Polymarket market
+    sockets while preserving the same shared trade_queue and book_queue
+  - Per-socket exponential backoff/reconnect keeps failures isolated to the
+    affected shard instead of tearing down all trade ingestion
+  - Motivation: eliminate chronic "no close frame received" disconnects caused
+    by subscribing 300+ assets on a single market WebSocket
   - 2 new config knobs: stealth_abandon_drift_cents=2.0, stealth_abandon_fill_pct=0.75
   - 4 new tests in TestStealthAbandonment
 
@@ -2042,6 +2143,23 @@ Execution Alpha & Microstructure Blueprint:
   - 4 new tests in TestChaserToxicityGuard
 
   Test summary: 33 new tests pass; 66/66 execution-pipeline tests pass
+
+March 9th — WhaleMonitor WSS Migration:
+  - WhaleMonitor primary transport changed from Polygonscan REST polling to
+    Polygon RPC WebSocket log streaming via eth_subscribe(logs)
+  - Correct CTF contract pinned: 0x4D9702590A32765052304E32E116992d00a71943
+    (replacing stale older address usage)
+  - Added ABI decoding for ERC-1155 TransferSingle and TransferBatch logs
+  - Anonymous large transfers now count as whale activity when
+    whale_threshold_shares is exceeded
+  - Added config knobs: polygon_rpc_wss_url, whale_threshold_shares,
+    whale_ws_heartbeat_s
+  - Added scripts/test_whale_wss.py for live stream verification and
+    tests/test_whale_wss.py for decoding/start-mode coverage
+  - Live deployment on VPS initially exposed a false 30s heartbeat churn on
+    quiet periods; fixed by sending WebSocket ping/pong before reconnecting
+  - Production state after fix: whale_monitor_started_wss observed in logs,
+    subscription active, no recurring false heartbeat reconnects
 
 March 5th — Dynamic Prior Generation Engine (DPGE):
   Replaces static Beta(2,2) prior in GenericBayesianModel across 4 vectors:
@@ -2089,6 +2207,48 @@ March 5th — Dynamic Prior Generation Engine (DPGE):
     TestBackwardCompatibility (4)
   All existing test_resolution_probability.py assertions updated to reflect
   new semantics (tag priors intentionally diverge from market price).
+
+March 9th — VPS Zero-Trade Root Cause Diagnosis & Hot-Fixes:
+  Two bugs causing zero fills on PAPER mode VPS confirmed and patched.
+  Audit performed March 9, 13:38–14:17 UTC (bot PID 166106).
+
+  Bug 1 — _regime_score UnboundLocalError (src/bot.py):
+  - _regime_score was assigned only inside `if sig:` (panic fires) at ~line 1470.
+  - Referenced in `if not sig:` drift path at ~line 1523.
+  - On drift-only evaluations (most markets), variable was unbound → UnboundLocalError.
+  - Exception swallowed by _stale_bar_flush_loop's broad except → silent crash,
+    zero signal evaluations despite bars closing normally.
+  - Evidence: 27 stale_bar_flush_error events in old bot logs (03:23 UTC).
+  - Fix: `_regime_score = regime_det.regime_score if regime_det else 0.5`
+    moved BEFORE the `if sig:` block.
+  - Verified: 0 stale_bar_flush_error events since 13:38 restart.
+
+  Bug 2 — Heartbeat position_stale multiplier too tight (src/core/heartbeat.py):
+  - position_stale_ms = self._stale_ms * 3 = 15,000 ms threshold.
+  - Polymarket prediction market L2 snapshots arrive every ~15 s on low-volume
+    markets; max_gap_ms values of 15,043–15,242 ms exceeded threshold constantly.
+  - heartbeat_stale_detected → LatencyGuard.force_block → all open positions
+    cancelled within ~25 s of entry (PAPER-8 through PAPER-13 all cancelled).
+  - Fix: multiplier changed 3 → 6 (30 s threshold accommodates natural cadence).
+  - tests/test_heartbeat.py updated: stale threshold assertions adjusted 31 s/25 s.
+  - Verified: 0 heartbeat_stale_detected events since 13:38 restart (the 1 event
+    visible in logs is timestamped 13:35:47Z = old bot, `ws_transport_dead`).
+
+  Operational context:
+  - First restart attempt at 13:35:47Z failed after 7 s: l2_worker_0 stale
+    (emergency_stop_triggered).  Current session started at 13:38:48Z.
+  - Post-patch audit confirmed execution funnel alive:
+    * 14:16:26Z and 14:17:26Z: drift_signal_fired on 0x9352c559e9648a,
+      direction BUY_NO, displacement −0.9282, score 0.5801.
+    * PCE VaR gate passing (portfolio_var: 0.0).
+    * EQS correctly blocking: sub_tick_spread (entry 0.69, VWAP 0.6997,
+      gross_cents 0.4843, tick_margin 0) — legitimate market condition.
+  - System health at 14:17: HEALTHY, 77 active markets, 0 errors.
+  - New outstanding issue: MarketWebSocket subscribing 152+ assets on a single
+    connection → "no close frame received" disconnects (12 in 40 min) → bar
+    formation relies on stale_bar_flush (30 s timer) instead of live ticks.
+    Fix: deploy MarketWebSocketPool (already designed, see "March 9th —
+    Market WebSocket Sharding" entry above).
 
 March 8th — WFO Zero-Trade Root Cause & Backfill Timestamp Repair:
   - Root cause was not Optuna, the fold generator, or BotReplayAdapter gate

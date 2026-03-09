@@ -1,9 +1,11 @@
 """
 Shared-memory IPC layer for cross-process L2 order book exchange.
 
-Provides zero-copy, sub-microsecond reads of reconstructed order books
-from L2 worker processes.  Each asset gets a fixed-size shared memory
-block laid out as a packed C struct.
+Provides lock-free, sub-microsecond reads of reconstructed order books
+from L2 worker processes using a double-buffered Seqlock (Sequence Lock)
+architecture.  Each asset gets a fixed-size shared memory block with two
+data buffers so readers never block writers and always get a consistent
+snapshot.
 
 Components
 ----------
@@ -12,38 +14,44 @@ Components
 ``SharedBookReader``
     Used in the main process to read the latest book state.
 
-Memory layout (per asset, total ≈ 1_768 bytes):
-    Header  (56 bytes):
-        seq             uint64      8
-        timestamp       float64     8
-        server_time     float64     8
-        best_bid        float64     8
-        best_ask        float64     8
-        bid_depth_usd   float64     8
-        ask_depth_usd   float64     8
-        spread_score    float64     8
-        depth_near_mid  float64     8   (pre-computed for ASG fast-path)
-        state           uint8       1
-        latency_state   uint8       1   (0=HEALTHY 1=DEGRADED 2=BLOCKED)
-        is_reliable     uint8       1
-        _pad            5 bytes
-        n_bid_levels    uint16      2
-        n_ask_levels    uint16      2
-        delta_count     uint32      4
-        desync_total    uint32      4
-    Bid levels (50 × 16 = 800 bytes):
-        price           float64     8
-        size            float64     8
-    Ask levels (50 × 16 = 800 bytes):
-        price           float64     8
-        size            float64     8
-    Write lock (8 bytes):
-        lock_flag       uint64      8   (0 = free, 1 = writing)
+Memory layout (per asset, total = 3_424 bytes):
+    Control region (16 bytes):
+        seqlock_counter uint64      8   (even = idle, odd = write in progress)
+        active_block    uint8       1   (0 = Block A active, 1 = Block B active)
+        _pad            7 bytes
+
+    Block A — Data block (1_704 bytes), offset 16:
+        Header (104 bytes):
+            seq             uint64      8
+            timestamp       float64     8
+            server_time     float64     8
+            best_bid        float64     8
+            best_ask        float64     8
+            bid_depth_usd   float64     8
+            ask_depth_usd   float64     8
+            spread_score    float64     8
+            depth_near_mid  float64     8   (pre-computed for ASG fast-path)
+            state           uint8       1
+            latency_state   uint8       1   (0=HEALTHY 1=DEGRADED 2=BLOCKED)
+            is_reliable     uint8       1
+            _pad            5 bytes
+            n_bid_levels    uint16      2
+            n_ask_levels    uint16      2
+            delta_count     uint32      4
+            desync_total    uint32      4
+        Bid levels (50 × 16 = 800 bytes):
+            price           float64     8
+            size            float64     8
+        Ask levels (50 × 16 = 800 bytes):
+            price           float64     8
+            size            float64     8
+
+    Block B — Data block (1_704 bytes), offset 1_720:
+        (identical layout to Block A)
 """
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import struct
 import time
@@ -67,13 +75,26 @@ _HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 104 bytes
 _LEVEL_FMT = "<dd"  # price + size
 _LEVEL_SIZE = struct.calcsize(_LEVEL_FMT)  # 16 bytes
 _LEVELS_BLOCK = MAX_LEVELS * _LEVEL_SIZE  # 800 bytes per side
-_LOCK_FMT = "<Q"
-_LOCK_SIZE = struct.calcsize(_LOCK_FMT)  # 8 bytes
-BLOCK_SIZE = _HEADER_SIZE + 2 * _LEVELS_BLOCK + _LOCK_SIZE  # 1712 bytes
 
-_LOCK_OFFSET = _HEADER_SIZE + 2 * _LEVELS_BLOCK
-_BIDS_OFFSET = _HEADER_SIZE
-_ASKS_OFFSET = _HEADER_SIZE + _LEVELS_BLOCK
+# ── Seqlock control region ─────────────────────────────────────────────────
+_SEQ_FMT = "<Q"                                        # uint64 seqlock counter
+_SEQ_SIZE = struct.calcsize(_SEQ_FMT)                  # 8 bytes
+_ACTIVE_FMT = "<B"                                     # uint8 active block index
+_CONTROL_SIZE = 16                                     # 8 (seq) + 1 (active) + 7 (pad)
+
+_SEQ_OFFSET = 0
+_ACTIVE_OFFSET = _SEQ_SIZE                             # 8
+
+# ── Data block (header + bids + asks, NO lock byte) ────────────────────────
+_DATA_BLOCK_SIZE = _HEADER_SIZE + 2 * _LEVELS_BLOCK    # 1704 bytes
+
+# ── Block offsets within shared memory ─────────────────────────────────────
+_BLOCK_A_OFFSET = _CONTROL_SIZE                        # 16
+_BLOCK_B_OFFSET = _CONTROL_SIZE + _DATA_BLOCK_SIZE     # 1720
+BLOCK_SIZE = _CONTROL_SIZE + 2 * _DATA_BLOCK_SIZE      # 3424 bytes
+
+# ── Seqlock reader limits ──────────────────────────────────────────────────
+_MAX_SEQLOCK_RETRIES = 10
 
 # BookState enum value mapping (mirrors l2_book.BookState)
 _STATE_MAP = {"empty": 0, "buffering": 1, "synced": 2, "desynced": 3}
@@ -147,7 +168,13 @@ class SharedBookSnapshot:
 #  Writer (used inside L2 worker processes)
 # ═══════════════════════════════════════════════════════════════════════════
 class SharedBookWriter:
-    """Writes L2 book state into a shared memory segment.
+    """Writes L2 book state into a double-buffered shared memory segment
+    using a Seqlock protocol.
+
+    The writer always writes to the *standby* block (the one readers are
+    NOT currently reading), then atomically flips the active-block index.
+    The surrounding sequence-counter increments let readers detect any
+    concurrent mutation and retry.
 
     Parameters
     ----------
@@ -156,6 +183,8 @@ class SharedBookWriter:
     shm_name:
         Name of the ``SharedMemory`` segment (created externally).
     """
+
+    __slots__ = ("asset_id", "_shm", "_buf")
 
     def __init__(self, asset_id: str, shm_name: str) -> None:
         self.asset_id = asset_id
@@ -184,20 +213,33 @@ class SharedBookWriter:
         bid_levels: list[tuple[float, float]],
         ask_levels: list[tuple[float, float]],
     ) -> None:
-        """Pack the full book state into shared memory.
+        """Pack the full book state into the standby block using a Seqlock.
 
-        The write-lock byte prevents the reader from seeing a torn write.
+        Protocol:
+            1. Increment seqlock counter → odd  (signals write-in-progress)
+            2. Write data to the standby block
+            3. Toggle active-block index
+            4. Increment seqlock counter → even (signals write-complete)
         """
         buf = self._buf
 
-        # Acquire write lock
-        struct.pack_into(_LOCK_FMT, buf, _LOCK_OFFSET, 1)
+        # ── Step 1: increment seqlock counter to ODD (write-in-progress) ──
+        cur_seq = struct.unpack_from(_SEQ_FMT, buf, _SEQ_OFFSET)[0]
+        struct.pack_into(_SEQ_FMT, buf, _SEQ_OFFSET, cur_seq + 1)
 
-        # Pack header
+        # ── Step 2: determine standby block and write into it ─────────────
+        active = struct.unpack_from(_ACTIVE_FMT, buf, _ACTIVE_OFFSET)[0] & 1
+        standby_idx = 1 - active
+        block_off = _BLOCK_A_OFFSET if standby_idx == 0 else _BLOCK_B_OFFSET
+
+        bids_off = block_off + _HEADER_SIZE
+        asks_off = block_off + _HEADER_SIZE + _LEVELS_BLOCK
+
+        # Pack header into standby block
         struct.pack_into(
             _HEADER_FMT,
             buf,
-            0,
+            block_off,
             seq,
             timestamp,
             server_time,
@@ -217,27 +259,30 @@ class SharedBookWriter:
         )
 
         # Pack bid levels
-        offset = _BIDS_OFFSET
-        for i in range(min(n_bid_levels, MAX_LEVELS)):
+        n_bids = min(n_bid_levels, MAX_LEVELS)
+        offset = bids_off
+        for i in range(n_bids):
             struct.pack_into(_LEVEL_FMT, buf, offset, bid_levels[i][0], bid_levels[i][1])
             offset += _LEVEL_SIZE
-        # Zero remaining bid slots
-        for i in range(min(n_bid_levels, MAX_LEVELS), MAX_LEVELS):
+        for _ in range(n_bids, MAX_LEVELS):
             struct.pack_into(_LEVEL_FMT, buf, offset, 0.0, 0.0)
             offset += _LEVEL_SIZE
 
         # Pack ask levels
-        offset = _ASKS_OFFSET
-        for i in range(min(n_ask_levels, MAX_LEVELS)):
+        n_asks = min(n_ask_levels, MAX_LEVELS)
+        offset = asks_off
+        for i in range(n_asks):
             struct.pack_into(_LEVEL_FMT, buf, offset, ask_levels[i][0], ask_levels[i][1])
             offset += _LEVEL_SIZE
-        # Zero remaining ask slots
-        for i in range(min(n_ask_levels, MAX_LEVELS), MAX_LEVELS):
+        for _ in range(n_asks, MAX_LEVELS):
             struct.pack_into(_LEVEL_FMT, buf, offset, 0.0, 0.0)
             offset += _LEVEL_SIZE
 
-        # Release write lock
-        struct.pack_into(_LOCK_FMT, buf, _LOCK_OFFSET, 0)
+        # ── Step 3: flip active-block pointer to the freshly-written block ─
+        struct.pack_into(_ACTIVE_FMT, buf, _ACTIVE_OFFSET, standby_idx)
+
+        # ── Step 4: increment seqlock counter to EVEN (write-complete) ─────
+        struct.pack_into(_SEQ_FMT, buf, _SEQ_OFFSET, cur_seq + 2)
 
     def close(self) -> None:
         """Detach from shared memory (does not unlink)."""
@@ -251,7 +296,8 @@ class SharedBookWriter:
 #  Reader (used in main process)
 # ═══════════════════════════════════════════════════════════════════════════
 class SharedBookReader:
-    """Reads L2 book state from a shared memory segment.
+    """Reads L2 book state from a double-buffered shared memory segment
+    using the Seqlock protocol (lock-free on the reader side).
 
     Parameters
     ----------
@@ -261,152 +307,191 @@ class SharedBookReader:
         Name of the ``SharedMemory`` segment.
     """
 
+    __slots__ = (
+        "asset_id", "_shm", "_buf",
+        "_last_seq", "_last_snapshot",
+        "_contention_warnings",
+    )
+
     def __init__(self, asset_id: str, shm_name: str) -> None:
         self.asset_id = asset_id
         self._shm = shared_memory.SharedMemory(name=shm_name, create=False)
         self._buf = self._shm.buf
-        # Cached last-read seq for change detection
         self._last_seq: int = 0
-        # Spin-lock safety: cache last-good snapshot and track failures
         self._last_snapshot: SharedBookSnapshot | None = None
-        self._spin_failures: int = 0
+        self._contention_warnings: int = 0
 
+    # ── internal: resolve active block offset ──────────────────────────────
+    @staticmethod
+    def _block_offset(active_idx: int) -> int:
+        return _BLOCK_A_OFFSET if (active_idx & 1) == 0 else _BLOCK_B_OFFSET
+
+    # ── public API ─────────────────────────────────────────────────────────
     def read_header(self) -> SharedBookSnapshot:
         """Read only the header fields (no level arrays).
 
         Fast path for consumers that only need BBO / spread / depth.
-        Spins briefly if a write is in progress (the lock is held for
-        only a few microseconds).
+        Uses the Seqlock retry protocol — never blocks the writer.
         """
         buf = self._buf
-        # Spin on write lock (extremely brief)
-        acquired = False
-        for _ in range(100):
-            lock_val = struct.unpack_from(_LOCK_FMT, buf, _LOCK_OFFSET)[0]
-            if lock_val == 0:
-                acquired = True
-                break
 
-        if not acquired:
-            self._spin_failures += 1
-            if self._spin_failures % 100 == 1:
-                _log.warning(
-                    "ipc_spin_lock_timeout",
-                    extra={"asset_id": self.asset_id, "total_failures": self._spin_failures},
-                )
-            if self._last_snapshot is not None:
-                return self._last_snapshot
-            raise IPCReadError(
-                f"Spin-lock timeout on first read for {self.asset_id}"
+        for _attempt in range(_MAX_SEQLOCK_RETRIES):
+            # Step 1-2: read seqlock counter; if odd a write is in-flight
+            s1 = struct.unpack_from(_SEQ_FMT, buf, _SEQ_OFFSET)[0]
+            if s1 & 1:
+                continue  # writer busy → retry immediately
+
+            # Step 3: copy header from the active block into local memory
+            active = struct.unpack_from(_ACTIVE_FMT, buf, _ACTIVE_OFFSET)[0]
+            block_off = self._block_offset(active)
+            header_bytes = bytes(buf[block_off: block_off + _HEADER_SIZE])
+
+            # Step 4: re-read seqlock counter
+            s2 = struct.unpack_from(_SEQ_FMT, buf, _SEQ_OFFSET)[0]
+
+            # Step 5: consistency check
+            if s1 != s2:
+                continue  # concurrent write detected → retry
+
+            # ── success: unpack from the local copy ───────────────────────
+            fields = struct.unpack_from(_HEADER_FMT, header_bytes, 0)
+            (
+                seq, timestamp, server_time, best_bid, best_ask,
+                bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
+                state, latency_state, is_reliable_byte,
+                n_bid, n_ask, delta_count, desync_total,
+            ) = fields
+
+            self._last_seq = seq
+            snap = SharedBookSnapshot(
+                asset_id=self.asset_id,
+                seq=seq,
+                timestamp=timestamp,
+                server_time=server_time,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_depth_usd=bid_depth_usd,
+                ask_depth_usd=ask_depth_usd,
+                spread_score=spread_score,
+                depth_near_mid=depth_near_mid,
+                state=state,
+                latency_state=latency_state,
+                is_reliable=bool(is_reliable_byte),
+                n_bid_levels=n_bid,
+                n_ask_levels=n_ask,
+                delta_count=delta_count,
+                desync_total=desync_total,
             )
+            self._last_snapshot = snap
+            return snap
 
-        # Read header
-        fields = struct.unpack_from(_HEADER_FMT, buf, 0)
-        (
-            seq, timestamp, server_time, best_bid, best_ask,
-            bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
-            state, latency_state, is_reliable_byte,
-            n_bid, n_ask, delta_count, desync_total,
-        ) = fields
-
-        self._last_seq = seq
-        snap = SharedBookSnapshot(
-            asset_id=self.asset_id,
-            seq=seq,
-            timestamp=timestamp,
-            server_time=server_time,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            bid_depth_usd=bid_depth_usd,
-            ask_depth_usd=ask_depth_usd,
-            spread_score=spread_score,
-            depth_near_mid=depth_near_mid,
-            state=state,
-            latency_state=latency_state,
-            is_reliable=bool(is_reliable_byte),
-            n_bid_levels=n_bid,
-            n_ask_levels=n_ask,
-            delta_count=delta_count,
-            desync_total=desync_total,
+        # ── all retries exhausted ─────────────────────────────────────────
+        self._contention_warnings += 1
+        if self._contention_warnings % 100 == 1:
+            _log.warning(
+                "high_contention_warning",
+                extra={
+                    "asset_id": self.asset_id,
+                    "total_warnings": self._contention_warnings,
+                },
+            )
+        if self._last_snapshot is not None:
+            return self._last_snapshot
+        raise IPCReadError(
+            f"Seqlock contention on first read for {self.asset_id}"
         )
-        self._last_snapshot = snap
-        return snap
 
     def read_full(self) -> SharedBookSnapshot:
-        """Read header + all bid/ask levels."""
+        """Read header + all bid/ask levels (lock-free Seqlock)."""
         buf = self._buf
-        # Spin on write lock
-        acquired = False
-        for _ in range(100):
-            lock_val = struct.unpack_from(_LOCK_FMT, buf, _LOCK_OFFSET)[0]
-            if lock_val == 0:
-                acquired = True
-                break
 
-        if not acquired:
-            self._spin_failures += 1
-            if self._spin_failures % 100 == 1:
-                _log.warning(
-                    "ipc_spin_lock_timeout",
-                    extra={"asset_id": self.asset_id, "total_failures": self._spin_failures},
-                )
-            if self._last_snapshot is not None:
-                return self._last_snapshot
-            raise IPCReadError(
-                f"Spin-lock timeout on first read for {self.asset_id}"
+        for _attempt in range(_MAX_SEQLOCK_RETRIES):
+            # Step 1-2: read seqlock counter
+            s1 = struct.unpack_from(_SEQ_FMT, buf, _SEQ_OFFSET)[0]
+            if s1 & 1:
+                continue
+
+            # Step 3: snapshot the entire active data block into local memory
+            active = struct.unpack_from(_ACTIVE_FMT, buf, _ACTIVE_OFFSET)[0]
+            block_off = self._block_offset(active)
+            local = bytes(buf[block_off: block_off + _DATA_BLOCK_SIZE])
+
+            # Step 4: re-read seqlock counter
+            s2 = struct.unpack_from(_SEQ_FMT, buf, _SEQ_OFFSET)[0]
+
+            # Step 5: consistency check
+            if s1 != s2:
+                continue
+
+            # ── success: unpack from the local copy ───────────────────────
+            fields = struct.unpack_from(_HEADER_FMT, local, 0)
+            (
+                seq, timestamp, server_time, best_bid, best_ask,
+                bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
+                state, latency_state, is_reliable_byte,
+                n_bid, n_ask, delta_count, desync_total,
+            ) = fields
+
+            # Bid levels (offsets relative to local copy)
+            bids_off = _HEADER_SIZE
+            bids: list[tuple[float, float]] = []
+            offset = bids_off
+            for _ in range(n_bid):
+                price, size = struct.unpack_from(_LEVEL_FMT, local, offset)
+                if size > 0:
+                    bids.append((price, size))
+                offset += _LEVEL_SIZE
+
+            # Ask levels
+            asks_off = _HEADER_SIZE + _LEVELS_BLOCK
+            asks: list[tuple[float, float]] = []
+            offset = asks_off
+            for _ in range(n_ask):
+                price, size = struct.unpack_from(_LEVEL_FMT, local, offset)
+                if size > 0:
+                    asks.append((price, size))
+                offset += _LEVEL_SIZE
+
+            self._last_seq = seq
+            snap = SharedBookSnapshot(
+                asset_id=self.asset_id,
+                seq=seq,
+                timestamp=timestamp,
+                server_time=server_time,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_depth_usd=bid_depth_usd,
+                ask_depth_usd=ask_depth_usd,
+                spread_score=spread_score,
+                depth_near_mid=depth_near_mid,
+                state=state,
+                latency_state=latency_state,
+                is_reliable=bool(is_reliable_byte),
+                n_bid_levels=n_bid,
+                n_ask_levels=n_ask,
+                delta_count=delta_count,
+                desync_total=desync_total,
+                bid_levels=bids,
+                ask_levels=asks,
             )
+            self._last_snapshot = snap
+            return snap
 
-        # Header
-        fields = struct.unpack_from(_HEADER_FMT, buf, 0)
-        (
-            seq, timestamp, server_time, best_bid, best_ask,
-            bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
-            state, latency_state, is_reliable_byte,
-            n_bid, n_ask, delta_count, desync_total,
-        ) = fields
-
-        # Bid levels
-        bids: list[tuple[float, float]] = []
-        offset = _BIDS_OFFSET
-        for _ in range(n_bid):
-            price, size = struct.unpack_from(_LEVEL_FMT, buf, offset)
-            if size > 0:
-                bids.append((price, size))
-            offset += _LEVEL_SIZE
-
-        # Ask levels
-        asks: list[tuple[float, float]] = []
-        offset = _ASKS_OFFSET
-        for _ in range(n_ask):
-            price, size = struct.unpack_from(_LEVEL_FMT, buf, offset)
-            if size > 0:
-                asks.append((price, size))
-            offset += _LEVEL_SIZE
-
-        self._last_seq = seq
-        snap = SharedBookSnapshot(
-            asset_id=self.asset_id,
-            seq=seq,
-            timestamp=timestamp,
-            server_time=server_time,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            bid_depth_usd=bid_depth_usd,
-            ask_depth_usd=ask_depth_usd,
-            spread_score=spread_score,
-            depth_near_mid=depth_near_mid,
-            state=state,
-            latency_state=latency_state,
-            is_reliable=bool(is_reliable_byte),
-            n_bid_levels=n_bid,
-            n_ask_levels=n_ask,
-            delta_count=delta_count,
-            desync_total=desync_total,
-            bid_levels=bids,
-            ask_levels=asks,
+        # ── all retries exhausted ─────────────────────────────────────────
+        self._contention_warnings += 1
+        if self._contention_warnings % 100 == 1:
+            _log.warning(
+                "high_contention_warning",
+                extra={
+                    "asset_id": self.asset_id,
+                    "total_warnings": self._contention_warnings,
+                },
+            )
+        if self._last_snapshot is not None:
+            return self._last_snapshot
+        raise IPCReadError(
+            f"Seqlock contention on first read for {self.asset_id}"
         )
-        self._last_snapshot = snap
-        return snap
 
     @property
     def last_seq(self) -> int:
