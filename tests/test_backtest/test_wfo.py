@@ -1024,7 +1024,7 @@ class TestBackwardCompatibility:
         assert cfg.storage_url == "sqlite:///wfo_optuna.db"
         assert cfg.study_prefix == "polymarket_wfo"
         assert cfg.latency_ms == 150.0
-        assert cfg.fee_max_pct == 1.56
+        assert cfg.fee_max_pct == 2.00
         assert cfg.fee_enabled is True
 
     def test_fold_result_old_fields_still_work(self):

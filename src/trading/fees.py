@@ -5,8 +5,8 @@ The fee curve for crypto/sports markets is:
 
     Fee(p) = f_max · 4 · p · (1 - p)
 
-where *p* is the mid-price (probability) and *f_max* = 1.56%.
-Peak fee is at p = 0.50 (1.56%), tapering to 0 at p ∈ {0, 1}.
+where *p* is the mid-price (probability) and *f_max* = 2.00%.
+Peak fee is at p = 0.50 (2.00%), tapering to 0 at p ∈ {0, 1}.
 
 Political / non-fee markets remain at 0%.
 """

@@ -336,9 +336,9 @@ class TestFeeModelValidation:
     @pytest.mark.asyncio
     async def test_validate_passes_when_fees_match(self):
         """When CLOB returns the same BPS as our formula, validation passes."""
-        # At mid=0.50, our formula: f_max × 4 × 0.5 × 0.5 = 0.0156 = 156 bps
+        # At mid=0.50, our formula: f_max × 4 × 0.5 × 0.5 = 0.0200 = 200 bps
         with patch.object(FeeCache, "get_fee_rate", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = 156
+            mock_get.return_value = 200
             result = await validate_fee_model(
                 ["TOKEN_A"], [0.50], tolerance_bps=5
             )
@@ -348,7 +348,7 @@ class TestFeeModelValidation:
     async def test_validate_fails_on_divergence(self):
         """When CLOB returns significantly different BPS, validation fails."""
         with patch.object(FeeCache, "get_fee_rate", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = 200  # 44bps divergence from 156
+            mock_get.return_value = 250  # 50bps divergence from 200
             result = await validate_fee_model(
                 ["TOKEN_A"], [0.50], tolerance_bps=5
             )
@@ -358,7 +358,7 @@ class TestFeeModelValidation:
     async def test_validate_within_tolerance(self):
         """Small divergence within tolerance should pass."""
         with patch.object(FeeCache, "get_fee_rate", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = 158  # 2bps off — within 5bps tolerance
+            mock_get.return_value = 202  # 2bps off — within 5bps tolerance
             result = await validate_fee_model(
                 ["TOKEN_A"], [0.50], tolerance_bps=5
             )
@@ -390,7 +390,7 @@ class TestFeeModelValidation:
         async def mock_get(self_or_token, token=None):
             nonlocal call_count
             call_count += 1
-            return 156 if call_count == 1 else 300
+            return 200 if call_count == 1 else 300
 
         with patch.object(FeeCache, "get_fee_rate", mock_get):
             result = await validate_fee_model(

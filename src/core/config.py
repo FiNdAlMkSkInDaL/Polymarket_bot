@@ -362,7 +362,7 @@ class StrategyParams:
     mti_penalty_points: float = _env_float("MTI_PENALTY_POINTS", 40.0)
 
     # Fee-adaptive stop-loss
-    fee_max_pct: float = _env_float("FEE_MAX_PCT", 1.56)  # peak fee %
+    fee_max_pct: float = _env_float("FEE_MAX_PCT", 2.00)  # peak fee %
     fee_enabled_categories: str = _env("FEE_ENABLED_CATEGORIES", "crypto,sports")
 
     # Fee-efficiency floor for EQS.  Prevents fees from zeroing the

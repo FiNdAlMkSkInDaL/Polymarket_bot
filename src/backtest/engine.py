@@ -62,7 +62,7 @@ class BacktestConfig:
 
     initial_cash: float = 1000.0
     latency_ms: float = 150.0
-    fee_max_pct: float = 1.56
+    fee_max_pct: float = 2.00
     fee_enabled: bool = True
     equity_sample_interval: int = 100
     bar_interval_s: float = 60.0

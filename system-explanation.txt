@@ -145,6 +145,8 @@ src/                      — main bot package
     take_profit.py        — TP computation (alpha with 6 adjustments, fee floor)
     adverse_selection_monitor.py — AdverseSelectionMonitor (Welch t-test, dynamic α)
     pce_worker.py         — pce_worker_main() subprocess; O(N²) PCE matrix math isolated from main asyncio loop; communicates via multiprocessing.Queue (input/output/var-gate queues)
+                            Two early heartbeat.beat() calls on init (before and after load_state)
+                            prevent ProcessManager emergency-stop during startup.
     portfolio_correlation.py — PCE (N×N correlation, VaR, bisection sizing ~1400 lines)
 
   monitoring/
@@ -575,6 +577,8 @@ Two parallel market-data transport paths:
      - Auto-reconnect with exponential backoff (1s to 60s) + jitter
        on a per-socket basis
      - Silence watchdog: closes WS if no messages for ws_silence_timeout_s
+       (default: 120.0s; raised from 10.0s on 2026-03-09 to eliminate
+       spurious reconnects on low-volume 50-market shards)
      - Bounded queues: drops OLDEST on overflow (preserves latest state)
      - Failure domain is isolated: if one shard disconnects, only that shard
        reconnects; sibling shards remain live
@@ -2224,6 +2228,18 @@ March 9th — Circuit Breaker Graceful Suspend & Hard Reset (Band-aid 3 Remediat
 
   Test summary: 33 new tests pass; 66/66 execution-pipeline tests pass
 
+March 9th (~22:xx UTC) — PCE Serialization Dict Fix (_check_var_remote):
+  - A git stash reversion re-introduced tuple-based serialization in
+    PositionManager._check_var_remote(). The PCE worker calls
+    _MinimalPosition(**p) which requires a dict; tuples raised TypeError,
+    silently swallowed by _stale_bar_flush_loop.
+  - Fix: list comprehension in _check_var_remote() replaced with a dict
+    comprehension matching all 7 _MinimalPosition kwargs (market_id,
+    entry_price, size←entry_size, filled_size, trade_asset_id, no_asset_id,
+    event_id). Note: _MinimalPosition.size maps to Position.entry_size.
+  - 8 tests/test_position_manager.py tests pass; 0 stale_bar_flush_error
+    events in logs after fix.
+
 March 9th — WhaleMonitor WSS Migration:
   - WhaleMonitor primary transport changed from Polygonscan REST polling to
     Polygon RPC WebSocket log streaming via eth_subscribe(logs)
@@ -2337,23 +2353,31 @@ March 9th (18:xx UTC) — Panic Signal Zero-Fill Root Cause Diagnosis & Hot-Fixe
   Two bugs were identified, patched locally, deployed via scp, and the bot was
   restarted cleanly.
 
-  Bug 1 — `entry_side` AttributeError in `_check_var_remote()` (CRITICAL):
-  - Root cause: the March 5 "Signal Decoupling" refactor renamed
-    Position.entry_side → Position.trade_side everywhere except line 311 of
-    position_manager.py inside _check_var_remote().
-  - _check_var_remote() serialises open positions into the PCE worker queue as
-    (p.market_id, p.entry_price * p.entry_size, p.entry_side). With the wrong
-    attribute name it raised AttributeError on every signal evaluation after
-    the first position was opened.
+  Bug 1 — PCE serialization crash in `_check_var_remote()` (CRITICAL):
+  - Root cause (18:xx fix attempt): the March 5 "Signal Decoupling" refactor
+    renamed Position.entry_side → Position.trade_side everywhere except line
+    311 of position_manager.py. The 18:xx hotfix corrected the attribute name
+    but left the serialization as a bare 3-tuple:
+      (p.market_id, p.entry_price * p.entry_size, p.trade_side)
+  - Root cause (22:xx full fix): a git stash reversion re-introduced the
+    broken tuple form. The PCE worker calls `_MinimalPosition(**p)` for each
+    element — `**` unpacking requires a dict, not a tuple, so a TypeError was
+    being raised and swallowed by the stale_bar_flush_loop on every signal after
+    the first open position. Furthermore, the 3-tuple omitted 4 of the 7 kwargs
+    _MinimalPosition expects (filled_size, trade_asset_id, no_asset_id, event_id),
+    causing silently degraded VaR accuracy even if the container type were fixed.
+  - Definitive fix: replaced the tuple comprehension with a full dict comprehension
+    whose keys match _MinimalPosition.__init__ kwargs exactly:
+      { "market_id": p.market_id, "entry_price": p.entry_price,
+        "size": p.entry_size,  # _MinimalPosition uses 'size'; Position uses 'entry_size'
+        "filled_size": p.filled_size, "trade_asset_id": p.trade_asset_id,
+        "no_asset_id": p.no_asset_id, "event_id": p.event_id }
   - The crash was completely silent: bot.py._stale_bar_flush_loop() wraps the
     entire flush cycle in `except Exception`, logging only "stale_bar_flush_error"
-    — so signals 2 and 3 appear to vanish with no rejection reason in the main
-    log stream.
+    — so signals 2 and 3 vanished with no rejection reason in the main log stream.
   - Evidence: {"error": "'Position' object has no attribute 'entry_side'",
-    "event": "stale_bar_flush_error"} at 18:22:34Z and 18:23:34Z — both
-    coinciding exactly with signal timestamps.
-  - Fix: p.entry_side → p.trade_side at position_manager.py line 311.
-  - File deployed: src/trading/position_manager.py
+    "event": "stale_bar_flush_error"} at 18:22:34Z and 18:23:34Z.
+  - Files deployed: src/trading/position_manager.py (both patches, same day)
 
   Bug 2 — Duplicate `trend_guard_pct` field in frozen StrategyParams (CRITICAL):
   - Root cause: src/core/config.py defines StrategyParams (a frozen dataclass)
@@ -2583,6 +2607,35 @@ March 9th — Forensic Trace: Last 5 PanicSignal Events:
   Both bugs patched and deployed earlier in this session. No code changes
   resulted from this forensic audit.
 
+
+March 9th — VPS Infrastructure Remediation (3-Task Session):
+  Three compounding infrastructure failures silently degrading the live bot
+  were diagnosed, patched, deployed, and verified in a single session.
+
+  TASK 1 — PCE Worker VaR Serialisation Bug (src/trading/position_manager.py):
+    _check_var_remote() was serialising positions_data as 3-tuples
+    (market_id, entry_price*size, entry_side). pce_worker.py unpacks via
+    _MinimalPosition(**p) which expects dicts → TypeError on every VaR check
+    → trade entries fail-closed. Fixed: comprehension now produces 7-key dicts
+    matching all _MinimalPosition kwargs (market_id, entry_price, size,
+    filled_size, trade_asset_id, no_asset_id, event_id).
+
+  TASK 2 — L2 Books 0/304 via Cascading Emergency Stop (src/trading/pce_worker.py):
+    PCE worker’s first heartbeat.beat() was inside the request loop, AFTER
+    pce.load_state() (takes seconds). ProcessManager saw pce_worker.stale_duration
+    = Infinity > 6.0s critical threshold → emergency_stop_triggered → all workers
+    killed including the fully-functioning l2_worker_0. L2 books WERE syncing
+    (hundreds of l2_synced events) before the kill. Fixed: two early
+    heartbeat.beat() calls added: (1) immediately after WorkerHeartbeatSender
+    creation, (2) immediately after pce.load_state() returns.
+
+  TASK 3 — Trade WS Spurious Reconnects (src/core/config.py):
+    ws_silence_timeout_s was 10.0s; low-volume shards (50 markets each) can
+    naturally go silent >10s → ~23 spurious reconnects per 68-minute window.
+    Fixed: default raised to 120.0s (matching l2_silence_timeout_s).
+
+  VPS post-restart verification (3-min window): 774 l2_synced, 0 workers_stale,
+  0 emergency_stop, 0 ws_reconnect. All 3 patches deployed and confirmed live.
 
 ================================================================================
 END OF DOCUMENT

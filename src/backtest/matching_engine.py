@@ -145,7 +145,7 @@ class MatchingEngine:
         self,
         *,
         latency_ms: float = 150.0,
-        fee_max_pct: float = 1.56,
+        fee_max_pct: float = 2.00,
         fee_enabled: bool = True,
         impact_recovery_ms: float = 5000.0,
     ) -> None:

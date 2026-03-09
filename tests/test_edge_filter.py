@@ -133,7 +133,7 @@ class TestHardZeros:
         so it doesn't zero the entire geometric mean, but tick_viability=0
         still zeros the score."""
         # entry=0.50, VWAP=0.53 → gross=0.50*0.03=1.5¢
-        # Fee at 0.50 ≈ 1.56¢, fee at 0.515 ≈ 1.56¢ → total ≈ 3.12¢ > 1.5¢
+        # Fee at 0.50 ≈ 2.00¢, fee at 0.515 ≈ 2.00¢ → total ≈ 4.00¢ > 1.5¢
         ea = compute_edge_score(
             entry_price=0.50,
             no_vwap=0.53,
@@ -170,7 +170,7 @@ class TestSweetSpot:
         assert ea.tick_margin >= 3
 
     def test_mid_price_needs_larger_dislocation(self):
-        """p=0.50 faces max fees (1.56¢/leg).  Needs larger VWAP gap."""
+        """p=0.50 faces max fees (2.00¢/leg).  Needs larger VWAP gap."""
         # 5¢ gap works
         ea5 = compute_edge_score(
             entry_price=0.45,
@@ -197,7 +197,7 @@ class TestSweetSpot:
             volume_ratio=5.0,
         )
         assert ea.viable is True
-        assert ea.fee_efficiency > 0.7  # very little fee drag
+        assert ea.fee_efficiency > 0.6  # moderate fee drag at 2% regime
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -429,7 +429,7 @@ class TestTickViability:
         """1–2¢ net → tick_viability between 0 and 1."""
         ea = compute_edge_score(
             entry_price=0.15,
-            no_vwap=0.22,     # gross ≈ 3.5¢, fees ≈ 1.5¢, net ≈ 2¢
+            no_vwap=0.24,     # gross ≈ 4.5¢, fees ≈ 2.2¢, net ≈ 2.3¢
             zscore=3.0,
             volume_ratio=5.0,
             min_score=0.0,

@@ -138,7 +138,7 @@ class WfoConfig:
     study_prefix: str = "polymarket_wfo"
 
     latency_ms: float = 150.0
-    fee_max_pct: float = 1.56
+    fee_max_pct: float = 2.00
     fee_enabled: bool = True
 
     warm_start: bool = True
