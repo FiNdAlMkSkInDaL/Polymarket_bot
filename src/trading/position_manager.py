@@ -308,7 +308,15 @@ class PositionManager:
         """
         req_id = uuid.uuid4().hex[:12]
         positions_data = [
-            (p.market_id, p.entry_price * p.entry_size, p.trade_side)
+            {
+                "market_id": p.market_id,
+                "entry_price": p.entry_price,
+                "size": p.entry_size,
+                "filled_size": p.filled_size,
+                "trade_asset_id": p.trade_asset_id,
+                "no_asset_id": p.no_asset_id,
+                "event_id": p.event_id,
+            }
             for p in open_positions
         ]
         try:
@@ -1158,7 +1166,9 @@ class PositionManager:
             _fair_vs_clob = abs((1.0 - model_probability) - entry_price)
 
         fast_strike = _fair_vs_clob > 0.02 and latency_healthy
+        _fast_strike_fired_at: float | None = None
         if fast_strike:
+            _fast_strike_fired_at = time.monotonic()
             entry_price = round(entry_price + 0.01, 2)
             log.info(
                 "rpe_fast_strike_triggered",
@@ -1367,6 +1377,7 @@ class PositionManager:
             side=OrderSide.BUY,
             price=entry_price,
             size=entry_size,
+            signal_fired_at=_fast_strike_fired_at,
         )
 
         # ── Pillar 16: Alpha-source attribution ──────────────────────

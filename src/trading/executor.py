@@ -107,6 +107,7 @@ class OrderExecutor:
         *,
         post_only: bool = False,
         fee_rate_bps: int = 0,
+        signal_fired_at: float | None = None,
     ) -> Order:
         """Place a GTC limit order.
 
@@ -179,6 +180,38 @@ class OrderExecutor:
                 elif hasattr(resp, "orderID"):
                     clob_id = resp.orderID
                 order.clob_order_id = str(clob_id)
+
+                # SI-7 Fast-Strike latency telemetry
+                if signal_fired_at is not None:
+                    ack_at = time.monotonic()
+                    latency_ms = round((ack_at - signal_fired_at) * 1000, 2)
+                    log.info(
+                        "fast_strike_latency",
+                        order_id=order.order_id,
+                        signal_to_ack_ms=latency_ms,
+                        clob_id=order.clob_order_id,
+                    )
+
+                    # Detect lost-race rejections (faster bot took the liquidity)
+                    if isinstance(resp, dict):
+                        resp_status = (resp.get("status") or "").upper()
+                        resp_reason = (resp.get("reason") or resp.get("error") or "").upper()
+                        lost_race = any(tag in f"{resp_status} {resp_reason}" for tag in (
+                            "ALREADY_FILLED", "PRICE_OUT_OF_BOUNDS", "NOT_FOUND",
+                        ))
+                        if lost_race:
+                            order.status = OrderStatus.CANCELLED
+                            order.rejection_reason = "fast_strike_lost_race"
+                            log.warning(
+                                "fast_strike_lost_race",
+                                order_id=order.order_id,
+                                latency_ms=latency_ms,
+                                clob_status=resp_status,
+                                clob_reason=resp_reason,
+                            )
+                            self._orders[order.order_id] = order
+                            return order
+
                 log.info(
                     "order_placed_live",
                     order_id=order.order_id,
@@ -190,7 +223,31 @@ class OrderExecutor:
                 )
             except Exception as exc:
                 order.status = OrderStatus.CANCELLED
-                log.error("order_place_failed", error=str(exc))
+                # Log fast-strike failure with latency if applicable
+                if signal_fired_at is not None:
+                    fail_at = time.monotonic()
+                    latency_ms = round((fail_at - signal_fired_at) * 1000, 2)
+                    err_str = str(exc).upper()
+                    lost_race = any(tag in err_str for tag in (
+                        "ALREADY_FILLED", "PRICE_OUT_OF_BOUNDS",
+                    ))
+                    if lost_race:
+                        order.rejection_reason = "fast_strike_lost_race"
+                        log.warning(
+                            "fast_strike_lost_race",
+                            order_id=order.order_id,
+                            latency_ms=latency_ms,
+                            error=str(exc),
+                        )
+                    else:
+                        log.error(
+                            "fast_strike_order_failed",
+                            order_id=order.order_id,
+                            latency_ms=latency_ms,
+                            error=str(exc),
+                        )
+                else:
+                    log.error("order_place_failed", error=str(exc))
                 self._orders[order.order_id] = order
                 return order
         else:

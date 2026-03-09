@@ -253,6 +253,7 @@ class TradingBot:
 
         # Exception circuit breakers for critical async loops
         self._trade_loop_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._stale_bar_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
 
         # RPE per-market cooldown (Deliverable C)
         self._rpe_last_signal: dict[str, float] = {}
@@ -839,8 +840,9 @@ class TradingBot:
             ]
             self._tasks.append(ws_task)
 
-        # 5. Reset the circuit breaker so it can trip again on new errors
+        # 5. Reset the circuit breakers so they can trip again on new errors
         self._trade_loop_breaker.reset()
+        self._stale_bar_breaker.reset()
 
         # 6. Resume chasers
         self._fast_kill_event.set()
@@ -2722,8 +2724,27 @@ class TradingBot:
                         log.info("cross_market_scan", signals=len(cm_signals))
             except asyncio.CancelledError:
                 break
+            except (KeyError, ValueError) as exc:
+                # Targeted non-fatal: stale aggregator keys, bad bar data
+                log.warning("stale_bar_flush_non_fatal", error=str(exc))
             except Exception as exc:
-                log.error("stale_bar_flush_error", error=str(exc))
+                log.error(
+                    "stale_bar_flush_error",
+                    error=str(exc),
+                    exc_info=True,
+                )
+                if self._stale_bar_breaker.record():
+                    log.critical(
+                        "stale_bar_circuit_breaker_tripped",
+                        errors_in_window=self._stale_bar_breaker.recent_errors,
+                        msg="Too many unexpected errors in stale_bar_flush — suspending & resetting WS",
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: stale_bar_flush tripped "
+                        "(5 unexpected errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
+                    self._stale_bar_breaker.reset()
 
     async def _stats_loop(self) -> None:
         """Every 15 minutes, log and broadcast aggregate stats."""
