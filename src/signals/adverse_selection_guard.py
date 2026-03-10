@@ -1,4 +1,4 @@
-﻿"""
+"""
 Anti-adverse-selection module -- the **"Fast-Kill"** mechanism (v2).
 
 Detects toxic flow using four **intra-Polymarket** microstructure signals

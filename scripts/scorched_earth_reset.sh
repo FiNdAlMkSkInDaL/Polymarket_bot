@@ -81,13 +81,11 @@ else
     echo "    ✗ WARNING: data/vps_march2026 NOT FOUND!"
 fi
 
-# ── STEP 2.5: PULL LATEST CODE ────────────────────────────────
+# ── STEP 2.5: VERIFY CODE IS CURRENT ──────────────────────────
 echo ""
-echo "[STEP 2.5] Pulling latest code from origin..."
+echo "[STEP 2.5] Code version check..."
 cd "$BOT_DIR"
-git fetch origin
-git reset --hard origin/main
-echo "  ✓ code updated to $(git log --oneline -1)"
+echo "  current commit: $(git log --oneline -1)"
 
 # ── STEP 3: VERIFY CONFIGURATION ──────────────────────────────
 echo ""

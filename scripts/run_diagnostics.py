@@ -1,4 +1,4 @@
-﻿"""
+"""
 Diagnostic Report Runner
 
 Executes the full test suite via pytest, parses results per area,
