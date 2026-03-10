@@ -95,8 +95,8 @@ class StrategyParams:
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.0)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.8)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 0.8)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.5)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Trend regime guard (suppress signals during sustained up-trends).
@@ -239,7 +239,7 @@ class StrategyParams:
     sl_decay_start_minutes: float = _env_float("SL_DECAY_START_MINUTES", 5.0)
     sl_decay_half_life_minutes: float = _env_float("SL_DECAY_HALF_LIFE_MINUTES", 15.0)
 
-    signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
+    signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.25)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
     # Maximum dollar-risk per trade.  Caps position size so that a
@@ -400,7 +400,7 @@ class StrategyParams:
     # Requires a genuine 2% discount before entry to ensure the
     # contrarian edge exists.  Without this, entries at full VWAP
     # have no mean-reversion cushion and bleed on fees + spread.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.98)
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.995)
 
     # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
     # Exponentially-weighted moving average of 1-min log-return variance.
@@ -411,7 +411,7 @@ class StrategyParams:
     # ── Regime-adaptive EQS threshold (OE-6) ─────────────────────────────────
     # Scale min_edge_score by EWMA σ.  Low-vol → raise threshold
     # (avoid noise), high-vol → lower threshold (mean-reversion α).
-    eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", True)
+    eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", False)
     # Recalibrated from 0.02 to 0.70 based on 3-day tick data analysis:
     # actual market EWMA vols have median 0.72 (P10=0.21, P75=1.22).
     # At 0.02, the ratio was always 10-96x, jamming the ±25% adjuster
@@ -509,7 +509,7 @@ class StrategyParams:
     drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
     drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
     drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 0.8)
-    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.05)
+    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.35)
     drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 60.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)

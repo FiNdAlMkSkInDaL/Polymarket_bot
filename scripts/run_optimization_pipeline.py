@@ -173,7 +173,7 @@ PHASE3_DEFAULTS = {"max_markets": 31, "train_days": 30, "n_trials": 1}
 
 # Smoke-test overrides (minimal resources for local validation)
 SMOKE_OVERRIDES = {
-    "max_markets": 1, "train_days": 2, "n_trials": 2,
+    "max_markets": 1, "train_days": 5, "n_trials": 10,
     "max_workers": 1, "test_days": 2, "step_days": 30,
 }
 

@@ -274,7 +274,7 @@ def diagnose_single_market(
                     gates["G06b_sigma_zero"] += 1
                     continue
 
-                delta_p = bar.close - vwap
+                delta_p = (bar.close - vwap) / vwap
                 zscore = delta_p / sigma
 
                 # Intra-bar correction (same as PanicDetector)

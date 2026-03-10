@@ -321,11 +321,12 @@ class WfoReport:
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
 SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
     # Core signal parameters
-    # Hardened bounds (March 9 WFO Reset): admit only statistically
-    # significant panics.  Prior [0.15, 1.5] allowed sub-σ noise entries.
-    "zscore_threshold": ("suggest_float", 1.0, 2.5),
+    # Relaxed bounds (March 10): observed z-scores max ~0.43 (price-unit
+    # delta_p / log-return σ mismatch suppresses values).  Prior floor of
+    # 1.0 produced 0 trades.  Allow 0.05–2.5 so WFO can find viable range.
+    "zscore_threshold": ("suggest_float", 0.05, 2.5),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
-    "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
+    "volume_ratio_threshold": ("suggest_float", 0.1, 2.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
     "trend_guard_pct": ("suggest_float", 0.05, 1.0),
     # Risk management
@@ -338,8 +339,9 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     # Take-profit
     "alpha_default": ("suggest_float", 0.25, 0.75),
     "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
-    # Edge quality — institutional filter (hardened March 9)
-    "min_edge_score": ("suggest_float", 50.0, 85.0),
+    # Edge quality — floor lowered (March 10) to allow WFO to find
+    # baseline.  Prior 50.0 floor blocked marginal signals entirely.
+    "min_edge_score": ("suggest_float", 20.0, 85.0),
     # RPE (Pillar 14)
     "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
     "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),

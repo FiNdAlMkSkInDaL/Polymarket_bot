@@ -3009,6 +3009,11 @@ class TradingBot:
                 open_markets = self.positions.get_open_market_ids()
                 whale_tokens = self.whale_monitor.get_whale_tokens()
 
+                # Snapshot tier counts before refresh for delta tracking
+                prev_active = len(self.lifecycle.active)
+                prev_observing = len(self.lifecycle.observing)
+                prev_draining = len(self.lifecycle.draining)
+
                 newly_added, evicted = await self.lifecycle.refresh(
                     orderbook_trackers=self._book_trackers,
                     trade_counts=self._trade_counts,
@@ -3100,20 +3105,27 @@ class TradingBot:
                 total = len(self.lifecycle.active)
                 obs = len(self.lifecycle.observing)
                 drn = len(self.lifecycle.draining)
+                universe = total + obs + drn
+                discovered = len(newly_added)
+                dropped = len(evicted) + len(stale_evicted)
 
-                if newly_added or evicted:
+                if newly_added or evicted or stale_evicted:
                     log.info(
                         "market_refresh_done",
-                        added=len(newly_added),
-                        evicted=len(evicted),
+                        discovered=discovered,
+                        dropped=dropped,
                         active=total,
                         observing=obs,
                         draining=drn,
                     )
+                    # Separate universe-level deltas from tier breakdown
+                    promoted = max(0, total - prev_active)
                     await self.telegram.send(
                         f"🔄 <b>Market refresh</b>\n"
-                        f"Active: {total}  |  Observing: {obs}  |  Draining: {drn}\n"
-                        f"+{len(newly_added)} new  |  -{len(evicted)} evicted"
+                        f"Universe: {universe} tracked "
+                        f"(+{discovered} discovered, -{dropped} dropped)\n"
+                        f"Active: {total} (+{promoted} promoted)  |  "
+                        f"Observing: {obs}  |  Draining: {drn}"
                     )
 
             except asyncio.CancelledError:
