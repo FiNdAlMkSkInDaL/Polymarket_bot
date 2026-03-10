@@ -494,7 +494,19 @@ def allocate_shm(asset_id: str) -> tuple[shared_memory.SharedMemory, str]:
         stale.unlink()
     except FileNotFoundError:
         pass
-    shm = shared_memory.SharedMemory(name=name, create=True, size=BLOCK_SIZE)
+    try:
+        shm = shared_memory.SharedMemory(name=name, create=True, size=BLOCK_SIZE)
+    except FileExistsError:
+        # Stale segment still present (race or OS delay) — force unlink
+        # and retry so ungraceful shutdowns don't require manual cleanup.
+        _log.warning("shm_stale_retry", extra={"shm_name": name})
+        try:
+            stale = shared_memory.SharedMemory(name=name, create=False)
+            stale.close()
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+        shm = shared_memory.SharedMemory(name=name, create=True, size=BLOCK_SIZE)
     # Zero-initialize
     shm.buf[:BLOCK_SIZE] = b"\x00" * BLOCK_SIZE
     return shm, name

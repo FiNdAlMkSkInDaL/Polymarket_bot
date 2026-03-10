@@ -200,8 +200,8 @@ class StrategyParams:
     exit_timeout_seconds: int = _env_int("EXIT_TIMEOUT_SECONDS", 1800)
 
     # Market selection filters
-    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 5_000.0)
-    min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 3)
+    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 1500.0)
+    min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 1)
     min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
 
     # Discovery behaviour
@@ -209,6 +209,10 @@ class StrategyParams:
     reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", False)
     one_market_per_event: bool = _env_bool("ONE_MARKET_PER_EVENT", True)
     market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 10)
+
+    # Load shedding: maximum markets with full L2 book reconstruction.
+    # Remaining discovered markets use lightweight price/trade-only tracking.
+    max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 50)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)

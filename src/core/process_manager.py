@@ -494,7 +494,11 @@ class ProcessManager:
 
         for wid, record in self._workers.items():
             proc = record.process
-            if proc is None or not proc.is_alive():
+            if proc is None:
+                continue
+            if not proc.is_alive():
+                # Reap already-dead processes to prevent <defunct> zombies.
+                proc.join(timeout=1.0)
                 continue
             proc.join(timeout=timeout)
             if proc.is_alive():
@@ -503,6 +507,7 @@ class ProcessManager:
                 proc.join(timeout=3.0)
                 if proc.is_alive():
                     proc.kill()
+                    proc.join(timeout=1.0)  # reap after kill
 
         # Clean up shared memory
         for reader in self._readers.values():

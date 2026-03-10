@@ -351,8 +351,29 @@ class TradingBot:
         log.info("markets_selected", count=len(self._markets))
 
         # 3. Build per-market aggregators, detectors & book trackers
+        #    Load shedding: only the top MAX_ACTIVE_L2_MARKETS by 24h
+        #    volume get full L2 book reconstruction + SI-2 iceberg
+        #    detection.  The rest use lightweight price/trade-only
+        #    tracking to keep loop latency under 100ms.
         all_asset_ids: list[str] = []
         whale_map: dict[str, tuple[str, str]] = {}
+
+        l2_limit = settings.strategy.max_active_l2_markets
+        all_wirable = list(self._markets)
+        for om in self.lifecycle.observing.values():
+            if om.info not in all_wirable:
+                all_wirable.append(om.info)
+        # Sort descending by volume; top l2_limit get full L2
+        all_wirable.sort(key=lambda m: m.daily_volume_usd, reverse=True)
+        self._l2_active_set: set[str] = {
+            m.condition_id for m in all_wirable[:l2_limit]
+        }
+        log.info(
+            "load_shedding_applied",
+            total_markets=len(all_wirable),
+            l2_active=len(self._l2_active_set),
+            l2_limit=l2_limit,
+        )
 
         for m in self._markets:
             self._wire_market(m)
@@ -685,7 +706,14 @@ class TradingBot:
         )
 
         # Orderbook trackers for both tokens
-        if settings.strategy.l2_enabled:
+        # Load shedding: only markets in _l2_active_set get full L2 book
+        # reconstruction.  Others get the lightweight OrderbookTracker.
+        l2_eligible = (
+            settings.strategy.l2_enabled
+            and hasattr(self, '_l2_active_set')
+            and m.condition_id in self._l2_active_set
+        )
+        if l2_eligible:
             for token_id in (m.yes_token_id, m.no_token_id):
                 # SI-2: Create iceberg detector and wire as level-change callback
                 ice_cb = None
@@ -2870,14 +2898,18 @@ class TradingBot:
                 log.error("paper_summary_error", error=str(exc))
 
     async def _health_reporter(self) -> None:
-        """Every 60 seconds, write ``system_health.json`` to the log dir.
+        """Every 300 seconds, write ``system_health.json`` to the log dir.
 
         Tracks memory usage, WebSocket reconnect counts, SQLite lock
         retries, latency guard state, and heartbeat status — critical
         telemetry for the long-running data-harvesting soak test.
+
+        Load shedding: samples up to 5 random L2 books per cycle instead
+        of iterating every book, to reduce IPC overhead on large universes.
         """
         import json as _json
         import os as _os
+        import random as _random
         import tempfile
         from pathlib import Path as _Path
 
@@ -2897,8 +2929,10 @@ class TradingBot:
         except (ImportError, Exception):
             _process = None
 
+        _HEALTH_SAMPLE_SIZE = 5  # max L2 books to sample per cycle
+
         while self._running:
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)
             try:
                 ws_reconnects = (
                     getattr(self._ws, "reconnect_count", 0)
@@ -2936,27 +2970,55 @@ class TradingBot:
                     "observing_markets": len(self.lifecycle.observing),
                 }
 
-                # Aggregate L2 book health metrics across all tracked books
+                # Aggregate L2 book health metrics across all tracked books.
+                # In multicore mode, the actual L2 books live in worker
+                # processes — read health from shared-memory readers instead
+                # of the stale main-process book objects.
                 l2_total_deltas = 0
                 l2_total_desyncs = 0
                 l2_synced_count = 0
-                for book in self._l2_books.values():
-                    l2_total_deltas += book.delta_count
-                    l2_total_desyncs += book.desync_total
-                    if book.state == BookState.SYNCED:
-                        l2_synced_count += 1
+                l2_unreliable_count = 0
+                l2_total_count = len(self._l2_books)
+
+                # Load shedding: sample up to _HEALTH_SAMPLE_SIZE
+                # random books instead of reading all of them.
+                if (
+                    self._multicore_enabled
+                    and self._process_manager is not None
+                ):
+                    readers = self._process_manager.get_all_readers()
+                    l2_total_count = max(l2_total_count, len(readers))
+                    reader_items = list(readers.values())
+                    if len(reader_items) > _HEALTH_SAMPLE_SIZE:
+                        reader_items = _random.sample(reader_items, _HEALTH_SAMPLE_SIZE)
+                    for reader in reader_items:
+                        snap = reader.read_header()
+                        l2_total_deltas += snap.delta_count
+                        l2_total_desyncs += snap.desync_total
+                        if snap.state == 2:  # BookState.SYNCED
+                            l2_synced_count += 1
+                        if not snap.is_reliable:
+                            l2_unreliable_count += 1
+                else:
+                    book_items = list(self._l2_books.values())
+                    if len(book_items) > _HEALTH_SAMPLE_SIZE:
+                        book_items = _random.sample(book_items, _HEALTH_SAMPLE_SIZE)
+                    for book in book_items:
+                        l2_total_deltas += book.delta_count
+                        l2_total_desyncs += book.desync_total
+                        if book.state == BookState.SYNCED:
+                            l2_synced_count += 1
+                        if not book.is_reliable:
+                            l2_unreliable_count += 1
 
                 health["l2_total_deltas"] = l2_total_deltas
                 health["l2_total_desyncs"] = l2_total_desyncs
                 health["l2_synced_books"] = l2_synced_count
-                health["l2_total_books"] = len(self._l2_books)
+                health["l2_total_books"] = l2_total_count
                 health["l2_seq_gap_rate"] = round(
                     l2_total_desyncs / max(1, l2_total_deltas), 6
                 )
-                health["l2_unreliable_books"] = sum(
-                    1 for book in self._l2_books.values()
-                    if not book.is_reliable
-                )
+                health["l2_unreliable_books"] = l2_unreliable_count
 
                 # Atomic write: offload blocking file I/O to a thread
                 await asyncio.to_thread(
@@ -3025,6 +3087,7 @@ class TradingBot:
 
                 # Evict markets
                 for cid in evicted:
+                    self._l2_active_set.discard(cid)
                     for m in list(self._markets):
                         if m.condition_id == cid:
                             if self._ws:
@@ -3037,6 +3100,15 @@ class TradingBot:
                                 )
                             self._unwire_market(m)
                             break
+
+                # Re-evaluate L2 active set before wiring new markets
+                # so _wire_market knows which markets get full L2
+                l2_limit = settings.strategy.max_active_l2_markets
+                all_tracked = self.lifecycle.get_all_tracked()
+                all_tracked.sort(key=lambda m: m.daily_volume_usd, reverse=True)
+                self._l2_active_set = {
+                    m.condition_id for m in all_tracked[:l2_limit]
+                }
 
                 # Wire + subscribe new markets
                 new_asset_ids: list[str] = []
