@@ -487,6 +487,13 @@ def allocate_shm(asset_id: str) -> tuple[shared_memory.SharedMemory, str]:
     lifecycle (must call ``shm.close()`` + ``shm.unlink()``).
     """
     name = _shm_name(asset_id)
+    # Clean up stale segment from a prior crash before creating
+    try:
+        stale = shared_memory.SharedMemory(name=name, create=False)
+        stale.close()
+        stale.unlink()
+    except FileNotFoundError:
+        pass
     shm = shared_memory.SharedMemory(name=name, create=True, size=BLOCK_SIZE)
     # Zero-initialize
     shm.buf[:BLOCK_SIZE] = b"\x00" * BLOCK_SIZE
