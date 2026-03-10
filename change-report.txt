@@ -4998,3 +4998,143 @@ TEST RESULTS
 
 ================================================================================
 
+================================================================================
+CHANGE REPORT — Market Discovery: Token ID Validation Hardening
+Date: 2026-03-10
+================================================================================
+
+BACKGROUND
+----------
+Live bot reported logging "Skipping market. Asset ID is missing or invalid."
+for all 327 markets discovered during a refresh cycle, reducing the active
+trading universe to zero with no WebSocket connections and no trades.
+
+Root cause investigation (via live API inspection on VPS) revealed three issues:
+
+  1. CLOB Tier 1 always returns zero eligible markets: The CLOB /markets
+     endpoint ignores the `active=true&closed=false` server-side filter and
+     returns thousands of stale closed markets from 2023 (NBA, NCAAB games,
+     etc.).  Every market is rejected as "closed" by _parse_market, and the
+     bot falls through to the `clob_returned_zero_trying_gamma_events` path
+     every single refresh.  This wastes ~3 seconds per cycle but does not
+     cause the critical failure by itself.
+
+  2. _parse_market had no empty token_id guard: After identifying YES/NO
+     tokens (by outcome label or positional convention), the function called
+     yes_token.get("token_id", "") and directly assigned the result to
+     MarketInfo.yes_token_id without checking if the string was empty.  If
+     the Gamma API returns a market with clobTokenIds = ["", ""], null, or
+     a JSON-encoded "null", the zip() in _normalize_gamma_market produces
+     tokens with empty token_id strings.  These empty MarketInfo objects pass
+     every filter and reach _wire_market(), where they create broken
+     shared-memory segments, empty WebSocket subscriptions, and corrupted
+     market_map entries — manifesting as the "asset ID missing" failure.
+
+  3. _normalize_gamma_market lacked forward compatibility: It only handled
+     the current Gamma schema (clobTokenIds + outcomes as JSON strings) and
+     would silently produce an empty tokens list if Polymarket ever adds a
+     native `tokens` field to the Gamma API — which the CLOB API already
+     returns.  This creates a zero-token state that _parse_market rejects as
+     "too_few_tokens", causing the entire universe blackout seen in the report.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. src/data/market_discovery.py
+
+   _normalize_gamma_market() — two-path token extraction:
+   - NEW: If the Gamma market dict contains a native `tokens` list (each
+     element is a dict with `token_id` and `outcome` keys — same schema as
+     the CLOB API), it is used directly after normalising each element via
+     t.get("token_id", "") and t.get("outcome", "").
+   - FALLBACK: If no native `tokens` list is present, the existing
+     clobTokenIds + outcomes JSON-string logic is used (current Gamma schema
+     preserved with no behavioural change).
+   - This makes the normaliser forward-compatible if Polymarket unifies their
+     Gamma and CLOB schemas, while maintaining full backward compatibility.
+
+   _parse_market() — non-empty token_id validation gate (new check):
+   - After the YES/NO token identification block (label-matching then
+     positional fallback), the extracted IDs are captured into locals:
+         yes_tid = yes_token.get("token_id", "")
+         no_tid  = no_token.get("token_id", "")
+   - If either ID is empty/falsy, the market is immediately rejected:
+         return None, {
+             "reason": "missing_token_id",
+             "yes_token_id_present": bool(yes_tid),
+             "no_token_id_present": bool(no_tid),
+             "question": question,
+         }
+   - MarketInfo is now constructed with yes_tid / no_tid (the validated
+     locals) instead of repeated yes_token.get() / no_token.get() calls.
+   - The "missing_token_id" reason surfaces in market_rejected log events,
+     making the failure diagnosable without a debug script.
+
+================================================================================
+LIVE API SCHEMA (verified 2026-03-10)
+================================================================================
+
+  CLOB /markets:
+    - tokens: [{"token_id": "<hex>", "outcome": "Yes|No", "price": float,
+                "winner": bool}]
+    - Fields: condition_id, question, active, closed, neg_risk,
+      accepting_orders, end_date_iso, tags.  NO volume fields.
+    - Server-side active/closed filter is broken — returns stale closed data.
+
+  Gamma /events → markets[]:
+    - clobTokenIds: "[\"<hex>\", \"<hex>\"]"  (JSON-encoded string)
+    - outcomes: "[\"Yes\", \"No\"]"            (JSON-encoded string)
+    - No native `tokens` field (as of 2026-03-10).
+    - volume24hr, liquidityClob present and correct for all active markets.
+    - All 153 active markets returned valid non-empty clobTokenIds.
+
+  Gamma /markets:
+    - Same schema as markets embedded in /events.
+    - Used as Tier 3 fallback only.
+
+================================================================================
+DISCOVERY TIER BEHAVIOUR (post-patch)
+================================================================================
+
+  Tier 1 — CLOB /markets:
+    Status: Always returns 0 eligible markets (server filter broken, returns
+            stale 2023 sports markets all with closed=True).
+    Action: Falls through to Tier 2 after exhausting pages.  No code change
+            to CLOB fetch logic — a future server-side fix will automatically
+            restore Tier 1 without any code change required.
+
+  Tier 2 — Gamma /events (primary active path):
+    Status: Returns 150–155 markets every cycle. All have valid clobTokenIds.
+    Filters applied: active, not closed, acceptingOrders, binary (2 tokens),
+            non-empty token_id (new gate), volume ≥ min, liquidity ≥ min,
+            resolution ≥ min_days.
+    Result: ~147 active + ~6 observing → lifecycle_bootstrap.
+
+  Tier 3 — Gamma /markets:
+    Status: Dormant (Tier 2 always succeeds).
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+  Pre-deploy VPS test run:
+    1534 passed, 2 failed (pre-existing: test_default_is_paper env-var
+    mismatch — unrelated to this change), 0 regressions.
+
+  Deployment steps:
+    1. SCP patched market_discovery.py to VPS.
+    2. systemd auto-restarted (activating → active within 10s).
+    3. Log confirmation:
+       - clob_returned_zero_trying_gamma_events (expected)
+       - gamma_events_tag_done: markets_so_far=153
+       - markets_fetched: count=153, source=gamma_events
+       - lifecycle_bootstrap: active=147, observing=6, total_discovered=153
+       - markets_selected: count=147
+       - ws_connected × 8+ (market + L2 WebSockets)
+       - whale_wss_subscribed ✓
+       - l2_synced events flowing across all ~300 asset IDs ✓
+    No "missing_token_id" or "too_few_tokens" rejections observed.
+
+================================================================================
+

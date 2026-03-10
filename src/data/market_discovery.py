@@ -426,27 +426,38 @@ def _normalize_gamma_market(m: dict) -> dict:
       conditionId          condition_id
       negRisk              passed through for filtering
     """
-    clob_ids_raw = m.get("clobTokenIds") or []
-    outcomes_raw = m.get("outcomes") or []
+    # Prefer a native ``tokens`` list if Gamma starts providing one
+    # (mirrors the CLOB schema: [{"token_id": ..., "outcome": ...}, ...])
+    native_tokens = m.get("tokens")
+    if isinstance(native_tokens, list) and native_tokens:
+        tokens = [
+            {"token_id": t.get("token_id", ""), "outcome": t.get("outcome", "")}
+            for t in native_tokens
+            if isinstance(t, dict)
+        ]
+    else:
+        # Fall back to clobTokenIds + outcomes (current Gamma schema)
+        clob_ids_raw = m.get("clobTokenIds") or []
+        outcomes_raw = m.get("outcomes") or []
 
-    # Gamma sometimes returns these as JSON-encoded strings instead of lists
-    if isinstance(clob_ids_raw, str):
-        try:
-            clob_ids_raw = json.loads(clob_ids_raw)
-        except (json.JSONDecodeError, TypeError):
-            clob_ids_raw = []
-    if isinstance(outcomes_raw, str):
-        try:
-            outcomes_raw = json.loads(outcomes_raw)
-        except (json.JSONDecodeError, TypeError):
-            outcomes_raw = []
+        # Gamma sometimes returns these as JSON-encoded strings instead of lists
+        if isinstance(clob_ids_raw, str):
+            try:
+                clob_ids_raw = json.loads(clob_ids_raw)
+            except (json.JSONDecodeError, TypeError):
+                clob_ids_raw = []
+        if isinstance(outcomes_raw, str):
+            try:
+                outcomes_raw = json.loads(outcomes_raw)
+            except (json.JSONDecodeError, TypeError):
+                outcomes_raw = []
 
-    clob_ids: list[str] = clob_ids_raw if isinstance(clob_ids_raw, list) else []
-    outcomes: list[str] = outcomes_raw if isinstance(outcomes_raw, list) else []
-    tokens = [
-        {"token_id": tid, "outcome": outcome}
-        for tid, outcome in zip(clob_ids, outcomes)
-    ]
+        clob_ids: list[str] = clob_ids_raw if isinstance(clob_ids_raw, list) else []
+        outcomes: list[str] = outcomes_raw if isinstance(outcomes_raw, list) else []
+        tokens = [
+            {"token_id": tid, "outcome": outcome}
+            for tid, outcome in zip(clob_ids, outcomes)
+        ]
     # ── Volume: use 24-hour fields, NOT lifetime cumulative ──
     raw_volume = (
         m.get("volume24hr")
@@ -601,11 +612,22 @@ def _parse_market(
             yes_token = tokens[0]
             no_token = tokens[1]
 
+        # Validate that token IDs are actually present and non-empty
+        yes_tid = yes_token.get("token_id", "")
+        no_tid = no_token.get("token_id", "")
+        if not yes_tid or not no_tid:
+            return None, {
+                "reason": "missing_token_id",
+                "yes_token_id_present": bool(yes_tid),
+                "no_token_id_present": bool(no_tid),
+                "question": question,
+            }
+
         return MarketInfo(
             condition_id=raw.get("condition_id", ""),
             question=raw.get("question", ""),
-            yes_token_id=yes_token.get("token_id", ""),
-            no_token_id=no_token.get("token_id", ""),
+            yes_token_id=yes_tid,
+            no_token_id=no_tid,
             daily_volume_usd=volume,
             end_date=end_date,
             active=True,

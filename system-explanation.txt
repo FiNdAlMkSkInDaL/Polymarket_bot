@@ -661,8 +661,27 @@ Market Discovery (src/data/market_discovery.py):
   MarketInfo: condition_id, question, yes/no_token_ids, volume, end_date,
     event_id, liquidity, score, accepting_orders, tags
 
-  Filters: active, not closed, accepting orders, binary (2 tokens),
-  volume ≥ min, liquidity ≥ min, resolution ≥ min_days
+  Filters (applied by _parse_market, in order):
+    1. active=True, closed=False
+    2. acceptingOrders=True
+    3. negRisk=False (if reject_neg_risk config)
+    4. len(tokens) == 2 (binary only)
+    5. volume_num_24hr ≥ min_daily_volume_usd
+    6. liquidity ≥ min_liquidity_usd (if min > 0)
+    7. days_to_resolution ≥ min_days_to_resolution
+    8. token_id non-empty for both YES and NO (missing_token_id rejection)
+
+  Token extraction (_normalize_gamma_market):
+    - Preferred path: native `tokens` list if present (forward-compat with
+      CLOB schema: [{"token_id": ..., "outcome": ...}])
+    - Fallback: clobTokenIds + outcomes JSON-encoded strings (current Gamma
+      schema). Both fields JSON-parsed if str, empty list on decode error.
+
+  Discovery tier status (as of 2026-03-10):
+    Tier 1 (CLOB): broken — server ignores active/closed filters, returns
+      stale 2023 closed markets. Falls through to Tier 2 every cycle.
+    Tier 2 (Gamma /events): primary active path, yields ~150 markets/cycle.
+    Tier 3 (Gamma /markets): dormant fallback.
 
 Market Lifecycle (src/data/market_lifecycle.py):
   4-tier state machine: observing → active → draining → emergency
@@ -2726,6 +2745,35 @@ March 10th — Full-Spectrum Anti-Silent-Failure Circuit Breaker Hardening:
     l2_synced: 1000+ | emergency_stop: 0 | workers_stale: 0 |
     circuit_breaker_tripped: 0 | pce_worker_ready: 14:12:44 UTC.
   1542 passed, 0 failed, 0 regressions.
+
+March 10th — Market Discovery: Token ID Validation Hardening:
+  Critical data-ingestion fix: live bot reported all 327 markets skipped each
+  refresh cycle (zero active universe, no WebSocket connections, no trades).
+
+  Root causes identified:
+  - CLOB Tier 1 broken: server ignores active/closed filters, returns stale
+    2023 closed markets. Falls through to Gamma every cycle (expected).
+  - _parse_market lacked empty token_id guard: empty clobTokenIds from API
+    produced MarketInfo with yes_token_id="" / no_token_id="", silently
+    corrupting market_map, WS subscriptions, and shared-memory segments.
+  - _normalize_gamma_market not forward-compatible: would produce empty
+    tokens list if Gamma API ever adds native `tokens` field (like CLOB API),
+    causing all markets to fail the binary (2 tokens) filter.
+
+  Changes to src/data/market_discovery.py:
+  - _normalize_gamma_market(): two-path token extraction — prefer native
+    `tokens` list if present, fallback to clobTokenIds+outcomes JSON strings.
+  - _parse_market(): new empty token_id gate after YES/NO identification;
+    rejects with reason="missing_token_id" if either ID is empty/falsy.
+    LogS yes_token_id_present and no_token_id_present booleans for diagnosis.
+
+  Live API schema confirmed (2026-03-10): all 153 active Gamma markets have
+  valid non-empty clobTokenIds. Tier 2 (Gamma /events) is the sole active
+  discovery path.
+
+  Post-deploy: lifecycle_bootstrap active=147 observing=6 total=153;
+  300 asset IDs subscribed; l2_synced events flowing; 0 missing_token_id
+  rejections. 1534 passed, 0 regressions.
 
 
 ================================================================================
