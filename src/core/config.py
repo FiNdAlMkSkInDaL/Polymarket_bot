@@ -100,15 +100,15 @@ class StrategyParams:
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Trend regime guard (suppress signals during sustained up-trends).
-    # Wide default (0.99) so WFO can explore the full range without the
-    # guard silently blocking all signals during parameter search.
-    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.99)
+    # Suppresses panic signals when YES has risen ≥8% over trend_guard_bars.
+    # Prevents buying NO into genuine breakouts / institutional momentum.
+    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.08)
     trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
 
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
     alpha_min: float = _env_float("ALPHA_MIN", 0.40)
-    alpha_max: float = _env_float("ALPHA_MAX", 0.70)
+    alpha_max: float = _env_float("ALPHA_MAX", 0.55)
     min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
@@ -232,7 +232,7 @@ class StrategyParams:
     # Preemptive liquidity drain: trigger stop when support-side depth
     # is < threshold fraction of resistance-side depth AND position
     # is underwater.  Prevents slippage bleed on a "hollow book".
-    sl_preemptive_obi_threshold: float = _env_float("SL_PREEMPTIVE_OBI_THRESHOLD", 0.20)
+    sl_preemptive_obi_threshold: float = _env_float("SL_PREEMPTIVE_OBI_THRESHOLD", 0.10)
     # Time-decay: after sl_decay_start_minutes the vol multiplier
     # decays exponentially back toward 1.0 (tightening the stop)
     # with a half-life of sl_decay_half_life_minutes.
@@ -366,9 +366,9 @@ class StrategyParams:
     fee_enabled_categories: str = _env("FEE_ENABLED_CATEGORIES", "crypto,sports")
 
     # Fee-efficiency floor for EQS.  Prevents fees from zeroing the
-    # entire geometric-mean EQS score.  At 0.10 trades are still heavily
-    # penalised for poor fee economics but no longer hard-rejected.
-    eqs_fee_efficiency_floor: float = _env_float("EQS_FEE_EFFICIENCY_FLOOR", 0.10)
+    # entire geometric-mean EQS score.  At 0.30 trades losing >70% of
+    # gross spread to fees are hard-rejected as mathematically -EV.
+    eqs_fee_efficiency_floor: float = _env_float("EQS_FEE_EFFICIENCY_FLOOR", 0.30)
 
     # ── Pillar 10: Order Status Polling ─────────────────────────────────
     order_status_poll_s: float = _env_float("ORDER_STATUS_POLL_S", 2.0)
@@ -397,11 +397,10 @@ class StrategyParams:
     # ── Panic detector NO-discount gate ────────────────────────────────────
     # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
     # Lower = stricter (0.98 means NO must be 2% below VWAP).
-    # Relaxed from 0.98→1.005: the z-score gate already captures
-    # directional displacement; requiring an additional 2% NO discount
-    # was redundant and rejected 54% of otherwise-valid signals.
-    # At 1.005, NO ask just needs to be within 0.5% of VWAP.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 1.005)
+    # Requires a genuine 2% discount before entry to ensure the
+    # contrarian edge exists.  Without this, entries at full VWAP
+    # have no mean-reversion cushion and bleed on fees + spread.
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.98)
 
     # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
     # Exponentially-weighted moving average of 1-min log-return variance.

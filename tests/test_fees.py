@@ -88,10 +88,10 @@ class TestAdaptiveStopLoss:
         adaptive = compute_adaptive_stop_loss_cents(raw, 0.50, fee_enabled=True, f_max=0.0156)
         assert adaptive < raw
 
-    def test_floor_at_1_cent(self):
-        """Even with huge fee drag, SL never goes below 1.0¢."""
+    def test_floor_at_2_5_cents(self):
+        """Even with huge fee drag, SL never goes below 2.5¢."""
         adaptive = compute_adaptive_stop_loss_cents(2.0, 0.50, fee_enabled=True, f_max=0.0156)
-        assert adaptive >= 1.0
+        assert adaptive >= 2.5
 
     def test_no_tightening_when_disabled(self):
         raw = 8.0
@@ -105,12 +105,13 @@ class TestAdaptiveStopLoss:
         assert edge_sl > mid_sl  # less tightening at p=0.10
 
     def test_exact_calculation(self):
-        """Verify formula: SL_trigger = SL_base - roundtrip_fee."""
+        """Verify formula: SL_trigger = max(min_floor, SL_base - fee_drag)."""
         sl_base = 8.0
         entry = 0.50
         exit_est = max(0.01, entry - sl_base / 100.0)
         fee_drag = compute_roundtrip_fee_cents(entry, exit_est, fee_enabled=True, f_max=0.0156)
-        expected = max(1.0, round(sl_base - fee_drag, 2))
+        min_floor = max(2.5, fee_drag + 1.0)
+        expected = max(min_floor, round(sl_base - fee_drag, 2))
         actual = compute_adaptive_stop_loss_cents(sl_base, entry, fee_enabled=True, f_max=0.0156)
         assert abs(actual - expected) < 0.01
 
@@ -207,7 +208,8 @@ class TestVolAdaptiveStopLossInvariants:
         stretched = base * max_mult  # 12.0
         exit_est = max(0.01, entry - stretched / 100.0)
         fee_drag = compute_roundtrip_fee_cents(entry, exit_est, fee_enabled=True, f_max=0.0156)
-        expected = max(1.0, round(stretched - fee_drag, 2))
+        min_floor = max(2.5, fee_drag + 1.0)
+        expected = max(min_floor, round(stretched - fee_drag, 2))
 
         actual = compute_adaptive_stop_loss_cents(
             base, entry, fee_enabled=True, f_max=0.0156,
@@ -235,7 +237,8 @@ class TestVolAdaptiveStopLossInvariants:
         stretched = base * multiplier  # 4.8
         exit_est = max(0.01, entry - stretched / 100.0)
         fee_drag = compute_roundtrip_fee_cents(entry, exit_est, fee_enabled=True, f_max=0.0156)
-        expected = max(1.0, round(stretched - fee_drag, 2))
+        min_floor = max(2.5, fee_drag + 1.0)
+        expected = max(min_floor, round(stretched - fee_drag, 2))
 
         actual = compute_adaptive_stop_loss_cents(
             base, entry, fee_enabled=True, f_max=0.0156,

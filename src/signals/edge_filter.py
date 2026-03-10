@@ -351,6 +351,38 @@ def compute_edge_score(
 
     net_cents = gross_cents - fee_cents
 
+    # ── Hard negative-EV veto ──────────────────────────────────────────
+    # No trade should ever pass if expected gross profit cannot cover
+    # the roundtrip taker fee — this is mathematically guaranteed to
+    # lose money regardless of regime, signal, or tick factors.
+    if gross_cents > 0 and fee_cents >= gross_cents:
+        assessment = EdgeAssessment(
+            score=0.0,
+            regime_quality=round(binary_entropy(entry_price), 4),
+            fee_efficiency=0.0,
+            tick_margin=0,
+            tick_viability=0.0,
+            signal_quality=0.0,
+            expected_gross_cents=round(gross_cents, 4),
+            expected_fee_cents=round(fee_cents, 4),
+            expected_net_cents=round(net_cents, 4),
+            viable=False,
+            rejection_reason="negative_ev_after_fees",
+            execution_mode=execution_mode,
+        )
+        log.info(
+            "edge_assessment",
+            entry=entry_price,
+            vwap=no_vwap,
+            score=0.0,
+            gross_cents=round(gross_cents, 4),
+            fee_cents=round(fee_cents, 4),
+            net_cents=round(net_cents, 4),
+            viable=False,
+            reason="negative_ev_after_fees",
+        )
+        return assessment
+
     # ── Factor 2: Fee efficiency ───────────────────────────────────────
     # Floor at eqs_fee_efficiency_floor (default 0.10) so that fees
     # cannot zero the entire geometric-mean EQS.  Trades with poor fee

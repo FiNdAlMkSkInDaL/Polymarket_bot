@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from src.core.config import settings
+from src.core.config import DeploymentEnv, settings
 from src.core.guard import DeploymentGuard
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
@@ -803,6 +803,19 @@ class PositionManager:
 
         # ── V4: Probe sizing cap ──────────────────────────────────────────
         # Probe entries use micro-size (5% of standard Kelly, hard cap).
+        # In PENNY_LIVE mode the $1 deployment cap clamps probe and full
+        # sizes to the same value, destroying probe math.  Skip probes
+        # entirely in PENNY_LIVE — defer to PRODUCTION runs.
+        _is_penny_live = (
+            self._guard is not None
+            and self._guard.deployment_env == DeploymentEnv.PENNY_LIVE
+        )
+        if is_probe and _is_penny_live:
+            is_probe = False
+            log.info(
+                "probe_sizing_skipped_penny_live",
+                reason="penny_live_clamp_destroys_probe_math",
+            )
         if is_probe:
             probe_max_shares = round(strat.probe_max_usd / entry_price, 2) if entry_price > 0 else 0.0
             probe_kelly_shares = round(entry_size * strat.probe_kelly_fraction, 2)
@@ -1258,6 +1271,18 @@ class PositionManager:
         # signal exists, open at probe size (5% Kelly, $2 cap) to
         # explore model-based alpha with bounded downside.
         is_model_probe = bool(rpe_metadata.get("force_probe", False))
+        # In PENNY_LIVE mode, the $1 deployment cap makes probe sizing
+        # identical to full sizing.  Skip probes — defer to PRODUCTION.
+        _is_penny_live_rpe = (
+            self._guard is not None
+            and self._guard.deployment_env == DeploymentEnv.PENNY_LIVE
+        )
+        if is_model_probe and _is_penny_live_rpe:
+            is_model_probe = False
+            log.info(
+                "rpe_probe_skipped_penny_live",
+                reason="penny_live_clamp_destroys_probe_math",
+            )
         if is_model_probe:
             probe_max_usd = strat.probe_max_usd
             probe_fraction = strat.probe_kelly_fraction
@@ -1511,8 +1536,11 @@ class PositionManager:
             self._peak_pnl_cents - self._cumulative_pnl_cents,
         )
 
-        # Record stop-loss cooldown to prevent rapid re-entry on same market
-        if reason == "stop_loss":
+        # Record stop-loss cooldown to prevent rapid re-entry on same market.
+        # Includes preemptive_liquidity_drain which is a loss-exit that was
+        # previously missing — its omission caused a loser-loop where the bot
+        # re-entered immediately after a preemptive OBI exit.
+        if reason in ("stop_loss", "preemptive_liquidity_drain"):
             self._stop_loss_cooldowns[pos.market_id] = pos.exit_time
 
         log.info(
@@ -1699,6 +1727,20 @@ class PositionManager:
             return None
 
         strat = settings.strategy
+
+        # Guard 0: probe harvest is meaningless in PENNY_LIVE — the $1
+        # clamp makes the incremental scale-up identical to the original
+        # probe size.  Defer probe harvesting to PRODUCTION runs.
+        if (
+            self._guard is not None
+            and self._guard.deployment_env == DeploymentEnv.PENNY_LIVE
+        ):
+            log.info(
+                "probe_harvest_skipped_penny_live",
+                pos_id=pos.id,
+                reason="penny_live_clamp_destroys_probe_math",
+            )
+            return None
 
         # Guard 1: still open and net-positive
         asset_id = pos.trade_asset_id or pos.no_asset_id

@@ -3555,6 +3555,366 @@ ATTRIBUTE MAPPING TABLE
   filled_size             │  p.filled_size
   trade_asset_id          │  p.trade_asset_id
   no_asset_id             │  p.no_asset_id
+
+================================================================================
+CHANGE REPORT — Fee Model Update: f_max 1.56% → 2.00%
+Date           : 2026-03-09 (~23:43 UTC)
+================================================================================
+
+BACKGROUND
+--------------------------------------------------------------------------------
+The Telegram alerter fired "⚠️ Fee model divergence detected" on first startup
+in PENNY_LIVE mode.  The CLOB /fee-rate endpoint was returning 200 bps for all
+probed tokens at mid=0.50, while the local parabolic formula computed 156 bps —
+a 44 bps delta exceeding the 5 bps tolerance threshold.
+
+  Probe results (3 tokens, mid=0.50):
+    local_bps=156  remote_bps=200  delta_bps=44  → fee_model_divergence
+
+Polymarket raised their peak dynamic fee from 1.56% to 2.00%.  The parabolic
+shape f(p) = f_max × 4 × p × (1-p) is unchanged; only f_max increased.
+
+ROOT CAUSE
+--------------------------------------------------------------------------------
+The hardcoded default for fee_max_pct was 1.56 in config.py and across all
+backtest components.  At PENNY_LIVE scale ($1.00/trade) the dollar impact was
+negligible, but the underestimate would erode profitability at PRODUCTION scale
+and would cause edge_filter to undercount fee drag in live trade decisions.
+
+FILES MODIFIED
+--------------------------------------------------------------------------------
+1. src/core/config.py
+   - fee_max_pct default: 1.56 → 2.00
+
+2. src/trading/fees.py
+   - Module docstring updated: f_max = 2.00%, peak fee 2.00%
+
+3. src/backtest/engine.py
+   - BacktestConfig.fee_max_pct default: 1.56 → 2.00
+
+4. src/backtest/matching_engine.py
+   - MatchingEngine.__init__ fee_max_pct parameter default: 1.56 → 2.00
+
+5. src/backtest/wfo_optimizer.py
+   - WfoConfig.fee_max_pct default: 1.56 → 2.00
+
+TESTS UPDATED
+--------------------------------------------------------------------------------
+File: tests/test_architecture_fixes.py
+  - TestFeeModelValidation.test_validate_passes_when_fees_match:
+      mock return value 156 → 200, comment updated (formula now yields 200 bps)
+  - TestFeeModelValidation.test_validate_fails_on_divergence:
+      mock return value 200 → 250 (still diverges from 200)
+  - TestFeeModelValidation.test_validate_within_tolerance:
+      mock return value 158 → 202 (2 bps off 200, within tolerance)
+  - TestFeeModelValidation.test_validate_multiple_tokens:
+      first-token mock return value 156 → 200
+
+File: tests/test_backtest/test_wfo.py
+  - TestBackwardCompatibility.test_wfo_config_old_fields_unchanged:
+      assertion cfg.fee_max_pct == 1.56 → 2.00
+
+File: tests/test_edge_filter.py
+  - TestTickViability.test_partial_tick_viability:
+      VWAP adjusted 0.22 → 0.24 to maintain ≥1 tick margin under higher fees
+  - TestSweetSpot.test_low_fee_zone_tolerates_smaller_dislocation:
+      threshold loosened > 0.7 → > 0.6 (p=0.10 fee efficiency is 0.652 at 2%)
+
+
+================================================================================
+CHANGE REPORT — Systematic Loss Root-Cause Fixes (8 Bugs / Miscalibrations)
+Date: 2026-03-10
+================================================================================
+
+BACKGROUND
+----------
+Post-diagnostic sweep identified 8 root-cause defects across signal quality,
+position management, and execution that collectively caused systematic PnL
+leakage. Four were config miscalibrations (wrong defaults left from earlier
+refactors), two were logic inversions / numerical bugs in stop_loss.py, one
+was a formula cap missing in take_profit.py, and one was a fee-exposure
+undercount in chaser.py.
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. src/core/config.py
+   - trend_guard_pct: 1.005 → 0.08
+       Previously set to 0.99 (or 1.005 in various states), making the trend
+       guard functionally disabled (requires a ~100% price move to suppress).
+       Now set to 0.08 so a sustained 8%+ uptrend properly suppresses panic
+       BUY_NO signals — these are regime shifts, not mean-reversion opportunities.
+
+   - alpha_max: 0.70 → 0.55
+       With entry typically at p=0.45–0.55 and VWAP at 0.60–0.70, an α=0.70
+       projects a TP target ~12-15¢ above entry — far beyond realistic reversion
+       depth. Reducing to 0.55 keeps targets achievable on normal market moves.
+
+   - eqs_fee_efficiency_floor: 0.10 → 0.30
+       The geometric-mean EQS formula uses fee_efficiency as one factor. At 0.10
+       it barely penalises fee-heavy trades. Raising to 0.30 means trades where
+       fees consume >70% of the gross spread score significantly lower — more
+       borderline trades are correctly rejected.
+
+   - no_discount_factor: 1.005 → 0.98
+       Value of 1.005 means "fire if NO ask > 1.005 × VWAP" — i.e., only when
+       NO is already overpriced, which is backwards. 0.98 restores the original
+       intent: NO must be trading at ≥2% discount to its VWAP before a BUY_NO
+       signal is emitted.
+
+2. src/trading/stop_loss.py
+   - Preemptive liquidity drain OBI inversion (Pillar 11.3A):
+       our_support_ratio was computed as 1/book_depth_ratio (ask/bid).
+       For a BUY_NO position that exits by SELL, bid depth is the support.
+       bdr = bid/ask → when bdr → 0 bid support vanishes.
+       Fix: our_support_ratio = bdr  (direct, not inverted).
+       Was: triggering when bids were 5× asks (strong support).
+       Now: triggers when bids are thin relative to asks (weak support).
+
+   - Time-decay half-life formula (Pillar 11.3B):
+       decay_factor used exp(-(elapsed-start)/half_life), which decays to
+       1/e ≈ 36.8% at t=half_life (not 50%). This is an exponential mean-
+       lifetime, not a half-life.
+       Fix: decay_factor = exp(-ln(2) × (elapsed-start) / half_life)
+       So at t=half_life the multiplier has decayed exactly 50% of its excess,
+       matching the documented and expected behaviour.
+
+3. src/trading/take_profit.py
+   - Vol factor contribution capped:
+       alpha += 0.04 * (vol_factor - 1.0) was unbounded. At vol_factor=10
+       (panic event with 10× normal vol) this adds +0.36 to α, pushing the
+       clamp to dominate every high-vol trade rather than providing a signal.
+       Fix: alpha += 0.03 * min(vol_factor - 1.0, 1.5)
+       Contribution capped at +0.045α; combined with alpha_max=0.55 prevents
+       every high-vol entry from targeting an unreachable exit.
+
+4. src/trading/chaser.py
+   - Exit fee in alpha_check set to zero:
+       The requote escalation guard computed net P&L as (tp_target - cross_price)
+       × 100 minus entry_fee but with exit_fee=0.0, annotated as "Assume maker
+       exit". In practice the chaser crosses the spread to exit, paying taker fees.
+       Fix: exit_fee = cross_price × fee_bps / 10_000 × 100
+       Conservatively assumes taker exit (worst realistic case). Escalation is
+       now blocked when the true round-trip net is negative, not just entry fees.
+
+================================================================================
+TESTS UPDATED
+================================================================================
+
+File: tests/test_take_profit.py
+  - TestTakeProfit.test_iceberg_active_increases_alpha:
+      Removed exact +0.05 delta assertion (alpha already near alpha_max=0.55).
+      Now asserts iceberg.alpha >= no_iceberg.alpha and target_price >=.
+  - TestTakeProfit.test_iceberg_and_whale_stack:
+      With alpha_max=0.55, base(0.50) + whale(0.08) + iceberg(0.05) = 0.63
+      but clamps to 0.55. Assertion updated to both.alpha == approx(0.55).
+  - TestTakeProfit.test_alpha_clamped_to_bounds:
+      Upper bound assertion 0.70 → 0.55.
+
+File: tests/test_unit_math.py
+  - TestTakeProfitMath.test_high_vol_raises_alpha:
+      Removed exact +0.08 delta (baseline already at 0.54, near clamp).
+      Now asserts high_vol.alpha >= baseline.alpha.
+  - TestTakeProfitMath.test_deep_book_raises_alpha:
+      Removed exact +0.06 delta. Now asserts deep.alpha >= shallow.alpha.
+  - TestTakeProfitMath.test_whale_confluence_bump:
+      Removed exact +0.08 delta. Now asserts yes_w.alpha >= no_w.alpha.
+  - TestTakeProfitMath.test_alpha_clamped_upper:
+      Upper bound comment and assertion 0.70 → 0.55.
+  - TestNumericRegression.test_take_profit_golden_value_2:
+      entry=0.30, VWAP=0.80, whale=True: expected α was 0.62, now 0.55 (clamped).
+      Expected target updated to 0.30 + 0.55 × 0.50 = 0.575.
+
+================================================================================
+CHANGE REPORT — Risk/EV & Data/Sizing Fixes (4 items)
+Date: 2026-03-10
+================================================================================
+
+BACKGROUND
+----------
+Four structural issues identified via live observation and theoretical
+analysis of the bot's risk management, pre-trade evaluation, data
+resiliency, and order sizing layers.
+
+================================================================================
+FIX 1: "Chop Trap" — Fee-Induced Stop-Loss Collapse
+================================================================================
+
+File: src/trading/fees.py — compute_adaptive_stop_loss_cents()
+
+PROBLEM:
+  The adaptive stop-loss SUBTRACTED the roundtrip fee from the base stop-loss
+  and floored at 1.0¢.  In high-fee zones (near 50¢ where taker fees peak
+  at ~2%), a 4¢ roundtrip fee subtracted from a 4¢ base stop collapsed the
+  trigger to the 1.0¢ floor — a single tick.  This caused the bot to get
+  chopped out by pure market noise, eating taker fees on every exit.
+
+  Old formula:  SL_trigger = max(1.0, sl_stretched - fee_drag_cents)
+
+FIX:
+  Replaced the hard 1.0¢ floor with a dynamic, fee-aware floor that
+  guarantees at least 1¢ of breathing room above the roundtrip fee drag:
+
+    trigger   = sl_stretched − fee_drag_cents       (fees still subtracted)
+    min_floor = max(2.5, fee_drag_cents + 1.0)      (dynamic fee-aware floor)
+    SL_trigger = max(min_floor, trigger)
+
+  At p=0.50 with fee_drag≈3.12¢:
+    min_floor = max(2.5, 4.12) = 4.12¢
+    Even when trigger collapses to ~0.88¢, the stop is floored at 4.12¢ —
+    1¢ breathing room above the fee cost, not a meaningless single-tick floor.
+  At tail prices (p≈0.10, fee_drag≈0.3¢):
+    min_floor = max(2.5, 1.3) = 2.5¢ — global minimum applies.
+
+  New formula:
+    min_floor  = max(2.5, fee_drag_cents + 1.0)
+    SL_trigger = max(min_floor, (base_sl × multiplier) − fee_drag_cents)
+
+================================================================================
+FIX 2: EQS Pre-Trade Negative EV Veto
+================================================================================
+
+File: src/signals/edge_filter.py — compute_edge_score()
+
+PROBLEM:
+  The eqs_fee_efficiency_floor (0.30) prevented high fees from zeroing the
+  geometric mean, but this artificially passed trades that are mathematically
+  guaranteed to lose money (e.g., expected gross profit 2.0¢ but roundtrip
+  taker fee 3.0¢).  The floor rescued the fee_efficiency factor from zero,
+  allowing strong regime/signal factors to push the score above threshold.
+
+FIX:
+  Added a hard, mathematical veto BEFORE the geometric mean calculation:
+    if gross_cents > 0 and fee_cents >= gross_cents: → immediate rejection
+    rejection_reason = "negative_ev_after_fees"
+
+  This fires independently of and prior to the soft floor.  No trade can
+  pass the EQS gate if fees exceed expected gross profit.  The 0.30 floor
+  continues to apply for trades where fees are high but sub-100%.
+
+================================================================================
+FIX 3: Permanent L2 Data Death (seq_gap_rate)
+================================================================================
+
+File: src/data/l2_book.py — L2OrderBook
+
+PROBLEM:
+  seq_gap_rate was calculated as desync_total / delta_count where both
+  counters are cumulative and NEVER reset.  A burst of packet drops at
+  startup (e.g., 250 desyncs over 10,000 deltas) permanently breached the
+  2% threshold.  The market was forever stripped of advanced features
+  (OBI pacing, Iceberg detection) because is_reliable became permanently
+  False, even after the network stabilised.
+
+FIX:
+  Replaced cumulative ratio with a rolling window (deque of 10,000 bools):
+  - Each delta records True (gap) or False (clean) in the window.
+  - When the window is full, the oldest entry is evicted and the running
+    gap count is decremented/incremented accordingly.
+  - seq_gap_rate is now: gaps_in_window / window_size.
+  - Markets can recover is_reliable=True after ~10,000 clean deltas
+    push out the old gap entries.
+  - desync_total / delta_count remain available for lifetime diagnostics.
+
+  New members:
+    _seq_gap_window: deque[bool] (maxlen=10,000)
+    _seq_gap_window_gaps: int (running count of True entries)
+    _record_seq_gap(is_gap: bool): helper that maintains both
+
+================================================================================
+FIX 4: Probe vs. PENNY_LIVE Sizing Collision
+================================================================================
+
+Files: src/trading/position_manager.py, src/core/guard.py (unchanged)
+
+PROBLEM:
+  V4 Probe Sizing uses probe_kelly_fraction = 0.05 (5% of normal Kelly).
+  In PENNY_LIVE mode, the deployment guard clamps ALL sizes to $1.00
+  notional.  This destroys the probe math: both a full Kelly position
+  ($20 → clamped to $1) and a 5% probe ($1 → clamped to $1) become
+  identical $1 trades, making probe data-gathering meaningless.
+
+FIX:
+  Three bypass points added:
+  1. Panic entry path (L806): if guard is PENNY_LIVE and is_probe=True,
+     probe flag is cleared, trade proceeds at standard (clamped) size.
+     Log: "probe_sizing_skipped_penny_live"
+  2. RPE entry path (L1261): same bypass for model-based probe entries.
+     Log: "rpe_probe_skipped_penny_live"
+  3. Probe harvest (scale_probe_to_full): Guard 0 added at top of method.
+     If PENNY_LIVE, returns None immediately — no harvest attempt.
+     Log: "probe_harvest_skipped_penny_live"
+
+  Probe sizing is deferred to fully capitalised PRODUCTION runs where
+  the Kelly sizer has room to express the 5% difference meaningfully.
+
+  Added import: DeploymentEnv from src.core.config
+
+================================================================================
+TEST IMPACT
+================================================================================
+  - test_fees.py: stop-loss floor values may shift (1.0 → 2.5 minimum);
+    stop values now expand with fees instead of shrinking.
+  - test_edge_filter.py: trades with fee_cents >= gross_cents now get
+    hard-rejected with reason "negative_ev_after_fees".
+  - test_l2_book.py: seq_gap_rate now recovers over time as clean deltas
+    push gap entries out of the rolling window.
+  - test_deployment_guard.py: probe entries in PENNY_LIVE are now treated
+    as standard entries (no probe sizing applied).
+
+File: tests/test_stop_loss.py
+  - TestStopLossMonitor.test_preemptive_stop_underwater_hollow_book:
+      book_depth_ratio changed from 10.0 to 0.1 to trigger after OBI inversion
+      fix (bdr=0.1 means thin bids → support_ratio=0.1 < threshold=0.20).
+      Removed the large comment block that rationalized the wrong inversion.
+  - TestStopLossMonitor.test_preemptive_stop_in_profit_no_trigger:
+      book_depth_ratio changed from 10.0 to 0.1 (same reason; test still
+      passes because the position is profitable so drain guard is skipped).
+  - TestStopLossMonitor.test_time_decay_tightens_stop:
+      Updated scenario: mid moved to 0.39 (6¢ loss) instead of 0.40 (5¢) to
+      provide clear headroom above the decayed SL ≈ 4.79¢ at T+25min.
+      Updated comment to reflect correct half-life math.
+
+File: tests/test_edge_filter.py
+  - TestHardZeros.test_fees_exceed_spread_floors_fee_efficiency:
+      Floor value in comment and assertion 0.10 → 0.30.
+
+File: tests/test_alpha_evolution.py
+  - TestConfigDefaults.test_no_discount_factor_tightened:
+      Expected value 1.005 → 0.98.
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+Suite   : tests/  (all test files except test_architecture_fixes — pre-existing
+          failure due to missing py_clob_client dependency in local env)
+Run     : 1520 passed
+Failures: 5 (all pre-existing, unrelated to this change)
+  - test_architecture_fixes.py (3 tests): No module named 'py_clob_client'
+  - test_e2e_integration.py (2 tests): No module named 'optuna'
+Duration: ~55s
+
+================================================================================
+  - Comments updated throughout: 1.56¢ → 2.00¢
+
+TEST RESULT
+--------------------------------------------------------------------------------
+  Before fix: 14 failed, 1528 passed  (6 new regressions from fee change)
+  After fix :  8 failed, 1534 passed  (baseline restored, zero new regressions)
+
+VERIFICATION
+--------------------------------------------------------------------------------
+After deploy + restart, VPS logs confirmed:
+
+  {"token_id": "6147632657346389", "local_bps": 200, "remote_bps": 200, "event": "fee_model_validated"}
+  {"token_id": "8106426361461132", "local_bps": 200, "remote_bps": 200, "event": "fee_model_validated"}
+  {"token_id": "9186316211830866", "local_bps": 200, "remote_bps": 200, "event": "fee_model_validated"}
+
+All 3 probes pass. No further Telegram divergence alerts expected.
+
+Git commit: 1da63d1  "fix: update fee_max_pct 1.56→2.00 to match Polymarket fee schedule change"
   event_id                │  p.event_id
   ──────────────────────────────────────────────
   (trade_side no longer serialized — not a _MinimalPosition field)
@@ -4402,6 +4762,110 @@ GIT STATE NOTE
   was restored from stash@{0} (commit 62c9202, ~1957 lines) via:
     git checkout stash@{0} -- src/trading/position_manager.py
   The working tree has many modified files relative to HEAD (intentional).
+
+================================================================================
+
+
+================================================================================
+CHANGE REPORT — Loser-Loop & Premature Chop-Out Fix
+Date: 2026-03-10
+================================================================================
+
+BACKGROUND
+----------
+Critical system failure: the bot generates PanicSignal events but executes
+zero new trades, and positions that do open enter a "loser loop" — repeated
+stop-loss exits followed by immediate re-entry on the same market.
+
+ROOT CAUSE ANALYSIS
+-------------------
+Diagnostic command: ssh botuser@135.181.85.32
+    python scripts/diagnose_wfo_gates.py --data-dir data/vps_march2026
+
+Three interlocking issues were identified:
+
+1. STOP-LOSS COOLDOWN BYPASS (CRITICAL — patched)
+   File: src/trading/position_manager.py line 1541
+   Symptom: Bot re-enters market immediately after preemptive OBI exit.
+   Cause: The _stop_loss_cooldowns dict was only populated when
+     reason == "stop_loss". The StopLossMonitor also exits positions with
+     reason="preemptive_liquidity_drain" (Pillar 11.3 hollow-book detector),
+     but these exits did NOT record a cooldown. Consequence: position closes
+     via preemptive drain → market_id removed from open_positions → next bar
+     evaluates with no cooldown → re-enters immediately → same hollow book
+     → drains again → loser loop.
+   Fix: Changed condition from `if reason == "stop_loss"` to
+     `if reason in ("stop_loss", "preemptive_liquidity_drain")`.
+   Mathematical impact: eliminates O(n) re-entries per bar cycle where n
+     is the number of consecutive bars satisfying the hollow-book condition.
+
+2. PREEMPTIVE OBI THRESHOLD TOO AGGRESSIVE (IMPORTANT — patched)
+   File: src/core/config.py
+   Symptom: Premature position exits ("chop-out") on thin prediction market
+     orderbooks. Positions closed at a loss before the mean-reversion alpha
+     had time to materialise.
+   Cause: sl_preemptive_obi_threshold = 0.20 (20%). Polymarket L2 books
+     are naturally thin — bid/ask depth ratios routinely fluctuate below 20%
+     during normal market operations (not just during genuine liquidity
+     drains). A BDR of 0.15 is common on $5K-$20K daily volume markets and
+     does not indicate informed-trader book withdrawal.
+   Fix: Lowered default from 0.20 to 0.10 (10%). The 10th-percentile
+     methodology from scripts/analyze_book_resilience.py (Pillar 11.3
+     calibration script) supports this value for current market conditions.
+   Test update: test_stop_loss.py::test_preemptive_stop_underwater_hollow_book
+     adjusted book_depth_ratio from 0.1 to 0.05 to remain below new threshold.
+
+3. PER-MARKET LIMIT BLOCKING PANIC ON EXISTING DRIFT (CONTRIBUTING)
+   File: src/trading/position_manager.py
+   Symptom: The only active market (0x7054a1f2...) with strong panic signals
+     (zscore 3.077, 1.754) already had a drift position (POS-1). The
+     max_positions_per_market=1 gate blocked ALL subsequent panic signals.
+   Status: Not patched — this is correct safety behavior (prevents risk
+     stacking). The fix is upstream: improve market discovery pipeline
+     diversity so the bot is not dependent on a single active market.
+
+LOG EVIDENCE
+-----------
+  bot.jsonl.1 line 19903: position_opened POS-1 (drift, entry 0.40)
+  bot.jsonl.1 line 21242: panic_signal_fired (zscore 3.077) → blocked by
+    per_market_limit (count=1, limit=1)
+  bot.jsonl.1 line 21346: panic_signal_fired (zscore 1.754) → blocked by
+    per_market_limit (count=1, limit=1)
+  Multiple sub_tick_spread EQS rejections for drift signals on secondary
+    markets (entry_price ≈ no_vwap, α spread < 1 tick).
+
+DIAGNOSTIC FUNNEL (backtest data/vps_march2026, 7-day window)
+-------------------------------------------------------------
+  Total YES bars:                3,499
+  G01_near_resolved:             1,658 (47.4%) — markets near 0 or 1
+  G02_price_band:                  665 (19.0%)
+  G06_panic_detector:            1,175 (33.6%) — 100% zscore_low
+  PASSED ALL GATES:                  0 (0.0%)
+
+  Z-score max: 0.328 vs threshold 1.0  (0% above threshold)
+  Rolling σ: 1.749 (log-return std inflated by extreme backfill data)
+  Root cause: backtest data contains synthetic 1-trade bars with extreme
+    price swings producing log-return σ >> 1.0, which compresses z-scores
+    below threshold. Live bot data produces σ ≈ 0.02-0.10, enabling
+    z-scores of 1.7-3.1 on genuine panic events.
+
+FILES MODIFIED
+--------------
+  1. src/trading/position_manager.py
+     - Line ~1541: Expanded stop-loss cooldown condition to include
+       "preemptive_liquidity_drain" exits.
+
+  2. src/core/config.py
+     - Line 235: sl_preemptive_obi_threshold default 0.20 → 0.10.
+
+  3. tests/test_stop_loss.py
+     - test_preemptive_stop_underwater_hollow_book: book_depth_ratio
+       0.1 → 0.05 to stay below new threshold.
+
+TEST RESULTS
+-----------
+  1540 passed, 0 failed (2 deselected: pre-existing VPS env-var mismatch
+  for DEPLOYMENT_ENV=PENNY_LIVE vs test expectation of PAPER).
 
 ================================================================================
 

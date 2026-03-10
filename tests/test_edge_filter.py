@@ -125,13 +125,12 @@ class TestHardZeros:
         assert ea.expected_gross_cents < 1.0
         assert ea.tick_viability == 0.0
         assert ea.score == 0.0
-        assert ea.rejection_reason == "sub_tick_spread"
+        assert ea.rejection_reason == "negative_ev_after_fees"
 
-    def test_fees_exceed_spread_floors_fee_efficiency(self):
+    def test_fees_exceed_spread_hard_vetoed(self):
         """Small dislocation at p=0.50 (max fees) → fees eat all spread.
-        Fee efficiency is floored at eqs_fee_efficiency_floor (default 0.10)
-        so it doesn't zero the entire geometric mean, but tick_viability=0
-        still zeros the score."""
+        Hard negative-EV veto rejects immediately: no trade should pass
+        if expected gross profit cannot cover the roundtrip taker fee."""
         # entry=0.50, VWAP=0.53 → gross=0.50*0.03=1.5¢
         # Fee at 0.50 ≈ 2.00¢, fee at 0.515 ≈ 2.00¢ → total ≈ 4.00¢ > 1.5¢
         ea = compute_edge_score(
@@ -141,10 +140,10 @@ class TestHardZeros:
             volume_ratio=5.0,
             min_score=0.0,
         )
-        # Fee efficiency floored at 0.10, not zeroed
-        assert ea.fee_efficiency == 0.10
-        # Score is still 0 because tick_viability = 0 (net P&L negative)
+        # Hard-vetoed: fee_efficiency=0, score=0, specific rejection reason
+        assert ea.fee_efficiency == 0.0
         assert ea.score == 0.0
+        assert ea.rejection_reason == "negative_ev_after_fees"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -457,7 +456,7 @@ class TestRejectionReasons:
             entry_price=0.50, no_vwap=0.505,
             zscore=3.0, volume_ratio=5.0,
         )
-        assert ea.rejection_reason == "sub_tick_spread"
+        assert ea.rejection_reason == "negative_ev_after_fees"
 
     def test_reason_empty_when_viable(self):
         ea = compute_edge_score(

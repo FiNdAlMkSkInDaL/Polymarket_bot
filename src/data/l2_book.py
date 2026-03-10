@@ -111,13 +111,21 @@ class L2OrderBook:
         self._state: BookState = BookState.EMPTY
         self._desync_count: int = 0
 
-        # Cumulative desync counter — never reset; used for seq_gap_rate.
+        # Cumulative desync counter — never reset; used for diagnostics.
         self._desync_total: int = 0
 
         # Local delta counter — incremented for every successfully applied
         # delta regardless of whether the protocol includes a sequence
         # number.  Exposed via ``delta_count`` for health monitoring.
         self._delta_count: int = 0
+
+        # Rolling window for seq_gap_rate — tracks whether each of the
+        # last N deltas was a gap (True) or clean (False).  This allows
+        # markets to recover reliable status after transient network
+        # blips age out of the window.
+        _SEQ_GAP_WINDOW = 10_000
+        self._seq_gap_window: deque[bool] = deque(maxlen=_SEQ_GAP_WINDOW)
+        self._seq_gap_window_gaps: int = 0  # running count of True in window
 
         # ── Delta buffer (used during BUFFERING state) ────────────────
         self._delta_buffer: deque[dict] = deque(
@@ -193,10 +201,17 @@ class L2OrderBook:
 
     @property
     def seq_gap_rate(self) -> float:
-        """Fraction of deltas that caused desyncs (desync_total / delta_count)."""
-        if self._delta_count <= 0:
+        """Fraction of recent deltas that caused desyncs (rolling window).
+
+        Uses a rolling window of the last 10,000 deltas so that markets
+        can recover ``is_reliable`` status after transient packet drops
+        age out. The cumulative ``desync_total / delta_count`` is still
+        available via the individual properties for diagnostics.
+        """
+        window_size = len(self._seq_gap_window)
+        if window_size <= 0:
             return 0.0
-        return self._desync_total / self._delta_count
+        return self._seq_gap_window_gaps / window_size
 
     @property
     def is_reliable(self) -> bool:
@@ -437,6 +452,7 @@ class L2OrderBook:
         # ── Apply the delta ───────────────────────────────────────────
         self._apply_delta_changes(data)
         self._delta_count += 1
+        self._record_seq_gap(is_gap=False)
         now = time.time()
         self._last_update = now
         self._extract_server_time(data)
@@ -514,6 +530,8 @@ class L2OrderBook:
         self._state = BookState.DESYNCED
         self._desync_count += 1
         self._desync_total += 1
+        # Record gap in rolling window
+        self._record_seq_gap(is_gap=True)
         self._bids.clear()
         self._asks.clear()
         self._spread_score = SpreadScore()
@@ -538,6 +556,22 @@ class L2OrderBook:
                     asset_id=self.asset_id,
                     exc_info=True,
                 )
+
+    def _record_seq_gap(self, *, is_gap: bool) -> None:
+        """Record a delta event in the rolling seq-gap window.
+
+        When the window is full (10,000 entries), the oldest entry is
+        evicted. If the evicted entry was a gap, the running gap count
+        is decremented so ``seq_gap_rate`` stays accurate.
+        """
+        # If window is at capacity, the append will evict the oldest entry
+        if len(self._seq_gap_window) == self._seq_gap_window.maxlen:
+            evicted = self._seq_gap_window[0]
+            if evicted:
+                self._seq_gap_window_gaps -= 1
+        self._seq_gap_window.append(is_gap)
+        if is_gap:
+            self._seq_gap_window_gaps += 1
 
     # ═══════════════════════════════════════════════════════════════════════
     #  BBO tracking & spread score

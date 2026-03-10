@@ -254,6 +254,10 @@ class TradingBot:
         # Exception circuit breakers for critical async loops
         self._trade_loop_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._stale_bar_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._retrigger_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._tp_rescale_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._ghost_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._timeout_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
 
         # RPE per-market cooldown (Deliverable C)
         self._rpe_last_signal: dict[str, float] = {}
@@ -843,6 +847,10 @@ class TradingBot:
         # 5. Reset the circuit breakers so they can trip again on new errors
         self._trade_loop_breaker.reset()
         self._stale_bar_breaker.reset()
+        self._retrigger_breaker.reset()
+        self._tp_rescale_breaker.reset()
+        self._ghost_breaker.reset()
+        self._timeout_breaker.reset()
 
         # 6. Resume chasers
         self._fast_kill_event.set()
@@ -2213,7 +2221,17 @@ class TradingBot:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.warning("rpe_retrigger_error", exc_info=True)
+                log.error("rpe_retrigger_error", exc_info=True)
+                if self._retrigger_breaker.record():
+                    log.critical(
+                        "rpe_retrigger_circuit_breaker_tripped",
+                        errors_in_window=self._retrigger_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: rpe_retrigger tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
 
     def _check_paper_fills(self, event: TradeEvent) -> None:
         """Check if any paper orders should fill based on this trade."""
@@ -2520,7 +2538,17 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("tp_rescale_error", error=str(exc))
+                log.error("tp_rescale_error", error=str(exc), exc_info=True)
+                if self._tp_rescale_breaker.record():
+                    log.critical(
+                        "tp_rescale_circuit_breaker_tripped",
+                        errors_in_window=self._tp_rescale_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: tp_rescale tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Pillar 9 — Ghost Liquidity Circuit Breaker
@@ -2653,7 +2681,17 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("ghost_liquidity_error", error=str(exc))
+                log.error("ghost_liquidity_error", error=str(exc), exc_info=True)
+                if self._ghost_breaker.record():
+                    log.critical(
+                        "ghost_circuit_breaker_tripped",
+                        errors_in_window=self._ghost_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: ghost_liquidity tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
             await asyncio.sleep(interval_s)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -2686,7 +2724,17 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("timeout_loop_error", error=str(exc))
+                log.error("timeout_loop_error", error=str(exc), exc_info=True)
+                if self._timeout_breaker.record():
+                    log.critical(
+                        "timeout_circuit_breaker_tripped",
+                        errors_in_window=self._timeout_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: timeout_loop tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
             await asyncio.sleep(10)
 
     async def _stale_bar_flush_loop(self) -> None:
@@ -3071,7 +3119,7 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("market_refresh_error", error=str(exc))
+                log.error("market_refresh_error", error=str(exc), exc_info=True)
 
     async def _pce_refresh_loop(self) -> None:
         """Periodically recompute correlations, persist, and send dashboard."""
@@ -3104,7 +3152,7 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("pce_refresh_error", error=str(exc))
+                log.error("pce_refresh_error", error=str(exc), exc_info=True)
 
     async def _cleanup_loop(self) -> None:
         """Every 5 minutes: clean up stale positions, orders, reset daily PnL,
@@ -3140,4 +3188,4 @@ class TradingBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("cleanup_loop_error", error=str(exc))
+                log.error("cleanup_loop_error", error=str(exc), exc_info=True)

@@ -1235,6 +1235,12 @@ class TestIsReliable:
         book = L2OrderBook("ASSET_R", max_levels=50)
         book._delta_count = delta_count
         book._desync_total = desync_total
+        # Populate the rolling window to match: desync_total gaps,
+        # then (delta_count - desync_total) clean entries.
+        for _ in range(desync_total):
+            book._record_seq_gap(is_gap=True)
+        for _ in range(delta_count - desync_total):
+            book._record_seq_gap(is_gap=False)
         return book
 
     def test_high_gap_rate_unreliable(self) -> None:

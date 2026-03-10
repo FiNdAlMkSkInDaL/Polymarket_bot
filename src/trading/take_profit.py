@@ -101,7 +101,8 @@ def compute_take_profit(
         vol_factor = min(realised_vol / 0.02, 3.0)  # cap at 3×
         if vol_factor > 1.0:
             # High vol: widen target (panic = bigger reversion)
-            alpha += 0.04 * (vol_factor - 1.0)
+            # Cap contribution at 1.5× to prevent unreachable targets
+            alpha += 0.03 * min(vol_factor - 1.0, 1.5)
         else:
             # Low vol: tighten target (scalp the small move)
             alpha -= 0.08 * (1.0 - vol_factor)

@@ -182,14 +182,11 @@ class StopLossMonitor:
                 book = self._books.get(eval_asset)
                 if book and book.has_data:
                     bdr = book.book_depth_ratio  # bid/ask
-                    # For BUY_NO positions our support is the bid side:
-                    # bdr = bid/ask.  For typical BUY_NO, we already hold
-                    # NO tokens; our exit is a SELL whose fill quality
-                    # depends on bid depth.
-                    # Convention: our_support_ratio = 1/bdr
-                    # inverts to ask/bid — if bdr is high our support
-                    # is fine.  When bdr → 0 support vanishes.
-                    our_support_ratio = (1.0 / bdr) if bdr > 0 else 0.0
+                    # For BUY_NO positions our exit is a SELL whose
+                    # fill quality depends on bid depth.
+                    # bdr = bid/ask: when bdr → 0 bid support vanishes
+                    # and our exit liquidity is draining.
+                    our_support_ratio = bdr
                     if our_support_ratio < obi_threshold:
                         log.warning(
                             "preemptive_liquidity_drain",
@@ -222,7 +219,7 @@ class StopLossMonitor:
             elapsed_mins = (time.time() - pos.entry_time) / 60.0
             if elapsed_mins > decay_start:
                 decay_factor = math.exp(
-                    -(elapsed_mins - decay_start) / decay_hl
+                    -math.log(2) * (elapsed_mins - decay_start) / decay_hl
                 )
                 current_mult = 1.0 + (sl_vol_mult - 1.0) * decay_factor
                 # Fee drag is the difference between the stretched stop

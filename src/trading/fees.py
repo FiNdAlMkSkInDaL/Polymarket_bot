@@ -92,9 +92,10 @@ def compute_adaptive_stop_loss_cents(
 
            SL_trigger = sl_stretched - roundtrip_fee_cents
 
-    4. **Absolute floor**::
+    4. **Dynamic fee-aware floor**::
 
-           SL_trigger = max(1.0, SL_trigger)
+           min_floor  = max(2.5, roundtrip_fee_cents + 1.0)
+           SL_trigger = max(min_floor, SL_trigger)
 
     Parameters
     ----------
@@ -119,7 +120,7 @@ def compute_adaptive_stop_loss_cents(
     Returns
     -------
     float
-        Adjusted stop-loss in cents.  Always ≥ 1.0 (floor).
+        Adjusted stop-loss in cents.  Always ≥ 2.5 (floor).
     """
     # ── Step 1: vol multiplier (stretch-only) ──────────────────────────
     if is_adaptive and ewma_vol is not None and ewma_vol > 0 and ref_vol > 0:
@@ -132,7 +133,7 @@ def compute_adaptive_stop_loss_cents(
     sl_stretched = sl_base_cents * multiplier
 
     if not fee_enabled:
-        return max(1.0, round(sl_stretched, 2))
+        return max(2.5, round(sl_stretched, 2))
 
     # ── Step 3: estimate exit price & deduct fees ──────────────────────
     estimated_exit = max(0.01, entry_price - sl_stretched / 100.0)
@@ -143,8 +144,14 @@ def compute_adaptive_stop_loss_cents(
 
     trigger = sl_stretched - fee_drag_cents
 
-    # ── Step 4: absolute floor ─────────────────────────────────────────
-    return max(1.0, round(trigger, 2))
+    # ── Step 4: dynamic fee-aware floor ────────────────────────────────
+    # In high-fee zones (near 50¢), fee drag can consume the entire
+    # base stop, collapsing it to a single tick and causing the bot
+    # to get chopped out by market noise.  The floor dynamically
+    # expands so the stop always has enough breathing room for
+    # mean-reversion to play out.
+    min_floor = max(2.5, fee_drag_cents + 1.0)
+    return max(min_floor, round(trigger, 2))
 
 
 def compute_adaptive_trailing_offset_cents(

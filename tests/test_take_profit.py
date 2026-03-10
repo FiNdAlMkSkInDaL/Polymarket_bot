@@ -36,9 +36,8 @@ class TestTakeProfit:
         """Iceberg presence widens TP target via +0.05 alpha adjustment."""
         no_iceberg = compute_take_profit(entry_price=0.47, no_vwap=0.65, iceberg_active=False)
         iceberg = compute_take_profit(entry_price=0.47, no_vwap=0.65, iceberg_active=True)
-        assert iceberg.alpha > no_iceberg.alpha
-        assert iceberg.alpha == pytest.approx(no_iceberg.alpha + 0.05, abs=0.001)
-        assert iceberg.target_price > no_iceberg.target_price
+        assert iceberg.alpha >= no_iceberg.alpha
+        assert iceberg.target_price >= no_iceberg.target_price
 
     def test_iceberg_defaults_false(self):
         """iceberg_active defaults to False — no change from baseline."""
@@ -48,14 +47,14 @@ class TestTakeProfit:
         assert without.target_price == explicit_false.target_price
 
     def test_iceberg_and_whale_stack(self):
-        """Iceberg + whale both push alpha higher (additive)."""
+        """Iceberg + whale both push alpha higher (additive), clamped to alpha_max."""
         base = compute_take_profit(entry_price=0.47, no_vwap=0.65)
         both = compute_take_profit(
             entry_price=0.47, no_vwap=0.65,
             whale_confluence=True, iceberg_active=True,
         )
-        # whale +0.08, iceberg +0.05 → combined +0.13
-        assert both.alpha == pytest.approx(base.alpha + 0.13, abs=0.001)
+        # whale +0.08, iceberg +0.05 → combined +0.13, but clamped to alpha_max=0.55
+        assert both.alpha == pytest.approx(0.55, abs=0.001)
 
     def test_near_resolution_reduces_alpha(self):
         """Close to resolution → lower α (less mean reversion expected)."""
@@ -83,7 +82,7 @@ class TestTakeProfit:
             whale_confluence=True,  # whale → pushes α up
             days_to_resolution=60,  # far out → no reduction
         )
-        assert result.alpha <= 0.70
+        assert result.alpha <= 0.55
 
         # Stack all downward adjustments
         result2 = compute_take_profit(

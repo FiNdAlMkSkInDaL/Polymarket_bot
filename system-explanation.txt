@@ -65,7 +65,7 @@ Market:
   - Price range: 0.01 to 0.99 (probabilities)
   - Tick size: 1 cent ($0.01)
   - Fee model: Dynamic parabolic curve — f(p) = f_max × 4 × p × (1 − p)
-    Peak at p=0.50 (1.56%), zero at tails. Maker fee = 0 bps.
+    Peak at p=0.50 (2.00%), zero at tails. Maker fee = 0 bps.
   - Chain: Polygon mainnet (137), settlements on-chain
 
 Deployment modes:
@@ -347,13 +347,15 @@ Key parameter groups (~160 total):
     zscore_threshold = 1.0        (z-score trigger — lowered from 1.5, 3x EV)
     volume_ratio_threshold = 0.8  (volume trigger — lowered from 1.2, +64% signals)
     lookback_minutes = 60         (rolling window)
-    no_discount_factor = 1.005    (relaxed from 0.98; z-score captures displacement)
+    no_discount_factor = 0.98     (NO must trade ≥2% below its VWAP — restored 2026-03-10; was 1.005 which inverted the check)
     trend_guard_bars = 15         (suppress during sustained uptrends)
-    trend_guard_pct = 0.99        (99% move = genuine regime shift; was 0.10 — duplicate field bug fixed 2026-03-09)
+    trend_guard_pct = 0.08        (8% move = regime shift; was 0.99 which disabled the guard — fixed 2026-03-10)
 
   EDGE QUALITY SCORE (EQS):
     min_edge_score = 40.0         (lowered from 50; marginal signals at 40-50 are +EV)
-    eqs_fee_efficiency_floor = 0.10  (prevents fees from zeroing score)
+    eqs_fee_efficiency_floor = 0.30  (prevents fees from dominating score; raised from 0.10 — 2026-03-10)
+    Hard negative-EV veto: if fee_cents >= gross_cents → immediate rejection
+      (reason: "negative_ev_after_fees"; fires before geometric mean)
     eqs_vol_adaptive = True       (vol-adaptive threshold)
     eqs_vol_ref = 0.70            (median 1-min sigma from data; was 0.02)
     eqs_vol_scale_range = 0.25    (±25% adjustment range)
@@ -419,7 +421,7 @@ Key parameter groups (~160 total):
   TAKE PROFIT:
     alpha_default = 0.50          (mean-reversion alpha)
     alpha_min = 0.40
-    alpha_max = 0.70
+    alpha_max = 0.55              (lowered from 0.70 — targets at 0.70 were unreachable on typical moves — fixed 2026-03-10)
     min_spread_cents = 4.0
     tp_rescale_interval_s = 15
     tp_vol_sensitivity = 1.5
@@ -464,7 +466,7 @@ Key parameter groups (~160 total):
     4 signal thresholds (MTI, depth, spread, velocity)
 
   FEES:
-    fee_max_pct = 1.56            (peak fee %)
+    fee_max_pct = 2.00            (peak fee %)
     fee_cache_ttl_s = 300
     fee_default_bps = 200
     desired_margin_cents = 2.5
@@ -541,6 +543,10 @@ DeploymentGuard enforces capital constraints WITHOUT mutating frozen config.
     - get_allowed_trade_size(raw) → min(raw, $1.00) — UN-OVERRIDEABLE
     - get_allowed_trade_shares() → iteratively clamps to $1.00 notional
     - get_wallet_balance() → max_trade_size_usd × 5
+    - V4 Probe sizing is BYPASSED (probe flag cleared; log emitted)
+    - Probe harvesting (scale_probe_to_full) returns None immediately
+      Reason: $1 clamp makes probe and full sizes identical, destroying
+      the 5% Kelly difference.  Probes deferred to PRODUCTION.
 
   PRODUCTION:
     - Pass-through to Kelly sizer
@@ -599,7 +605,9 @@ L2OrderBook (src/data/l2_book.py, ~790 lines):
 
   Key properties:
     is_reliable — True if delta_count < 50 OR seq_gap_rate < 2%
-    seq_gap_rate — desync_total / delta_count (NEVER reset)
+    seq_gap_rate — rolling window of last 10,000 deltas (recoverable)
+      Old: desync_total / delta_count (cumulative, NEVER recovered)
+      New: gaps_in_window / window_size (transient blips age out)
     best_bid, best_ask, spread_cents, book_depth_ratio
 
   Recovery flow:
@@ -718,7 +726,9 @@ EdgeFilter / EQS (src/signals/edge_filter.py):
     R = regime_quality = binary_entropy(entry_price)
         Markets near 50/50 → max uncertainty → noise → mean-revertible
     F = fee_efficiency = max(floor, 1 - fee_cents/gross_cents)
-        floor = 0.10 prevents fee from zeroing entire geometric mean
+        floor = 0.30 prevents fees from dominating score on partial-fee cases
+        Hard veto pre-empts: if fee_cents >= gross_cents → score=0, viable=False,
+        reason="negative_ev_after_fees" (fires before geometric mean formula)
     T = tick_viability = min(1.0, discretised_net_cents / 3.0)
         How many 1¢ ticks the expected move spans on Polymarket grid
     S = signal_quality:
@@ -998,6 +1008,9 @@ OrderChaser (src/trading/chaser.py):
   
   Escalation: after chaser_max_rejections POST_ONLY rejections → crosses spread
     (places marketable limit at best_ask + 1 tick, checks alpha viability first)
+    Alpha viability (_alpha_check): net = (tp_target - cross_price)×100 - entry_fee - exit_fee
+    exit_fee = cross_price × fee_bps / 10_000 × 100  (conservatively assumes taker exit)
+    [was exit_fee=0.0 "assume maker exit" — understated round-trip cost; fixed 2026-03-10]
   
   fast_kill_event: asyncio.Event that pauses all chasers when adverse selection
     guard fires. Chasers block on _wait_fast_kill() until event is set.
@@ -1049,19 +1062,24 @@ Kelly Sizer (src/trading/sizer.py):
 
 Fee Model (src/trading/fees.py):
   Polymarket dynamic curve: f(p) = f_max × 4 × p × (1 − p)
-  Peak 1.56% at p=0.50, zero at tails. Maker = always 0 bps.
+  Peak 2.00% at p=0.50, zero at tails. Maker = always 0 bps.
 
   compute_net_pnl_cents(entry, exit, size, fee_enabled):
     PnL = [(exit - entry) - Fee_entry - Fee_exit] × size × 100
 
   compute_adaptive_stop_loss_cents(sl_base, entry, fee_enabled):
-    SL_trigger = SL_base - roundtrip_fee_cents, floor at 1.0¢
+    trigger   = sl_stretched − fee_drag_cents
+    min_floor = max(2.5, fee_drag_cents + 1.0)   (≥1¢ breathing room above fee drag)
+    SL_trigger = max(min_floor, trigger)
+    (at p=0.50 with fee_drag≈3¢: min_floor=4¢ — prevents chop-out at the
+     old 1¢ hard floor that collapsed stops in high-fee zones)
 
 Take Profit (src/trading/take_profit.py):
   Base model: target = entry + α × (VWAP_no - entry)
 
   Alpha adjustments (6 factors):
-    1. Volatility (asymmetric): high → +0.04, low → −0.08
+    1. Volatility (asymmetric): high → +0.03×min(vol_factor−1, 1.5), low → −0.08
+       [was +0.04×(vol_factor−1) unbounded — could add +0.36 on 10× vol events]
     2. Book depth: deep → +0.03
     3. Whale confluence: +0.08
     4. Time decay: < 14d → −0.05
@@ -1091,7 +1109,9 @@ StopLossMonitor (src/trading/stop_loss.py):
 
     Baseline SL (compute_adaptive_stop_loss_cents):
       multiplier = clamp(σ_downside / σ_ref, 1.0, max_mult)
-      SL_trigger = max(1.0, (base_sl × multiplier) − fee_drag)
+      trigger   = (base_sl × multiplier) − fee_drag
+      min_floor = max(2.5, fee_drag + 1.0)   (dynamic: ≥1¢ above fee drag)
+      SL_trigger = max(min_floor, trigger)
 
     Trailing offset (compute_adaptive_trailing_offset_cents):
       multiplier = clamp(σ_downside / σ_ref, 1.0, max_mult)
@@ -1104,24 +1124,32 @@ StopLossMonitor (src/trading/stop_loss.py):
     Two runtime guards evaluated inside _evaluate_position():
 
     A. L2-Aware Preemptive Stop:
-       our_support_ratio = 1 / book_depth_ratio   (Ask/Bid depth)
-       If our_support_ratio < sl_preemptive_obi_threshold (0.20)
+       our_support_ratio = book_depth_ratio   (bid/ask — direct, not inverted)
+       [was 1/bdr which triggered on strong bids — logic inversion fixed 2026-03-10]
+       If our_support_ratio < sl_preemptive_obi_threshold (0.10)
          AND unrealised_pnl < 0 (underwater):
          → force_stop_loss(reason="preemptive_liquidity_drain")
        Invariant: never fires on healthy (profitable) positions.
-       Prevents slippage bleed on "hollow book" exits.
+       Prevents slippage bleed when bid depth evaporates on exit.
+       [Threshold lowered from 0.20 to 0.10 on 2026-03-10: Polymarket books
+        are naturally thin with BDR routinely fluctuating 0.10-0.25; the old
+        0.20 threshold caused false-positive premature exits on normal books.]
+       Preemptive exits now also record a stop-loss cooldown (300s) to prevent
+       the loser-loop that occurred when repeated re-entry followed preemptive
+       drain exits without any inter-signal pause.
 
     B. Time-Decaying Vol Multiplier:
        After sl_decay_start_minutes (5 min), the extra volatility room
        given at entry decays exponentially toward 1.0×:
-         decay_factor = exp(-(elapsed - start) / half_life)
-         current_mult = 1.0 + (initial_mult - 1.0) × decay_factor
+         decay_factor = exp(−ln(2) × (elapsed − start) / half_life)
+         current_mult = 1.0 + (initial_mult − 1.0) × decay_factor
          decayed_sl = max(1.0, base_cents × current_mult − fee_drag)
+       [was exp(−(elapsed−start)/half_life) — mean-lifetime, not half-life; fixed 2026-03-10]
        At half_life=15 min, a 1.5× multiplier decays to:
          T+5  → 1.50  (decay starts)
-         T+20 → 1.18  (≈37% of extra room remaining)
-         T+35 → 1.07  (≈13% remaining)
-         T+50 → 1.02  (≈5% remaining)
+         T+20 → 1.25  (exactly 50% of extra room remaining at T+20 = start+15)
+         T+35 → 1.12  (25% remaining)
+         T+50 → 1.06  (12.5% remaining)
 
 AdverseSelectionMonitor (src/trading/adverse_selection_monitor.py):
   POST_ONLY fill mark-to-market monitor.
@@ -1596,7 +1624,7 @@ SI-5 — Order Flow Imbalance (OFI) — Dual Role:
     OR book_depth_ratio < ofi_depth_ratio_floor → cancel peg + market-sell 1 tick.
 
 Dynamic Fee Curve:
-  f(p) = f_max × 4 × p × (1 − p), f_max = 0.0156
+  f(p) = f_max × 4 × p × (1 − p), f_max = 0.0200
 
 Take-Profit:
   target = entry + α × (VWAP - entry)
@@ -1626,7 +1654,9 @@ Volatility-Adaptive Stop-Loss (Pillar 11.1 → 11.2 → 11.3):
     σ²_down_t = λ · σ²_down_{t-1} + (1-λ) · downside_r²
   Baseline stop:
     multiplier = clamp(σ_down / σ_ref, 1.0, max_multiplier)
-    SL_trigger = max(1.0, (base_sl × multiplier) − roundtrip_fee_cents)
+    trigger   = (base_sl × multiplier) − fee_drag_cents
+    min_floor = max(2.5, fee_drag_cents + 1.0)   (≥1¢ above fee drag — dynamic)
+    SL_trigger = max(min_floor, trigger)
   Trailing offset:
     multiplier = clamp(σ_down / σ_ref, 1.0, max_multiplier)
     trailing_offset = base_offset × multiplier  (no fee deduction)
@@ -1706,7 +1736,12 @@ SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
 
 7. SEQUENCE GAP TRACKING
    L2OrderBook.desync_total is NEVER reset (cumulative lifetime counter).
-   desync_count resets on each snapshot. seq_gap_rate = total / delta_count.
+   desync_count resets on each snapshot.
+   seq_gap_rate now uses a 10,000-delta rolling window (deque[bool]):
+     _seq_gap_window tracks True (gap) / False (clean) per delta.
+     _seq_gap_window_gaps is a running count of gaps in the window.
+     Markets recover is_reliable=True after ~10K clean deltas.
+   Old: seq_gap_rate = desync_total / delta_count (permanent damage).
    is_reliable = gap_rate < 2%. This drives the L2 hard gate decision.
 
 8. MAKER FEE = 0

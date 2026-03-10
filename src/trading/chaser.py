@@ -608,8 +608,9 @@ class OrderChaser:
                 return True
             gross_spread = (self._tp_target - cross_price) * 100
             entry_fee = cross_price * self._fee_bps / 10_000 * 100
-            # Assume maker exit (0 fee) as the optimistic case
-            exit_fee = 0.0
+            # Conservatively assume taker exit (same fee as entry).
+            # If exit is actually maker, it's bonus alpha — not relied upon.
+            exit_fee = cross_price * self._fee_bps / 10_000 * 100
             net = gross_spread - entry_fee - exit_fee
         else:
             # SELL side: anchor is the entry price we're trying to sell above
