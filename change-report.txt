@@ -4869,3 +4869,132 @@ TEST RESULTS
 
 ================================================================================
 
+
+================================================================================
+CHANGE REPORT — Full-Spectrum Anti-Silent-Failure Circuit Breaker Hardening
+Date: 2026-03-10
+================================================================================
+
+BACKGROUND
+----------
+Following the Loser-Loop & Premature Chop-Out Fix (same date), a full system
+integrity audit was performed to guarantee the live bot cannot enter a
+silent-failure state after deployment.  The audit revealed that only 2 of the
+18+ concurrent async loops had ExceptionCircuitBreaker protection
+(_trade_loop_breaker and _stale_bar_breaker).  The remaining 16 loops used
+bare `except Exception: continue/pass` patterns — a critical gap because any
+uncaught exception in these loops would either be swallowed silently or crash
+the loop without notification, degrading live performance invisibly.
+
+Four hot-path loops were identified as requiring immediate hardening:
+  1. _rpe_crypto_retrigger_loop (200ms poll — higher priority than stale bar)
+  2. _tp_rescale_loop (adaptive TP target recalculation)
+  3. _ghost_liquidity_loop (500ms ghost book detector)
+  4. _timeout_loop (10s timeout enforcement for open positions)
+
+Additionally, three lower-priority loops lacked stack traces in their error
+logs, making post-hoc debugging extremely difficult.
+
+AUDIT PROCESS
+-------------
+1. WFO Gates Dry-Run (scripts/diagnose_wfo_gates.py, VPS, 31 markets, 7-day
+   window): confirmed gate funnel healthy.  G06c_zscore_low rejecting at
+   threshold=1.0 vs max z=0.328 (backtest data artefact, expected).  PASS.
+
+2. Anti-Silent-Failure Loop Inventory: grepped all async loop functions for
+   `except Exception` handlers.  Identified 4 hot-path loops without breakers.
+   Counted breakers in __init__: only 2 (_trade_loop_breaker, _stale_bar_breaker).
+
+3. Config & State-Machine Integrity:
+   - StrategyParams: 221 fields audited, zero duplicates confirmed.
+   - sl_preemptive_obi_threshold = 0.10 ✓
+   - trend_guard_pct = 0.08 ✓
+   - preemptive_liquidity_drain cooldown: confirmed in on_exit_filled() alongside
+     "stop_loss" at all 3 entry paths (bot.py lines 1296, 1555, 1608). PASS.
+
+4. Full test suite: 1542 passed, 0 failed (122.69s) on VPS.
+
+5. Clean production deployment:
+   - Cleared 200+ stale /dev/shm/pmb_* files from PID 214304 (rm -f /dev/shm/pmb_*).
+   - SCP'd patched bot.py to VPS.
+   - SIGTERM to PID 214304 → systemd Restart=always → new PID 215715 at 14:12 UTC.
+
+6. Live health monitoring (5-min window post-restart):
+   - l2_synced events: 1000+ → FLOWING
+   - emergency_stop_triggered: 0 → CLEAN
+   - workers_stale: 0 → PCE/L2 healthy
+   - circuit_breaker_tripped: 0 → no breaker trips
+   - WS connections (PID 215715): 7 initial pool (stable)
+   - PCE worker: pce_worker_ready at 14:12:44 UTC
+   - L2 child worker (PID 215724): 760 l2_synced events
+
+CIRCUIT BREAKER HARDENING MATRIX
+----------------------------------
+  Loop                      Freq     Before                    After
+  ─────────────────────────────────────────────────────────────────────────────
+  _rpe_crypto_retrigger_loop  200ms  log.warning, no breaker   log.error + exc_info
+                                                                + _retrigger_breaker
+                                                                + Telegram + suspend
+  _tp_rescale_loop          15s      log.error, no traceback   exc_info=True
+                                                                + _tp_rescale_breaker
+                                                                + Telegram + suspend
+  _ghost_liquidity_loop     500ms    log.error, no traceback   exc_info=True
+                                                                + _ghost_breaker
+                                                                + Telegram + suspend
+  _timeout_loop             10s      log.error, no traceback   exc_info=True
+                                                                + _timeout_breaker
+                                                                + Telegram + suspend
+  _market_refresh_loop      10min    log.error, no traceback   exc_info=True added
+  _pce_refresh_loop         30min    log.error, no traceback   exc_info=True added
+  _cleanup_loop             5min     log.error, no traceback   exc_info=True added
+  _stale_bar_flush_loop     30s      Already hardened          No change
+  _process_trades           fast     Already hardened          No change
+  _decision_loop (ASG)      50ms     Already hardened          No change
+
+ARCHITECTURAL INVARIANTS ENFORCED
+-----------------------------------
+Per policy in Section 15 item 19 (EXCEPTION CIRCUIT BREAKER):
+  - Every hot-path loop must have its own ExceptionCircuitBreaker instance.
+  - threshold=5 errors in window_s=60.0s rolling window.
+  - On trip: CRITICAL log + Telegram alert + _suspend_and_reset().
+  - Breakers reset in _suspend_and_reset() alongside WS pool rebuild.
+  - Silent exception swallowing is FORBIDDEN in hot-path loops.
+
+New breakers added to TradingBot.__init__():
+  self._retrigger_breaker  = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+  self._tp_rescale_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+  self._ghost_breaker      = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+  self._timeout_breaker    = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+
+All 4 reset in _suspend_and_reset():
+  self._retrigger_breaker.reset()
+  self._tp_rescale_breaker.reset()
+  self._ghost_breaker.reset()
+  self._timeout_breaker.reset()
+
+FILES MODIFIED
+--------------
+  1. src/bot.py
+     - TradingBot.__init__(): 4 new ExceptionCircuitBreaker instances.
+     - TradingBot._suspend_and_reset(): 4 new .reset() calls.
+     - _rpe_crypto_retrigger_loop(): except-block upgraded from log.warning
+       without stack trace to log.error + exc_info=True + _retrigger_breaker
+       + Telegram alert + suspend-on-trip.
+     - _tp_rescale_loop(): except-block upgraded to exc_info=True +
+       _tp_rescale_breaker + Telegram alert + suspend-on-trip.
+     - _ghost_liquidity_loop(): except-block upgraded to exc_info=True +
+       _ghost_breaker + Telegram alert + suspend-on-trip.
+     - _timeout_loop(): except-block upgraded to exc_info=True +
+       _timeout_breaker + Telegram alert + suspend-on-trip.
+     - _market_refresh_loop(), _pce_refresh_loop(), _cleanup_loop():
+       exc_info=True added to all except-block log calls.
+
+TEST RESULTS
+-----------
+  1542 passed, 0 failed (122.69s) on VPS with DEPLOYMENT_ENV=PAPER.
+  (2 deselected on first run with DEPLOYMENT_ENV=PENNY_LIVE: pre-existing
+   test_default_is_paper env-var mismatch — not related to this change.)
+  0 regressions.
+
+================================================================================
+

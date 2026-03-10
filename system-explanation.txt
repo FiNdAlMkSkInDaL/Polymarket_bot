@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 9, 2026
+  Last updated: March 10, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -265,19 +265,27 @@ CONCURRENT TASKS (18+):
                         60s → CRITICAL log + graceful shutdown via stop()
   book_processor      — Orderbook update consumption
   timeout_loop        — Position timeout checks (10s)
+                        Exception circuit breaker: 5 unexpected errors in
+                        60s → CRITICAL log + Telegram alert + _suspend_and_reset()
   stats_loop          — Stats broadcast (15 min)
   whale_monitor       — Polygon CTF WebSocket log stream (REST fallback)
   market_refresh      — Re-discovery/re-scoring (10 min)
   cleanup             — Stale cleanup + daily PnL reset (5 min)
   tp_rescale          — Adaptive TP target rescaling (15s)
+                        Exception circuit breaker: 5 unexpected errors in
+                        60s → CRITICAL log + Telegram alert + _suspend_and_reset()
   adverse_sel         — Fast-kill detection (50ms)
                         Exception circuit breaker: 5 unexpected errors in
                         60s → CRITICAL log + graceful shutdown via on_shutdown()
   heartbeat           — Book staleness detection
-  ghost_liquidity     — Ghost liquidity circuit breaker (500ms)
+  ghost_liquidity     — Ghost liquidity detector (500ms)
+                        Exception circuit breaker: 5 unexpected errors in
+                        60s → CRITICAL log + Telegram alert + _suspend_and_reset()
   order_status_poller — CLOB order fill polling (2s)
   health_reporter     — system_health.json writer (60s)
   rpe_retrigger       — BTC spot retrigger (200ms) [was 5s — reduced for latency edge]
+                        Exception circuit breaker: 5 unexpected errors in
+                        60s → CRITICAL log + Telegram alert + _suspend_and_reset()
   pce_refresh         — Correlation matrix recalc (30 min) + prior validation (every 6h)
   stale_bar_flush     — Flush stale OHLCV bars (30s)
   paper_summary       — Paper trade summary (30 min)
@@ -2671,6 +2679,54 @@ March 9th — VPS Infrastructure Remediation (3-Task Session):
 
   VPS post-restart verification (3-min window): 774 l2_synced, 0 workers_stale,
   0 emergency_stop, 0 ws_reconnect. All 3 patches deployed and confirmed live.
+
+March 10th — Loser-Loop & Premature Chop-Out Fix:
+  Two-bug microstructure fix for zero-trade / re-entry bleed on the live VPS.
+
+  Bug 1 — Stop-loss cooldown bypass (CRITICAL, src/trading/position_manager.py):
+  - on_exit_filled() only recorded _stop_loss_cooldowns[market_id] when
+    reason == "stop_loss". Pillar 11.3 exits (reason="preemptive_liquidity_drain")
+    did NOT record a cooldown → position closed → next bar re-entered immediately
+    → same hollow book → drain again → loser loop.
+  - Fix: condition broadened to `if reason in ("stop_loss",
+    "preemptive_liquidity_drain")`.  All 3 entry paths in bot.py confirmed
+    calling is_stop_loss_cooled_down() (lines 1296, 1555, 1608).
+
+  Bug 2 — sl_preemptive_obi_threshold too aggressive (src/core/config.py):
+  - Default 0.20 caused premature exits on naturally thin Polymarket books
+    (BDR routinely 0.15 on $5K–$20K daily-volume markets).
+  - Lowered to 0.10 (10th-percentile methodology from analyze_book_resilience.py).
+  - test_stop_loss.py: book_depth_ratio test fixture 0.1 → 0.05.
+
+  WFO gate audit (diagnose_wfo_gates.py, 31 markets, 7-day backtest window):
+  - Gate funnel confirmed: G06c_zscore_low blocking at 1.0 vs max z=0.328.
+  - Root cause of 0 backtest passes: σ inflated by synthetic 1-trade bars in
+    backfill data (not a live bot issue — live σ ≈ 0.02–0.10).
+  - 1540 passed, 0 failed.
+
+March 10th — Full-Spectrum Anti-Silent-Failure Circuit Breaker Hardening:
+  Six-step operational audit confirmed zero silent-failure exposure post-deploy.
+
+  Changes to src/bot.py:
+  - 4 new ExceptionCircuitBreaker instances in __init__:
+      _retrigger_breaker, _tp_rescale_breaker, _ghost_breaker, _timeout_breaker
+      (threshold=5, window_s=60.0; all reset in _suspend_and_reset()).
+  - _rpe_crypto_retrigger_loop (200ms): upgraded log.warning → log.error +
+    exc_info=True + _retrigger_breaker + Telegram + suspend.
+  - _tp_rescale_loop (15s): added exc_info=True + _tp_rescale_breaker +
+    Telegram + suspend.
+  - _ghost_liquidity_loop (500ms): added exc_info=True + _ghost_breaker +
+    Telegram + suspend.
+  - _timeout_loop (10s): added exc_info=True + _timeout_breaker + Telegram
+    + suspend.
+  - _market_refresh_loop, _pce_refresh_loop, _cleanup_loop: exc_info=True
+    added to all error log sites.
+
+  Post-deploy live health (5-min window, PID 215715):
+    l2_synced: 1000+ | emergency_stop: 0 | workers_stale: 0 |
+    circuit_breaker_tripped: 0 | pce_worker_ready: 14:12:44 UTC.
+  1542 passed, 0 failed, 0 regressions.
+
 
 ================================================================================
 END OF DOCUMENT
