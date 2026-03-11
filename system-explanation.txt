@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 10, 2026
+  Last updated: March 11, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -1366,7 +1366,9 @@ External bounds injection (search_space_bounds_path):
 
 Composite objective:
   Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
-  Returns -inf when fills < min_trades
+  Returns -10.0 when fills < min_trades (finite penalty so Optuna TPE can learn;
+  -inf would make the sampler treat all zero-trade regions as equally bad and
+  never learn to avoid them)
 
 Fold generation: rolling/anchored IS window with embargo gap
 Warm-start: seeds from previous fold's best params
@@ -2775,6 +2777,206 @@ March 10th — Market Discovery: Token ID Validation Hardening:
   300 asset IDs subscribed; l2_synced events flowing; 0 missing_token_id
   rejections. 1534 passed, 0 regressions.
 
+
+March 10th — Hard Negative-EV Veto in Edge Scoring (commit 61858a7):
+  Problem: Trades could be admitted where the expected gross profit was
+  mathematically incapable of covering the round-trip taker fee, meaning the
+  bot was taking positions with guaranteed negative expected value before
+  market uncertainty was even factored in.
+
+  Changes across src/trading/fees.py, src/trading/chaser.py,
+  src/trading/stop_loss.py, src/trading/take_profit.py, src/bot.py,
+  src/core/config.py, src/data/l2_book.py, src/signals/edge_filter.py:
+  - compute_edge_score now performs a hard pre-filter: if
+    expected_gross_profit < round_trip_taker_fee the trade is vetoed and
+    the function returns score=0 with is_signal=False. No downstream code
+    is reached for such trades.
+  - OrderChaser fee calculations conservatively assume taker exit fees
+    (worst-case fill assumption) rather than optimistic maker fees.
+  - Adaptive stop-loss gains a dynamic fee-aware floor of 2.5 cents,
+    preventing premature exits when the remaining profit margin is
+    less than the cost of unwinding.
+  - probe sizing is skipped in PENNY_LIVE mode to preserve probe math
+    integrity; probing only fires in full production runs.
+  - Take-profit alpha contributions are capped so targets remain reachable
+    under typical market conditions.
+  All 19 affected test files were updated to match the new fee/stop-loss
+  behaviour. 1534 passed, 0 regressions.
+
+
+March 10th — Config Parameter Recalibration + signal_q Clamp Fix (commit ab51f26):
+  Problem 1 (signal_q clamping): iceberg and whale confluence bonuses were
+  being added to signal_quality without a per-bonus intermediate clamp, so
+  the whale bonus could push signal_quality above 1.0 before the iceberg
+  bonus was applied. Tests were asserting `base + 0.15` without the clamp,
+  causing them to fail when a high-sigma input already saturated the base.
+  Fix: each bonus is now applied as `min(1.0, current + bonus)` and the
+  test assertions were updated to use the same expression.
+
+  Problem 2 (panic detector dimensionality): the z-score formula computed
+  `delta_p = bar.close - vwap` (raw price difference) and divided by sigma
+  (a log-return standard deviation). Because numerator and denominator had
+  different units, the z-score was wrongly scaled.
+  Fix in src/signals/panic_detector.py:
+    delta_p = (bar.close - vwap) / vwap   # fractional deviation (dimensionless)
+    zscore  = delta_p / sigma              # sigma also dimensionless
+  This also corrected the default thresholds:
+    zscore_threshold:      1.0 → 0.8   (tighter trigger after unit fix)
+    volume_ratio_threshold: 0.8 → 0.5
+
+  Additional parameter recalibrations in src/core/config.py:
+    signal_cooldown_minutes: 0.5 → 0.25  (halved, faster re-arm)
+    no_discount_factor:     0.98 → 0.995  (requires tighter discount at entry)
+    eqs_vol_adaptive:       True → False  (disabled; proxy ratio was
+                                           always 10-96×, jamming the ±25%
+                                           adjuster; value is noise)
+    drift_vol_ceiling:      0.05 → 0.35  (raised to reflect actual median
+                                          market EWMA vol of 0.72)
+
+
+March 10th — Ops: Scorched Earth Reset Script (commit beb6516):
+  Added scripts/scorched_earth_reset.sh — a comprehensive VPS reset procedure
+  for use when the system must be returned to a clean state. Steps executed:
+    1. SIGTERM all src.cli / polybot / wfo_optimizer / optuna processes.
+    2. Remove all /dev/shm/pmb_* shared-memory segments.
+    3. Kill tmux server (terminates bot_prod and wfo_prod sessions).
+    4. Stop systemd polymarket-bot.service if active.
+    5. Verify no residual Python processes remain.
+    6. Wipe logs/ (except .env), clear Optuna SQLite databases.
+    7. Re-create logs/ directories; confirm parquet data is present.
+    8. Show current git commit (no implicit git pull — keeps deploy explicit).
+    9. Validate .env configuration.
+   10. Reinstall Python dependencies into .venv.
+   11. Run full pytest suite (must pass before restart).
+   12. Launch fresh tmux sessions: wfo_prod (WFO pipeline) + bot_prod (live bot).
+  The script is idempotent; steps that find nothing to do print a "not found"
+  notice rather than erroring.
+
+
+March 10th — UTF-8 BOM Strip + scorched_earth_reset Hardening (commit 6c27df6):
+  Problem: Both src/signals/adverse_selection_guard.py and
+  scripts/run_diagnostics.py were saved with a UTF-8 BOM (0xEF 0xBB 0xBF)
+  as their first byte. On Linux/Python this causes the docstring's opening
+  triple-quote to be misread, producing a SyntaxError or UnicodeDecodeError
+  on import.
+  Fix: BOM removed from both files (re-saved as plain UTF-8). Zero
+  functional changes.
+
+  scorched_earth_reset.sh step 2.5 was originally performing a hard
+  `git fetch; git reset --hard origin/main`, which would silently overwrite
+  any uncommitted local changes before the operator had a chance to review
+  them. Changed to a passive version-check:
+    echo "  current commit: $(git log --oneline -1)"
+  Deploys are now always explicit (operator runs `git pull` separately).
+
+
+March 10th — IPC: Stale Shared-Memory Segment Cleanup (commit 39d871b):
+  Problem: On VPS restart (or after a crash) the previous bot process left
+  /dev/shm/pmb_<asset_id> segments allocated. When the new bot called
+  allocate_shm(), shared_memory.SharedMemory(create=True) raised
+  FileExistsError because the name was already registered, preventing
+  the bot from starting.
+
+  Fix in src/core/ipc.py — allocate_shm() now attempts to attach to and
+  immediately unlink any pre-existing segment with the same name before
+  calling create=True:
+    try:
+        stale = SharedMemory(name=name, create=False)
+        stale.close()
+        stale.unlink()
+    except FileNotFoundError:
+        pass          # normal case: no stale segment present
+  This is safe because the unlink is performed only if the segment exists
+  with the expected name, and the subsequent create=True call then succeeds.
+  The scorched_earth_reset.sh STEP 1 also explicitly `rm -f /dev/shm/pmb_*`
+  as a belt-and-suspenders belt ahead of any Python startup.
+
+
+March 11th — Active/Passive L2 Tracking (Load Shedding for 150+ Markets):
+  Problem: With 150+ active markets (300+ asset IDs), maintaining full-depth
+  L2 order book reconstruction for every market is computationally infeasible
+  on the VPS.  WebSocket connections are sharded (MAX_SUBSCRIPTIONS_PER_SOCKET
+  = 50 per physical WS connection), and each L2OrderBook maintains a full
+  state machine (EMPTY → BUFFERING → SYNCED ↔ DESYNCED) with seq gap tracking.
+
+  Solution: The bot tiers markets into Active and Passive categories based on
+  24-hour volume ranking.  `max_active_l2_markets` (config) caps the number
+  of markets receiving full L2 reconstruction via dedicated worker subprocesses
+  (ProcessManager → start_l2_workers → SharedBookWriter → shared memory).
+  Markets beyond the cap get lightweight top-of-book tracking only.
+
+  Architecture:
+  - MarketWebSocketPool chunks asset IDs across multiple WS connections
+    (50 subs per socket), feeding a shared trade_queue and book_queue.
+  - L2 workers (l2_worker.py) run as subprocesses, each managing an asset
+    shard via L2WebSocket + L2OrderBook → SharedBookWriter to /dev/shm.
+  - ProcessManager monitors worker health via WorkerHeartbeatChecker,
+    restarting stale workers automatically.
+  - Bot main loop sorts markets by volume, top N get full L2 + SpreadScore
+    + IcebergDetector, the rest get OrderbookTracker (BBO only).
+  - L2OrderBook reliability gate: seq_gap_rate < l2_max_seq_gap_rate (2%)
+    must hold for L2 data to be considered reliable.
+
+  Config: l2_enabled=True, l2_max_levels=50, l2_max_seq_gap_rate=0.02,
+  max_active_l2_markets (controls the tiering cutoff).
+
+March 11th — Ghost Liquidity Vacuum (VacuumSignal + POST_ONLY Stink Bids):
+  New alpha source: detects "ghost liquidity" events where >50% of order book
+  depth vanishes within a 2-second window — a signature of spoofing (fake
+  orders placed then cancelled) or market-maker risk-off.
+
+  Signal: VacuumSignal (src/signals/signal_framework.py)
+    Fires when ghost-liquidity detector sees >50% depth drop.
+    Fields: depth_velocity (negative = drop), baseline_depth (pre-drop USD),
+    yes_asset_id, mid_price at detection moment.
+
+  Strategy: POST_ONLY stink bids placed at mid - offset (default 8¢ below).
+  - PositionManager.open_vacuum_stink_bids():
+    Calculates yes_bid = max(0.01, mid - offset), no_bid = max(0.01, (1-mid) - offset)
+    Risk-gated: _check_risk_gates + hard cap at vacuum_stink_bid_max_risk_usd ($2).
+    Places POST_ONLY limit orders via OrderExecutor.
+    Position created with prefix "VACUUM-", target_price = side_mid.
+  - PositionManager.cancel_vacuum_stink_bids():
+    Cancels unfilled ENTRY_PENDING stink bids when depth recovers
+    (ghost_recovery_s=60 seconds), reason="ghost_recovered".
+
+  Config:
+    ghost_depth_drop_threshold=0.50 (50% drop trigger)
+    ghost_window_s=2.0 (measurement window)
+    ghost_recovery_s=60.0 (recovery period)
+    ghost_check_interval_ms=500 (polling interval)
+    vacuum_stink_bid_enabled=True
+    vacuum_stink_bid_offset_cents=8.0 (entry 8¢ below mid)
+    vacuum_stink_bid_max_risk_usd=2.0 (position size cap)
+
+  Rationale: Ghost liquidity events create temporary dislocations.
+  By placing cheap limit orders during the panic, the bot harvests
+  mean-reversion once depth refills. POST_ONLY ensures maker fees
+  (rebates) rather than taker fees.
+
+March 11th — WFO Penalty Logic: Zero-Trade Rejection Returns -10.0:
+  Previous behavior: compute_wfo_score() returned float("-inf") when
+  total_fills < min_trades (default 5).  This prevented Optuna's TPE
+  sampler from learning which parameter regions produce zero trades,
+  because -inf makes all such regions look equally terrible.
+
+  New behavior: Returns -10.0 (a finite, severely negative score).
+  This allows the TPE sampler to model the density of zero-trade
+  parameter space and steer subsequent trials away from it.  The
+  improvement is visible in the WFO database: 62 of 254 completed
+  trials scored -10.0 (penalty), while the sampler still found the
+  best Sharpe of 4.16 — demonstrating that it successfully learned
+  to concentrate exploration in productive parameter regions.
+
+  Also applied to worker error paths: data-loading failures and
+  unexpected exceptions also return -10.0 via study.tell(trial, -10.0)
+  to prevent zombie RUNNING trials from corrupting the study.
+
+  Test suite updated: 9 tests updated to match new -10.0 semantics,
+  search space bounds (zscore_threshold [0.05, 2.5], min_edge_score >= 20),
+  normalised zscore formula ((close-vwap)/vwap/σ), and config defaults
+  (no_discount_factor=0.995, drift_vol_ceiling=0.35).
+  1542 passed, 0 failed.
 
 ================================================================================
 END OF DOCUMENT
