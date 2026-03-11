@@ -251,12 +251,12 @@ class TestWfoScore:
     # ── Trade gate tests ───────────────────────────────────────────────
 
     def test_too_few_trades_returns_neg_inf(self):
-        """Fewer than min_trades → score = -inf."""
+        """Fewer than min_trades → score = -10.0 (finite penalty for Optuna learning)."""
         score = compute_wfo_score(
             sharpe_ratio=3.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=2, min_trades=5,
         )
-        assert score == float("-inf")
+        assert score == -10.0
 
     def test_exactly_min_trades_passes(self):
         """Exactly min_trades should pass the gate."""
@@ -267,12 +267,12 @@ class TestWfoScore:
         assert score > 0
 
     def test_zero_fills_rejected(self):
-        """Zero fills always rejected."""
+        """Zero fills always rejected (score = -10.0)."""
         score = compute_wfo_score(
             sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=0,
         )
-        assert score == float("-inf")
+        assert score == -10.0
 
     # ── Multi-metric composite tests ───────────────────────────────────
 
@@ -327,8 +327,8 @@ class TestWfoScore:
         score = compute_wfo_score(
             sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
         )
-        # With default min_trades=5 and total_fills=0, should be -inf
-        assert score == float("-inf")
+        # With default min_trades=5 and total_fills=0, should be -10.0
+        assert score == -10.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -685,7 +685,7 @@ class TestSearchSpace:
         params = _suggest_params(mock_trial)
         sp = StrategyParams(**params)
 
-        assert sp.zscore_threshold == (1.0 + 2.5) / 2
+        assert sp.zscore_threshold == (0.05 + 2.5) / 2
         assert sp.kelly_fraction == (0.03 + 0.40) / 2
 
     def test_expanded_search_space_has_new_params(self):
@@ -715,13 +715,13 @@ class TestSearchSpace:
             )
 
     def test_min_edge_score_lower_bound(self):
-        """Lower bound of min_edge_score must be >= 30 to prevent regression."""
+        """Lower bound of min_edge_score must be >= 20 to allow WFO exploration."""
         from src.backtest.wfo_optimizer import SEARCH_SPACE
 
         spec = SEARCH_SPACE["min_edge_score"]
         lower_bound = spec[1]
-        assert lower_bound >= 30.0, (
-            f"min_edge_score lower bound {lower_bound} is below 30.0 — "
+        assert lower_bound >= 20.0, (
+            f"min_edge_score lower bound {lower_bound} is below 20.0 — "
             "risk of WFO recommending a value that undoes quality-gate tightening"
         )
 

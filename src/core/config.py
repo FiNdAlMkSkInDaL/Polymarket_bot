@@ -449,6 +449,13 @@ class StrategyParams:
     ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 60.0)
     ghost_check_interval_ms: int = _env_int("GHOST_CHECK_INTERVAL_MS", 500)
 
+    # ── Vacuum / Stink Bid Strategy ────────────────────────────────────────
+    # When ghost liquidity is detected, place POST_ONLY limit orders deeply
+    # out-of-the-money on both sides of the book to catch flash-crash wicks.
+    vacuum_stink_bid_enabled: bool = _env_bool("VACUUM_STINK_BID_ENABLED", True)
+    vacuum_stink_bid_offset_cents: float = _env_float("VACUUM_STINK_BID_OFFSET_CENTS", 8.0)
+    vacuum_stink_bid_max_risk_usd: float = _env_float("VACUUM_STINK_BID_MAX_RISK_USD", 2.0)
+
     # Paper-mode fill slippage.  In paper mode, fills are simulated by
     # crossing the limit price.  This adds a configurable adverse
     # slippage (in cents) to avoid overstating performance.  Set to 0

@@ -53,6 +53,33 @@ class BaseSignal:
     no_best_ask: float = 0.0
 
 
+@dataclass
+class VacuumSignal(BaseSignal):
+    """Fires when the ghost-liquidity detector sees a >50% depth drop.
+
+    Used by the stink-bid strategy to place deeply out-of-the-money
+    POST_ONLY limit orders on both sides of the book during the
+    liquidity vacuum, catching flash-crash wicks left by retail
+    market orders.
+
+    Fields
+    ------
+    depth_velocity:
+        Measured depth-velocity at trigger time (negative = drop).
+    baseline_depth:
+        Pre-drop depth estimate (USD) used for recovery gating.
+    yes_asset_id:
+        Token ID for the YES outcome token (needed for ask-side orders).
+    mid_price:
+        Book mid-price at the moment of the vacuum detection.
+    """
+
+    depth_velocity: float = 0.0
+    baseline_depth: float = 0.0
+    yes_asset_id: str = ""
+    mid_price: float = 0.0
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Abstract base
 # ═══════════════════════════════════════════════════════════════════════════

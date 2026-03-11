@@ -55,6 +55,7 @@ from src.signals.signal_framework import (
     OrderbookImbalanceSignal,
     SignalResult,
     SpreadCompressionSignal,
+    VacuumSignal,
 )
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
@@ -2696,14 +2697,57 @@ class TradingBot:
                                 f"Depth drop: {abs(dv)*100:.0f}% in {ghost_window}s\n"
                                 f"Emergency drain activated."
                             )
+
+                            # ── Vacuum stink-bid exploit ───────────────────
+                            # Place deeply OTM POST_ONLY orders on both sides
+                            # to catch flash-crash wicks during the vacuum.
+                            if settings.strategy.vacuum_stink_bid_enabled and am:
+                                no_tracker = self._book_trackers.get(am.info.no_token_id)
+                                mid = 0.0
+                                no_ask = 0.0
+                                if no_tracker and no_tracker.has_data:
+                                    snap = no_tracker.snapshot()
+                                    mid = snap.mid_price
+                                    no_ask = snap.best_ask
+                                if mid > 0:
+                                    vsig = VacuumSignal(
+                                        market_id=cid,
+                                        no_asset_id=am.info.no_token_id,
+                                        no_best_ask=no_ask,
+                                        depth_velocity=dv,
+                                        baseline_depth=baseline_pre,
+                                        yes_asset_id=am.info.yes_token_id,
+                                        mid_price=mid,
+                                    )
+                                    try:
+                                        vac_positions = await self.positions.open_vacuum_stink_bids(
+                                            vsig, event_id=am.info.event_id,
+                                        )
+                                        if vac_positions:
+                                            await self.telegram.send(
+                                                f"🎯 <b>Vacuum Stink Bids</b> placed: "
+                                                f"{len(vac_positions)} orders on "
+                                                f"<code>{cid[:16]}</code>"
+                                            )
+                                    except Exception as vex:
+                                        log.error("vacuum_stink_bid_error", error=str(vex))
+
                             break  # only need one token to trigger per market
 
                 # Check emergency markets for recovery
                 recovered = self.lifecycle.check_emergency_recovery(self._book_trackers)
                 for cid in recovered:
-                    log.info("ghost_liquidity_recovered", condition_id=cid)
+                    # Cancel any unfilled vacuum stink bids — structural
+                    # advantage has disappeared now that depth recovered.
+                    n_cancelled = await self.positions.cancel_vacuum_stink_bids(cid)
+                    log.info(
+                        "ghost_liquidity_recovered",
+                        condition_id=cid,
+                        vacuum_bids_cancelled=n_cancelled,
+                    )
                     await self.telegram.send(
                         f"✅ <b>Ghost recovered</b>: <code>{cid[:16]}</code> back to ACTIVE"
+                        + (f"\n🗑 Cancelled {n_cancelled} vacuum stink bid(s)" if n_cancelled else "")
                     )
 
             except asyncio.CancelledError:

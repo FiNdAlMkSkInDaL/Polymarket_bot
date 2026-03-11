@@ -33,7 +33,7 @@ from src.signals.edge_filter import ConfluenceContext, compute_confluence_discou
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
-from src.signals.signal_framework import BaseSignal
+from src.signals.signal_framework import BaseSignal, VacuumSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import (
     compute_adaptive_stop_loss_cents,
@@ -2072,3 +2072,171 @@ class PositionManager:
                 )
 
         return positions
+
+    # ── Vacuum stink-bid strategy (ghost liquidity exploit) ────────────
+    async def open_vacuum_stink_bids(
+        self,
+        signal: VacuumSignal,
+        *,
+        event_id: str = "",
+    ) -> list[Position]:
+        """Place POST_ONLY limit orders on both sides during a ghost liquidity vacuum.
+
+        When a :class:`VacuumSignal` fires (>50% depth drop), this method
+        places deeply OTM maker orders to catch flash-crash wicks caused
+        by retail market orders hitting the thinned book.
+
+        All orders are strictly POST_ONLY to guarantee maker execution
+        (0 bps fee).  Sizing is capped by Kelly / VaR gates and the
+        ``vacuum_stink_bid_max_risk_usd`` hard cap ($1–$2).
+
+        Parameters
+        ----------
+        signal:
+            The VacuumSignal carrying mid-price and asset IDs.
+        event_id:
+            Market event id for risk-gate checks.
+
+        Returns
+        -------
+        list[Position]
+            Positions created for each stink bid placed (bid + ask sides).
+        """
+        strat = settings.strategy
+        if not strat.vacuum_stink_bid_enabled:
+            return []
+
+        mid = signal.mid_price
+        if mid <= 0:
+            return []
+
+        offset = strat.vacuum_stink_bid_offset_cents / 100.0  # cents → dollars
+        max_risk_usd = strat.vacuum_stink_bid_max_risk_usd
+
+        # mid is the YES token mid-price; NO mid = 1.0 - mid.
+        # Each stink bid sits *below* that side's mid to catch flash-crash wicks.
+        yes_bid = round(max(0.01, mid - offset), 2)
+        no_bid = round(max(0.01, (1.0 - mid) - offset), 2)
+
+        sides: list[tuple[float, str, str, float]] = []
+        # BUY YES token below YES mid — catches YES flash-crash
+        if 0.01 <= yes_bid <= 0.99 and signal.yes_asset_id:
+            sides.append((yes_bid, signal.yes_asset_id, "BUY", mid))
+        # BUY NO token below NO mid — catches NO flash-crash
+        if 0.01 <= no_bid <= 0.99 and signal.no_asset_id:
+            sides.append((no_bid, signal.no_asset_id, "BUY", 1.0 - mid))
+
+        if not sides:
+            return []
+
+        positions: list[Position] = []
+        async with self._entry_lock:
+            for entry_price, asset_id, _, side_mid in sides:
+                if entry_price <= 0 or entry_price >= 1.0:
+                    continue
+
+                # Risk gates (Kelly, VaR, max positions, etc.)
+                passed, max_trade, _ = await self._check_risk_gates(
+                    signal.market_id, event_id,
+                )
+                if not passed:
+                    break
+
+                # Cap at vacuum_stink_bid_max_risk_usd
+                capped_usd = min(max_trade, max_risk_usd)
+                entry_size = max(1.0, round(capped_usd / entry_price, 2))
+
+                # Deployment guard cap
+                if self._guard is not None:
+                    entry_size = self._guard.get_allowed_trade_shares(
+                        entry_size, entry_price,
+                    )
+                if entry_size < 1:
+                    continue
+
+                order = await self.executor.place_limit_order(
+                    market_id=signal.market_id,
+                    asset_id=asset_id,
+                    side=OrderSide.BUY,
+                    price=entry_price,
+                    size=entry_size,
+                    post_only=True,
+                )
+
+                # POST_ONLY rejection — would cross the spread
+                if order.status == OrderStatus.CANCELLED:
+                    log.info(
+                        "vacuum_stink_bid_rejected_post_only",
+                        asset=asset_id[:16],
+                        price=entry_price,
+                    )
+                    continue
+
+                pos_id = f"VACUUM-{self._next_id}"
+                self._next_id += 1
+
+                # Take-profit: revert to side mid (where price was before the crash)
+                target = round(min(side_mid, 0.99), 2)
+
+                pos = Position(
+                    id=pos_id,
+                    market_id=signal.market_id,
+                    no_asset_id=signal.no_asset_id,
+                    event_id=event_id,
+                    state=PositionState.ENTRY_PENDING,
+                    entry_order=order,
+                    entry_price=entry_price,
+                    entry_size=entry_size,
+                    entry_time=time.time(),
+                    signal=signal,
+                    signal_type="vacuum_stink_bid",
+                    trade_asset_id=asset_id,
+                    yes_asset_id=signal.yes_asset_id,
+                    target_price=target,
+                )
+                self._positions[pos.id] = pos
+                positions.append(pos)
+
+                log.info(
+                    "vacuum_stink_bid_placed",
+                    pos_id=pos.id,
+                    market=signal.market_id[:16],
+                    asset=asset_id[:16],
+                    price=entry_price,
+                    size=entry_size,
+                    mid=mid,
+                    depth_velocity=round(signal.depth_velocity, 3),
+                )
+
+        return positions
+
+    async def cancel_vacuum_stink_bids(self, market_id: str) -> int:
+        """Cancel all unfilled vacuum stink bids for a market.
+
+        Called when the ghost liquidity event recovers and the market
+        returns to ACTIVE — the structural advantage has disappeared.
+
+        Returns the number of orders cancelled.
+        """
+        cancelled = 0
+        for pos in list(self._positions.values()):
+            if pos.market_id != market_id:
+                continue
+            if pos.signal_type != "vacuum_stink_bid":
+                continue
+            if pos.state != PositionState.ENTRY_PENDING:
+                continue
+            if pos.entry_order and pos.entry_order.status in (
+                OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
+            ):
+                await self.executor.cancel_order(pos.entry_order)
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = "ghost_recovered"
+                cancelled += 1
+                log.info(
+                    "vacuum_stink_bid_cancelled",
+                    pos_id=pos.id,
+                    market=market_id[:16],
+                    reason="ghost_recovered",
+                )
+        return cancelled

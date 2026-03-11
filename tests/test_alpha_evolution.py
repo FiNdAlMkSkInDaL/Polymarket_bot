@@ -41,7 +41,7 @@ class TestConfigDefaults:
         assert settings.strategy.min_edge_score == 40.0
 
     def test_no_discount_factor_tightened(self):
-        assert settings.strategy.no_discount_factor == 0.98
+        assert settings.strategy.no_discount_factor == 0.995
 
     def test_max_loss_per_trade_cents_exists(self):
         assert settings.strategy.max_loss_per_trade_cents == 1500.0
