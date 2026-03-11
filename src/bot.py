@@ -829,69 +829,86 @@ class TradingBot:
         Unlike ``stop()``, this keeps the main process and all risk-management
         state alive.  Only the WebSocket transport is torn down and rebuilt
         after a 30-second cooldown.
+
+        IMPORTANT: This method must NEVER raise — it is called from inside
+        ``except Exception`` blocks in hot-path loops.  An unhandled
+        exception here would escape the except handler and kill the
+        asyncio task, crashing the bot via ``gather(return_exceptions=False)``.
         """
-        log.warning("suspend_and_reset_begin")
-
-        # 1. Pause order chasers via the fast-kill event
-        self._fast_kill_event.clear()
-
-        # 2. Cleanly stop the WebSocket pool
-        if self._ws is not None:
-            try:
-                await self._ws.stop()
-            except Exception:
-                log.warning("ws_stop_error_during_reset", exc_info=True)
-
-        # Cancel the WS task from self._tasks (if present)
-        for task in list(self._tasks):
-            if task.get_name() == "ws" and not task.done():
-                task.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(task), timeout=3,
-                    )
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
-
-        # 3. Cooldown penalty
-        log.info("suspend_cooldown_start", cooldown_s=30)
-        await asyncio.sleep(30)
-
-        # 4. Re-initialise WebSocket connections with the same asset set
-        if self._ws is not None:
-            asset_ids = self._ws.asset_ids
-            self._ws = MarketWebSocketPool(
-                asset_ids,
-                self._trade_queue,
-                book_queue=self._book_queue,
-                recorder=self._recorder,
-            )
-            ws_task = asyncio.create_task(self._ws.start(), name="ws")
-            # Replace the old WS task in self._tasks
-            self._tasks = [
-                t for t in self._tasks if t.get_name() != "ws" or not t.done()
-            ]
-            self._tasks.append(ws_task)
-
-        # 5. Reset the circuit breakers so they can trip again on new errors
-        self._trade_loop_breaker.reset()
-        self._stale_bar_breaker.reset()
-        self._retrigger_breaker.reset()
-        self._tp_rescale_breaker.reset()
-        self._ghost_breaker.reset()
-        self._timeout_breaker.reset()
-
-        # 6. Resume chasers
-        self._fast_kill_event.set()
-
-        log.warning("suspend_and_reset_complete")
         try:
-            await self.telegram.send(
-                "✅ <b>WS Hard-Reset complete</b> — chasers resumed, "
-                "risk state preserved."
-            )
+            log.warning("suspend_and_reset_begin")
+
+            # 1. Pause order chasers via the fast-kill event
+            self._fast_kill_event.clear()
+
+            # 2. Cleanly stop the WebSocket pool
+            if self._ws is not None:
+                try:
+                    await self._ws.stop()
+                except Exception:
+                    log.warning("ws_stop_error_during_reset", exc_info=True)
+
+            # Let the event loop process the WS task completion naturally.
+            # DO NOT cancel the WS task explicitly — it is part of the
+            # top-level asyncio.gather() in start().  Cancelling it causes
+            # gather to propagate CancelledError, which terminates start()
+            # and crashes the entire bot process.
+            await asyncio.sleep(0)  # yield so the WS task can finalise
+
+            # Wait briefly for the WS task to finish after stop()
+            for task in list(self._tasks):
+                if task.get_name() == "ws" and not task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), timeout=5,
+                        )
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+
+            # 3. Cooldown penalty
+            log.info("suspend_cooldown_start", cooldown_s=30)
+            await asyncio.sleep(30)
+
+            # 4. Re-initialise WebSocket connections with the same asset set
+            if self._ws is not None:
+                asset_ids = self._ws.asset_ids
+                self._ws = MarketWebSocketPool(
+                    asset_ids,
+                    self._trade_queue,
+                    book_queue=self._book_queue,
+                    recorder=self._recorder,
+                )
+                ws_task = asyncio.create_task(self._ws.start(), name="ws")
+                # Replace the old WS task in self._tasks
+                self._tasks = [
+                    t for t in self._tasks if t.get_name() != "ws" or not t.done()
+                ]
+                self._tasks.append(ws_task)
+
+            # 5. Reset the circuit breakers so they can trip again on new errors
+            self._trade_loop_breaker.reset()
+            self._stale_bar_breaker.reset()
+            self._retrigger_breaker.reset()
+            self._tp_rescale_breaker.reset()
+            self._ghost_breaker.reset()
+            self._timeout_breaker.reset()
+
+            # 6. Resume chasers
+            self._fast_kill_event.set()
+
+            log.warning("suspend_and_reset_complete")
+            try:
+                await self.telegram.send(
+                    "✅ <b>WS Hard-Reset complete</b> — chasers resumed, "
+                    "risk state preserved."
+                )
+            except Exception:
+                pass
+
+        except asyncio.CancelledError:
+            raise  # never swallow task cancellation
         except Exception:
-            pass
+            log.error("suspend_and_reset_error", exc_info=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
@@ -2671,13 +2688,20 @@ class TradingBot:
                             # Force-exit any open positions in this market
                             for pos in self.positions.get_open_positions():
                                 if pos.market_id == cid:
-                                    if pos.state == PositionState.EXIT_PENDING:
-                                        await self.positions.force_stop_loss(pos)
-                                    elif pos.state == PositionState.ENTRY_PENDING:
-                                        if pos.entry_order:
-                                            await self.executor.cancel_order(pos.entry_order)
-                                        pos.state = PositionState.CANCELLED
-                                        pos.exit_reason = "ghost_liquidity"
+                                    try:
+                                        if pos.state == PositionState.EXIT_PENDING:
+                                            await self.positions.force_stop_loss(pos)
+                                        elif pos.state == PositionState.ENTRY_PENDING:
+                                            if pos.entry_order:
+                                                await self.executor.cancel_order(pos.entry_order)
+                                            pos.state = PositionState.CANCELLED
+                                            pos.exit_reason = "ghost_liquidity"
+                                    except Exception as fex:
+                                        log.warning(
+                                            "ghost_force_exit_error",
+                                            pos_id=pos.id,
+                                            error=str(fex),
+                                        )
 
                             log.warning(
                                 "ghost_liquidity_detected",
@@ -2739,7 +2763,11 @@ class TradingBot:
                 for cid in recovered:
                     # Cancel any unfilled vacuum stink bids — structural
                     # advantage has disappeared now that depth recovered.
-                    n_cancelled = await self.positions.cancel_vacuum_stink_bids(cid)
+                    try:
+                        n_cancelled = await self.positions.cancel_vacuum_stink_bids(cid)
+                    except Exception:
+                        log.warning("cancel_vacuum_bids_error", condition_id=cid, exc_info=True)
+                        n_cancelled = 0
                     log.info(
                         "ghost_liquidity_recovered",
                         condition_id=cid,

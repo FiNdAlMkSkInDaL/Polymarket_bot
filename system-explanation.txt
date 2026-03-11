@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 11, 2026
+  Last updated: March 11, 2026 (patch 2)
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -2977,6 +2977,81 @@ March 11th — WFO Penalty Logic: Zero-Trade Rejection Returns -10.0:
   normalised zscore formula ((close-vwap)/vwap/σ), and config defaults
   (no_discount_factor=0.995, drift_vol_ceiling=0.35).
   1542 passed, 0 failed.
+
+March 11th — CRITICAL: Ghost Liquidity Crash-Loop Fix (3 bugs):
+  Problem: Bot was trapped in a continuous crash-and-restart loop.  The
+  external watchdog / systemd service kept triggering cold boots evidenced by
+  recurring "Bot starting in PAPER mode" log entries.  Every restart was
+  preceded by a cluster of 5-6 ghost_liquidity_detected events, perfectly
+  aligning with the _ghost_breaker threshold of 5 errors per 60 seconds.
+
+  Root-cause analysis identified three cascading bugs in src/bot.py:
+
+  Bug 1 — Fatal: _suspend_and_reset() killed the process (CRITICAL)
+    _suspend_and_reset() called task.cancel() on the WS task (line ~847).
+    That task is part of asyncio.gather(*self._tasks, return_exceptions=False)
+    in start().  When a gather-managed task is cancelled, gather propagates
+    the CancelledError upward.  start() caught it, exited the try block,
+    returned — event loop tore down — process died — watchdog restarted.
+    This is the primary crash vector.  All circuit-breaker handlers in all 6
+    hot-path loops trigger _suspend_and_reset(), so any breaker trip produced
+    a guaranteed kill.
+
+  Bug 2 — Unprotected breaker-trip handlers
+    All 6 except-Exception blocks called `await self._suspend_and_reset()`
+    with no wrapper.  If _suspend_and_reset() itself raised (e.g. a network
+    error during ws.stop()), the exception escaped the except handler, killed
+    the async task, and crashed the process through gather.
+
+  Bug 3 — Unprotected force-exit calls in ghost loop
+    Inside the emergency drain path, force_stop_loss() and cancel_order()
+    were called without try/except.  These are network/executor calls that
+    can fail (API errors, timeouts), producing raw exceptions that accumulated
+    against the _ghost_breaker threshold.  Within 60 seconds of sustained
+    ghost detections, 5 executor errors tripped the breaker → called
+    _suspend_and_reset() → killed the process (Bug 1).
+
+  Crash sequence:
+    1. Force-exit calls during ghost drain throw executor exceptions (Bug 3)
+    2. Each exception caught → _ghost_breaker.record() increments
+    3. After 5th error, breaker trips → calls _suspend_and_reset()
+    4. _suspend_and_reset() cancels WS task inside gather (Bug 1)
+    5. gather propagates CancelledError → start() exits → process dies
+    6. Watchdog restarts → "Bot starting in PAPER mode"
+
+  Fixes applied to src/bot.py:
+
+  Fix 1 — Remove task.cancel() from _suspend_and_reset():
+    Replaced explicit `task.cancel()` with `ws.stop()` + yield to event loop
+    (`await asyncio.sleep(0)`) + wait for natural task completion via
+    `asyncio.wait_for(asyncio.shield(task), timeout=5)`.
+    The WS task is no longer forcibly cancelled, so gather never receives an
+    unsolicted CancelledError from within _suspend_and_reset().
+
+  Fix 2 — Wrap entire _suspend_and_reset() in try/except:
+    Added outer try/except(Exception) around the full body of
+    _suspend_and_reset() so any internal failure logs via log.error() and
+    returns cleanly.  CancelledError is explicitly re-raised to preserve
+    correct task cancellation semantics.  Updated docstring to document the
+    "must never raise" contract.
+
+  Fix 3 — Wrap per-position force-exit calls in ghost loop:
+    Each call to force_stop_loss() / cancel_order() during the emergency
+    drain position-force-exit block is now wrapped in try/except(Exception)
+    with a log.warning("ghost_force_exit_error").  A failed executor call for
+    one position no longer propagates and feeds the circuit breaker.
+
+  Fix 4 — Wrap cancel_vacuum_stink_bids() in recovery section:
+    The call to positions.cancel_vacuum_stink_bids(cid) in the recovery loop
+    is wrapped with try/except; n_cancelled defaults to 0 on failure so the
+    Telegram message still sends.
+
+  Post-deploy verification (PID 244523, 02:33 UTC):
+    l2_synced events flowing across 27 markets, same PID held for 25+ seconds.
+    Zero ghost_liquidity_error, zero circuit_breaker_tripped, zero restart
+    events in the observation window.  Crash loop confirmed resolved.
+  112 targeted tests passed (test_market_lifecycle, test_position_manager,
+  test_system, test_integration, test_resilience, test_risk_controls), 0 failed.
 
 ================================================================================
 END OF DOCUMENT
