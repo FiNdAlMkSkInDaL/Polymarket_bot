@@ -3053,6 +3053,54 @@ March 11th — CRITICAL: Ghost Liquidity Crash-Loop Fix (3 bugs):
   112 targeted tests passed (test_market_lifecycle, test_position_manager,
   test_system, test_integration, test_resilience, test_risk_controls), 0 failed.
 
-================================================================================
-END OF DOCUMENT
-================================================================================
+─── Patch 2026-03-11 — PCE Worker AttributeError & PAPER-Mode Lock ────────────
+
+  Date: 2026-03-11 ~06:49 UTC (overnight session 2026-03-10 20:00 → 03-11 08:00)
+
+  Symptoms:
+    1. Bot executed zero real trades overnight (599 paper orders, 0 fills).
+    2. Bot experienced repeated emergency resets every ~20 minutes.
+    3. Specific reset at 06:49:02 UTC triggered investigation.
+
+  Root Cause 1 — _MinimalPosition missing entry_size attribute:
+    The pce_worker's _MinimalPosition class (lightweight cross-process stand-in
+    for Position) did not include the entry_size field. Position.entry_size was
+    serialized as "size" in the dict (position_manager.py:314), and
+    _MinimalPosition correctly read it as self.size. However,
+    portfolio_correlation.py:1376 (_build_exposure_list) and line 928
+    (compute_concentration_haircut) both access pos.entry_size, which triggered
+    AttributeError: '_MinimalPosition' object has no attribute 'entry_size'.
+    This error fired 5 times within 1 second, tripping the pce_worker circuit
+    breaker → emergency_stop_triggered → systemd restart.  The cycle repeated
+    every ~20 minutes (111 var_gate_error events, ~15 emergency stops overnight).
+
+  Root Cause 2 — Service file forced PAPER mode:
+    scripts/polymarket-bot.service ExecStart used the legacy --paper flag:
+      ExecStart=... python -m src.cli run --paper
+    This overrode the .env DEPLOYMENT_ENV=PENNY_LIVE setting, causing every
+    restart to boot in PAPER mode.  All 599 orders were paper trades (PAPER-1
+    through PAPER-599), with zero real CLOB interaction.
+
+  Also noted:
+    - trade_side field was missing from the positions serialization dict sent
+      to the pce_worker, causing _build_exposure_list to always default to "NO"
+      via getattr() fallback.  This silently miscalculated directional exposure
+      for YES-side positions.
+
+  Fixes applied:
+
+  Fix 1 — Add entry_size and trade_side to _MinimalPosition (pce_worker.py):
+    Added self.entry_size = kwargs.get("entry_size", self.size) to map from
+    either the direct "entry_size" key or the "size" key used by serialization.
+    Added self.trade_side = kwargs.get("trade_side", "NO") for correct
+    directional exposure in _build_exposure_list.
+
+  Fix 2 — Include trade_side in position serialization (position_manager.py):
+    Added "trade_side": p.trade_side to the positions_data dict at line 314+
+    so the pce_worker receives the actual trade direction.
+
+  Fix 3 — Change service file to PENNY_LIVE mode (polymarket-bot.service):
+    Replaced: ExecStart=... python -m src.cli run --paper
+    With:     ExecStart=... python -m src.cli run --env PENNY_LIVE
+    Bot now starts in PENNY_LIVE mode as intended by .env configuration.
+

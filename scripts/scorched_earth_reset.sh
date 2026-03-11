@@ -130,9 +130,9 @@ echo "    ✓ wfo_fresh session started"
 
 sleep 2
 
-echo "  → Launching bot in PAPER mode in tmux 'bot_fresh'..."
+echo "  → Launching bot in PENNY_LIVE mode in tmux 'bot_fresh'..."
 tmux new-session -d -s bot_fresh \
-  "cd $BOT_DIR && source .venv/bin/activate && python -m src.cli run --paper 2>&1 | tee logs/bot_fresh.log"
+  "cd $BOT_DIR && source .venv/bin/activate && python -m src.cli run --env PENNY_LIVE 2>&1 | tee logs/bot_fresh.log"
 echo "    ✓ bot_fresh session started"
 
 sleep 5

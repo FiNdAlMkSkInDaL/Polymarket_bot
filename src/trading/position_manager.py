@@ -316,6 +316,7 @@ class PositionManager:
                 "trade_asset_id": p.trade_asset_id,
                 "no_asset_id": p.no_asset_id,
                 "event_id": p.event_id,
+                "trade_side": p.trade_side,
             }
             for p in open_positions
         ]
