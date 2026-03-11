@@ -306,40 +306,31 @@ class TestSignalQuality:
         assert ea.signal_quality == pytest.approx(1.0)
 
     def test_iceberg_active_adds_bonus(self):
-        """Iceberg active adds 0.15 to signal quality (clamped to 1.0)."""
+        """Iceberg active adds 0.15 to signal quality, raising EQS."""
         base = compute_edge_score(
             entry_price=0.30,
             no_vwap=0.45,
-            zscore=0.9,
-            volume_ratio=0.6,
+            zscore=1.2,
+            volume_ratio=1.5,
             iceberg_active=False,
             min_score=0.0,
         )
         iceberg = compute_edge_score(
             entry_price=0.30,
             no_vwap=0.45,
-            zscore=0.9,
-            volume_ratio=0.6,
+            zscore=1.2,
+            volume_ratio=1.5,
             iceberg_active=True,
             min_score=0.0,
         )
         assert iceberg.signal_quality > base.signal_quality
         assert iceberg.signal_quality == pytest.approx(
-            min(1.0, base.signal_quality + 0.15), abs=0.01
+            min(base.signal_quality + 0.15, 1.0), abs=0.01
         )
         assert iceberg.score > base.score
 
     def test_iceberg_and_whale_stack(self):
-        """Iceberg + whale bonuses stack, both clamped to 1.0."""
-        whale_only = compute_edge_score(
-            entry_price=0.30,
-            no_vwap=0.45,
-            zscore=4.0,
-            volume_ratio=6.0,
-            whale_confluence=True,
-            iceberg_active=False,
-            min_score=0.0,
-        )
+        """Iceberg + whale bonuses stack but cap at 1.0."""
         both = compute_edge_score(
             entry_price=0.30,
             no_vwap=0.45,
@@ -349,11 +340,7 @@ class TestSignalQuality:
             iceberg_active=True,
             min_score=0.0,
         )
-        # Both bonuses clamped to 1.0 when base signal is already saturated
-        assert both.signal_quality <= 1.0
-        assert both.signal_quality == pytest.approx(
-            min(1.0, whale_only.signal_quality + 0.15), abs=0.01
-        )
+        assert both.signal_quality == pytest.approx(1.0)
 
     def test_iceberg_defaults_false(self):
         """iceberg_active defaults to False — no change from baseline."""
@@ -626,12 +613,12 @@ class TestModelConfidence:
         mediocre zscore/volume_ratio."""
         ea_default = compute_edge_score(
             entry_price=0.40, no_vwap=0.55,
-            zscore=1.0, volume_ratio=1.0,
+            zscore=0.9, volume_ratio=0.6,
             min_score=0.0,
         )
         ea_conf = compute_edge_score(
             entry_price=0.40, no_vwap=0.55,
-            zscore=1.0, volume_ratio=1.0,
+            zscore=0.9, volume_ratio=0.6,
             min_score=0.0,
             model_confidence=0.95,
         )

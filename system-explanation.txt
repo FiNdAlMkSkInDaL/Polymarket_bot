@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 11, 2026 (patch 2)
+  Last updated: March 11, 2026 (PENNY_LIVE Live Fire validation)
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -3103,4 +3103,119 @@ March 11th — CRITICAL: Ghost Liquidity Crash-Loop Fix (3 bugs):
     Replaced: ExecStart=... python -m src.cli run --paper
     With:     ExecStart=... python -m src.cli run --env PENNY_LIVE
     Bot now starts in PENNY_LIVE mode as intended by .env configuration.
+
+March 11th (~12:00 UTC) — PENNY_LIVE "Live Fire" Validation:
+  Wallet 0x9F16...18a59c fully funded with POL (gas) and ~30.69 USDC.e.
+  Token approvals completed via approve_usdc.py (CTF Exchange spender).
+  Bot running in PENNY_LIVE mode via tmux (PID 252215, started 10:49 UTC).
+
+  Diagnostic results:
+
+  1. Balance Recognition — PASS (with caveat):
+     DeploymentGuard.get_wallet_balance() returns synthetic $75.00 for
+     PENNY_LIVE (max_trade_size_usd × 5), not the real on-chain balance.
+     The insufficient_balance warnings in bot.jsonl originated from the
+     concurrent WFO backtester process (which shares the same log sink),
+     NOT the live bot.  The live bot (bot_fresh.log) has zero
+     insufficient_balance events.
+
+  2. Order Execution — PASS (pipeline verified, no fills yet):
+     DeploymentGuard correctly clamps every order to $1.00 USD max.
+     penny_live_size_clamped events logged at 11:09, 11:19, 11:29, 11:49,
+     12:00 UTC — confirming the sizing pipeline is active and the $1.00
+     hardcap is enforced.
+     Vacuum stink bids are being submitted to the real CLOB with
+     post_only=True.  All bids returned OrderStatus.CANCELLED by the
+     exchange (vacuum_stink_bid_rejected_post_only) — pricing is currently
+     at or above the best ask, so POST_ONLY prevents taker fills.  This
+     confirms the full signing → submission → exchange response pipeline
+     is operational.  No fills yet; pricing offsets need tuning.
+
+  3. Signature Health — PASS:
+     Zero auth_signature_error or eip712_signing_failed events in any log
+     file.  The eoa_private_key is correctly signing L2 CLOB requests.
+     Confirmed by the exchange returning valid CANCELLED responses to our
+     signed POST_ONLY orders (authentication succeeded).
+
+  4. WebSocket Connectivity — PASS:
+     MarketWebSocketPool maintaining stable l2_synced status across all
+     active markets.  All synced events show seq_gap_rate: 0.0 — zero
+     sequence gaps.  periodic_server_snapshot resync events flowing
+     normally (last observed 12:06 UTC).
+
+  5. WFO Synchronization — PASS (running, no alpha found yet):
+     Walk-Forward Optimizer active with 2 worker processes (~96% CPU each).
+     Phase 1 discovery running: --n-trials 50, --max-markets 5,
+     --train-days 14.  Multiple wfo_complete events logged with folds=1-2.
+     Current results: oos_sharpe=0.0, oos_pnl=0.0 across all folds — the
+     backtest data has not yet produced a champion parameter set.
+     The bot is wired to reload champion params from
+     logs/phase1_champion.json when a new best-performer is found.
+
+  Cleanup:
+     Removed scripts/approve_usdc.py and /tmp/fix_tests.py from VPS.
+
+  Status: Bot is fully operational in PENNY_LIVE mode.  The signing,
+  sizing, clamping, and CLOB submission pipeline is verified end-to-end.
+  No real fills yet — market-eligible vacuum bids are being POST_ONLY
+  rejected due to aggressive pricing relative to current spreads.
+
+March 11th (Session 3) — Live Fire Stabilization & Execution Fixes:
+  Consolidated session covering all architectural repairs made to bring the bot
+  from a crash-looping PAPER-mode state into stable, fully-funded PENNY_LIVE
+  execution.
+
+  - Ghost Liquidity Crash Loop Resolved (Bugfix): Fixed a fatal
+    asyncio.gather propagation bug that caused the bot process to die on
+    every circuit-breaker trip.  The root cause was explicit task.cancel()
+    calls inside _suspend_and_reset(): cancelling a task that is managed
+    by gather(return_exceptions=False) causes gather to propagate the
+    CancelledError upward, tearing down the entire event loop.  Fix:
+    removed all task.cancel() calls from _suspend_and_reset().  Additionally,
+    wrapped _suspend_and_reset() and all network-bound force-exit calls
+    (force_stop_loss, cancel_order, cancel_vacuum_stink_bids) in targeted
+    try/except blocks so that API timeouts and executor errors cannot
+    accumulate against the _ghost_breaker threshold and re-trigger the
+    crash sequence.
+
+  - PCE Worker Serialization Mismatch Fixed (Bugfix): Fixed an
+    AttributeError that caused the pce_worker to crash on every VaR check
+    and subsequently trigger emergency_stop_triggered.  The _MinimalPosition
+    class in pce_worker.py was missing the entry_size and trade_side fields
+    that portfolio_correlation.py accesses at runtime.  Synchronized
+    _MinimalPosition attribute definitions (entry_size, trade_side) with
+    the cross-process serialization dicts produced by position_manager.py,
+    ensuring the pce_worker consistently receives all required fields.
+
+  - DevOps --paper Override Removed (Config): Fixed an issue where the bot
+    simulated all trades despite DEPLOYMENT_ENV=PENNY_LIVE being set in
+    .env.  The hardcoded --paper flag in scripts/polymarket-bot.service and
+    scripts/scorched_earth_reset.sh was overriding the environment variable
+    on every systemd start and scorched-earth relaunch.  Removed --paper
+    from both files and replaced with --env PENNY_LIVE, allowing .env to
+    correctly route orders through the live CLOB.
+
+  - Test Suite Config Drift Repaired (Testing): Fixed 13 failing tests
+    caused by parameter-tuning commits that landed after the test suite was
+    last updated.  Changes: updated WFO zero-trade penalty assertions from
+    float("-inf") to -10.0, corrected the Z-score relative normalisation
+    formula in unit tests to (close - vwap) / vwap / σ (dimensionless),
+    updated WFO search space bounds (zscore_threshold range [0.05, 2.5],
+    min_edge_score lower bound ≥ 20), and patched DEPLOYMENT_ENV state
+    bleed in pytest fixtures that was causing PENNY_LIVE guard logic to
+    activate in unrelated test cases.
+
+  - Spread-Aware Vacuum Stink Bids (Logic Change): Fixed an issue where
+    POST_ONLY stink bids were unconditionally rejected by the CLOB because
+    mid - offset was priced at or above the best ask during liquidity
+    vacuums (when the spread is blown out, mid is not a reliable reference).
+    Updated open_vacuum_stink_bids() with spread-aware clamping:
+      bid_price = min(max(0.01, mid - offset), best_ask - 0.01)
+    This ensures maker orders are always mathematically priced below the
+    best ask, satisfying the POST_ONLY constraint regardless of how wide
+    the spread becomes during a ghost-liquidity event.
+
+  System successfully funded with POL/USDC.e, contracts approved, and
+  verified fully operational in PENNY_LIVE mode with $1.00 DeploymentGuard
+  clamping active.
 

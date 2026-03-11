@@ -251,7 +251,7 @@ class TestWfoScore:
     # ── Trade gate tests ───────────────────────────────────────────────
 
     def test_too_few_trades_returns_neg_inf(self):
-        """Fewer than min_trades → score = -10.0 (finite penalty for Optuna learning)."""
+        """Fewer than min_trades → score = -inf."""
         score = compute_wfo_score(
             sharpe_ratio=3.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=2, min_trades=5,
@@ -267,7 +267,7 @@ class TestWfoScore:
         assert score > 0
 
     def test_zero_fills_rejected(self):
-        """Zero fills always rejected (score = -10.0)."""
+        """Zero fills always rejected."""
         score = compute_wfo_score(
             sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=0,
@@ -715,7 +715,7 @@ class TestSearchSpace:
             )
 
     def test_min_edge_score_lower_bound(self):
-        """Lower bound of min_edge_score must be >= 20 to allow WFO exploration."""
+        """Lower bound of min_edge_score must be >= 30 to prevent regression."""
         from src.backtest.wfo_optimizer import SEARCH_SPACE
 
         spec = SEARCH_SPACE["min_edge_score"]

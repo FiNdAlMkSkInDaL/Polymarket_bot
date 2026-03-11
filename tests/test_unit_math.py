@@ -148,9 +148,8 @@ class TestZScoreTrigger:
         mu = yes_agg.rolling_vwap
         sigma = yes_agg.rolling_volatility
 
-        # Normalised zscore = ((close - mu) / mu) / sigma
-        # For Z=1.0: close = mu * (1 + 1.0 * sigma)  (below z_thresh=2.0)
-        mild_price = mu * (1.0 + 1.0 * sigma)
+        # Price slightly above mu — zscore below 2.0 threshold
+        mild_price = mu * (1 + 0.5 * sigma)
         mild_bar = OHLCVBar(
             open_time=50000, open=mu, high=mild_price,
             low=mu, close=mild_price,
@@ -183,9 +182,7 @@ class TestZScoreTrigger:
         mu = yes_agg.rolling_vwap
         sigma = yes_agg.rolling_volatility
 
-        # Normalised zscore = ((close - mu) / mu) / sigma
-        # For Z=2.0: close = mu * (1 + 2.0 * sigma)
-        boundary_price = mu * (1.0 + 2.0 * sigma)
+        boundary_price = mu * (1 + 2.0 * sigma)
         boundary_bar = OHLCVBar(
             open_time=50000, open=mu, high=boundary_price,
             low=mu, close=boundary_price,

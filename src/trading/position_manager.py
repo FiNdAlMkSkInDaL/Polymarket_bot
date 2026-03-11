@@ -2119,6 +2119,19 @@ class PositionManager:
         yes_bid = round(max(0.01, mid - offset), 2)
         no_bid = round(max(0.01, (1.0 - mid) - offset), 2)
 
+        # ── Spread-aware clamping ──────────────────────────────────────────────────────
+        # During ghost-liquidity events the spread blows out.  If the
+        # calculated bid >= best_ask, POST_ONLY would reject because the
+        # order would cross.  Clamp each bid to best_ask - 0.01 so it
+        # always rests as a maker order.
+        yes_tracker = self._book_trackers.get(signal.yes_asset_id)
+        no_tracker = self._book_trackers.get(signal.no_asset_id)
+
+        if yes_tracker is not None and yes_tracker.best_ask > 0:
+            yes_bid = round(min(yes_bid, yes_tracker.best_ask - 0.01), 2)
+        if no_tracker is not None and no_tracker.best_ask > 0:
+            no_bid = round(min(no_bid, no_tracker.best_ask - 0.01), 2)
+
         sides: list[tuple[float, str, str, float]] = []
         # BUY YES token below YES mid — catches YES flash-crash
         if 0.01 <= yes_bid <= 0.99 and signal.yes_asset_id:

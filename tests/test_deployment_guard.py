@@ -199,9 +199,16 @@ class TestConfigDeploymentEnv:
         assert isinstance(settings.deployment_env, DeploymentEnv)
 
     def test_default_is_paper(self):
-        from src.core.config import settings
-        # In test environment DEPLOYMENT_ENV defaults to PAPER
-        assert settings.deployment_env == DeploymentEnv.PAPER
+        from src.core.config import Settings
+        import os
+        from unittest.mock import patch
+        # With DEPLOYMENT_ENV unset, default should be PAPER
+        env = os.environ.copy()
+        env.pop("DEPLOYMENT_ENV", None)
+        env["PAPER_MODE"] = "true"
+        with patch.dict(os.environ, env, clear=True):
+            s = Settings()
+            assert s.deployment_env == DeploymentEnv.PAPER
 
     def test_paper_mode_derived_from_deployment_env(self):
         from src.core.config import settings
