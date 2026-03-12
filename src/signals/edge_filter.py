@@ -344,11 +344,14 @@ def compute_edge_score(
     if execution_mode == "maker":
         entry_fee_frac = 0.0
         exit_est = entry_price + raw_gross
-        exit_fee_frac = get_fee_rate(exit_est, fee_enabled=fee_enabled)
+        # Exit is taker ~87.5% of the time — always model fee regardless
+        # of market category to prevent negative-EV leaks on no-fee markets.
+        exit_fee_frac = get_fee_rate(exit_est, fee_enabled=True)
     else:
         entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
         exit_est = entry_price + raw_gross
-        exit_fee_frac = get_fee_rate(exit_est, fee_enabled=fee_enabled)
+        # Exit is taker — always model fee.
+        exit_fee_frac = get_fee_rate(exit_est, fee_enabled=True)
     fee_cents = (entry_fee_frac + exit_fee_frac) * 100.0
 
     net_cents = gross_cents - fee_cents

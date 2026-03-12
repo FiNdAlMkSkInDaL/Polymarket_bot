@@ -372,9 +372,10 @@ class TestSignalQuality:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFeeDisabled:
-    """Political markets charge 0% fees — fee efficiency should be 1.0."""
+    """Political markets charge 0% entry fees but exit is always modeled
+    as taker (spread-crossing cost is real regardless of category)."""
 
-    def test_no_fee_market_full_efficiency(self):
+    def test_no_fee_market_exit_still_modeled(self):
         ea = compute_edge_score(
             entry_price=0.40,
             no_vwap=0.55,
@@ -383,9 +384,10 @@ class TestFeeDisabled:
             fee_enabled=False,
             min_score=0.0,
         )
-        assert ea.expected_fee_cents == 0.0
-        assert ea.fee_efficiency == pytest.approx(1.0)
-        assert ea.expected_net_cents == ea.expected_gross_cents
+        # Entry fee is 0 (fee_enabled=False), but exit fee is always modeled
+        assert ea.expected_fee_cents > 0.0
+        assert ea.fee_efficiency < 1.0
+        assert ea.expected_net_cents < ea.expected_gross_cents
 
     def test_fee_disabled_helps_marginal_trades(self):
         """A trade that fails with fees should pass without them."""

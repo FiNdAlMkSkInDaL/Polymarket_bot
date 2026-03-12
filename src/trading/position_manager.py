@@ -973,7 +973,8 @@ class PositionManager:
             slippage_rt_cents = 2 * strat.paper_slippage_cents
             entry_fee_cents = entry_fee_frac * 100.0
             exit_est_price = tp.target_price
-            exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=fee_enabled) * 100.0
+            # Exit is taker — always model fee regardless of market category.
+            exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=True) * 100.0
             min_viable_spread = slippage_rt_cents + entry_fee_cents + exit_fee_cents + strat.desired_margin_cents
         if tp.spread_cents < min_viable_spread:
             log.info(

@@ -100,6 +100,7 @@ class StrategyParams:
 
     # Panic spike detector
     zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 0.20)
+    panic_zscore_threshold: float = _env_float("PANIC_ZSCORE_THRESHOLD", 0.684)
     volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.5)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 

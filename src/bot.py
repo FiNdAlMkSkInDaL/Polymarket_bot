@@ -307,6 +307,7 @@ class TradingBot:
             mode=mode_label,
             **self.guard.startup_summary(),
             zscore_threshold=strat.zscore_threshold,
+            panic_zscore_threshold=strat.panic_zscore_threshold,
             volume_ratio_threshold=strat.volume_ratio_threshold,
             min_edge_score=strat.min_edge_score,
             signal_cooldown_min=strat.signal_cooldown_minutes,
@@ -720,6 +721,7 @@ class TradingBot:
             no_asset_id=m.no_token_id,
             yes_aggregator=yes_agg,
             no_aggregator=no_agg,
+            zscore_threshold=settings.strategy.panic_zscore_threshold,
         )
         self._detectors[m.condition_id] = detector
 

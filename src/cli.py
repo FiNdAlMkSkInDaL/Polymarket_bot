@@ -450,6 +450,10 @@ def wfo(
     """Run Walk-Forward Optimization on recorded historical data."""
     import os
 
+    from src.core.logger import setup_logging
+
+    setup_logging(log_dir="logs", log_file="wfo.jsonl")
+
     from src.backtest.wfo_optimizer import WfoConfig, run_wfo
 
     # Resolve max_workers: -1 means all cores, None means cpu_count - 1
