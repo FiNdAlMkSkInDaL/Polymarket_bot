@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 11, 2026 (SI-9 Mutually Exclusive Combinatorial Arbitrage)
+  Last updated: March 12, 2026 (Surgical Patches: Fee Modeling, Panic Threshold Decoupling, Log Isolation)
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -101,7 +101,12 @@ src/                      — main bot package
     heartbeat.py          — BookHeartbeat (3-layer staleness detection)
     ipc.py                — SharedBookWriter + SharedBookReader; double-buffered Seqlock shared memory for cross-process L2 exchange (~454 lines)
     latency_guard.py      — LatencyGuard (HEALTHY→DEGRADED→BLOCKED state machine)
-    logger.py             — structlog JSON logging with async-safe QueueHandler
+    logger.py             — structlog JSON logging with async-safe QueueHandler;
+                            setup_logging(log_dir, level, log_file) now accepts
+                            log_file parameter (default: "bot.jsonl"). WFO command
+                            calls setup_logging(log_file="wfo.jsonl") to isolate
+                            optimization logs from live bot logs, preventing
+                            log contamination during parallel WFO runs.
     process_manager.py    — ProcessManager; spawns/monitors L2 worker shards + PCE worker; allocates shared memory; health loop via WorkerHeartbeatChecker
     worker_heartbeat.py   — WorkerHealth, WorkerHeartbeatSender (worker side), WorkerHeartbeatChecker (main side); process liveness protocol (separate from Pillar 8 BookHeartbeat)
 
@@ -376,7 +381,9 @@ Key parameter groups (~160 total):
     max_tradeable_price = 0.95    (ceiling — near resolution)
 
   PANIC DETECTOR:
-    zscore_threshold = 1.0        (z-score trigger — lowered from 1.5, 3x EV)
+    zscore_threshold = 1.0        (general z-score threshold — used for older/legacy gates)
+    panic_zscore_threshold = 0.684 (decoupled z-score threshold specifically for PanicDetector;
+                                   lowered from shared threshold to capture more signals)
     volume_ratio_threshold = 0.8  (volume trigger — lowered from 1.2, +64% signals)
     lookback_minutes = 60         (rolling window)
     no_discount_factor = 0.98     (NO must trade ≥2% below its VWAP — restored 2026-03-10; was 1.005 which inverted the check)
@@ -507,17 +514,16 @@ Key parameter groups (~160 total):
     l2_enabled = True
     l2_max_levels = 50
     l2_max_seq_gap_rate = 0.02    (2% threshold for reliability)
-    max_active_l2_markets = 50    (config default; deploy_params overrides to 25)
+    max_active_l2_markets = 25    (deploy_params override from default 50; reduced to prevent
+                                   L2 delta storms on low-volume markets)
       Only the top N markets by daily_volume_usd get full L2OrderBook
       reconstruction + IcebergDetector. Remaining markets fall back to the
       lightweight OrderbookTracker (price/trade only). See Section 6 → L2
       Load Shedding and scripts/deploy_params.py.
 
   TIMEOUTS & COOLDOWNS:
-    exit_timeout_seconds = 1800   (config default; deploy_params overrides to 900)
-      Time before a filled position is force-exited as a timeout. Reduced
-      from 1800s to 900s via deploy_params — MR half-life is ~15 min, so
-      30 min was far too generous.
+    exit_timeout_seconds = 900    (deploy_params override from default 1800; MR half-life
+                                   is ~15 min, so 15-min timeout is more realistic than 30 min)
     signal_cooldown_minutes = 5.0 (deploy_params override; prevents rapid re-entry)
     stop_loss_cooldown_s = 300.0  (5 min inter-signal pause after SL / timeout /
       preemptive drain exits — see Section 8 → PositionManager)
@@ -620,9 +626,9 @@ WFO Parameter Deployment (scripts/deploy_params.py):
     (2× default)
 
   Manual overrides (hardcoded in MANUAL_OVERRIDES dict):
-    EXIT_TIMEOUT_SECONDS    = 900   (down from 1800 default)
-    MAX_ACTIVE_L2_MARKETS   = 25    (down from 50 default)
-    SIGNAL_COOLDOWN_MINUTES = 5.0
+    EXIT_TIMEOUT_SECONDS    = 900   (down from 1800 default; MR half-life ~15 min)
+    MAX_ACTIVE_L2_MARKETS   = 25    (down from 50 default; prevents L2 delta overload)
+    SIGNAL_COOLDOWN_MINUTES = 5.0   (prevents rapid re-entry on same market)
 
   Usage: python scripts/deploy_params.py        (dry-run, prints diff)
          python scripts/deploy_params.py --apply (writes .env with backup)
@@ -851,7 +857,8 @@ PanicDetector (src/signals/panic_detector.py):
     4. Intra-bar retracement discount: if price already reverting within bar
        (close in lower half), discounts z-score by 0.70-0.85
     5. Volume ratio: bar.volume / avg_bar_volume
-    6. Z-score gate: zscore ≥ zscore_threshold
+    6. Z-score gate: zscore ≥ panic_zscore_threshold (decoupled from general
+       zscore_threshold; default 0.684 — specifically tuned for panic detection)
     7. Volume ratio gate: v_ratio ≥ volume_ratio_threshold
     8. NO discount check: no_best_ask < no_vwap × no_discount_factor
        (NO must actually be discounted vs its VWAP)
@@ -1230,6 +1237,19 @@ Fee Model (src/trading/fees.py):
   Polymarket dynamic curve: f(p) = f_max × 4 × p × (1 − p)
   Peak 2.00% at p=0.50, zero at tails. Maker = always 0 bps.
 
+  CRITICAL FEE MODELING FIX (2026-03-12):
+    Exit fees are ALWAYS modeled as taker in EQS scoring (compute_edge_score)
+    and paper PnL accounting, regardless of execution_mode or market fee status.
+    Reason: ~87.5% of exits cross the spread due to OrderChaser escalation,
+    TP target movement, or timeout impatience. The old logic zero-ed exit fees
+    in maker mode or no-fee markets, allowing guaranteed-loss trades to pass
+    the negative-EV gate (fee_cents ≥ gross_cents). The bot was accepting
+    3¢ spreads at p=0.50 (where round-trip fee is 4¢) and bleeding capital.
+    
+    Implementation: compute_edge_score() and PositionManager TP check both
+    call get_fee_rate(exit_price, fee_enabled=True) unconditionally, even
+    when entry is maker or the market is tagged no-fee (political category).
+
   compute_net_pnl_cents(entry, exit, size, *, fee_enabled,
                         is_maker_entry=False, is_maker_exit=False):
     entry_fee = 0.0 if is_maker_entry else get_fee_rate(entry)
@@ -1411,6 +1431,18 @@ TelegramAlerter (src/monitoring/telegram.py):
   Rate limited: 30 messages per 60 seconds, drops excess.
   Message truncation at 4096 chars.
   Convenience methods: signal, entry, exit, stats, RPE, PCE, paper summary, kill
+
+Logging (src/core/logger.py):
+  Structured JSON logging via structlog with async-safe QueueHandler.
+  RotatingFileHandler: 10 MB per file, 5 backups.
+  
+  Log isolation (added 2026-03-12):
+    setup_logging() now accepts log_file parameter (default: "bot.jsonl").
+    The WFO command calls setup_logging(log_file="wfo.jsonl") to write
+    optimization logs to logs/wfo.jsonl instead of the default logs/bot.jsonl.
+    This prevents WFO runs from contaminating the live bot's operational log
+    stream, allowing clean separation of backtest/optimization events from
+    production trading events.
 
 
 ================================================================================
