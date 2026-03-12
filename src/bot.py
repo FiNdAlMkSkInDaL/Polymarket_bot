@@ -60,7 +60,7 @@ from src.signals.signal_framework import (
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
-from src.trading.position_manager import PositionManager, PositionState
+from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
 from src.trading.stealth_executor import StealthExecutor
@@ -68,7 +68,18 @@ from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.cross_market import CrossMarketSignalGenerator
+from src.signals.combinatorial_arb import ComboArbDetector, ComboArbSignal, ComboSizer
+from src.data.arb_clusters import ArbitrageClusterManager
 from src.signals.drift_signal import DriftSignal, MeanReversionDrift
+from src.signals.oracle_signal import OracleSignalEngine
+from src.data.oracle_adapter import (
+    OracleAdapterRegistry,
+    OracleMarketConfig,
+    OracleSnapshot,
+    OffChainOracleAdapter,
+)
+from src.data.adapters.ap_election_adapter import APElectionAdapter
+from src.data.adapters.sports_adapter import SportsAdapter
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
@@ -259,9 +270,24 @@ class TradingBot:
         self._tp_rescale_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._ghost_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._timeout_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._oracle_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._combo_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+
+        # SI-9: Combinatorial Arbitrage state
+        self._cluster_mgr = ArbitrageClusterManager()
+        self._combo_detector: ComboArbDetector | None = None  # set in _run()
+        self._combo_positions: dict[str, ComboPosition] = {}
 
         # RPE per-market cooldown (Deliverable C)
         self._rpe_last_signal: dict[str, float] = {}
+
+        # SI-8: Oracle Latency Arbitrage state
+        self._oracle_last_signal: dict[str, float] = {}
+        self._oracle_signal_engine = OracleSignalEngine()
+        self._oracle_registry = OracleAdapterRegistry()
+        self._oracle_registry.register("ap_election", APElectionAdapter)
+        self._oracle_registry.register("sports", SportsAdapter)
+        self._oracle_adapter_tasks: list[asyncio.Task] = []
 
         # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
         self._recorder = None
@@ -572,6 +598,25 @@ class TradingBot:
             asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
+
+        # SI-8: Oracle Latency Arbitrage polling loop (if enabled)
+        if settings.strategy.oracle_arb_enabled:
+            self._tasks.append(
+                asyncio.create_task(self._oracle_polling_loop(), name="oracle_poll")
+            )
+
+        # SI-9: Combinatorial Arbitrage cluster scanning + execution
+        if settings.strategy.si9_arb_enabled:
+            # Build initial clusters from discovered markets
+            self._cluster_mgr.scan_clusters(self._markets)
+            # Ensure YES-token books exist for cluster legs
+            for tid in self._cluster_mgr.all_cluster_yes_token_ids():
+                if tid not in self._book_trackers:
+                    self._book_trackers[tid] = OrderbookTracker(tid)
+            self._combo_detector = ComboArbDetector(self._book_trackers)
+            self._tasks.append(
+                asyncio.create_task(self._combo_arbitrage_loop(), name="combo_arb")
+            )
 
         # Multi-core mode: add worker consumer tasks, skip in-process PCE loop
         if self._process_manager is not None:
@@ -892,6 +937,7 @@ class TradingBot:
             self._tp_rescale_breaker.reset()
             self._ghost_breaker.reset()
             self._timeout_breaker.reset()
+            self._oracle_breaker.reset()
 
             # 6. Resume chasers
             self._fast_kill_event.set()
@@ -2279,6 +2325,349 @@ class TradingBot:
                     )
                     await self._suspend_and_reset()
 
+    # ── SI-8: Oracle Latency Arbitrage ─────────────────────────────────────
+
+    async def _oracle_polling_loop(self) -> None:
+        """Poll off-chain oracle APIs and fire fast-strike taker signals.
+
+        Parses ``oracle_market_configs`` JSON from StrategyParams,
+        instantiates adapters via the registry, spawns each adapter's
+        polling loop as a sub-task, and consumes ``OracleSnapshot``
+        objects from the shared queue.
+
+        Each snapshot is evaluated by ``OracleSignalEngine`` against
+        the current CLOB price; if a signal fires it is routed into
+        ``_on_oracle_signal()`` which calls
+        ``PositionManager.open_rpe_position()`` with
+        ``latency_healthy=True`` to enable the fast-strike taker path.
+
+        Circuit breaker: ``self._oracle_breaker`` (threshold=5,
+        window=60 s).  On trip → ``_suspend_and_reset()``.
+        """
+        import json as _json
+
+        strat = settings.strategy
+        try:
+            configs_raw = _json.loads(strat.oracle_market_configs)
+        except _json.JSONDecodeError:
+            log.error("oracle_market_configs_invalid_json", raw=strat.oracle_market_configs)
+            return
+
+        if not configs_raw:
+            log.info("oracle_polling_loop_no_configs")
+            return
+
+        oracle_queue: asyncio.Queue[OracleSnapshot] = asyncio.Queue(maxsize=500)
+
+        # Instantiate adapters and spawn their polling sub-tasks
+        for cfg_dict in configs_raw:
+            try:
+                mc = OracleMarketConfig(
+                    market_id=cfg_dict.get("market_id", ""),
+                    oracle_type=cfg_dict.get("oracle_type", ""),
+                    oracle_params=cfg_dict.get("oracle_params", {}),
+                    yes_asset_id=cfg_dict.get("yes_asset_id", ""),
+                    no_asset_id=cfg_dict.get("no_asset_id", ""),
+                    event_id=cfg_dict.get("event_id", ""),
+                )
+                adapter = self._oracle_registry.create(
+                    mc.oracle_type,
+                    mc,
+                    on_trip=self._oracle_adapter_tripped,
+                )
+                task = asyncio.create_task(
+                    adapter.start(oracle_queue),
+                    name=f"oracle_{mc.oracle_type}_{mc.market_id[:12]}",
+                )
+                task.add_done_callback(_safe_task_done_callback)
+                self._oracle_adapter_tasks.append(task)
+                log.info(
+                    "oracle_adapter_spawned",
+                    oracle_type=mc.oracle_type,
+                    market_id=mc.market_id,
+                )
+            except KeyError:
+                log.error(
+                    "oracle_adapter_unknown_type",
+                    oracle_type=cfg_dict.get("oracle_type", ""),
+                )
+            except Exception:
+                log.error("oracle_adapter_init_error", exc_info=True)
+
+        if not self._oracle_adapter_tasks:
+            log.warning("oracle_polling_loop_no_adapters_created")
+            return
+
+        log.info(
+            "oracle_polling_loop_started",
+            adapter_count=len(self._oracle_adapter_tasks),
+        )
+
+        # ── Consumer loop ──────────────────────────────────────────────
+        while self._running:
+            try:
+                try:
+                    snapshot = await asyncio.wait_for(oracle_queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                # Look up oracle config for asset IDs
+                oc = self._find_oracle_config(snapshot.market_id, configs_raw)
+                if oc is None:
+                    continue
+
+                # Look up market info in lifecycle
+                market = self._find_market(snapshot.market_id)
+                if market is None:
+                    log.debug("oracle_market_not_tracked", market_id=snapshot.market_id)
+                    continue
+
+                # Gate: market must be tradeable and accepting orders
+                if not self.lifecycle.is_tradeable(market.condition_id):
+                    continue
+                if not market.accepting_orders:
+                    continue
+
+                # Get current YES price from book or aggregator
+                yes_agg = self._yes_aggs.get(market.yes_token_id)
+                yes_price = yes_agg.current_price if yes_agg else 0.0
+                if yes_price <= 0:
+                    continue
+
+                # Get current spread for spread-width gate
+                spread_cents = 0.0
+                no_book = self._book_trackers.get(market.no_token_id)
+                if no_book and no_book.has_data:
+                    snap = no_book.snapshot()
+                    spread_cents = (snap.best_ask - snap.best_bid) * 100.0 if snap.best_ask > 0 and snap.best_bid > 0 else 0.0
+
+                # Evaluate signal
+                signal = self._oracle_signal_engine.evaluate(
+                    snapshot,
+                    market_price=yes_price,
+                    spread_cents=spread_cents,
+                )
+
+                if signal:
+                    await self._on_oracle_signal(signal, market, oc)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error("oracle_polling_loop_error", exc_info=True)
+                if self._oracle_breaker.record():
+                    log.critical(
+                        "oracle_polling_circuit_breaker_tripped",
+                        errors_in_window=self._oracle_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: oracle_poll tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
+                    return
+
+        # Cleanup adapter sub-tasks on shutdown
+        for t in self._oracle_adapter_tasks:
+            if not t.done():
+                t.cancel()
+
+    async def _oracle_adapter_tripped(self) -> None:
+        """Callback invoked when an individual oracle adapter's breaker trips."""
+        log.critical("oracle_adapter_breaker_tripped_callback")
+        try:
+            await self.telegram.send(
+                "🟡 <b>Oracle adapter circuit breaker tripped</b> — "
+                "adapter stopped, bot continues."
+            )
+        except Exception:
+            pass
+
+    def _find_oracle_config(
+        self, market_id: str, configs_raw: list[dict],
+    ) -> dict | None:
+        """Find the oracle config dict for a given market_id."""
+        for cfg in configs_raw:
+            if cfg.get("market_id") == market_id:
+                return cfg
+        return None
+
+    def _find_market(self, market_id: str) -> MarketInfo | None:
+        """Find tracked MarketInfo by condition_id."""
+        for m in list(self._markets):
+            if m.condition_id == market_id:
+                return m
+        return None
+
+    async def _on_oracle_signal(
+        self,
+        signal: SignalResult,
+        market: MarketInfo,
+        oracle_config: dict,
+    ) -> None:
+        """Handle an oracle divergence signal — routes into the RPE execution funnel.
+
+        Mirrors ``_on_rpe_signal()`` with oracle-specific gates, then
+        calls ``PositionManager.open_rpe_position()`` with
+        ``latency_healthy=True`` to enable the SI-7 fast-strike taker
+        path.  The existing ``_fair_vs_clob > 0.02`` check in
+        ``_open_rpe_position_inner()`` still gates whether fast-strike
+        actually fires.
+        """
+        meta = signal.metadata
+        direction = meta.get("direction", "buy_no")
+        model_prob = meta.get("model_probability", 0.5)
+        confidence = meta.get("confidence", 0.0)
+        shadow = settings.strategy.oracle_shadow_mode
+        strat = settings.strategy
+
+        # ── Per-market cooldown ────────────────────────────────────
+        now = time.monotonic()
+        last_fire = self._oracle_last_signal.get(market.condition_id, 0.0)
+        if now - last_fire < strat.oracle_cooldown_seconds:
+            log.debug(
+                "oracle_cooldown_active",
+                market=market.condition_id,
+                seconds_remaining=round(strat.oracle_cooldown_seconds - (now - last_fire), 1),
+            )
+            return
+
+        # ── Stamp cooldown ─────────────────────────────────────────
+        self._oracle_last_signal[market.condition_id] = now
+
+        # ── Telegram notification ──────────────────────────────────
+        mode_label = "👻 SHADOW" if shadow else "🔴 LIVE"
+        _safe_fire_and_forget(
+            self.telegram.send(
+                f"{mode_label} <b>Oracle Signal</b>\n"
+                f"Market: <code>{market.condition_id[:16]}…</code>\n"
+                f"Question: {market.question[:80]}\n"
+                f"Direction: {direction}\n"
+                f"Model P: {model_prob:.4f}\n"
+                f"Confidence: {confidence:.3f}\n"
+                f"Phase: {meta.get('oracle_event_phase', '?')}\n"
+                f"Adapter: {meta.get('model_name', '?')}"
+            ),
+            name="oracle_telegram_notify",
+        )
+
+        # ── Data recorder ──────────────────────────────────────────
+        if self._recorder is not None:
+            self._recorder.enqueue("oracle_signal", {
+                "market": market.condition_id,
+                "model_probability": model_prob,
+                "confidence": confidence,
+                "direction": direction,
+                "shadow": shadow,
+                "event_phase": meta.get("oracle_event_phase"),
+                "adapter": meta.get("model_name"),
+                "resolved_outcome": meta.get("resolved_outcome"),
+            })
+
+        if shadow:
+            log.info(
+                "oracle_signal_shadow",
+                market=market.condition_id,
+                model_prob=round(model_prob, 4),
+                confidence=round(confidence, 3),
+                direction=direction,
+                event_phase=meta.get("oracle_event_phase"),
+            )
+            return
+
+        # ── Live-mode gates ────────────────────────────────────────
+
+        # Gate: Position deduplication
+        positioned = self._positioned_asset_ids()
+        if market.yes_token_id in positioned or market.no_token_id in positioned:
+            log.info(
+                "oracle_already_positioned",
+                market=market.condition_id,
+            )
+            return
+
+        # Gate: Determine entry price from appropriate book
+        if direction == "buy_no":
+            book = self._book_trackers.get(market.no_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                no_agg = self._no_aggs.get(market.no_token_id)
+                entry_price = round(no_agg.current_price, 2) if no_agg else 0.0
+        else:
+            book = self._book_trackers.get(market.yes_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                yes_agg = self._yes_aggs.get(market.yes_token_id)
+                entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
+
+        if entry_price <= 0:
+            return
+
+        # Gate: Minimum ask depth
+        if book and book.has_data:
+            snap_depth = book.snapshot()
+            min_depth = strat.min_ask_depth_usd
+            if snap_depth.ask_depth_usd < min_depth:
+                log.info(
+                    "oracle_rejected_thin_asks",
+                    market=market.condition_id,
+                    ask_depth_usd=round(snap_depth.ask_depth_usd, 2),
+                    min_required=min_depth,
+                )
+                return
+
+        fee_enabled = self._is_fee_enabled(market)
+
+        # Days to resolution
+        days_to_resolution = 1
+        if market.end_date:
+            delta = market.end_date - datetime.now(tz=timezone.utc)
+            days_to_resolution = max(1, delta.days)
+
+        oracle_signal_meta = dict(meta)
+        oracle_signal_meta["signal_source"] = "si8_oracle"
+
+        # ── Route into the RPE execution funnel with latency_healthy=True ──
+        # Pass latency_healthy=True to enable the fast-strike taker gate.
+        # The existing _fair_vs_clob > 0.02 check in _open_rpe_position_inner()
+        # still gates whether the +1¢ bump and taker execution actually fires.
+        pos = await self.positions.open_rpe_position(
+            market_id=market.condition_id,
+            yes_asset_id=oracle_config.get("yes_asset_id", market.yes_token_id),
+            no_asset_id=oracle_config.get("no_asset_id", market.no_token_id),
+            direction=direction,
+            model_probability=model_prob,
+            confidence=confidence,
+            entry_price=entry_price,
+            event_id=oracle_config.get("event_id", market.event_id),
+            days_to_resolution=days_to_resolution,
+            fee_enabled=fee_enabled,
+            book=book,
+            signal_metadata=oracle_signal_meta,
+            latency_healthy=True,
+        )
+
+        if pos:
+            # Fast-strike positions skip the OrderChaser — order placed as
+            # a taker to immediately consume stale CLOB liquidity.
+            if getattr(pos, 'fast_strike', False):
+                log.info(
+                    "oracle_fast_strike_no_chaser",
+                    pos_id=pos.id,
+                    market=market.condition_id,
+                )
+            elif book and book.has_data:
+                chaser_task = asyncio.create_task(
+                    self._entry_chaser_flow(pos, book),
+                    name=f"chaser_entry_oracle_{pos.id}",
+                )
+                chaser_task.add_done_callback(_safe_task_done_callback)
+                pos.entry_chaser_task = chaser_task
+
     def _check_paper_fills(self, event: TradeEvent) -> None:
         """Check if any paper orders should fill based on this trade."""
         filled_orders = self.executor.check_paper_fill(event.asset_id, event.price)
@@ -2742,6 +3131,7 @@ class TradingBot:
                                         baseline_depth=baseline_pre,
                                         yes_asset_id=am.info.yes_token_id,
                                         mid_price=mid,
+                                        signal_source="VACUUM_GhostLiquidity",
                                     )
                                     try:
                                         vac_positions = await self.positions.open_vacuum_stink_bids(
@@ -3345,3 +3735,148 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("cleanup_loop_error", error=str(exc), exc_info=True)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  SI-9: Combinatorial Arbitrage Loop
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _combo_arbitrage_loop(self) -> None:
+        """Scan negRisk clusters for mis-priced arb, place multi-leg orders.
+
+        Runs every ``si9_scan_interval_ms``.  For each active cluster:
+          1. Evaluate via ``ComboArbDetector.evaluate_cluster()``.
+             Passes wallet_balance so ComboSizer can enforce share-count
+             pegging (NOT Kelly USD sizing).
+          2. If signal emitted, place combo via ``open_combo_position()``.
+          3. Monitor existing combos for fill status and leg timeout.
+          4. On timeout → ``abandon_combo()`` runs the Hanging Leg State
+             Machine (State 1: clean cancel / State 2: emergency hedge
+             or dump).
+
+        Circuit breaker: ``self._combo_breaker`` (threshold=5, window=60s).
+        """
+        strat = settings.strategy
+        interval = strat.si9_scan_interval_ms / 1000.0
+        max_leg_delay_s = strat.si9_max_leg_delay_ms / 1000.0
+
+        log.info("combo_arb_loop_started", scan_interval_ms=strat.si9_scan_interval_ms)
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+
+                # Skip if no detector wired (safety)
+                if self._combo_detector is None:
+                    continue
+
+                # ── 1. Scan clusters for new arb signals ──────────────
+                # Pass wallet_balance so ComboSizer can compute uniform
+                # share counts constrained by available capital.
+                wallet_bal = self.positions._wallet_balance_usd
+
+                for cluster in self._cluster_mgr.active_clusters:
+                    # Skip if we already have a combo for this event
+                    existing = self._combo_positions.get(cluster.event_id)
+                    if existing and existing.state in (
+                        ComboState.ENTRY_PENDING,
+                        ComboState.PARTIAL_FILL,
+                        ComboState.ALL_FILLED,
+                    ):
+                        continue
+
+                    signal = self._combo_detector.evaluate_cluster(
+                        cluster, wallet_balance=wallet_bal,
+                    )
+                    if signal is None:
+                        continue
+
+                    combo = await self.positions.open_combo_position(
+                        signal, self._combo_positions,
+                    )
+                    if combo is not None:
+                        self._combo_positions[cluster.event_id] = combo
+                        await self.telegram.send(
+                            f"🎯 <b>SI-9 Combo Arb</b>\n"
+                            f"Event: {cluster.event_id[:16]}\n"
+                            f"Legs: {combo.n_legs} | "
+                            f"Shares: {signal.target_shares} | "
+                            f"Edge: {signal.edge_cents:.1f}¢ | "
+                            f"Σbids: {signal.sum_best_bids:.4f} | "
+                            f"Collateral: ${signal.total_collateral:.2f}"
+                        )
+
+                # ── 2. Monitor existing combos ────────────────────────
+                now = time.time()
+                for event_id, combo in list(self._combo_positions.items()):
+                    if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
+                        continue
+
+                    # Check for order fills by polling order status
+                    for pos in combo.legs.values():
+                        if pos.state == PositionState.ENTRY_PENDING and pos.entry_order:
+                            status = await self.executor.get_order_status(pos.entry_order)
+                            if status == OrderStatus.MATCHED:
+                                pos.state = PositionState.ENTRY_FILLED
+                                pos.filled_size = pos.entry_size
+                                log.info(
+                                    "combo_leg_filled",
+                                    combo_id=combo.combo_id,
+                                    market_id=pos.market_id[:16],
+                                )
+
+                    # Update combo state
+                    if combo.all_filled:
+                        if combo.state != ComboState.ALL_FILLED:
+                            combo.state = ComboState.ALL_FILLED
+                            log.info(
+                                "combo_all_filled",
+                                combo_id=combo.combo_id,
+                                pnl_cents=round(combo.pnl_cents_if_resolved, 2),
+                            )
+                            await self.telegram.send(
+                                f"✅ <b>SI-9 Combo Filled</b>\n"
+                                f"Combo: {combo.combo_id}\n"
+                                f"PnL at resolution: "
+                                f"{combo.pnl_cents_if_resolved:.1f}¢"
+                            )
+                    elif len(combo.filled_legs) > 0 and combo.state == ComboState.ENTRY_PENDING:
+                        combo.state = ComboState.PARTIAL_FILL
+
+                    # ── Leg timeout → Hanging Leg State Machine ────────
+                    # abandon_combo() handles the two states:
+                    #   State 1 (0 fills): safe cancel of all resting orders
+                    #   State 2 (partial fills): emergency taker hedge or
+                    #     dump of filled legs to eliminate directional risk
+                    elapsed = now - combo.created_at
+                    if (
+                        elapsed > max_leg_delay_s
+                        and combo.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL)
+                        and not combo.all_filled
+                    ):
+                        log.warning(
+                            "combo_leg_timeout",
+                            combo_id=combo.combo_id,
+                            elapsed_s=round(elapsed, 1),
+                            filled=len(combo.filled_legs),
+                            pending=len(combo.pending_legs),
+                        )
+                        await self.positions.abandon_combo(combo, reason="leg_timeout")
+                        await self.telegram.send(
+                            f"⚠️ <b>SI-9 Abandon</b>\n"
+                            f"Combo: {combo.combo_id}\n"
+                            f"State: {combo.state.value}\n"
+                            f"Filled: {len(combo.filled_legs)} | "
+                            f"Elapsed: {elapsed:.0f}s"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("combo_arb_loop_error", error=str(exc), exc_info=True)
+                if self._combo_breaker.record():
+                    log.critical(
+                        "combo_breaker_tripped",
+                        recent_errors=self._combo_breaker.recent_errors,
+                    )
+                    await self._suspend_and_reset()
+                    break

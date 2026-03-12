@@ -94,7 +94,7 @@ echo "[STEP 3] Verifying configuration..."
 echo "  → Checking config defaults..."
 grep -n "NO_DISCOUNT_FACTOR.*0.995" src/core/config.py && echo "    ✓ NO_DISCOUNT_FACTOR = 0.995" || echo "    ✗ NO_DISCOUNT_FACTOR mismatch!"
 grep -n "DRIFT_VOL_CEILING.*0.35" src/core/config.py && echo "    ✓ DRIFT_VOL_CEILING = 0.35" || echo "    ✗ DRIFT_VOL_CEILING mismatch!"
-grep -n "ZSCORE_THRESHOLD.*0.8" src/core/config.py && echo "    ✓ ZSCORE_THRESHOLD = 0.8" || echo "    ✗ ZSCORE_THRESHOLD mismatch!"
+grep -n "ZSCORE_THRESHOLD.*0.20" src/core/config.py && echo "    ✓ ZSCORE_THRESHOLD = 0.20" || echo "    ✗ ZSCORE_THRESHOLD mismatch!"
 grep -n "EQS_VOL_ADAPTIVE.*False" src/core/config.py && echo "    ✓ EQS_VOL_ADAPTIVE = False" || echo "    ✗ EQS_VOL_ADAPTIVE mismatch!"
 
 echo "  → Checking iceberg_eqs_bonus clamp fix..."

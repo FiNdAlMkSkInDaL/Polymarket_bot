@@ -61,6 +61,8 @@ class CrossMarketSignal:
     spread_vol: float         # σ of the spread series
     confidence: float         # 0-1
     timestamp: float
+    is_shadow: bool = False   # routed to SPT pipeline when True
+    signal_source: str = "SI-3_CrossMarket"
 
 
 class CrossMarketSignalGenerator:
@@ -222,12 +224,12 @@ class CrossMarketSignalGenerator:
                 spread_vol=round(spread_vol, 6),
                 confidence=round(confidence, 3),
                 timestamp=now,
+                is_shadow=self._shadow,
             )
             signals.append(sig)
 
-            prefix = "[SHADOW] " if self._shadow else ""
             log.info(
-                f"{prefix}cross_market_signal",
+                "cross_market_signal",
                 lagging=lagging_id[:16],
                 leading=leading_id[:16],
                 lagging_asset_id=lagging_asset,
@@ -242,10 +244,6 @@ class CrossMarketSignalGenerator:
         self._last_returns.clear()
 
         return signals
-
-    @property
-    def is_shadow(self) -> bool:
-        return self._shadow
 
     def reset(self) -> None:
         """Clear all state."""

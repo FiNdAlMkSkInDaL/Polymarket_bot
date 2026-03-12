@@ -217,6 +217,7 @@ class PanicDetector:
             volume_ratio=v_ratio,
             no_best_ask=no_best_ask,
             whale_confluence=whale_confluence,
+            signal_source="PRIMARY_Panic",
         )
 
         log.info(

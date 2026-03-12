@@ -48,6 +48,8 @@ def compute_roundtrip_fee_cents(
     *,
     fee_enabled: bool = True,
     f_max: float | None = None,
+    is_maker_entry: bool = False,
+    is_maker_exit: bool = False,
 ) -> float:
     """Compute total round-trip fee drag in cents.
 
@@ -56,8 +58,8 @@ def compute_roundtrip_fee_cents(
     float
         Total fee in cents (entry_fee + exit_fee) * 100.
     """
-    entry_fee = get_fee_rate(entry_price, fee_enabled=fee_enabled, f_max=f_max)
-    exit_fee = get_fee_rate(exit_price, fee_enabled=fee_enabled, f_max=f_max)
+    entry_fee = 0.0 if is_maker_entry else get_fee_rate(entry_price, fee_enabled=fee_enabled, f_max=f_max)
+    exit_fee = 0.0 if is_maker_exit else get_fee_rate(exit_price, fee_enabled=fee_enabled, f_max=f_max)
     return (entry_fee + exit_fee) * 100.0
 
 
@@ -206,13 +208,18 @@ def compute_net_pnl_cents(
     *,
     fee_enabled: bool = True,
     f_max: float | None = None,
+    is_maker_entry: bool = False,
+    is_maker_exit: bool = False,
 ) -> float:
     """Compute net PnL in cents after deducting round-trip fees.
 
     PnL = [(exit - entry) - Fee_entry - Fee_exit] × size × 100
+
+    Maker fills on Polymarket pay 0% fee.  Pass ``is_maker_entry`` /
+    ``is_maker_exit`` to zero the corresponding leg.
     """
-    entry_fee = get_fee_rate(entry_price, fee_enabled=fee_enabled, f_max=f_max)
-    exit_fee = get_fee_rate(exit_price, fee_enabled=fee_enabled, f_max=f_max)
+    entry_fee = 0.0 if is_maker_entry else get_fee_rate(entry_price, fee_enabled=fee_enabled, f_max=f_max)
+    exit_fee = 0.0 if is_maker_exit else get_fee_rate(exit_price, fee_enabled=fee_enabled, f_max=f_max)
     gross = exit_price - entry_price
     net = gross - entry_fee - exit_fee
     return round(net * size * 100.0, 2)

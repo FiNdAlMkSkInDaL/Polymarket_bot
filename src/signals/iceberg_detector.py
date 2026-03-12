@@ -55,6 +55,8 @@ class IcebergSignal:
     estimated_total: float  # refill_count × avg_slice_size
     timestamp: float
     confidence: float  # 0-1 how confident we are this is really an iceberg
+    is_shadow: bool = False
+    signal_source: str = "SI-2_Iceberg"
 
 
 class IcebergDetector:

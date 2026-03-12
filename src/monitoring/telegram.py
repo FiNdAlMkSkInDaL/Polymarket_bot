@@ -241,3 +241,50 @@ class TelegramAlerter:
 
     async def notify_kill(self) -> None:
         await self.send("🛑 <b>KILL SWITCH ACTIVATED</b> — all orders cancelled, bot stopping.")
+
+    # ── Shadow Performance Tracker: graduation alert ────────────────────
+    async def shadow_graduation_alert(
+        self,
+        signal_source: str,
+        stats: dict,
+    ) -> None:
+        """Send an HTML-formatted alert when a shadow strategy passes go-live criteria."""
+        total = stats.get("total_trades", 0)
+        wr = stats.get("win_rate", 0.0)
+        ev = stats.get("expectancy_cents", 0.0)
+        total_pnl = stats.get("total_pnl_cents", 0.0)
+        max_dd = stats.get("max_drawdown_cents", 0.0)
+
+        safe_source = _html.escape(signal_source)
+        await self.send(
+            f"🎓 <b>SHADOW STRATEGY GRADUATION</b>\n\n"
+            f"Signal: <code>{safe_source}</code>\n"
+            f"Status: <b>READY FOR DEPLOYMENT</b>\n\n"
+            f"📊 <b>Counterfactual Performance</b>\n"
+            f"  Trades: {total}\n"
+            f"  Win rate: {wr:.1%}\n"
+            f"  Expectancy: {ev:+.2f}¢/trade\n"
+            f"  Total PnL: {total_pnl:+.2f}¢\n"
+            f"  Max DD: {max_dd:.2f}¢\n\n"
+            f"✅ This shadow strategy has proved its statistical edge "
+            f"and is ready for live capital allocation."
+        )
+
+    async def check_shadow_graduations(self, trade_store: object) -> None:
+        """Daily cron-style check: evaluate all shadow strategies and
+        alert on any that cross the go-live threshold.
+
+        Parameters
+        ----------
+        trade_store:
+            A ``TradeStore`` instance with ``get_all_shadow_sources()``
+            and ``passes_shadow_go_live()`` methods.
+        """
+        try:
+            sources = await trade_store.get_all_shadow_sources()  # type: ignore[union-attr]
+            for source in sources:
+                ready, stats = await trade_store.passes_shadow_go_live(source)  # type: ignore[union-attr]
+                if ready:
+                    await self.shadow_graduation_alert(source, stats)
+        except Exception as exc:
+            log.warning("shadow_graduation_check_failed", error=str(exc))

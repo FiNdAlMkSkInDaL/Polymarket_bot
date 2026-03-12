@@ -55,6 +55,32 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_state ON trades(state);
 
+-- Shadow Performance Tracker: counterfactual trades from shadow strategies
+CREATE TABLE IF NOT EXISTS shadow_trades (
+    id              TEXT PRIMARY KEY,
+    signal_source   TEXT NOT NULL,
+    market_id       TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    direction       TEXT DEFAULT 'NO',
+    entry_price     REAL,
+    entry_size      REAL,
+    entry_time      REAL,
+    target_price    REAL,
+    stop_price      REAL,
+    exit_price      REAL,
+    exit_time       REAL,
+    exit_reason     TEXT,
+    pnl_cents       REAL,
+    hold_seconds    REAL,
+    entry_fee_bps   INTEGER DEFAULT 0,
+    exit_fee_bps    INTEGER DEFAULT 0,
+    zscore          REAL,
+    confidence      REAL,
+    created_at      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
+CREATE INDEX IF NOT EXISTS idx_shadow_state ON shadow_trades(state);
+
 -- State-persistence: live orders snapshot
 CREATE TABLE IF NOT EXISTS live_orders (
     order_id        TEXT PRIMARY KEY,
@@ -139,6 +165,44 @@ class TradeStore:
             await self._db.commit()
         except Exception:
             log.warning("schema_migration_skipped", exc_info=True)
+
+        # ── Schema migration: add shadow_trades if missing ────────────
+        try:
+            cursor = await self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='shadow_trades'"
+            )
+            if not await cursor.fetchone():
+                await self._db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS shadow_trades (
+                        id              TEXT PRIMARY KEY,
+                        signal_source   TEXT NOT NULL,
+                        market_id       TEXT NOT NULL,
+                        state           TEXT NOT NULL,
+                        direction       TEXT DEFAULT 'NO',
+                        entry_price     REAL,
+                        entry_size      REAL,
+                        entry_time      REAL,
+                        target_price    REAL,
+                        stop_price      REAL,
+                        exit_price      REAL,
+                        exit_time       REAL,
+                        exit_reason     TEXT,
+                        pnl_cents       REAL,
+                        hold_seconds    REAL,
+                        entry_fee_bps   INTEGER DEFAULT 0,
+                        exit_fee_bps    INTEGER DEFAULT 0,
+                        zscore          REAL,
+                        confidence      REAL,
+                        created_at      REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
+                    CREATE INDEX IF NOT EXISTS idx_shadow_state ON shadow_trades(state);
+                    """
+                )
+                await self._db.commit()
+        except Exception:
+            log.warning("shadow_trades_migration_skipped", exc_info=True)
 
         log.info("trade_store_initialised", path=str(self.db_path))
 
@@ -534,3 +598,155 @@ class TradeStore:
         except Exception:
             await self._db.rollback()
             raise
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Shadow Performance Tracker — counterfactual trade persistence
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def record_shadow_trade(
+        self,
+        *,
+        trade_id: str,
+        signal_source: str,
+        market_id: str,
+        direction: str = "NO",
+        entry_price: float,
+        entry_size: float,
+        entry_time: float,
+        target_price: float,
+        stop_price: float,
+        exit_price: float,
+        exit_time: float,
+        exit_reason: str,
+        pnl_cents: float,
+        entry_fee_bps: int = 0,
+        exit_fee_bps: int = 0,
+        zscore: float = 0.0,
+        confidence: float = 0.0,
+    ) -> None:
+        """Persist a counterfactual shadow trade result."""
+        await self._ensure_db()
+
+        hold = (exit_time - entry_time) if exit_time and entry_time else 0.0
+
+        await self._db.execute(
+            """
+            INSERT OR REPLACE INTO shadow_trades
+            (id, signal_source, market_id, state, direction,
+             entry_price, entry_size, entry_time,
+             target_price, stop_price, exit_price, exit_time,
+             exit_reason, pnl_cents, hold_seconds,
+             entry_fee_bps, exit_fee_bps, zscore, confidence, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                trade_id,
+                signal_source,
+                market_id,
+                PositionState.CLOSED.value,
+                direction,
+                entry_price,
+                entry_size,
+                entry_time,
+                target_price,
+                stop_price,
+                exit_price,
+                exit_time,
+                exit_reason,
+                pnl_cents,
+                round(hold, 1),
+                entry_fee_bps,
+                exit_fee_bps,
+                zscore,
+                confidence,
+                time.time(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_shadow_stats(self, signal_source: str) -> dict:
+        """Compute aggregate stats for a specific shadow signal source.
+
+        Returns a dict compatible with ``passes_go_live_criteria`` checks.
+        """
+        await self._ensure_db()
+
+        cursor = await self._db.execute(
+            "SELECT pnl_cents, exit_reason, hold_seconds "
+            "FROM shadow_trades "
+            "WHERE signal_source = ? AND state = ? "
+            "ORDER BY exit_time ASC",
+            (signal_source, PositionState.CLOSED.value),
+        )
+        rows = await cursor.fetchall()
+
+        if not rows:
+            return {"signal_source": signal_source, "total_trades": 0}
+
+        pnls = [r[0] for r in rows]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        holds = [r[2] for r in rows if r[2]]
+
+        target_exits = sum(1 for r in rows if r[1] == "target")
+        stop_exits = sum(1 for r in rows if r[1] == "stop_loss")
+
+        total = len(pnls)
+        win_rate = len(wins) / total if total else 0.0
+        avg_win = sum(wins) / len(wins) if wins else 0.0
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+        total_pnl = sum(pnls)
+
+        # Max drawdown (cumulative)
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            dd = peak - cum
+            max_dd = max(max_dd, dd)
+
+        return {
+            "signal_source": signal_source,
+            "total_trades": total,
+            "win_rate": round(win_rate, 4),
+            "avg_win_cents": round(avg_win, 2),
+            "avg_loss_cents": round(avg_loss, 2),
+            "total_pnl_cents": round(total_pnl, 2),
+            "max_drawdown_cents": round(max_dd, 2),
+            "target_exits": target_exits,
+            "stop_exits": stop_exits,
+            "avg_hold_seconds": round(sum(holds) / len(holds), 1) if holds else 0,
+            "expectancy_cents": round(total_pnl / total, 2) if total else 0,
+        }
+
+    async def get_all_shadow_sources(self) -> list[str]:
+        """Return all distinct signal_source values in the shadow_trades table."""
+        await self._ensure_db()
+        cursor = await self._db.execute(
+            "SELECT DISTINCT signal_source FROM shadow_trades ORDER BY signal_source"
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+    async def passes_shadow_go_live(self, signal_source: str) -> tuple[bool, dict]:
+        """Check whether a shadow strategy meets go-live criteria.
+
+        Criteria (same as live):
+          - >= 20 trades
+          - Win rate >= 55%
+          - Positive expectancy
+        """
+        stats = await self.get_shadow_stats(signal_source)
+
+        if stats["total_trades"] < 20:
+            return False, stats
+
+        if stats["win_rate"] < 0.55:
+            return False, stats
+
+        if stats.get("expectancy_cents", 0) <= 0:
+            return False, stats
+
+        return True, stats

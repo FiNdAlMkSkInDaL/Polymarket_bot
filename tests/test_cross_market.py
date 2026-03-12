@@ -106,7 +106,7 @@ class TestCrossMarketSignalGenerator:
 
     def test_shadow_mode(self):
         gen = CrossMarketSignalGenerator(FakePCE(), shadow_mode=True)
-        assert gen.is_shadow is True
+        assert gen._shadow is True
 
     def test_reset(self):
         gen = CrossMarketSignalGenerator(FakePCE())

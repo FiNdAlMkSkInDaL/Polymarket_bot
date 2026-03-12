@@ -1,0 +1,293 @@
+"""
+SI-9 Combinatorial Arbitrage — signal detection and sizing for mutually
+exclusive Polymarket event clusters.
+
+When the sum of YES best-bids across all legs of a negRisk cluster
+drops below ``1.0 - margin``, a risk-free arbitrage exists:
+buy every YES token at best_bid (maker), hold to resolution, collect
+the guaranteed $1.00 payout on the winning leg.
+
+This module provides:
+  - ``ComboLeg`` / ``ComboArbSignal`` — data payloads for multi-leg arb.
+  - ``ComboSizer`` — share-count-pegged sizer (NOT Kelly/USD).
+  - ``ComboArbDetector`` — scans clusters and emits signals.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from src.core.config import settings
+from src.core.logger import get_logger
+from src.data.arb_clusters import ArbCluster
+from src.data.orderbook import OrderbookTracker
+from src.signals.signal_framework import BaseSignal, SignalGenerator, SignalResult
+
+log = get_logger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Data payloads
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ComboLeg:
+    """One leg of a combinatorial arbitrage opportunity."""
+
+    market_id: str         # condition_id
+    yes_token_id: str      # token to BUY
+    no_token_id: str       # NO token (needed for emergency unwind reference)
+    best_bid: float        # current YES best_bid from book
+    best_ask: float        # current YES best_ask (for emergency hedge costing)
+    target_price: float    # price to place the BUY order at
+    target_shares: float   # shares to buy (IDENTICAL across all legs)
+    question: str = ""     # human label for logging
+
+
+@dataclass
+class ComboArbSignal(BaseSignal):
+    """Emitted when a mutually exclusive cluster is mis-priced.
+
+    Carries the full set of legs and the computed edge so the
+    execution layer can place all orders atomically.
+    """
+
+    cluster_event_id: str = ""
+    legs: list[ComboLeg] = field(default_factory=list)
+    sum_best_bids: float = 0.0   # Σ YES best_bids across legs
+    edge_cents: float = 0.0      # (1.0 - sum_best_bids)*100 - min_margin_cents
+    margin_used: float = 0.0     # si9_min_margin_cents at evaluation time
+    target_shares: float = 0.0   # uniform share count across all legs
+    total_collateral: float = 0.0  # Σ(target_price_i * target_shares)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ComboSizer — share-count pegging (NOT Kelly/USD)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ComboSizer:
+    """Compute a uniform share count for all legs of a combo arb.
+
+    Combinatorial arbitrage REQUIRES buying the exact same number of
+    shares S across all N outcomes.  The total collateral is:
+
+        C = S * Σ(target_price_i)
+
+    We solve for S given:
+      - wallet_balance: available USDC
+      - max_per_combo_usd: hard cap on total combo collateral
+      - max_wallet_risk_pct: fraction of wallet we may commit
+      - target_prices: list of per-leg prices
+
+    The sizer ensures S₁ = S₂ = ... = Sₙ, which is the fundamental
+    invariant of Dutch Book arbitrage.  Using Kelly/USD sizing would
+    produce unequal share counts and leave the portfolio unhedged.
+    """
+
+    @staticmethod
+    def compute_shares(
+        target_prices: list[float],
+        wallet_balance: float,
+        max_per_combo_usd: float,
+        max_wallet_risk_pct: float,
+        min_leg_depth_shares: float,
+    ) -> float:
+        """Return the uniform share count, or 0.0 if infeasible.
+
+        Parameters
+        ----------
+        target_prices :
+            Price per share for each leg (usually best_bid or best_bid+1¢).
+        wallet_balance :
+            Current USDC balance.
+        max_per_combo_usd :
+            Hard cap on total collateral for one combo.
+        max_wallet_risk_pct :
+            Maximum percent of wallet to risk on combos (0-100).
+        min_leg_depth_shares :
+            Thinnest leg depth in shares — we cap S to avoid slamming
+            an illiquid leg.
+        """
+        if not target_prices or any(p <= 0 for p in target_prices):
+            return 0.0
+
+        sum_prices = sum(target_prices)
+        if sum_prices <= 0:
+            return 0.0
+
+        # Budget: min of (hard cap, wallet fraction)
+        wallet_budget = wallet_balance * max_wallet_risk_pct / 100.0
+        budget = min(max_per_combo_usd, wallet_budget)
+        if budget <= 0:
+            return 0.0
+
+        # S = budget / Σ(price_i)  — same share count across all legs
+        shares = budget / sum_prices
+
+        # Cap to thinnest leg depth (take no more than 50% of depth)
+        if min_leg_depth_shares > 0:
+            shares = min(shares, min_leg_depth_shares * 0.5)
+
+        # Minimum viable: at least 1 share
+        if shares < 1.0:
+            return 0.0
+
+        return round(shares, 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Detector
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ComboArbDetector(SignalGenerator):
+    """Scans arb clusters for actionable mis-pricings.
+
+    For each active cluster:
+      1. Read ``best_bid`` from each leg's YES-token OrderbookTracker.
+      2. Compute ``sum_bids = Σ best_bid(YES_i)``.
+      3. If ``sum_bids < 1.0 - min_margin_cents/100``: arb detected.
+      4. Size via ``ComboSizer`` (share-count pegging, NOT Kelly).
+
+    Parameters
+    ----------
+    book_trackers :
+        Mapping ``{yes_token_id → OrderbookTracker}`` for live BBO reads.
+    """
+
+    def __init__(
+        self,
+        book_trackers: dict[str, OrderbookTracker],
+    ) -> None:
+        self._books = book_trackers
+        self._sizer = ComboSizer()
+
+    @property
+    def name(self) -> str:
+        return "combo_arb"
+
+    # ── SignalGenerator interface (single-market, not used for combos) ──
+    def evaluate(self, **kwargs: Any) -> SignalResult | None:
+        return None
+
+    # ── Cluster-level evaluation (called by the combo loop) ────────────
+    def evaluate_cluster(
+        self,
+        cluster: ArbCluster,
+        wallet_balance: float = 0.0,
+    ) -> ComboArbSignal | None:
+        """Check a single cluster for arb.  Returns signal or ``None``.
+
+        Parameters
+        ----------
+        cluster :
+            The cluster to evaluate.
+        wallet_balance :
+            Current USDC balance for sizing.
+        """
+        strat = settings.strategy
+        min_margin = strat.si9_min_margin_cents / 100.0  # convert to $
+        buffer = strat.si9_margin_buffer_cents / 100.0
+        min_depth_usd = strat.si9_min_leg_depth_usd
+
+        legs: list[ComboLeg] = []
+        sum_bids = 0.0
+        min_bid_depth_shares = float("inf")
+
+        for mkt in cluster.legs:
+            book = self._books.get(mkt.yes_token_id)
+            if book is None:
+                return None  # no book data — skip cluster
+
+            snap = book.snapshot()
+            if not snap.fresh:
+                return None  # stale data — unsafe for arb
+
+            bid = snap.best_bid
+            ask = snap.best_ask
+            if bid <= 0:
+                return None  # no bid on a leg — no arb
+
+            # Check bid-side depth meets minimum
+            bid_depth_usd = snap.bid_depth_usd
+            if bid_depth_usd < min_depth_usd:
+                return None  # too thin to fill
+
+            # Compute depth in shares at bid price for sizer cap
+            depth_shares = bid_depth_usd / bid if bid > 0 else 0
+            if depth_shares < min_bid_depth_shares:
+                min_bid_depth_shares = depth_shares
+
+            sum_bids += bid
+
+            legs.append(ComboLeg(
+                market_id=mkt.condition_id,
+                yes_token_id=mkt.yes_token_id,
+                no_token_id=mkt.no_token_id,
+                best_bid=bid,
+                best_ask=ask if ask > 0 else 1.0,
+                target_price=0.0,  # computed below
+                target_shares=0.0,  # computed below
+                question=mkt.question[:60],
+            ))
+
+        # ── Arb check: Σ(YES best_bids) < 1.0 - margin ───────────────
+        threshold = 1.0 - min_margin
+        if sum_bids >= threshold:
+            return None  # no arb
+
+        edge_dollars = 1.0 - sum_bids
+        edge_cents = edge_dollars * 100.0 - strat.si9_min_margin_cents
+
+        # ── Target prices: best_bid, or +1¢ if edge allows ────────────
+        for leg in legs:
+            if edge_dollars > min_margin + buffer:
+                # Extra edge allows joining the queue 1¢ above best bid
+                leg.target_price = round(leg.best_bid + 0.01, 2)
+            else:
+                leg.target_price = round(leg.best_bid, 2)
+
+        # ── Sizing: ComboSizer — share-count pegging ───────────────────
+        # CRITICAL: All legs get the SAME share count S.
+        # Total collateral = S * Σ(target_price_i).
+        target_prices = [lg.target_price for lg in legs]
+        shares = self._sizer.compute_shares(
+            target_prices=target_prices,
+            wallet_balance=wallet_balance,
+            max_per_combo_usd=strat.si9_max_per_combo_usd,
+            max_wallet_risk_pct=strat.max_wallet_risk_pct,
+            min_leg_depth_shares=min_bid_depth_shares,
+        )
+        if shares < 1.0:
+            return None  # infeasible size
+
+        total_collateral = shares * sum(target_prices)
+
+        for leg in legs:
+            leg.target_shares = shares
+
+        signal = ComboArbSignal(
+            market_id=cluster.event_id,  # BaseSignal.market_id → event_id
+            cluster_event_id=cluster.event_id,
+            legs=legs,
+            sum_best_bids=round(sum_bids, 4),
+            edge_cents=round(edge_cents, 2),
+            margin_used=strat.si9_min_margin_cents,
+            target_shares=shares,
+            total_collateral=round(total_collateral, 2),
+        )
+
+        log.info(
+            "combo_arb_signal",
+            event_id=cluster.event_id,
+            n_legs=len(legs),
+            sum_bids=round(sum_bids, 4),
+            edge_cents=round(edge_cents, 2),
+            shares=shares,
+            total_collateral=round(total_collateral, 2),
+        )
+        return signal

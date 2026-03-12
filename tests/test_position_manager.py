@@ -18,7 +18,7 @@ import pytest
 from src.data.l2_book import BookState, L2OrderBook
 from src.signals.panic_detector import PanicSignal
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus
-from src.trading.position_manager import PositionManager, PositionState
+from src.trading.position_manager import Position, PositionManager, PositionState
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -268,3 +268,65 @@ class TestLiquidityHoleFill:
         assert pos.state == PositionState.EXIT_PENDING
         assert pos.entry_price == 0.50
         assert pos.filled_size == pos.entry_size
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Timeout exit cooldown
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTimeoutCooldown:
+    """Step 2 fix: timeout exits must record a cooldown to prevent
+    serial re-entry on the same market."""
+
+    def test_timeout_exit_triggers_cooldown(self):
+        """After a timeout exit, is_stop_loss_cooled_down must return False."""
+        executor = OrderExecutor(paper_mode=True)
+        pm = PositionManager(executor, max_open_positions=10)
+        pm.set_wallet_balance(1000.0)
+
+        # Create a position and simulate a filled entry
+        pos = Position(
+            id="POS-TIMEOUT-1",
+            market_id="MKT_TIMEOUT",
+            no_asset_id="ASSET_TIMEOUT",
+            state=PositionState.EXIT_PENDING,
+            entry_price=0.30,
+            entry_size=10.0,
+            filled_size=10.0,
+            entry_time=time.time() - 1800,
+            target_price=0.35,
+            fee_enabled=True,
+        )
+        pm._positions[pos.id] = pos
+
+        # Call on_exit_filled with reason="timeout"
+        pm.on_exit_filled(pos, reason="timeout")
+
+        # Cooldown must be recorded
+        assert pos.market_id in pm._stop_loss_cooldowns
+        assert not pm.is_stop_loss_cooled_down(pos.market_id)
+
+    def test_normal_target_exit_no_cooldown(self):
+        """A normal 'target' exit should NOT trigger a cooldown."""
+        executor = OrderExecutor(paper_mode=True)
+        pm = PositionManager(executor, max_open_positions=10)
+        pm.set_wallet_balance(1000.0)
+
+        pos = Position(
+            id="POS-TARGET-1",
+            market_id="MKT_TARGET",
+            no_asset_id="ASSET_TARGET",
+            state=PositionState.EXIT_PENDING,
+            entry_price=0.30,
+            entry_size=10.0,
+            filled_size=10.0,
+            entry_time=time.time() - 600,
+            target_price=0.35,
+            fee_enabled=True,
+        )
+        pm._positions[pos.id] = pos
+
+        pm.on_exit_filled(pos, reason="target")
+
+        # No cooldown for successful TP exits
+        assert pos.market_id not in pm._stop_loss_cooldowns

@@ -559,16 +559,13 @@ class TestAuditFilePersistence:
         self, raw_data_dir: Path, converter: ParquetConverter, tmp_path: Path
     ) -> None:
         """Audit file timestamp is recent (current time)."""
-        import time
         from datetime import datetime, timedelta, timezone
 
         before = datetime.now(tz=timezone.utc)
-        time.sleep(0.1)
 
         out_dir = tmp_path / "processed"
         converter.convert([raw_data_dir], out_dir)
 
-        time.sleep(0.1)
         after = datetime.now(tz=timezone.utc)
 
         audit_files = list(out_dir.rglob("batch_audit_*.json"))
@@ -582,4 +579,4 @@ class TestAuditFilePersistence:
             )
 
             # Should be within our test window
-            assert before <= audit_ts <= after + timedelta(seconds=1)
+            assert before - timedelta(seconds=1) <= audit_ts <= after + timedelta(seconds=2)

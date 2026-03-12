@@ -16,7 +16,12 @@ import os
 
 import pytest
 
-from src.core.config import DeploymentEnv, PENNY_LIVE_MAX_TRADE_USD
+from src.core.config import (
+    DeploymentEnv,
+    EXCHANGE_MIN_SHARES,
+    EXCHANGE_MIN_USD,
+    PENNY_LIVE_MAX_TRADE_USD,
+)
 from src.core.guard import DeploymentGuard
 
 
@@ -48,8 +53,8 @@ class TestDeploymentEnv:
 # ── PENNY_LIVE_MAX_TRADE_USD constant ─────────────────────────────────────
 
 class TestPennyLiveConstant:
-    def test_value_is_one_dollar(self):
-        assert PENNY_LIVE_MAX_TRADE_USD == 1.0
+    def test_value_is_five_dollars(self):
+        assert PENNY_LIVE_MAX_TRADE_USD == 5.0
 
     def test_type_is_float(self):
         assert isinstance(PENNY_LIVE_MAX_TRADE_USD, float)
@@ -87,15 +92,15 @@ class TestDeploymentGuard:
         assert guard.get_allowed_trade_size(100.0) == 100.0
         assert guard.get_allowed_trade_size(0.5) == 0.5
 
-    def test_penny_live_clamps_to_one_dollar(self):
+    def test_penny_live_clamps_to_five_dollars(self):
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        assert guard.get_allowed_trade_size(5.0) == PENNY_LIVE_MAX_TRADE_USD
-        assert guard.get_allowed_trade_size(0.50) == 0.50  # below cap
-        assert guard.get_allowed_trade_size(1.0) == 1.0    # exactly at cap
+        assert guard.get_allowed_trade_size(10.0) == PENNY_LIVE_MAX_TRADE_USD
+        assert guard.get_allowed_trade_size(3.00) == 3.00  # below cap
+        assert guard.get_allowed_trade_size(5.0) == 5.0    # exactly at cap
 
     def test_penny_live_clamps_large_amount(self):
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        assert guard.get_allowed_trade_size(1000.0) == 1.0
+        assert guard.get_allowed_trade_size(1000.0) == 5.0
 
     def test_production_passes_through(self):
         guard = DeploymentGuard(
@@ -106,9 +111,9 @@ class TestDeploymentGuard:
     # ── get_allowed_trade_shares ───────────────────────────────────────
     def test_penny_live_clamps_shares(self):
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        # 10 shares at $0.50 each = $5.00 → clamped to $1.00 → 2 shares
-        result = guard.get_allowed_trade_shares(10.0, 0.50)
-        assert result == 2.0
+        # 20 shares at $0.50 each = $10.00 → clamped to $5.00 → 10 shares
+        result = guard.get_allowed_trade_shares(20.0, 0.50)
+        assert result == 10.0
 
     def test_shares_zero_price(self):
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
@@ -122,41 +127,58 @@ class TestDeploymentGuard:
     def test_penny_live_very_low_price_tokens(self):
         """Verify robustness when token price is $0.0099 (below penny)."""
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        # 200 shares at $0.0099 = $1.98 → clamped to ~101 shares = $0.9999
-        result = guard.get_allowed_trade_shares(200.0, 0.0099)
-        # Verify the final notional is ≤ $1.00
+        # 1000 shares at $0.0099 = $9.90 → clamped to $5.00 → 505 shares
+        result = guard.get_allowed_trade_shares(1000.0, 0.0099)
+        # Verify the final notional is ≤ $5.00
         final_usd = result * 0.0099
-        assert final_usd <= 1.00, f"Exceeded $1 cap: {result} shares * $0.0099 = ${final_usd}"
-        assert result > 0, "Should return non-zero shares for valid price"
+        assert final_usd <= 5.00, f"Exceeded $5 cap: {result} shares * $0.0099 = ${final_usd}"
+        assert result >= EXCHANGE_MIN_SHARES, "Should meet exchange minimum shares"
 
     def test_penny_live_fractional_cent_price(self):
         """Verify robustness when token price is $0.001 (tenth of a cent)."""
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        # 2000 shares at $0.001 = $2.00 → clamped to 1000 shares = $1.00
-        result = guard.get_allowed_trade_shares(2000.0, 0.001)
+        # 10000 shares at $0.001 = $10.00 → clamped to 5000 shares = $5.00
+        result = guard.get_allowed_trade_shares(10000.0, 0.001)
         final_usd = result * 0.001
-        assert final_usd <= 1.00, f"Exceeded $1 cap: {result} shares * $0.001 = ${final_usd}"
-        assert result == 1000.0  # exactly at cap
+        assert final_usd <= 5.00, f"Exceeded $5 cap: {result} shares * $0.001 = ${final_usd}"
+        assert result == 5000.0  # exactly at cap
 
     def test_penny_live_token_price_above_cap(self):
-        """If token price > $1, should return fractional shares = $1.00 worth."""
+        """If token price > $5, shares below exchange min → vetoed."""
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
         result = guard.get_allowed_trade_shares(10.0, 5.00)
-        # With $1 cap and $5 token price: 1.00 / 5.00 = 0.2 shares
-        # (Minimum share enforcement happens in position_manager, not guard)
-        assert result == 0.2
-        final_usd = result * 5.00
-        assert final_usd == 1.00  # exactly at cap
+        # With $5 cap and $5 token price: 5.00 / 5.00 = 1 share
+        # 1 share < EXCHANGE_MIN_SHARES (5) → vetoed
+        assert result == 0.0
 
     def test_penny_live_rounding_edge_case(self):
         """Verify post-condition check handles float rounding correctly."""
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        # Pathological case: price that causes rounding issues
-        # $0.299 per share: 1.00 / 0.299 = 3.344... → rounds to 3.34
+        # $0.299 per share: 5.00 / 0.299 = 16.72... → floored to 16 shares
         result = guard.get_allowed_trade_shares(100.0, 0.299)
         final_usd = result * 0.299
-        assert final_usd <= 1.00, f"Exceeded $1 cap: {result} shares * $0.299 = ${final_usd}"
-        # 3.34 shares * $0.299 = 0.99866 ✓
+        assert final_usd <= 5.00, f"Exceeded $5 cap: {result} shares * $0.299 = ${final_usd}"
+        assert result >= EXCHANGE_MIN_SHARES
+
+    def test_exchange_minimum_shares_veto(self):
+        """4 shares at any price must be vetoed as BELOW_EXCHANGE_MINIMUM."""
+        guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
+        # 4 shares at $0.50 = $2.00 (meets USD min but not share min)
+        result = guard.get_allowed_trade_shares(4.0, 0.50)
+        assert result == 0.0
+
+    def test_exchange_minimum_usd_veto(self):
+        """Shares meeting count but below $1 USD are vetoed."""
+        guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
+        # 5 shares at $0.10 = $0.50 (meets share min but not USD min)
+        result = guard.get_allowed_trade_shares(5.0, 0.10)
+        assert result == 0.0
+
+    def test_exchange_minimum_both_met(self):
+        """5 shares at $0.50 = $2.50 passes both minimums."""
+        guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
+        result = guard.get_allowed_trade_shares(5.0, 0.50)
+        assert result == 5.0
 
     # ── enforce_data_recording ─────────────────────────────────────────
     def test_paper_forces_recording_on(self):
@@ -183,7 +205,7 @@ class TestDeploymentGuard:
     # ── max_trade_size_label ───────────────────────────────────────────
     def test_penny_live_label(self):
         guard = DeploymentGuard(DeploymentEnv.PENNY_LIVE)
-        assert "$1.00" in guard.max_trade_size_label
+        assert "$5.00" in guard.max_trade_size_label
 
     def test_paper_label(self):
         guard = DeploymentGuard(DeploymentEnv.PAPER)

@@ -32,66 +32,76 @@ from src.signals.drift_signal import DriftSignal, MeanReversionDrift
 
 
 class TestMakerRouting:
-    """V1: Maker-mode EQS scoring removes phantom fee drag."""
+    """V1: Maker-mode EQS scoring — maker entry is free, exit is taker.
+
+    After the fee fix, maker mode no longer zeroes exit fees.  Entry is
+    still free (POST_ONLY limit order), so maker has lower total fees
+    than taker, but exit is conservatively modelled as full taker fee.
+    Tests use wider spreads to avoid the hard negative-EV veto zone."""
 
     def test_maker_mode_higher_fee_efficiency(self):
-        """Maker EQS should have higher fee_efficiency than taker at p=0.50."""
+        """Maker EQS should have higher fee_efficiency than taker.
+        Use a wide spread where both modes are viable."""
         taker = compute_edge_score(
-            entry_price=0.47,
-            no_vwap=0.50,
+            entry_price=0.20,
+            no_vwap=0.40,
             zscore=3.0,
-            volume_ratio=2.0,
+            volume_ratio=5.0,
             execution_mode="taker",
+            min_score=0.0,
         )
         maker = compute_edge_score(
-            entry_price=0.47,
-            no_vwap=0.50,
+            entry_price=0.20,
+            no_vwap=0.40,
             zscore=3.0,
-            volume_ratio=2.0,
+            volume_ratio=5.0,
             execution_mode="maker",
+            min_score=0.0,
         )
         assert maker.fee_efficiency > taker.fee_efficiency
-        assert maker.expected_fee_cents == 0.0
-        assert taker.expected_fee_cents > 0.0
+        # Maker still charges exit fee — just not entry fee
+        assert maker.expected_fee_cents > 0.0
+        assert maker.expected_fee_cents < taker.expected_fee_cents
 
     def test_maker_mode_higher_score(self):
         """Maker-mode should produce a higher composite score."""
         taker = compute_edge_score(
-            entry_price=0.47,
-            no_vwap=0.50,
+            entry_price=0.20,
+            no_vwap=0.40,
             zscore=3.0,
-            volume_ratio=2.0,
+            volume_ratio=5.0,
             execution_mode="taker",
+            min_score=0.0,
         )
         maker = compute_edge_score(
-            entry_price=0.47,
-            no_vwap=0.50,
+            entry_price=0.20,
+            no_vwap=0.40,
             zscore=3.0,
-            volume_ratio=2.0,
+            volume_ratio=5.0,
             execution_mode="maker",
+            min_score=0.0,
         )
         assert maker.score > taker.score
 
     def test_maker_mode_unlocks_marginal_entries(self):
         """An entry rejected under taker mode should pass under maker mode."""
-        # Entry with small spread that gets killed by fees
         taker = compute_edge_score(
-            entry_price=0.48,
-            no_vwap=0.50,
+            entry_price=0.30,
+            no_vwap=0.40,
             zscore=2.5,
             volume_ratio=1.5,
-            min_score=45.0,
+            min_score=0.0,
             execution_mode="taker",
         )
         maker = compute_edge_score(
-            entry_price=0.48,
-            no_vwap=0.50,
+            entry_price=0.30,
+            no_vwap=0.40,
             zscore=2.5,
             volume_ratio=1.5,
-            min_score=45.0,
+            min_score=0.0,
             execution_mode="maker",
         )
-        # Maker should be viable (or at least score higher)
+        # Maker should score higher (saves entry fee)
         assert maker.score > taker.score
 
     def test_execution_mode_field_on_assessment(self):

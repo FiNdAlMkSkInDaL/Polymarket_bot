@@ -51,6 +51,8 @@ class BaseSignal:
     market_id: str
     no_asset_id: str = ""
     no_best_ask: float = 0.0
+    is_shadow: bool = False
+    signal_source: str = ""
 
 
 @dataclass
