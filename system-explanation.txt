@@ -507,6 +507,24 @@ Key parameter groups (~160 total):
     l2_enabled = True
     l2_max_levels = 50
     l2_max_seq_gap_rate = 0.02    (2% threshold for reliability)
+    max_active_l2_markets = 50    (config default; deploy_params overrides to 25)
+      Only the top N markets by daily_volume_usd get full L2OrderBook
+      reconstruction + IcebergDetector. Remaining markets fall back to the
+      lightweight OrderbookTracker (price/trade only). See Section 6 → L2
+      Load Shedding and scripts/deploy_params.py.
+
+  TIMEOUTS & COOLDOWNS:
+    exit_timeout_seconds = 1800   (config default; deploy_params overrides to 900)
+      Time before a filled position is force-exited as a timeout. Reduced
+      from 1800s to 900s via deploy_params — MR half-life is ~15 min, so
+      30 min was far too generous.
+    signal_cooldown_minutes = 5.0 (deploy_params override; prevents rapid re-entry)
+    stop_loss_cooldown_s = 300.0  (5 min inter-signal pause after SL / timeout /
+      preemptive drain exits — see Section 8 → PositionManager)
+
+  MARKET QUALITY:
+    min_days_to_resolution = 3    (markets resolving within 3 days are hard-blocked
+      in discovery — see Section 6 → Market Discovery)
 
   RPE (Pillar 14) — Dynamic Prior Generation Engine (DPGE):
     rpe_shadow_mode = False           (live by default now)
@@ -589,6 +607,25 @@ Settings dataclass (outer wrapper):
            whale_threshold_shares=50000, whale_ws_heartbeat_s=30
   - validate_credentials() → list[str] (missing fields for live modes)
   - __repr__ masks secrets: shows first 4 chars + ***
+
+WFO Parameter Deployment (scripts/deploy_params.py):
+  Reads logs/final_validation_tearsheet.json (WFO champion params), selects a
+  conservative subset, and appends them to .env as environment overrides.
+
+  Deployed WFO params:
+    zscore_threshold, alpha_default, min_edge_score, kelly_fraction,
+    stop_loss_cents, drift_z_threshold
+
+  Skipped as overfit: trend_guard_pct (7× default), pce_max_portfolio_var_usd
+    (2× default)
+
+  Manual overrides (hardcoded in MANUAL_OVERRIDES dict):
+    EXIT_TIMEOUT_SECONDS    = 900   (down from 1800 default)
+    MAX_ACTIVE_L2_MARKETS   = 25    (down from 50 default)
+    SIGNAL_COOLDOWN_MINUTES = 5.0
+
+  Usage: python scripts/deploy_params.py        (dry-run, prints diff)
+         python scripts/deploy_params.py --apply (writes .env with backup)
 
 
 ================================================================================
@@ -723,10 +760,20 @@ Market Discovery (src/data/market_discovery.py):
     2. acceptingOrders=True
     3. negRisk=False (if reject_neg_risk config)
     4. len(tokens) == 2 (binary only)
-    5. volume_num_24hr ≥ min_daily_volume_usd
-    6. liquidity ≥ min_liquidity_usd (if min > 0)
-    7. days_to_resolution ≥ min_days_to_resolution
-    8. token_id non-empty for both YES and NO (missing_token_id rejection)
+    5. Hard-block: end_date is None → reject (reason: "missing_end_date")
+       Markets with no parseable end_date are permanently excluded. The CLOB
+       API sometimes returns markets with null or missing end_date fields;
+       these are untradeable for a mean-reversion strategy because there is
+       no time-to-resolution anchor for decay scoring.
+    6. Hard-block: end_date < now() → reject (reason: "already_resolved")
+       Markets whose end_date is in the past are blocked regardless of the
+       API's active/closed flags, which are known to be unreliable (Tier 1
+       CLOB returns stale 2023-era closed markets).
+    7. days_to_resolution ≥ min_days_to_resolution (default: 3)
+       (reason: "resolves_too_soon"; days_left and threshold logged)
+    8. volume_num_24hr ≥ min_daily_volume_usd
+    9. liquidity ≥ min_liquidity_usd (if min > 0)
+    10. token_id non-empty for both YES and NO (missing_token_id rejection)
 
   Token extraction (_normalize_gamma_market):
     - Preferred path: native `tokens` list if present (forward-compat with
@@ -734,11 +781,21 @@ Market Discovery (src/data/market_discovery.py):
     - Fallback: clobTokenIds + outcomes JSON-encoded strings (current Gamma
       schema). Both fields JSON-parsed if str, empty list on decode error.
 
-  Discovery tier status (as of 2026-03-10):
+  Discovery tier status (as of 2026-03-12):
     Tier 1 (CLOB): broken — server ignores active/closed filters, returns
       stale 2023 closed markets. Falls through to Tier 2 every cycle.
     Tier 2 (Gamma /events): primary active path, yields ~150 markets/cycle.
     Tier 3 (Gamma /markets): dormant fallback.
+
+  L2 Load Shedding (src/bot.py):
+    Markets are ranked by daily_volume_usd descending. Only the top
+    max_active_l2_markets (deploy override: 25) receive full L2OrderBook
+    reconstruction + IcebergDetector wiring. All remaining markets are
+    assigned lightweight OrderbookTracker instances (price/trade only,
+    no depth data). This prevents L2 delta storms from overloading the
+    event loop on low-volume shards that yield negligible depth alpha.
+    Load shedding is logged at startup: "load_shedding_applied" with
+    total_markets, l2_active count, and l2_limit.
 
 Market Lifecycle (src/data/market_lifecycle.py):
   4-tier state machine: observing → active → draining → emergency
@@ -1000,6 +1057,13 @@ PositionManager (src/trading/position_manager.py, ~1613 lines):
   Position states: ENTRY_PENDING → ENTRY_FILLED → EXIT_PENDING → CLOSED
                                                                 → CANCELLED
 
+  Stop-loss cooldown: a per-market 300s cooldown is recorded after ANY of
+    these exit reasons: "stop_loss", "preemptive_liquidity_drain", "timeout".
+    (As of 2026-03-12, timeout exits correctly trigger the cooldown — previously
+    they did not, causing a loser-loop where the bot immediately re-entered
+    markets it had just timed out of.)
+    Checked via is_stop_loss_cooled_down(market_id) before new entry signals.
+
   Position dataclass fields (27+): id, market_id, no_asset_id, event_id,
     state, entry/exit orders, prices, sizes, times, target_price, tp_result,
     signal, sizing/kelly results, fee info, chaser tasks, pnl_cents,
@@ -1166,8 +1230,22 @@ Fee Model (src/trading/fees.py):
   Polymarket dynamic curve: f(p) = f_max × 4 × p × (1 − p)
   Peak 2.00% at p=0.50, zero at tails. Maker = always 0 bps.
 
-  compute_net_pnl_cents(entry, exit, size, fee_enabled):
-    PnL = [(exit - entry) - Fee_entry - Fee_exit] × size × 100
+  compute_net_pnl_cents(entry, exit, size, *, fee_enabled,
+                        is_maker_entry=False, is_maker_exit=False):
+    entry_fee = 0.0 if is_maker_entry else get_fee_rate(entry)
+    exit_fee  = 0.0 if is_maker_exit  else get_fee_rate(exit)
+    PnL = [(exit - entry) - entry_fee - exit_fee] × size × 100
+
+    The is_maker_entry / is_maker_exit flags (added 2026-03-12) allow
+    accurate paper PnL accounting. Previously the function always applied
+    the dynamic curve fee to BOTH legs regardless of execution mode, which
+    over-penalised maker entries by ~2% at mid-price and under-reported
+    true round-trip cost for taker exits. Callers (e.g. EdgeFilter paper
+    scoring, PositionManager exit logging) now pass the actual execution
+    mode so simulated PnL matches live fills.
+
+  compute_roundtrip_fee_cents also accepts is_maker_entry / is_maker_exit
+    with identical semantics (entry_fee = 0 when maker, else curve fee).
 
   compute_adaptive_stop_loss_cents(sl_base, entry, fee_enabled):
     trigger   = sl_stretched − fee_drag_cents
@@ -1187,6 +1265,18 @@ Take Profit (src/trading/take_profit.py):
     4. Time decay: < 14d → −0.05
     5. VWAP proximity: > 10% discount → +0.04, < 2% → −0.05
     6. Clamp to [alpha_min, alpha_max]
+
+  Dynamic fee-aware alpha_min floor (added 2026-03-12):
+    At low entry prices (< 0.30) where the quadratic fee curve is steep,
+    a dynamic alpha_min is computed so the TP target covers ≥ 2× round-trip
+    fees. Formula:
+      rt_fee = get_fee_rate(entry) + get_fee_rate(entry + 0.04)
+      required_spread = 2.0 × rt_fee
+      dynamic_alpha_min = required_spread / (VWAP_no − entry)
+      alpha = max(alpha, dynamic_alpha_min)
+      alpha = min(alpha, alpha_max)
+    This prevents the bot from accepting TP targets in the fee-dead-zone
+    where round-trip costs exceed the expected reversion profit.
 
   Fee-floor enforcement: Newton step to widen target if spread < fees
 
