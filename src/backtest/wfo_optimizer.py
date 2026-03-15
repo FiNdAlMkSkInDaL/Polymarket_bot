@@ -191,12 +191,14 @@ class FoldResult:
     is_max_drawdown: float = 0.0
     is_total_pnl: float = 0.0
     is_sortino: float = 0.0
+    is_win_rate: float = 0.0
     is_profit_factor: float = 0.0
     is_total_fills: int = 0
     oos_sharpe: float = 0.0
     oos_max_drawdown: float = 0.0
     oos_total_pnl: float = 0.0
     oos_sortino: float = 0.0
+    oos_win_rate: float = 0.0
     oos_profit_factor: float = 0.0
     oos_total_fills: int = 0
     is_equity_curve: list[tuple[float, float]] = field(default_factory=list)
@@ -217,6 +219,9 @@ class WfoReport:
     aggregate_oos_sharpe: float = 0.0
     aggregate_oos_max_drawdown: float = 0.0
     aggregate_oos_total_pnl: float = 0.0
+    aggregate_oos_win_rate: float = 0.0
+    aggregate_oos_profit_factor: float = 0.0
+    aggregate_oos_trade_count: int = 0
     parameter_stability: dict[str, list[float]] = field(default_factory=dict)
     total_elapsed_s: float = 0.0
 
@@ -323,7 +328,7 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     # Core signal parameters
     # Hardened bounds (March 9 WFO Reset): admit only statistically
     # significant panics.  Prior [0.15, 1.5] allowed sub-σ noise entries.
-    "zscore_threshold": ("suggest_float", 1.0, 2.5),
+    "zscore_threshold": ("suggest_float", 0.2, 2.5),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
     "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
@@ -1216,6 +1221,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             fr.is_max_drawdown = is_metrics.get("max_drawdown", 0.0)
             fr.is_total_pnl = is_metrics.get("total_pnl", 0.0)
             fr.is_sortino = is_metrics.get("sortino_ratio", 0.0)
+            fr.is_win_rate = is_metrics.get("win_rate", 0.0)
             fr.is_profit_factor = is_metrics.get("profit_factor", 0.0)
             fr.is_total_fills = is_metrics.get("total_fills", 0)
             fr.is_equity_curve = is_metrics.get("equity_curve", [])
@@ -1225,6 +1231,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             fr.oos_max_drawdown = oos_metrics.get("max_drawdown", 0.0)
             fr.oos_total_pnl = oos_metrics.get("total_pnl", 0.0)
             fr.oos_sortino = oos_metrics.get("sortino_ratio", 0.0)
+            fr.oos_win_rate = oos_metrics.get("win_rate", 0.0)
             fr.oos_profit_factor = oos_metrics.get("profit_factor", 0.0)
             fr.oos_total_fills = oos_metrics.get("total_fills", 0)
             fr.oos_equity_curve = oos_metrics.get("equity_curve", [])
@@ -1259,6 +1266,18 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
     # ── Overfitting diagnostics ───────────────────────────────────────
     sharpe_decays = [fr.sharpe_decay_pct for fr in fold_results if abs(fr.is_sharpe) > 1e-6]
     avg_decay = float(np.mean(sharpe_decays)) if sharpe_decays else 0.0
+
+    total_oos_trades = int(sum(fr.oos_total_fills for fr in fold_results))
+    if total_oos_trades > 0:
+        agg_oos_win_rate = float(
+            sum(fr.oos_win_rate * fr.oos_total_fills for fr in fold_results) / total_oos_trades
+        )
+        agg_oos_profit_factor = float(
+            sum(fr.oos_profit_factor * fr.oos_total_fills for fr in fold_results) / total_oos_trades
+        )
+    else:
+        agg_oos_win_rate = 0.0
+        agg_oos_profit_factor = 0.0
 
     # Probability of overfitting: fraction of folds where OOS Sharpe < 0
     n_overfit = sum(1 for fr in fold_results if fr.oos_sharpe < 0)
@@ -1334,6 +1353,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         aggregate_oos_sharpe=agg_sharpe,
         aggregate_oos_max_drawdown=agg_dd,
         aggregate_oos_total_pnl=agg_pnl,
+        aggregate_oos_win_rate=agg_oos_win_rate,
+        aggregate_oos_profit_factor=agg_oos_profit_factor,
+        aggregate_oos_trade_count=total_oos_trades,
         parameter_stability=stability,
         total_elapsed_s=elapsed,
         avg_sharpe_decay_pct=avg_decay,
@@ -1381,6 +1403,9 @@ def _export_champion_params(cfg: WfoConfig, report: WfoReport) -> None:
         "meta": {
             "champion_fold": report.champion_fold_index,
             "oos_sharpe": round(report.aggregate_oos_sharpe, 4),
+            "oos_win_rate": round(report.aggregate_oos_win_rate, 4),
+            "oos_profit_factor": round(report.aggregate_oos_profit_factor, 4),
+            "oos_trade_count": int(report.aggregate_oos_trade_count),
             "oos_degradation_pct": round(report.champion_degradation_pct, 2),
             "n_folds": len(report.folds),
             "n_trials_per_fold": cfg.n_trials,

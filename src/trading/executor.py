@@ -64,6 +64,69 @@ class OrderExecutor:
         self._next_id = 1
         self._clob_client: Any = None  # Lazy init
         self._open_count: int = 0  # Incrementally maintained open-order counter
+        self._telegram_alerter: Any = None
+        self._on_shutdown: Callable[[], Any] | None = None
+        self._consecutive_balance_allowance_errors: int = 0
+        self._balance_allowance_error_threshold: int = 5
+        self._balance_breaker_tripped: bool = False
+
+    def configure_runtime_hooks(
+        self,
+        *,
+        telegram_alerter: Any | None = None,
+        on_shutdown: Callable[[], Any] | None = None,
+    ) -> None:
+        """Inject optional runtime hooks from TradingBot.
+
+        ``on_shutdown`` should point to the bot's graceful stop path.
+        """
+        self._telegram_alerter = telegram_alerter
+        self._on_shutdown = on_shutdown
+
+    def _reset_balance_allowance_error_streak(self) -> None:
+        if self._consecutive_balance_allowance_errors > 0:
+            self._consecutive_balance_allowance_errors = 0
+
+    @staticmethod
+    def _is_balance_allowance_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "not enough balance / allowance" in msg
+
+    async def _handle_balance_allowance_error(self, exc: Exception) -> None:
+        self._consecutive_balance_allowance_errors += 1
+        if (
+            self._balance_breaker_tripped
+            or self._consecutive_balance_allowance_errors < self._balance_allowance_error_threshold
+        ):
+            return
+
+        self._balance_breaker_tripped = True
+        err_text = str(exc)
+        log.critical(
+            "balance_allowance_breaker_tripped",
+            consecutive_rejections=self._consecutive_balance_allowance_errors,
+            threshold=self._balance_allowance_error_threshold,
+            action="graceful_shutdown",
+            error=err_text,
+        )
+
+        if self._telegram_alerter is not None:
+            try:
+                await self._telegram_alerter.send(
+                    "🔴 <b>CRITICAL</b>: balance/allowance breaker tripped after "
+                    f"{self._consecutive_balance_allowance_errors} consecutive rejections. "
+                    "Initiating graceful shutdown."
+                )
+            except Exception as notify_exc:
+                log.warning("balance_breaker_telegram_failed", error=str(notify_exc))
+
+        if self._on_shutdown is not None:
+            try:
+                shutdown_result = self._on_shutdown()
+                if asyncio.iscoroutine(shutdown_result):
+                    asyncio.create_task(shutdown_result)
+            except Exception as shutdown_exc:
+                log.error("balance_breaker_shutdown_failed", error=str(shutdown_exc))
 
     # ── CLOB client ─────────────────────────────────────────────────────────
     def _get_clob_client(self) -> Any:
@@ -221,8 +284,13 @@ class OrderExecutor:
                     size=size,
                     post_only=post_only,
                 )
+                self._reset_balance_allowance_error_streak()
             except Exception as exc:
                 order.status = OrderStatus.CANCELLED
+                if self._is_balance_allowance_error(exc):
+                    await self._handle_balance_allowance_error(exc)
+                else:
+                    self._reset_balance_allowance_error_streak()
                 # Log fast-strike failure with latency if applicable
                 if signal_fired_at is not None:
                     fail_at = time.monotonic()
@@ -259,6 +327,7 @@ class OrderExecutor:
                 size=size,
                 asset=asset_id[:16],
             )
+            self._reset_balance_allowance_error_streak()
 
         self._orders[order.order_id] = order
         self._open_count += 1  # Track new live order

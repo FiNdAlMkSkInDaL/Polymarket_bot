@@ -11,8 +11,8 @@ Phase 1: Discovery Sweep
     - Saves champion → logs/phase1_champion.json.
 
 Bounds Narrowing
-    - Reads Phase 1 champion, computes ±15% of original domain width
-      around the winning value for every parameter.
+        - Reads Phase 1 champion, computes strict ±15% around
+            each winning parameter value.
     - Clamps to original absolute min/max.
     - Saves → logs/phase2_bounds.json.
 
@@ -116,10 +116,8 @@ def compute_narrowed_bounds(
 
     For every parameter in ``SEARCH_SPACE``:
 
-        original_width = abs(hi - lo)
-        margin          = half_width_frac × original_width
-        new_lo          = clamp(champion_value - margin, lo, hi)
-        new_hi          = clamp(champion_value + margin, lo, hi)
+        new_lo          = clamp(champion_value × (1 - half_width_frac), lo, hi)
+        new_hi          = clamp(champion_value × (1 + half_width_frac), lo, hi)
 
     Integer parameters produce integer-rounded bounds.
 
@@ -138,24 +136,30 @@ def compute_narrowed_bounds(
             bounds[name] = [orig_lo, orig_hi]
             continue
 
-        domain_width = abs(orig_hi - orig_lo)
-        margin = half_width_frac * domain_width
-
-        new_lo = max(orig_lo, value - margin)
-        new_hi = min(orig_hi, value + margin)
+        margin_mult = float(half_width_frac)
+        new_lo = max(orig_lo, value * (1.0 - margin_mult))
+        new_hi = min(orig_hi, value * (1.0 + margin_mult))
 
         # Guarantee new_lo < new_hi (defend against edge cases)
         if new_lo >= new_hi:
-            new_lo = max(orig_lo, value - margin * 0.01)
-            new_hi = min(orig_hi, value + margin * 0.01)
+            epsilon = max(abs(value) * 0.001, 1e-9)
+            new_lo = max(orig_lo, value - epsilon)
+            new_hi = min(orig_hi, value + epsilon)
             if new_lo >= new_hi:
                 new_lo, new_hi = orig_lo, orig_hi
 
         if method == "suggest_int":
-            new_lo = float(int(new_lo))
-            new_hi = float(int(new_hi))
+            new_lo = float(int(round(new_lo)))
+            new_hi = float(int(round(new_hi)))
+            new_lo = max(new_lo, float(int(orig_lo)))
+            new_hi = min(new_hi, float(int(orig_hi)))
             if new_lo >= new_hi:
-                new_hi = new_lo + 1.0
+                if new_hi < float(int(orig_hi)):
+                    new_hi += 1.0
+                elif new_lo > float(int(orig_lo)):
+                    new_lo -= 1.0
+                else:
+                    new_lo, new_hi = float(int(orig_lo)), float(int(orig_hi))
 
         bounds[name] = [new_lo, new_hi]
 

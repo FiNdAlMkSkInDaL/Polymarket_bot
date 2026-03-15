@@ -203,7 +203,11 @@ class L2WebSocket:
     #  Internal connection
     # ═══════════════════════════════════════════════════════════════════════
     async def _connect_and_consume(self) -> None:
-        async with websockets.connect(self._ws_url, ping_interval=20) as ws:
+        async with websockets.connect(
+            self._ws_url,
+            ping_interval=20,
+            max_size=2**24,
+        ) as ws:
             self._ws = ws
             self._last_message_time = time.time()
             log.info("l2_ws_connected", url=self._ws_url)

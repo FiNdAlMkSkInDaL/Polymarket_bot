@@ -147,7 +147,11 @@ class MarketWebSocket:
 
     # ── internal ───────────────────────────────────────────────────────────
     async def _connect_and_consume(self) -> None:
-        async with websockets.connect(self.ws_url, ping_interval=20) as ws:
+        async with websockets.connect(
+            self.ws_url,
+            ping_interval=20,
+            max_size=2**24,
+        ) as ws:
             self._ws = ws
             self._last_message_time = time.time()
             log.info("ws_connected", url=self.ws_url)

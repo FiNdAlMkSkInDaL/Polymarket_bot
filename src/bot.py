@@ -165,6 +165,10 @@ class TradingBot:
         )
         self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
+        self.executor.configure_runtime_hooks(
+            telegram_alerter=self.telegram,
+            on_shutdown=self._schedule_stop,
+        )
         self.lifecycle = MarketLifecycleManager()
         self.latency_guard = LatencyGuard()
 

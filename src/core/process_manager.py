@@ -88,11 +88,13 @@ class ProcessManager:
         n_l2_workers: int | None = None,
         heartbeat_stale_s: float = 3.0,
         health_check_interval_s: float = 1.0,
+        stale_startup_grace_s: float = 15.0,
     ) -> None:
         cpu = os.cpu_count() or 4
         self._n_l2_workers = n_l2_workers or max(1, min(cpu - 2, 4))
         self._on_emergency_stop = on_emergency_stop
         self._health_interval = health_check_interval_s
+        self._stale_startup_grace_s = stale_startup_grace_s
         self._heartbeat_checker = WorkerHeartbeatChecker(stale_threshold_s=heartbeat_stale_s)
 
         # Worker registry
@@ -347,6 +349,7 @@ class ProcessManager:
         self._running = True
         # Give workers time to initialize
         await asyncio.sleep(5.0)
+        monitor_started_at = time.monotonic()
 
         while self._running:
             try:
@@ -378,6 +381,8 @@ class ProcessManager:
 
                 stale = self._heartbeat_checker.stale_workers()
                 if stale:
+                    now = time.monotonic()
+                    in_startup_grace = (now - monitor_started_at) < self._stale_startup_grace_s
                     names = [w.worker_id for w in stale]
                     durations = {w.worker_id: round(w.stale_duration, 1) for w in stale}
                     log.warning(
@@ -385,6 +390,14 @@ class ProcessManager:
                         workers=names,
                         durations=durations,
                     )
+                    if in_startup_grace:
+                        log.info(
+                            "workers_stale_ignored_startup_grace",
+                            workers=names,
+                            stale_durations=durations,
+                            grace_s=self._stale_startup_grace_s,
+                        )
+                        continue
                     # Only emergency-stop if stale beyond 2× threshold (gives
                     # workers a chance to recover after GC pauses etc.)
                     critical = [w for w in stale if w.stale_duration > 6.0]

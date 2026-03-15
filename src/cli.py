@@ -142,6 +142,15 @@ def run(
             "  Usage: polybot run --env PRODUCTION --confirm-production"
         )
 
+    if env == DeploymentEnv.PENNY_LIVE:
+        proceed = click.confirm(
+            "PENNY_LIVE uses real wallet funds. Continue?",
+            default=False,
+        )
+        if not proceed:
+            click.echo("Aborted PENNY_LIVE launch.", err=True)
+            sys.exit(1)
+
     # ── Credential validation ──────────────────────────────────────────
     if env != DeploymentEnv.PAPER:
         from src.core.config import settings

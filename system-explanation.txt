@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 10, 2026
+  Last updated: March 15, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -102,13 +102,13 @@ src/                      — main bot package
     ipc.py                — SharedBookWriter + SharedBookReader; double-buffered Seqlock shared memory for cross-process L2 exchange (~454 lines)
     latency_guard.py      — LatencyGuard (HEALTHY→DEGRADED→BLOCKED state machine)
     logger.py             — structlog JSON logging with async-safe QueueHandler
-    process_manager.py    — ProcessManager; spawns/monitors L2 worker shards + PCE worker; allocates shared memory; health loop via WorkerHeartbeatChecker
+    process_manager.py    — ProcessManager; spawns/monitors L2 worker shards + PCE worker; allocates shared memory; health loop via WorkerHeartbeatChecker with startup stale-grace window
     worker_heartbeat.py   — WorkerHealth, WorkerHeartbeatSender (worker side), WorkerHeartbeatChecker (main side); process liveness protocol (separate from Pillar 8 BookHeartbeat)
 
   data/                   — market data pipeline
     types.py              — Level dataclass (price, size)
       websocket_client.py   — MarketWebSocket + MarketWebSocketPool (sharded trade/book events)
-    l2_websocket.py       — L2WebSocket (dedicated L2 delta stream)
+    l2_websocket.py       — L2WebSocket (dedicated L2 delta stream; enlarged WS frame max_size for large snapshots)
     l2_worker.py          — l2_worker_main() subprocess entry; handles L2WebSocket + L2OrderBook for an asset shard; publishes via SharedBookWriter; heartbeat + circuit-breaker events
     l2_book.py            — L2OrderBook (full-depth reconstruction, seq tracking, liquidity-gap detection ~840 lines)
     orderbook.py          — OrderbookTracker (top-of-book), L2OrderBookAdapter
@@ -551,6 +551,8 @@ DeploymentGuard enforces capital constraints WITHOUT mutating frozen config.
     - get_allowed_trade_size(raw) → min(raw, $1.00) — UN-OVERRIDEABLE
     - get_allowed_trade_shares() → iteratively clamps to $1.00 notional
     - get_wallet_balance() → max_trade_size_usd × 5
+    - CLI launch now requires explicit interactive confirmation prompt
+      (click.confirm, default=False) before starting PENNY_LIVE
     - V4 Probe sizing is BYPASSED (probe flag cleared; log emitted)
     - Probe harvesting (scale_probe_to_full) returns None immediately
       Reason: $1 clamp makes probe and full sizes identical, destroying
@@ -594,6 +596,8 @@ Two parallel market-data transport paths:
        (default: 120.0s; raised from 10.0s on 2026-03-09 to eliminate
        spurious reconnects on low-volume 50-market shards)
      - Bounded queues: drops OLDEST on overflow (preserves latest state)
+    - WebSocket frame ceiling raised: websockets.connect(..., max_size=2**24)
+      to prevent 1009 "message too big" disconnects during high-volume snapshots
      - Failure domain is isolated: if one shard disconnects, only that shard
        reconnects; sibling shards remain live
 
@@ -602,6 +606,8 @@ Two parallel market-data transport paths:
        from starving trade processing)
      - Routes to L2OrderBook instances directly
      - Handles snapshot fetching on connect/desync
+    - Uses websockets.connect(..., max_size=2**24) to absorb oversized
+      initial book frames and avoid repeated 1009 disconnect loops
      - Retry with exponential backoff
 
 L2OrderBook (src/data/l2_book.py, ~790 lines):
@@ -1025,6 +1031,11 @@ OrderExecutor (src/trading/executor.py):
   Paper mode: records locally, simulates fills with slippage
   Live mode: py-clob-client → create_order + post_order
   POST_ONLY rejection detection: status="rejected" → CANCELLED + "would_cross"
+  Balance/allowance fail-fast breaker:
+    - Tracks consecutive "not enough balance / allowance" placement failures
+    - At 5 consecutive rejections: emits CRITICAL structlog event
+      (balance_allowance_breaker_tripped), sends Telegram alert, and
+      invokes graceful bot shutdown hook (wired via TradingBot)
   OrderStatusPoller: polls CLOB REST for live-order updates (2s interval)
 
 OrderChaser (src/trading/chaser.py):
@@ -1343,6 +1354,11 @@ WfoConfig: train_days=30, test_days=7, step_days=7, embargo_days=1,
   n_trials=100, max_workers=cpu_count-1, max_markets=None (optional universe cap),
   search_space_bounds_path=None (optional external per-parameter bounds JSON)
 
+Important March 15 floor correction:
+  SEARCH_SPACE absolute bounds for zscore_threshold are now [0.2, 2.5]
+  (previously [1.0, 2.5]). This prevents false zero-trade lockout on
+  backfilled datasets where observed z-scores peak below 1.0.
+
 22-parameter search space:
   Core: zscore_threshold, spread_compression_pct, volume_ratio_threshold, trend_guard_pct
   Risk: stop_loss_cents, trailing_stop_offset_cents, kelly_fraction, max_impact_pct
@@ -1363,6 +1379,15 @@ External bounds injection (search_space_bounds_path):
   When path is None or file absent, full SEARCH_SPACE bounds are used.
   This is the mechanism used by the 3-phase pipeline scripts to progressively
   narrow the Optuna search space between phases.
+
+Phase-2 narrowing semantics (March 15 fix):
+  compute_narrowed_bounds() in scripts/run_optimization_pipeline.py now uses
+  strict multiplicative tightening around the Phase-1 champion:
+    lo = champion * (1 - 0.15)
+    hi = champion * (1 + 0.15)
+  then clamps to SEARCH_SPACE absolute [min, max].
+  This replaced the prior buggy domain-width-based narrowing that could
+  unintentionally expand ranges far beyond ±15% of the champion value.
 
 Composite objective:
   Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
@@ -1466,14 +1491,20 @@ scripts/run_optimization_pipeline.py:
     Output: logs/phase1_champion.json
 
   Phase 2 — Refinement: 10 markets, 30 days, 100 trials, 2 workers on the VPS.
-    Search space narrowed to ±15% around Phase 1 champion via
-    compute_narrowed_bounds(). Warm-started from Phase 1 output.
+    Search space narrowed to strict ±15% around Phase 1 champion via
+    compute_narrowed_bounds() (multiplicative, then absolute-bound clamp).
+    Warm-started from Phase 1 output.
     Outputs: logs/phase2_champion.json, logs/phase2_bounds.json
 
   Phase 3 — Validation: 31 markets, 30 days, 1 trial.
     Bounds epsilon-locked to Phase 2 champion for a deterministic
     out-of-sample tearsheet.
     Outputs: logs/final_validation_tearsheet.json, logs/phase3_locked_bounds.json
+
+  March 15, 2026 export enrichment:
+    final_validation_tearsheet.json meta now includes
+    oos_win_rate, oos_profit_factor, and oos_trade_count in addition to
+    oos_sharpe / degradation / overfit diagnostics.
 
   Per-phase Optuna databases:
     logs/wfo_phase1.db, wfo_phase2.db, wfo_phase3.db
@@ -2084,7 +2115,8 @@ bot.py (orchestrator)
   ├── core/latency_guard.py (LatencyGuard → used by bot + chaser)
   ├── core/logger.py (structlog → used by ALL modules)
   ├── core/process_manager.py (ProcessManager → spawns l2_worker shards + pce_worker;
-  │                            health_check_loop task in bot; emergency stop on worker failure)
+  │                            health_check_loop task in bot; startup stale grace;
+  │                            emergency stop on worker failure)
   ├── core/worker_heartbeat.py (WorkerHeartbeatSender in workers; WorkerHeartbeatChecker in ProcessManager)
   │
   ├── data/websocket_client.py (MarketWebSocketPool → feeds trade_queue,
@@ -2223,6 +2255,19 @@ March 9th — Market WebSocket Sharding:
   - Prevents any single WS connection from hitting Polymarket's per-socket
     subscription limit as the tracked asset universe grows.
 
+March 15th — PENNY_LIVE Safety + L2 Transport Hardening:
+  - CLI now blocks PENNY_LIVE startup unless the operator explicitly confirms
+    an interactive prompt (default deny).
+  - OrderExecutor now tracks consecutive "not enough balance / allowance"
+    rejections and trips a fail-fast breaker at 5 consecutive hits:
+      CRITICAL log + Telegram alert + graceful bot shutdown hook.
+  - L2WebSocket and MarketWebSocket now set websockets.connect(..., max_size=2**24)
+    to prevent 1009 "message too big" disconnect loops during snapshot bursts.
+  - ProcessManager health_check_loop now applies a 15s startup stale-grace
+    before enforcing critical stale-worker escalation.
+  - Post-fix VPS verification: no 1009 disconnects in isolated restart window,
+    l2_worker_0 remained alive, and heartbeat recovered without emergency stop.
+
 March 9th — IPC Seqlock Cleanup (Band-aid 1 Remediation):
   - Removed IPCReadError exception class from src/core/ipc.py; no production
     caller used it.
@@ -2258,6 +2303,22 @@ March 9th — Circuit Breaker Graceful Suspend & Hard Reset (Band-aid 3 Remediat
       Step 4: rebuild MarketWebSocketPool + new ws task
       Step 5: self._trade_loop_breaker.reset()
       Step 6: self._fast_kill_event.set()     → resume chasers
+
+March 15th — WFO Pipeline Corrections (Phase-2/3 Reliability):
+  - Fixed phase2 bounds narrowing bug in scripts/run_optimization_pipeline.py:
+    old logic used ±15% of full parameter domain width, which could produce
+    oversized windows (for some params effectively far beyond ±15% of champion).
+    New logic enforces strict ±15% around champion value with SEARCH_SPACE clamp.
+  - Updated src/backtest/wfo_optimizer.py SEARCH_SPACE floor for
+    zscore_threshold from 1.0 to 0.2 to avoid data-regime lockout where
+    observed replay z-scores are sub-1.0.
+  - Enriched Phase-3 tearsheet export metadata with explicit
+    oos_win_rate, oos_profit_factor, and oos_trade_count.
+  - Operational runbook validated on VPS:
+      1) kill doomed tmux run,
+      2) patch/deploy wfo_optimizer.py,
+      3) delete logs/wfo_phase2.db + logs/phase2_bounds.json,
+      4) restart pipeline with --skip-to narrowing.
       Step 7: Telegram "✅ WS Hard-Reset complete"
   - self._running, positions, executor, PCE, risk state, StopLossMonitor,
     AdverseSelectionGuard all preserved across reset.
