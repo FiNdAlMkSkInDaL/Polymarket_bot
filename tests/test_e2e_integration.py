@@ -33,7 +33,7 @@ from src.data.synthetic import SyntheticGenerator, _DEFAULT_YES_ASSET, _DEFAULT_
 # ═══════════════════════════════════════════════════════════════════════════
 
 _SEED = 42
-_NUM_ROWS = 50_000          # smaller for CI speed, still large enough
+_NUM_ROWS = 10_000          # lean for CI speed, covers all code paths
 _DURATION_HOURS = 48.0
 _NUM_ASSETS = 3
 _GAP_PROB = 0.01

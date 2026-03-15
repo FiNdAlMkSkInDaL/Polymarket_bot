@@ -461,7 +461,12 @@ class L2OrderBook:
 
     def _apply_delta_changes(self, data: dict) -> None:
         """Apply price/size changes from a delta message."""
-        changes = data.get("changes") or data.get("data") or []
+        changes = (
+            data.get("changes")
+            or data.get("price_changes")
+            or data.get("data")
+            or []
+        )
         if isinstance(changes, dict):
             changes = [changes]
 

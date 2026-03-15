@@ -225,6 +225,96 @@ def kill() -> None:
     click.echo("    sudo systemctl stop polymarket-bot")
 
 
+@main.command("shadow-report")
+@click.option("--db", default="logs/trades.db", help="Path to SQLite trade database.")
+@click.option("--source", default=None, help="Filter to a specific signal source (e.g. SI-3).")
+def shadow_report(db: str, source: str | None) -> None:
+    """Generate a tearsheet for shadow strategies and evaluate go-live readiness."""
+
+    async def _report() -> None:
+        from src.monitoring.trade_store import TradeStore
+
+        store = TradeStore(db)
+        await store.init()
+
+        if source:
+            sources = [source]
+        else:
+            sources = await store.get_all_shadow_sources()
+
+        if not sources:
+            click.echo("\n⚠️  No shadow trades found.\n")
+            await store.close()
+            return
+
+        click.echo("\n👻  Shadow Strategy Performance Report")
+        click.echo("═" * 60)
+
+        for src_name in sources:
+            ready, stats = await store.passes_shadow_go_live(src_name)
+
+            total = stats.get("total_trades", 0)
+            wr = stats.get("win_rate", 0.0)
+            ev = stats.get("expectancy_cents", 0.0)
+            total_pnl = stats.get("total_pnl_cents", 0.0)
+            avg_win = stats.get("avg_win_cents", 0.0)
+            avg_loss = stats.get("avg_loss_cents", 0.0)
+            max_dd = stats.get("max_drawdown_cents", 0.0)
+            target_exits = stats.get("target_exits", 0)
+            stop_exits = stats.get("stop_exits", 0)
+            avg_hold = stats.get("avg_hold_seconds", 0)
+
+            click.echo(f"\n📊  Signal Source: {src_name}")
+            click.echo("─" * 50)
+            click.echo(f"  {'Total trades':<30} {total}")
+            click.echo(f"  {'Win rate':<30} {wr:.1%}")
+            click.echo(f"  {'Expectancy (cents)':<30} {ev:+.2f}")
+            click.echo(f"  {'Total PnL (cents)':<30} {total_pnl:+.2f}")
+            click.echo(f"  {'Avg win (cents)':<30} {avg_win:+.2f}")
+            click.echo(f"  {'Avg loss (cents)':<30} {avg_loss:+.2f}")
+            click.echo(f"  {'Max drawdown (cents)':<30} {max_dd:.2f}")
+            click.echo(f"  {'TP exits':<30} {target_exits}")
+            click.echo(f"  {'SL exits':<30} {stop_exits}")
+            click.echo(f"  {'Avg hold (seconds)':<30} {avg_hold:.0f}")
+
+            # Go-live criteria evaluation
+            criteria_lines = []
+            criteria_lines.append(
+                f"    {'≥20 trades':<26} {'✅' if total >= 20 else '❌'}  ({total})"
+            )
+            criteria_lines.append(
+                f"    {'WR ≥ 55%':<26} {'✅' if wr >= 0.55 else '❌'}  ({wr:.1%})"
+            )
+            criteria_lines.append(
+                f"    {'Positive EV':<26} {'✅' if ev > 0 else '❌'}  ({ev:+.2f}¢)"
+            )
+
+            click.echo(f"\n  Go-live criteria:")
+            for line in criteria_lines:
+                click.echo(line)
+
+            if ready:
+                click.echo(
+                    click.style(
+                        f"\n  ✅ {src_name}: READY FOR DEPLOYMENT",
+                        fg="green",
+                        bold=True,
+                    )
+                )
+            else:
+                click.echo(
+                    click.style(
+                        f"\n  ❌ {src_name}: NOT READY",
+                        fg="red",
+                    )
+                )
+
+        click.echo()
+        await store.close()
+
+    asyncio.run(_report())
+
+
 @main.command()
 def scores() -> None:
     """Discover markets and print their quality scores (no trading)."""
@@ -368,6 +458,10 @@ def wfo(
 ) -> None:
     """Run Walk-Forward Optimization on recorded historical data."""
     import os
+
+    from src.core.logger import setup_logging
+
+    setup_logging(log_dir="logs", log_file="wfo.jsonl")
 
     from src.backtest.wfo_optimizer import WfoConfig, run_wfo
 

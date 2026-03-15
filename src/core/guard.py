@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from src.core.config import (
     DeploymentEnv,
+    EXCHANGE_MIN_SHARES,
+    EXCHANGE_MIN_USD,
     PENNY_LIVE_MAX_TRADE_USD,
     settings,
 )
@@ -106,6 +108,10 @@ class DeploymentGuard:
         Robust against floating-point rounding errors: verifies the final
         notional value and iteratively decreases the share count if needed
         to strictly enforce the USD cap (critical for PENNY_LIVE).
+
+        Exchange minimums (total_usd >= $1.00 AND shares >= 5) are
+        enforced for live phases.  If the clamped result falls below
+        either floor the trade is vetoed (returns 0.0).
         """
         if entry_price <= 0:
             return 0.0
@@ -113,8 +119,8 @@ class DeploymentGuard:
         raw_usd = raw_shares * entry_price
         allowed_usd = self.get_allowed_trade_size(raw_usd)
 
-        # Convert USD → shares with rounding
-        clamped_shares = round(allowed_usd / entry_price, 2)
+        # Convert USD → shares, floored to whole shares
+        clamped_shares = int(allowed_usd / entry_price)
 
         # ── Post-condition check: verify notional value ───────────────────
         # Guard against floating-point rounding causing the final USD value
@@ -122,31 +128,36 @@ class DeploymentGuard:
         if self._env == DeploymentEnv.PENNY_LIVE:
             final_usd = clamped_shares * entry_price
             if final_usd > PENNY_LIVE_MAX_TRADE_USD:
-                # Iteratively reduce by 0.01 shares until under cap
-                # (max 100 iterations = safety net for $0.01+ tokens)
-                for _ in range(100):
-                    clamped_shares = round(clamped_shares - 0.01, 2)
-                    if clamped_shares <= 0:
-                        return 0.0
-                    final_usd = clamped_shares * entry_price
-                    if final_usd <= PENNY_LIVE_MAX_TRADE_USD:
-                        break
-                else:
-                    # Fallback: force to 1 share if price is sane
-                    if entry_price <= PENNY_LIVE_MAX_TRADE_USD:
-                        clamped_shares = 1.0
-                    else:
-                        clamped_shares = 0.0
+                # Reduce by 1 share at a time until under cap
+                while clamped_shares > 0 and clamped_shares * entry_price > PENNY_LIVE_MAX_TRADE_USD:
+                    clamped_shares -= 1
 
+            final_usd = clamped_shares * entry_price
+
+            if final_usd > PENNY_LIVE_MAX_TRADE_USD:
                 log.warning(
                     "penny_live_shares_post_clamped",
                     entry_price=round(entry_price, 6),
                     original_shares=round(raw_shares, 4),
-                    final_shares=round(clamped_shares, 4),
-                    final_usd=round(clamped_shares * entry_price, 6),
+                    final_shares=clamped_shares,
+                    final_usd=round(final_usd, 6),
                 )
 
-        return clamped_shares
+        # ── Exchange minimum enforcement (live phases only) ───────────────
+        if self.is_live:
+            final_usd = clamped_shares * entry_price
+            if clamped_shares < EXCHANGE_MIN_SHARES or final_usd < EXCHANGE_MIN_USD:
+                log.info(
+                    "veto_below_exchange_minimum",
+                    reason="BELOW_EXCHANGE_MINIMUM",
+                    shares=clamped_shares,
+                    usd=round(final_usd, 4),
+                    min_shares=EXCHANGE_MIN_SHARES,
+                    min_usd=EXCHANGE_MIN_USD,
+                )
+                return 0.0
+
+        return float(clamped_shares)
 
     # ── Data recording policy ─────────────────────────────────────────────
 

@@ -139,6 +139,23 @@ def compute_take_profit(
     # Clamp alpha
     alpha = max(strat.alpha_min, min(strat.alpha_max, alpha))
 
+    # ── Fee-aware dynamic alpha floor ──────────────────────────────────────
+    # At low prices the quadratic fee curve is steep relative to mean-
+    # reversion spread.  Raise alpha so the target covers ≥ 2× round-trip
+    # fee, preventing entries where fee drag eclipses the expected move.
+    if entry_price < 0.30 and no_vwap > entry_price and fee_enabled:
+        fee_multiplier = 2.0
+        rt_fee = get_fee_rate(entry_price, fee_enabled=True) + get_fee_rate(
+            entry_price + 0.04, fee_enabled=True,
+        )
+        required_spread = fee_multiplier * rt_fee
+        anchor = no_vwap - entry_price
+        if anchor > 0:
+            dynamic_alpha_min = required_spread / anchor
+            alpha = max(alpha, dynamic_alpha_min)
+            # Re-apply hard ceiling so adjustments stay bounded
+            alpha = min(alpha, strat.alpha_max)
+
     # ── Target price ────────────────────────────────────────────────────────
     if no_vwap <= entry_price:
         # Edge case: VWAP has already moved below our entry (rare).

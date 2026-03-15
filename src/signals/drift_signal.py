@@ -209,6 +209,7 @@ class MeanReversionDrift:
             ewma_vol=round(ewma_vol, 6),
             lookback_bars=self.lookback_bars,
             timestamp=time.time(),
+            signal_source="V3_MeanRevDrift",
         )
 
         log.debug(

@@ -102,6 +102,7 @@ class MarketInfo:
     score: float = 0.0
     accepting_orders: bool = True
     tags: str = ""
+    neg_risk: bool = False
 
 
 async def fetch_active_markets(
@@ -532,14 +533,17 @@ def _parse_market(
         if not raw.get("acceptingOrders", True):
             return None, {"reason": "not_accepting_orders", "question": question}
 
-        # Reject negRisk bracket markets — correlated pricing breaks
-        # the mean-reversion assumption
-        if settings.strategy.reject_neg_risk and raw.get("negRisk", False):
-            return None, {
-                "reason": "neg_risk_group",
-                "group_title": raw.get("groupItemTitle", "")[:40],
-                "question": question,
-            }
+        # Reject negRisk bracket markets for mean-reversion — unless
+        # SI-9 combo arb is enabled, in which case we admit them for
+        # cluster discovery (they are filtered separately).
+        is_neg_risk = bool(raw.get("negRisk", False))
+        if settings.strategy.reject_neg_risk and is_neg_risk:
+            if not settings.strategy.si9_arb_enabled:
+                return None, {
+                    "reason": "neg_risk_group",
+                    "group_title": raw.get("groupItemTitle", "")[:40],
+                    "question": question,
+                }
 
         # Token count check — must be exactly 2 (true binary)
         tokens = raw.get("tokens", [])
@@ -587,15 +591,28 @@ def _parse_market(
             except ValueError:
                 end_date = None
 
-        if end_date:
-            days_left = (end_date - datetime.now(timezone.utc)).days
-            if days_left < min_days_to_resolution:
-                return None, {
-                    "reason": "resolves_too_soon",
-                    "days_left": days_left,
-                    "threshold": min_days_to_resolution,
-                    "question": question,
-                }
+        # Hard-block markets with no parseable end_date — we cannot
+        # gate resolution risk without one.
+        if end_date is None:
+            return None, {"reason": "missing_end_date", "question": question}
+
+        days_left = (end_date - datetime.now(timezone.utc)).days
+
+        # Hard-block already-resolved markets regardless of API flags
+        if days_left < 0:
+            return None, {
+                "reason": "already_resolved",
+                "end_date": str(end_date),
+                "question": question,
+            }
+
+        if days_left < min_days_to_resolution:
+            return None, {
+                "reason": "resolves_too_soon",
+                "days_left": days_left,
+                "threshold": min_days_to_resolution,
+                "question": question,
+            }
 
         # Identify YES / NO tokens
         yes_token = None
@@ -635,6 +652,7 @@ def _parse_market(
             liquidity_usd=float(raw.get("liquidity", 0)),
             accepting_orders=bool(raw.get("acceptingOrders", True)),
             tags=raw.get("tags", raw.get("category", "")),
+            neg_risk=bool(raw.get("negRisk", False)),
         ), None
 
     except (KeyError, TypeError, ValueError) as exc:

@@ -363,8 +363,11 @@ class TestEnvSafety:
     def test_paper_mode_default_is_true(self):
         """Paper mode should default to True (safe default)."""
         from src.core.config import Settings
-        # With PAPER_MODE not set, should default to True
-        with patch.dict(os.environ, {"PAPER_MODE": "true"}):
+        # With DEPLOYMENT_ENV unset and PAPER_MODE=true, should default to True
+        env = os.environ.copy()
+        env.pop("DEPLOYMENT_ENV", None)
+        env["PAPER_MODE"] = "true"
+        with patch.dict(os.environ, env, clear=True):
             s = Settings()
             assert s.paper_mode is True
 

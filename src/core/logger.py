@@ -21,7 +21,11 @@ _CONFIGURED = False
 _LISTENER: logging.handlers.QueueListener | None = None
 
 
-def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
+def setup_logging(
+    log_dir: str = "logs",
+    level: int = logging.INFO,
+    log_file: str = "bot.jsonl",
+) -> None:
     """Initialise structured logging.  Safe to call multiple times."""
     global _CONFIGURED, _LISTENER
     if _CONFIGURED:
@@ -32,7 +36,7 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
 
     # Rotating file handler — 10 MB per file, 5 backups
     file_handler = logging.handlers.RotatingFileHandler(
-        log_path / "bot.jsonl",
+        log_path / log_file,
         encoding="utf-8",
         maxBytes=10 * 1024 * 1024,  # 10 MB
         backupCount=5,

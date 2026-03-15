@@ -33,12 +33,13 @@ from src.signals.edge_filter import ConfluenceContext, compute_confluence_discou
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
-from src.signals.signal_framework import BaseSignal
+from src.signals.signal_framework import BaseSignal, VacuumSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
 from src.trading.fees import (
     compute_adaptive_stop_loss_cents,
     compute_adaptive_trailing_offset_cents,
     compute_net_pnl_cents,
+    get_fee_rate,
 )
 from src.trading.sizer import (
     KellyResult,
@@ -57,6 +58,16 @@ class PositionState(str, Enum):
     EXIT_PENDING = "EXIT_PENDING"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
+
+
+class ComboState(str, Enum):
+    """Lifecycle state for a multi-leg combinatorial arb position."""
+
+    ENTRY_PENDING = "ENTRY_PENDING"     # orders placed, waiting for fills
+    PARTIAL_FILL = "PARTIAL_FILL"       # some legs filled, others pending
+    ALL_FILLED = "ALL_FILLED"           # all legs filled — risk-free
+    ABANDONED = "ABANDONED"             # leg(s) timed out, unwinding
+    CLOSED = "CLOSED"                   # resolved or emergency-drained
 
 
 @dataclass
@@ -130,6 +141,48 @@ class Position:
     def effective_size(self) -> float:
         """Shares to use for exit orders / PnL — filled_size if set, else entry_size."""
         return self.filled_size if self.filled_size > 0 else self.entry_size
+
+
+@dataclass
+class ComboPosition:
+    """Tracks a multi-leg combinatorial arbitrage position (SI-9).
+
+    All legs target the same share count.  The combo is risk-free
+    once ALL legs fill (guaranteed $1.00 payout at resolution).
+    """
+
+    combo_id: str
+    event_id: str
+    state: ComboState = ComboState.ENTRY_PENDING
+    target_size: float = 0.0                           # uniform shares per leg
+    legs: dict[str, Position] = field(default_factory=dict)   # market_id → Position
+    created_at: float = field(default_factory=time.time)
+
+    @property
+    def n_legs(self) -> int:
+        return len(self.legs)
+
+    @property
+    def filled_legs(self) -> list[Position]:
+        return [p for p in self.legs.values() if p.state == PositionState.ENTRY_FILLED]
+
+    @property
+    def pending_legs(self) -> list[Position]:
+        return [p for p in self.legs.values() if p.state == PositionState.ENTRY_PENDING]
+
+    @property
+    def all_filled(self) -> bool:
+        return all(p.state == PositionState.ENTRY_FILLED for p in self.legs.values())
+
+    @property
+    def total_collateral(self) -> float:
+        return sum(p.entry_price * p.entry_size for p in self.legs.values())
+
+    @property
+    def pnl_cents_if_resolved(self) -> float:
+        """Expected PnL if all legs fill and the event resolves."""
+        sum_entry = sum(p.entry_price for p in self.legs.values())
+        return (1.0 - sum_entry) * self.target_size * 100.0
 
 
 class PositionManager:
@@ -316,6 +369,7 @@ class PositionManager:
                 "trade_asset_id": p.trade_asset_id,
                 "no_asset_id": p.no_asset_id,
                 "event_id": p.event_id,
+                "trade_side": p.trade_side,
             }
             for p in open_positions
         ]
@@ -919,7 +973,8 @@ class PositionManager:
             slippage_rt_cents = 2 * strat.paper_slippage_cents
             entry_fee_cents = entry_fee_frac * 100.0
             exit_est_price = tp.target_price
-            exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=fee_enabled) * 100.0
+            # Exit is taker — always model fee regardless of market category.
+            exit_fee_cents = get_fee_rate(exit_est_price, fee_enabled=True) * 100.0
             min_viable_spread = slippage_rt_cents + entry_fee_cents + exit_fee_cents + strat.desired_margin_cents
         if tp.spread_cents < min_viable_spread:
             log.info(
@@ -1517,6 +1572,7 @@ class PositionManager:
             exit_price=pos.exit_price,
             size=pos.effective_size,
             fee_enabled=pos.fee_enabled,
+            is_maker_entry=(pos.entry_fee_bps == 0 and pos.fee_enabled),
         )
 
         # Release heavy references to allow GC of closures and metadata
@@ -1540,7 +1596,7 @@ class PositionManager:
         # Includes preemptive_liquidity_drain which is a loss-exit that was
         # previously missing — its omission caused a loser-loop where the bot
         # re-entered immediately after a preemptive OBI exit.
-        if reason in ("stop_loss", "preemptive_liquidity_drain"):
+        if reason in ("stop_loss", "preemptive_liquidity_drain", "timeout"):
             self._stop_loss_cooldowns[pos.market_id] = pos.exit_time
 
         log.info(
@@ -2072,3 +2128,790 @@ class PositionManager:
                 )
 
         return positions
+
+    # ── Vacuum stink-bid strategy (ghost liquidity exploit) ────────────
+    async def open_vacuum_stink_bids(
+        self,
+        signal: VacuumSignal,
+        *,
+        event_id: str = "",
+    ) -> list[Position]:
+        """Place POST_ONLY limit orders on both sides during a ghost liquidity vacuum.
+
+        When a :class:`VacuumSignal` fires (>50% depth drop), this method
+        places deeply OTM maker orders to catch flash-crash wicks caused
+        by retail market orders hitting the thinned book.
+
+        All orders are strictly POST_ONLY to guarantee maker execution
+        (0 bps fee).  Sizing is capped by Kelly / VaR gates and the
+        ``vacuum_stink_bid_max_risk_usd`` hard cap ($1–$2).
+
+        Parameters
+        ----------
+        signal:
+            The VacuumSignal carrying mid-price and asset IDs.
+        event_id:
+            Market event id for risk-gate checks.
+
+        Returns
+        -------
+        list[Position]
+            Positions created for each stink bid placed (bid + ask sides).
+        """
+        strat = settings.strategy
+        if not strat.vacuum_stink_bid_enabled:
+            return []
+
+        mid = signal.mid_price
+        if mid <= 0:
+            return []
+
+        offset = strat.vacuum_stink_bid_offset_cents / 100.0  # cents → dollars
+        max_risk_usd = strat.vacuum_stink_bid_max_risk_usd
+
+        # mid is the YES token mid-price; NO mid = 1.0 - mid.
+        # Each stink bid sits *below* that side's mid to catch flash-crash wicks.
+        yes_bid = round(max(0.01, mid - offset), 2)
+        no_bid = round(max(0.01, (1.0 - mid) - offset), 2)
+
+        # ── Spread-aware clamping ──────────────────────────────────────────────────────
+        # During ghost-liquidity events the spread blows out.  If the
+        # calculated bid >= best_ask, POST_ONLY would reject because the
+        # order would cross.  Clamp each bid to best_ask - 0.01 so it
+        # always rests as a maker order.
+        yes_tracker = self._book_trackers.get(signal.yes_asset_id)
+        no_tracker = self._book_trackers.get(signal.no_asset_id)
+
+        if yes_tracker is not None and yes_tracker.best_ask > 0:
+            yes_bid = round(min(yes_bid, yes_tracker.best_ask - 0.01), 2)
+        if no_tracker is not None and no_tracker.best_ask > 0:
+            no_bid = round(min(no_bid, no_tracker.best_ask - 0.01), 2)
+
+        sides: list[tuple[float, str, str, float]] = []
+        # BUY YES token below YES mid — catches YES flash-crash
+        if 0.01 <= yes_bid <= 0.99 and signal.yes_asset_id:
+            sides.append((yes_bid, signal.yes_asset_id, "BUY", mid))
+        # BUY NO token below NO mid — catches NO flash-crash
+        if 0.01 <= no_bid <= 0.99 and signal.no_asset_id:
+            sides.append((no_bid, signal.no_asset_id, "BUY", 1.0 - mid))
+
+        if not sides:
+            return []
+
+        positions: list[Position] = []
+        async with self._entry_lock:
+            for entry_price, asset_id, _, side_mid in sides:
+                if entry_price <= 0 or entry_price >= 1.0:
+                    continue
+
+                # Risk gates (Kelly, VaR, max positions, etc.)
+                passed, max_trade, _ = await self._check_risk_gates(
+                    signal.market_id, event_id,
+                )
+                if not passed:
+                    break
+
+                # Cap at vacuum_stink_bid_max_risk_usd
+                capped_usd = min(max_trade, max_risk_usd)
+                entry_size = max(1.0, round(capped_usd / entry_price, 2))
+
+                # Deployment guard cap
+                if self._guard is not None:
+                    entry_size = self._guard.get_allowed_trade_shares(
+                        entry_size, entry_price,
+                    )
+                if entry_size < 1:
+                    continue
+
+                order = await self.executor.place_limit_order(
+                    market_id=signal.market_id,
+                    asset_id=asset_id,
+                    side=OrderSide.BUY,
+                    price=entry_price,
+                    size=entry_size,
+                    post_only=True,
+                )
+
+                # POST_ONLY rejection — would cross the spread
+                if order.status == OrderStatus.CANCELLED:
+                    log.info(
+                        "vacuum_stink_bid_rejected_post_only",
+                        asset=asset_id[:16],
+                        price=entry_price,
+                    )
+                    continue
+
+                pos_id = f"VACUUM-{self._next_id}"
+                self._next_id += 1
+
+                # Take-profit: revert to side mid (where price was before the crash)
+                target = round(min(side_mid, 0.99), 2)
+
+                pos = Position(
+                    id=pos_id,
+                    market_id=signal.market_id,
+                    no_asset_id=signal.no_asset_id,
+                    event_id=event_id,
+                    state=PositionState.ENTRY_PENDING,
+                    entry_order=order,
+                    entry_price=entry_price,
+                    entry_size=entry_size,
+                    entry_time=time.time(),
+                    signal=signal,
+                    signal_type="vacuum_stink_bid",
+                    trade_asset_id=asset_id,
+                    yes_asset_id=signal.yes_asset_id,
+                    target_price=target,
+                )
+                self._positions[pos.id] = pos
+                positions.append(pos)
+
+                log.info(
+                    "vacuum_stink_bid_placed",
+                    pos_id=pos.id,
+                    market=signal.market_id[:16],
+                    asset=asset_id[:16],
+                    price=entry_price,
+                    size=entry_size,
+                    mid=mid,
+                    depth_velocity=round(signal.depth_velocity, 3),
+                )
+
+        return positions
+
+    async def cancel_vacuum_stink_bids(self, market_id: str) -> int:
+        """Cancel all unfilled vacuum stink bids for a market.
+
+        Called when the ghost liquidity event recovers and the market
+        returns to ACTIVE — the structural advantage has disappeared.
+
+        Returns the number of orders cancelled.
+        """
+        cancelled = 0
+        for pos in list(self._positions.values()):
+            if pos.market_id != market_id:
+                continue
+            if pos.signal_type != "vacuum_stink_bid":
+                continue
+            if pos.state != PositionState.ENTRY_PENDING:
+                continue
+            if pos.entry_order and pos.entry_order.status in (
+                OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
+            ):
+                await self.executor.cancel_order(pos.entry_order)
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = "ghost_recovered"
+                cancelled += 1
+                log.info(
+                    "vacuum_stink_bid_cancelled",
+                    pos_id=pos.id,
+                    market=market_id[:16],
+                    reason="ghost_recovered",
+                )
+        return cancelled
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  SI-9: Combinatorial Arbitrage — multi-leg entry + Hanging Leg SM
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def open_combo_position(
+        self,
+        signal: Any,
+        combo_positions: dict[str, "ComboPosition"],
+    ) -> ComboPosition | None:
+        """Place all legs of a combinatorial arb as POST_ONLY BUY orders.
+
+        Uses ComboSizer (share-count pegging) — every leg receives the
+        SAME number of shares.  Bypasses Kelly/EQS sizing entirely
+        because this is a structural arb (risk-free if all legs fill).
+
+        Parameters
+        ----------
+        signal :
+            A ``ComboArbSignal`` carrying the legs and computed edge.
+            The signal already carries ``target_shares`` (uniform share
+            count computed by ``ComboSizer``).
+        combo_positions :
+            Active combo positions dict (for concurrency checks).
+
+        Returns
+        -------
+        ComboPosition | None
+            The created combo, or ``None`` if risk gates reject.
+        """
+        from src.signals.combinatorial_arb import ComboArbSignal
+
+        if not isinstance(signal, ComboArbSignal):
+            return None
+
+        strat = settings.strategy
+        async with self._entry_lock:
+            # ── Combo-specific risk gates ──────────────────────────────
+            if self._circuit_breaker_tripped:
+                log.warning("combo_blocked_circuit_breaker")
+                return None
+
+            if self._daily_pnl_cents <= -(strat.daily_loss_limit_usd * 100):
+                log.warning("combo_blocked_daily_loss")
+                return None
+            if self._max_drawdown_cents >= strat.max_drawdown_cents:
+                log.warning("combo_blocked_drawdown")
+                return None
+
+            # Max concurrent combos
+            active_combos = [
+                c for c in combo_positions.values()
+                if c.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL)
+            ]
+            if len(active_combos) >= strat.si9_max_concurrent_combos:
+                log.warning("combo_blocked_max_concurrent", count=len(active_combos))
+                return None
+
+            # No duplicate combo for same event
+            if signal.cluster_event_id in combo_positions:
+                existing = combo_positions[signal.cluster_event_id]
+                if existing.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL, ComboState.ALL_FILLED):
+                    return None
+
+            # Total exposure across all combos
+            total_exposure = sum(
+                c.total_collateral for c in combo_positions.values()
+                if c.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL, ComboState.ALL_FILLED)
+            )
+            # Use signal's pre-computed collateral (shares * Σ prices)
+            new_collateral = signal.total_collateral
+            if total_exposure + new_collateral > strat.si9_max_total_exposure_usd:
+                log.warning(
+                    "combo_blocked_exposure",
+                    current=round(total_exposure, 2),
+                    proposed=round(new_collateral, 2),
+                )
+                return None
+
+            # Wallet balance check
+            if new_collateral > self._wallet_balance_usd * strat.max_wallet_risk_pct / 100.0:
+                log.warning("combo_blocked_wallet", collateral=round(new_collateral, 2))
+                return None
+
+            # ── Place all leg orders ───────────────────────────────────
+            # Share count is UNIFORM across all legs (ComboSizer guarantee).
+            combo_id = f"COMBO-{signal.cluster_event_id[:12]}-{self._next_id}"
+            self._next_id += 1
+            legs: dict[str, Position] = {}
+            uniform_shares = signal.target_shares
+
+            for leg in signal.legs:
+                order = await self.executor.place_limit_order(
+                    market_id=leg.market_id,
+                    asset_id=leg.yes_token_id,
+                    side=OrderSide.BUY,
+                    price=leg.target_price,
+                    size=uniform_shares,
+                    post_only=True,
+                )
+
+                # If POST_ONLY was rejected, re-place at best_bid (never cross)
+                if order.status == OrderStatus.CANCELLED and order.rejection_reason == "would_cross":
+                    fallback_price = round(leg.best_bid, 2)
+                    if fallback_price <= 0:
+                        continue
+                    order = await self.executor.place_limit_order(
+                        market_id=leg.market_id,
+                        asset_id=leg.yes_token_id,
+                        side=OrderSide.BUY,
+                        price=fallback_price,
+                        size=uniform_shares,
+                        post_only=True,
+                    )
+                    if order.status == OrderStatus.CANCELLED:
+                        continue
+
+                pos_id = f"{combo_id}-L{len(legs)}"
+                pos = Position(
+                    id=pos_id,
+                    market_id=leg.market_id,
+                    no_asset_id=leg.no_token_id,
+                    event_id=signal.cluster_event_id,
+                    state=PositionState.ENTRY_PENDING,
+                    entry_order=order,
+                    entry_price=leg.target_price,
+                    entry_size=uniform_shares,
+                    entry_time=time.time(),
+                    trade_asset_id=leg.yes_token_id,
+                    trade_side="YES",
+                    yes_asset_id=leg.yes_token_id,
+                    signal_type="combo_arb",
+                    fee_enabled=False,  # maker = 0 bps
+                )
+                self._positions[pos.id] = pos
+                legs[leg.market_id] = pos
+
+            if not legs:
+                log.warning("combo_no_legs_placed", event_id=signal.cluster_event_id)
+                return None
+
+            combo = ComboPosition(
+                combo_id=combo_id,
+                event_id=signal.cluster_event_id,
+                state=ComboState.ENTRY_PENDING,
+                target_size=uniform_shares,
+                legs=legs,
+            )
+
+            log.info(
+                "combo_position_opened",
+                combo_id=combo_id,
+                event_id=signal.cluster_event_id,
+                n_legs=len(legs),
+                collateral=round(new_collateral, 2),
+                edge_cents=signal.edge_cents,
+                shares=uniform_shares,
+            )
+            return combo
+
+    async def abandon_combo(
+        self,
+        combo: ComboPosition,
+        reason: str = "leg_timeout",
+    ) -> None:
+        """Hanging-Leg State Machine — safely unwind a partial combo.
+
+        This is the CRITICAL safety mechanism for combinatorial arbitrage.
+        Unlike single-position exits, a combo with partial fills leaves
+        the portfolio with naked directional risk.  We must handle two
+        fundamentally different states:
+
+        ══════════════════════════════════════════════════════════════════
+        STATE 1: ZERO FILLS (no leg has been filled)
+        ══════════════════════════════════════════════════════════════════
+        Safe exit.  Simply cancel all resting maker BUY orders.
+        No shares acquired, no directional risk, no unwind needed.
+
+        ══════════════════════════════════════════════════════════════════
+        STATE 2: PARTIAL FILLS (≥1 leg filled, ≥1 leg unfilled)
+        ══════════════════════════════════════════════════════════════════
+        DANGEROUS.  We hold YES shares on some outcomes but not all.
+        The arb is incomplete — we have naked directional risk.
+
+        Emergency hedge decision tree for each UNFILLED leg:
+          a) Read the YES best_ask from the orderbook.
+          b) Compute the taker cost = (best_ask - original_bid) * shares * 100.
+          c) If taker_cost ≤ si9_emergency_taker_max_cents AND
+             spread ≤ si9_emergency_max_spread_cents:
+               → CROSS THE SPREAD: send a TAKER BUY at best_ask to
+                 forcibly complete the leg and preserve the arb structure.
+                 We pay the taker fee but the arb payout covers it.
+          d) If the spread is too wide or cost too high:
+               → DUMP FILLED LEGS: the arb is unsalvageable. Immediately
+                 market-sell all YES shares we've acquired on the filled
+                 legs to eliminate directional risk entirely.
+
+        The bot MUST NOT leave the portfolio holding partial combo shares.
+        Every code path terminates with either a complete arb or zero
+        exposure.
+        ══════════════════════════════════════════════════════════════════
+        """
+        strat = settings.strategy
+        max_taker_cents = strat.si9_emergency_taker_max_cents
+        max_spread_cents = strat.si9_emergency_max_spread_cents
+
+        filled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_FILLED]
+        unfilled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_PENDING]
+
+        # ── STATE 1: No fills — safe cancel ────────────────────────────
+        if not filled:
+            combo.state = ComboState.ABANDONED
+            for pos in unfilled:
+                if pos.entry_order and pos.entry_order.status in (
+                    OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
+                ):
+                    await self.executor.cancel_order(pos.entry_order)
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = reason
+            log.info(
+                "combo_abandoned_clean",
+                combo_id=combo.combo_id,
+                event_id=combo.event_id,
+                reason=reason,
+            )
+            return
+
+        # ── STATE 2: Partial fills — emergency hedge required ──────────
+        # First, cancel all still-resting unfilled orders so they can't
+        # fill while we're evaluating the hedge.
+        for pos in unfilled:
+            if pos.entry_order and pos.entry_order.status in (
+                OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
+            ):
+                await self.executor.cancel_order(pos.entry_order)
+
+        # Attempt to CROSS THE SPREAD on each unfilled leg to complete arb.
+        # Track which legs we successfully taker-fill vs which are too wide.
+        hedge_failures: list[Position] = []
+
+        for pos in unfilled:
+            book = self._book_trackers.get(pos.yes_asset_id or pos.trade_asset_id)
+            best_ask = book.best_ask if book else 0.0
+
+            if best_ask <= 0:
+                # No ask available — cannot cross, mark as failure
+                hedge_failures.append(pos)
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = f"{reason}_no_ask"
+                log.warning(
+                    "combo_hedge_no_ask",
+                    combo_id=combo.combo_id,
+                    market_id=pos.market_id[:16],
+                )
+                continue
+
+            # Compute cost of crossing the spread
+            spread_cents = (best_ask - pos.entry_price) * 100.0
+            taker_cost_cents = spread_cents * pos.entry_size
+
+            # Decision: cross if within tolerance, else mark as failure
+            if spread_cents <= max_spread_cents and taker_cost_cents <= max_taker_cents:
+                # ── CROSS THE SPREAD: taker BUY to force-fill the leg ──
+                # We send post_only=False (taker) and accept the fee hit.
+                taker_order = await self.executor.place_limit_order(
+                    market_id=pos.market_id,
+                    asset_id=pos.yes_asset_id or pos.trade_asset_id,
+                    side=OrderSide.BUY,
+                    price=round(best_ask, 2),
+                    size=pos.entry_size,
+                    post_only=False,  # TAKER — deliberately crossing
+                )
+                pos.entry_order = taker_order
+                if taker_order.status == OrderStatus.CANCELLED:
+                    # Taker order also failed — treat as hedge failure
+                    hedge_failures.append(pos)
+                    pos.state = PositionState.CANCELLED
+                    pos.exit_reason = f"{reason}_taker_rejected"
+                    log.warning(
+                        "combo_taker_rejected",
+                        combo_id=combo.combo_id,
+                        market_id=pos.market_id[:16],
+                    )
+                else:
+                    # Taker order placed — assume fill (GTC at best_ask)
+                    pos.state = PositionState.ENTRY_FILLED
+                    pos.filled_size = pos.entry_size
+                    pos.entry_price = best_ask
+                    log.info(
+                        "combo_emergency_taker_fill",
+                        combo_id=combo.combo_id,
+                        market_id=pos.market_id[:16],
+                        taker_price=best_ask,
+                        spread_cents=round(spread_cents, 1),
+                    )
+            else:
+                # Spread too wide — mark as hedge failure
+                hedge_failures.append(pos)
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = f"{reason}_spread_too_wide"
+                log.warning(
+                    "combo_spread_too_wide",
+                    combo_id=combo.combo_id,
+                    market_id=pos.market_id[:16],
+                    spread_cents=round(spread_cents, 1),
+                    taker_cost_cents=round(taker_cost_cents, 1),
+                )
+
+        # ── Check outcome: did we complete the arb or must we dump? ────
+        if not hedge_failures:
+            # All unfilled legs were successfully taker-filled.
+            # The arb is now complete (all legs filled).
+            combo.state = ComboState.ALL_FILLED
+            log.info(
+                "combo_emergency_hedge_complete",
+                combo_id=combo.combo_id,
+                event_id=combo.event_id,
+                n_taker_fills=len(unfilled),
+            )
+            return
+
+        # ── DUMP FILLED LEGS: arb is unsalvageable, eliminate risk ─────
+        # We MUST sell every YES token we hold to zero out directional
+        # exposure.  Use taker SELL at best_bid to guarantee execution.
+        combo.state = ComboState.ABANDONED
+        all_filled_now = [
+            p for p in combo.legs.values()
+            if p.state == PositionState.ENTRY_FILLED
+        ]
+        for pos in all_filled_now:
+            book = self._book_trackers.get(pos.yes_asset_id or pos.trade_asset_id)
+            bid = book.best_bid if book else 0.01
+            if bid <= 0:
+                bid = 0.01
+
+            # Market-sell at bid (taker) to guarantee execution
+            exit_order = await self.executor.place_limit_order(
+                market_id=pos.market_id,
+                asset_id=pos.yes_asset_id or pos.trade_asset_id,
+                side=OrderSide.SELL,
+                price=round(bid, 2),
+                size=pos.effective_size,
+                post_only=False,  # TAKER — must exit now
+            )
+            pos.exit_order = exit_order
+            pos.state = PositionState.EXIT_PENDING
+            pos.exit_reason = f"{reason}_emergency_dump"
+            log.warning(
+                "combo_emergency_dump",
+                combo_id=combo.combo_id,
+                market_id=pos.market_id[:16],
+                sell_price=bid,
+                shares=pos.effective_size,
+            )
+
+        log.warning(
+            "combo_abandoned_with_dump",
+            combo_id=combo.combo_id,
+            event_id=combo.event_id,
+            reason=reason,
+            filled_dumped=len(all_filled_now),
+            unfilled_failed=len(hedge_failures),
+        )
+
+    def combo_positions_for_pce(
+        self,
+        combo_positions: dict[str, "ComboPosition"],
+    ) -> list[dict[str, Any]]:
+        """Serialize active combo positions for the PCE worker.
+
+        Returns a list of dicts matching ``_MinimalPosition`` kwargs:
+        ``market_id, entry_price, size, filled_size, trade_asset_id,
+        no_asset_id, event_id, entry_size, trade_side``.
+
+        MUST be full dicts, NOT tuples — the PCE worker reconstructs
+        ``_MinimalPosition(**p)`` and would crash on positional args.
+        """
+        result: list[dict[str, Any]] = []
+        for combo in combo_positions.values():
+            if combo.state not in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL, ComboState.ALL_FILLED):
+                continue
+            for pos in combo.legs.values():
+                if pos.state not in (PositionState.ENTRY_PENDING, PositionState.ENTRY_FILLED):
+                    continue
+                result.append({
+                    "market_id": pos.market_id,
+                    "entry_price": pos.entry_price,
+                    "size": pos.entry_size,
+                    "filled_size": pos.filled_size,
+                    "trade_asset_id": pos.trade_asset_id,
+                    "no_asset_id": pos.no_asset_id,
+                    "event_id": pos.event_id,
+                    "entry_size": pos.entry_size,
+                    "trade_side": pos.trade_side,
+                })
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shadow Performance Tracker — virtual execution for shadow strategies
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ShadowPosition:
+    """In-memory virtual position for a shadow strategy signal."""
+
+    id: str
+    signal_source: str       # e.g. "SI-3", "RPE-Experimental"
+    market_id: str
+    asset_id: str
+    direction: str            # "YES" or "NO"
+    entry_price: float
+    entry_size: float
+    entry_time: float
+    target_price: float
+    stop_price: float
+    fee_enabled: bool = True
+    entry_fee_bps: int = 0
+    exit_fee_bps: int = 0
+    zscore: float = 0.0
+    confidence: float = 0.0
+
+
+class ShadowExecutionTracker:
+    """Tracks virtual shadow positions and closes them when the L2 book
+    touches the take-profit or stop-loss level.
+
+    Lifecycle:
+      1. ``open_shadow_position()`` — creates a virtual entry from a
+         shadow signal, simulating maker/taker routing and computing
+         TP/SL with fee deductions.
+      2. ``tick()`` — called on every L2 book update.  Checks whether
+         any open shadow position's TP or SL has been touched.
+      3. On closure, ``record_shadow_trade()`` is called on the
+         ``TradeStore`` to persist the counterfactual result.
+    """
+
+    def __init__(self, trade_store: Any | None = None):
+        self._trade_store = trade_store
+        self._positions: dict[str, ShadowPosition] = {}
+        self._next_id = 1
+
+    def open_shadow_position(
+        self,
+        *,
+        signal_source: str,
+        market_id: str,
+        asset_id: str,
+        direction: str,
+        best_ask: float,
+        best_bid: float,
+        entry_size: float = 10.0,
+        fee_enabled: bool = True,
+        zscore: float = 0.0,
+        confidence: float = 0.0,
+        tp_alpha: float = 0.05,
+        sl_cents: float = 4.0,
+    ) -> ShadowPosition | None:
+        """Create a virtual shadow position simulating maker entry.
+
+        Entry price: best_ask - 0.01 (maker, undercutting the ask).
+        TP: entry_price + tp_alpha (capped at 0.99).
+        SL: entry_price - sl_cents/100 (floored at 0.01).
+        Fees: Polymarket dynamic fee curve applied to both legs.
+        """
+        entry_price = round(best_ask - 0.01, 2)
+        if entry_price <= 0.01 or entry_price >= 0.99:
+            return None
+
+        # Compute fees via the dynamic fee curve
+        entry_fee = get_fee_rate(entry_price, fee_enabled=fee_enabled)
+        entry_fee_bps = round(entry_fee * 10000)
+
+        # TP target: partial mean-reversion alpha capture
+        target_price = round(min(0.99, entry_price + tp_alpha), 2)
+        exit_fee = get_fee_rate(target_price, fee_enabled=fee_enabled)
+        exit_fee_bps = round(exit_fee * 10000)
+
+        # SL: fee-adaptive stop-loss
+        sl_price = round(max(0.01, entry_price - sl_cents / 100.0), 2)
+
+        pos_id = f"SHADOW-{signal_source}-{self._next_id}"
+        self._next_id += 1
+
+        pos = ShadowPosition(
+            id=pos_id,
+            signal_source=signal_source,
+            market_id=market_id,
+            asset_id=asset_id,
+            direction=direction,
+            entry_price=entry_price,
+            entry_size=entry_size,
+            entry_time=time.time(),
+            target_price=target_price,
+            stop_price=sl_price,
+            fee_enabled=fee_enabled,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=exit_fee_bps,
+            zscore=zscore,
+            confidence=confidence,
+        )
+
+        self._positions[pos.id] = pos
+        log.info(
+            "shadow_position_opened",
+            pos_id=pos.id,
+            signal_source=signal_source,
+            market=market_id,
+            direction=direction,
+            entry=entry_price,
+            target=target_price,
+            stop=sl_price,
+            size=entry_size,
+        )
+        return pos
+
+    async def tick(
+        self,
+        asset_id: str,
+        best_bid: float,
+        best_ask: float,
+    ) -> list[ShadowPosition]:
+        """Check all open shadow positions against current L2 prices.
+
+        A shadow position is closed when:
+          - best_bid >= target_price  → take-profit hit
+          - best_ask <= stop_price    → stop-loss hit
+
+        Returns a list of positions that were closed on this tick.
+        """
+        closed: list[ShadowPosition] = []
+
+        for pos in list(self._positions.values()):
+            if pos.asset_id != asset_id:
+                continue
+
+            exit_price = 0.0
+            exit_reason = ""
+
+            if best_bid > 0 and best_bid >= pos.target_price:
+                exit_price = pos.target_price
+                exit_reason = "target"
+            elif best_ask > 0 and best_ask <= pos.stop_price:
+                exit_price = pos.stop_price
+                exit_reason = "stop_loss"
+            else:
+                continue
+
+            # Compute net PnL with fee deductions
+            pnl = compute_net_pnl_cents(
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                size=pos.entry_size,
+                fee_enabled=pos.fee_enabled,
+                is_maker_entry=(pos.entry_fee_bps == 0 and pos.fee_enabled),
+            )
+
+            now = time.time()
+
+            log.info(
+                "shadow_position_closed",
+                pos_id=pos.id,
+                signal_source=pos.signal_source,
+                entry=pos.entry_price,
+                exit=exit_price,
+                pnl=pnl,
+                reason=exit_reason,
+            )
+
+            # Persist to DB
+            if self._trade_store is not None:
+                try:
+                    await self._trade_store.record_shadow_trade(
+                        trade_id=pos.id,
+                        signal_source=pos.signal_source,
+                        market_id=pos.market_id,
+                        direction=pos.direction,
+                        entry_price=pos.entry_price,
+                        entry_size=pos.entry_size,
+                        entry_time=pos.entry_time,
+                        target_price=pos.target_price,
+                        stop_price=pos.stop_price,
+                        exit_price=exit_price,
+                        exit_time=now,
+                        exit_reason=exit_reason,
+                        pnl_cents=pnl,
+                        entry_fee_bps=pos.entry_fee_bps,
+                        exit_fee_bps=pos.exit_fee_bps,
+                        zscore=pos.zscore,
+                        confidence=pos.confidence,
+                    )
+                except Exception:
+                    log.warning("shadow_trade_persist_failed", pos_id=pos.id, exc_info=True)
+
+            del self._positions[pos.id]
+            closed.append(pos)
+
+        return closed
+
+    @property
+    def open_count(self) -> int:
+        return len(self._positions)
+
+    def get_open_shadow_positions(self) -> list[ShadowPosition]:
+        return list(self._positions.values())

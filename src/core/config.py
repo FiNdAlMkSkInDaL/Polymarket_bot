@@ -32,7 +32,11 @@ class DeploymentEnv(str, Enum):
 
 
 # Hardcoded — intentionally NOT configurable via env var.
-PENNY_LIVE_MAX_TRADE_USD: float = 1.0
+PENNY_LIVE_MAX_TRADE_USD: float = 5.0
+
+# Polymarket exchange minimums — orders below these are rejected.
+EXCHANGE_MIN_USD: float = 1.0
+EXCHANGE_MIN_SHARES: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Locate .env — prefer tmpfs (VPS decrypted secrets), fall back to project root
@@ -95,8 +99,9 @@ class StrategyParams:
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
     # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 1.0)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.8)
+    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 0.20)
+    panic_zscore_threshold: float = _env_float("PANIC_ZSCORE_THRESHOLD", 0.684)
+    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.5)
     lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
 
     # Trend regime guard (suppress signals during sustained up-trends).
@@ -200,7 +205,7 @@ class StrategyParams:
     exit_timeout_seconds: int = _env_int("EXIT_TIMEOUT_SECONDS", 1800)
 
     # Market selection filters
-    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 5_000.0)
+    min_daily_volume_usd: float = _env_float("MIN_DAILY_VOLUME_USD", 1500.0)
     min_days_to_resolution: int = _env_int("MIN_DAYS_TO_RESOLUTION", 3)
     min_liquidity_usd: float = _env_float("MIN_LIQUIDITY_USD", 0.0)
 
@@ -209,6 +214,10 @@ class StrategyParams:
     reject_neg_risk: bool = _env_bool("REJECT_NEG_RISK", False)
     one_market_per_event: bool = _env_bool("ONE_MARKET_PER_EVENT", True)
     market_refresh_minutes: int = _env_int("MARKET_REFRESH_MINUTES", 10)
+
+    # Load shedding: maximum markets with full L2 book reconstruction.
+    # Remaining discovered markets use lightweight price/trade-only tracking.
+    max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 50)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
@@ -239,7 +248,7 @@ class StrategyParams:
     sl_decay_start_minutes: float = _env_float("SL_DECAY_START_MINUTES", 5.0)
     sl_decay_half_life_minutes: float = _env_float("SL_DECAY_HALF_LIFE_MINUTES", 15.0)
 
-    signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 0.5)
+    signal_cooldown_minutes: float = _env_float("SIGNAL_COOLDOWN_MINUTES", 5.0)
     max_total_exposure_pct: float = _env_float("MAX_TOTAL_EXPOSURE_PCT", 60.0)
 
     # Maximum dollar-risk per trade.  Caps position size so that a
@@ -400,7 +409,7 @@ class StrategyParams:
     # Requires a genuine 2% discount before entry to ensure the
     # contrarian edge exists.  Without this, entries at full VWAP
     # have no mean-reversion cushion and bleed on fees + spread.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.98)
+    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.995)
 
     # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
     # Exponentially-weighted moving average of 1-min log-return variance.
@@ -411,7 +420,7 @@ class StrategyParams:
     # ── Regime-adaptive EQS threshold (OE-6) ─────────────────────────────────
     # Scale min_edge_score by EWMA σ.  Low-vol → raise threshold
     # (avoid noise), high-vol → lower threshold (mean-reversion α).
-    eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", True)
+    eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", False)
     # Recalibrated from 0.02 to 0.70 based on 3-day tick data analysis:
     # actual market EWMA vols have median 0.72 (P10=0.21, P75=1.22).
     # At 0.02, the ratio was always 10-96x, jamming the ±25% adjuster
@@ -444,6 +453,13 @@ class StrategyParams:
     ghost_window_s: float = _env_float("GHOST_WINDOW_S", 2.0)
     ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 60.0)
     ghost_check_interval_ms: int = _env_int("GHOST_CHECK_INTERVAL_MS", 500)
+
+    # ── Vacuum / Stink Bid Strategy ────────────────────────────────────────
+    # When ghost liquidity is detected, place POST_ONLY limit orders deeply
+    # out-of-the-money on both sides of the book to catch flash-crash wicks.
+    vacuum_stink_bid_enabled: bool = _env_bool("VACUUM_STINK_BID_ENABLED", True)
+    vacuum_stink_bid_offset_cents: float = _env_float("VACUUM_STINK_BID_OFFSET_CENTS", 8.0)
+    vacuum_stink_bid_max_risk_usd: float = _env_float("VACUUM_STINK_BID_MAX_RISK_USD", 2.0)
 
     # Paper-mode fill slippage.  In paper mode, fills are simulated by
     # crossing the limit price.  This adds a configurable adverse
@@ -509,7 +525,7 @@ class StrategyParams:
     drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
     drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
     drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 0.8)
-    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.05)
+    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.35)
     drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 60.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
@@ -595,6 +611,68 @@ class StrategyParams:
     stealth_abandon_drift_cents: float = _env_float("STEALTH_ABANDON_DRIFT_CENTS", 2.0)
     # Abandonment: skip remaining slices if this fraction already filled.
     stealth_abandon_fill_pct: float = _env_float("STEALTH_ABANDON_FILL_PCT", 0.75)
+
+    # ── SI-8: Oracle Latency Arbitrage ─────────────────────────────────────
+    # Generalised off-chain oracle system.  Polls real-world APIs (election
+    # feeds, live sports) and triggers the SI-7 fast-strike taker path when
+    # the CLOB price diverges from the oracle-derived probability.
+    oracle_arb_enabled: bool = _env_bool("ORACLE_ARB_ENABLED", False)
+    # Default polling interval (ms) for REST-based oracle adapters.
+    oracle_default_poll_ms: int = _env_int("ORACLE_DEFAULT_POLL_MS", 1000)
+    # Critical-window polling interval (ms) — throttled during decisive moments.
+    oracle_critical_poll_ms: int = _env_int("ORACLE_CRITICAL_POLL_MS", 200)
+    # Idle-period polling interval (ms) — relaxed during halftime / pre-event.
+    oracle_idle_poll_ms: int = _env_int("ORACLE_IDLE_POLL_MS", 30000)
+    # Base divergence threshold (tighter than RPE's 0.08 — oracle signals
+    # are high-conviction by nature).
+    oracle_confidence_threshold: float = _env_float("ORACLE_CONFIDENCE_THRESHOLD", 0.06)
+    # Minimum oracle confidence to fire a signal.  Higher bar than RPE's
+    # 0.15 because we only want to trade on highly verified API states.
+    oracle_min_confidence: float = _env_float("ORACLE_MIN_CONFIDENCE", 0.80)
+    # Per-market fire cooldown (seconds).  Longer than RPE's 120 s because
+    # oracle events are slower-moving.
+    oracle_cooldown_seconds: int = _env_int("ORACLE_COOLDOWN_SECONDS", 300)
+    # Maximum CLOB spread (cents) before suppressing the signal.  Wide
+    # spreads indicate the market is already pricing in the event or has
+    # low liquidity.
+    oracle_max_spread_cents: float = _env_float("ORACLE_MAX_SPREAD_CENTS", 15.0)
+    # JSON-encoded list of oracle market bindings.  Each entry:
+    #   {"market_id": "...", "oracle_type": "ap_election"|"sports",
+    #    "oracle_params": {...}, "yes_asset_id": "...", "no_asset_id": "...",
+    #    "event_id": "..."}
+    oracle_market_configs: str = _env("ORACLE_MARKET_CONFIGS", "[]")
+    # AP Election API credentials
+    oracle_ap_api_key: str = _env("ORACLE_AP_API_KEY")
+    oracle_ap_api_url: str = _env("ORACLE_AP_API_URL")
+    # Sports API credentials
+    oracle_sports_api_key: str = _env("ORACLE_SPORTS_API_KEY")
+    oracle_sports_api_url: str = _env("ORACLE_SPORTS_API_URL")
+    # Shadow mode — evaluate and log oracle signals without placing orders.
+    # Enabled by default for safe rollout; disable to go live.
+    oracle_shadow_mode: bool = _env_bool("ORACLE_SHADOW_MODE", True)
+
+    # ── SI-9: Mutually Exclusive Combinatorial Arbitrage ───────────────────
+    # Passive maker-only arbitrage across negRisk event clusters where
+    # sum(YES best_bids) < 1.0 - margin  ⇒  risk-free if all legs fill.
+    si9_arb_enabled: bool = _env_bool("SI9_ARB_ENABLED", False)
+    si9_min_margin_cents: float = _env_float("SI9_MIN_MARGIN_CENTS", 2.0)
+    si9_margin_buffer_cents: float = _env_float("SI9_MARGIN_BUFFER_CENTS", 1.0)
+    si9_max_legs: int = _env_int("SI9_MAX_LEGS", 6)
+    si9_max_concurrent_combos: int = _env_int("SI9_MAX_CONCURRENT_COMBOS", 2)
+    si9_max_total_exposure_usd: float = _env_float("SI9_MAX_TOTAL_EXPOSURE_USD", 50.0)
+    si9_max_per_combo_usd: float = _env_float("SI9_MAX_PER_COMBO_USD", 25.0)
+    si9_target_size_usd: float = _env_float("SI9_TARGET_SIZE_USD", 10.0)
+    si9_max_leg_delay_ms: int = _env_int("SI9_MAX_LEG_DELAY_MS", 30000)
+    si9_max_leg_chase_cents: float = _env_float("SI9_MAX_LEG_CHASE_CENTS", 2.0)
+    si9_chase_interval_ms: int = _env_int("SI9_CHASE_INTERVAL_MS", 500)
+    si9_scan_interval_ms: int = _env_int("SI9_SCAN_INTERVAL_MS", 500)
+    si9_min_leg_depth_usd: float = _env_float("SI9_MIN_LEG_DEPTH_USD", 50.0)
+    # Max taker fee (cents) tolerated when emergency-hedging a hanging leg.
+    # If the taker cost exceeds this, the bot dumps filled legs instead.
+    si9_emergency_taker_max_cents: float = _env_float("SI9_EMERGENCY_TAKER_MAX_CENTS", 4.0)
+    # Max spread (cents) on best_ask for a lagging leg before the bot
+    # gives up crossing and dumps filled legs instead.
+    si9_emergency_max_spread_cents: float = _env_float("SI9_EMERGENCY_MAX_SPREAD_CENTS", 5.0)
 
 
 @dataclass(frozen=True)

@@ -117,12 +117,14 @@ class TestAdverseSelectionGuard:
         executor, trackers, event, tc, tot, trd = components
         guard = AdverseSelectionGuard(executor, trackers, event)
         guard._running = True
-        guard._cooldown_s = 0.1
+        guard._cooldown_s = 0  # instant cooldown for test speed
 
         await guard._execute_fast_kill([{"signal": "test"}])
         assert not event.is_set()
 
-        await asyncio.sleep(0.2)
+        # Yield twice so loop.call_later(0, event.set) fires
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
         assert event.is_set()
 
     @pytest.mark.asyncio
@@ -861,12 +863,14 @@ class TestKillOutcomeTracker:
         """_schedule_outcome_check should trigger _record_kill_outcome
         after the configured delay."""
         guard_obj, trackers = guard
-        guard_obj._outcome_delay_s = 0.1  # short delay for test
+        guard_obj._outcome_delay_s = 0  # instant for test speed
         guard_obj._cancel_count = 1
 
         guard_obj._schedule_outcome_check(["flow_coherence", "depth_evaporation"])
 
-        await asyncio.sleep(0.3)
+        # Yield to let the fire-and-forget task complete
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
         import os
         assert os.path.exists(guard_obj._outcome_file)

@@ -55,11 +55,12 @@ from src.signals.signal_framework import (
     OrderbookImbalanceSignal,
     SignalResult,
     SpreadCompressionSignal,
+    VacuumSignal,
 )
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
-from src.trading.position_manager import PositionManager, PositionState
+from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
 from src.trading.stealth_executor import StealthExecutor
@@ -67,7 +68,18 @@ from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.cross_market import CrossMarketSignalGenerator
+from src.signals.combinatorial_arb import ComboArbDetector, ComboArbSignal, ComboSizer
+from src.data.arb_clusters import ArbitrageClusterManager
 from src.signals.drift_signal import DriftSignal, MeanReversionDrift
+from src.signals.oracle_signal import OracleSignalEngine
+from src.data.oracle_adapter import (
+    OracleAdapterRegistry,
+    OracleMarketConfig,
+    OracleSnapshot,
+    OffChainOracleAdapter,
+)
+from src.data.adapters.ap_election_adapter import APElectionAdapter
+from src.data.adapters.sports_adapter import SportsAdapter
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
@@ -262,9 +274,24 @@ class TradingBot:
         self._tp_rescale_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._ghost_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._timeout_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._oracle_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._combo_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+
+        # SI-9: Combinatorial Arbitrage state
+        self._cluster_mgr = ArbitrageClusterManager()
+        self._combo_detector: ComboArbDetector | None = None  # set in _run()
+        self._combo_positions: dict[str, ComboPosition] = {}
 
         # RPE per-market cooldown (Deliverable C)
         self._rpe_last_signal: dict[str, float] = {}
+
+        # SI-8: Oracle Latency Arbitrage state
+        self._oracle_last_signal: dict[str, float] = {}
+        self._oracle_signal_engine = OracleSignalEngine()
+        self._oracle_registry = OracleAdapterRegistry()
+        self._oracle_registry.register("ap_election", APElectionAdapter)
+        self._oracle_registry.register("sports", SportsAdapter)
+        self._oracle_adapter_tasks: list[asyncio.Task] = []
 
         # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
         self._recorder = None
@@ -284,6 +311,7 @@ class TradingBot:
             mode=mode_label,
             **self.guard.startup_summary(),
             zscore_threshold=strat.zscore_threshold,
+            panic_zscore_threshold=strat.panic_zscore_threshold,
             volume_ratio_threshold=strat.volume_ratio_threshold,
             min_edge_score=strat.min_edge_score,
             signal_cooldown_min=strat.signal_cooldown_minutes,
@@ -355,8 +383,29 @@ class TradingBot:
         log.info("markets_selected", count=len(self._markets))
 
         # 3. Build per-market aggregators, detectors & book trackers
+        #    Load shedding: only the top MAX_ACTIVE_L2_MARKETS by 24h
+        #    volume get full L2 book reconstruction + SI-2 iceberg
+        #    detection.  The rest use lightweight price/trade-only
+        #    tracking to keep loop latency under 100ms.
         all_asset_ids: list[str] = []
         whale_map: dict[str, tuple[str, str]] = {}
+
+        l2_limit = settings.strategy.max_active_l2_markets
+        all_wirable = list(self._markets)
+        for om in self.lifecycle.observing.values():
+            if om.info not in all_wirable:
+                all_wirable.append(om.info)
+        # Sort descending by volume; top l2_limit get full L2
+        all_wirable.sort(key=lambda m: m.daily_volume_usd, reverse=True)
+        self._l2_active_set: set[str] = {
+            m.condition_id for m in all_wirable[:l2_limit]
+        }
+        log.info(
+            "load_shedding_applied",
+            total_markets=len(all_wirable),
+            l2_active=len(self._l2_active_set),
+            l2_limit=l2_limit,
+        )
 
         for m in self._markets:
             self._wire_market(m)
@@ -555,6 +604,25 @@ class TradingBot:
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
 
+        # SI-8: Oracle Latency Arbitrage polling loop (if enabled)
+        if settings.strategy.oracle_arb_enabled:
+            self._tasks.append(
+                asyncio.create_task(self._oracle_polling_loop(), name="oracle_poll")
+            )
+
+        # SI-9: Combinatorial Arbitrage cluster scanning + execution
+        if settings.strategy.si9_arb_enabled:
+            # Build initial clusters from discovered markets
+            self._cluster_mgr.scan_clusters(self._markets)
+            # Ensure YES-token books exist for cluster legs
+            for tid in self._cluster_mgr.all_cluster_yes_token_ids():
+                if tid not in self._book_trackers:
+                    self._book_trackers[tid] = OrderbookTracker(tid)
+            self._combo_detector = ComboArbDetector(self._book_trackers)
+            self._tasks.append(
+                asyncio.create_task(self._combo_arbitrage_loop(), name="combo_arb")
+            )
+
         # Multi-core mode: add worker consumer tasks, skip in-process PCE loop
         if self._process_manager is not None:
             self._tasks.append(
@@ -657,6 +725,7 @@ class TradingBot:
             no_asset_id=m.no_token_id,
             yes_aggregator=yes_agg,
             no_aggregator=no_agg,
+            zscore_threshold=settings.strategy.panic_zscore_threshold,
         )
         self._detectors[m.condition_id] = detector
 
@@ -689,7 +758,14 @@ class TradingBot:
         )
 
         # Orderbook trackers for both tokens
-        if settings.strategy.l2_enabled:
+        # Load shedding: only markets in _l2_active_set get full L2 book
+        # reconstruction.  Others get the lightweight OrderbookTracker.
+        l2_eligible = (
+            settings.strategy.l2_enabled
+            and hasattr(self, '_l2_active_set')
+            and m.condition_id in self._l2_active_set
+        )
+        if l2_eligible:
             for token_id in (m.yes_token_id, m.no_token_id):
                 # SI-2: Create iceberg detector and wire as level-change callback
                 ice_cb = None
@@ -804,69 +880,87 @@ class TradingBot:
         Unlike ``stop()``, this keeps the main process and all risk-management
         state alive.  Only the WebSocket transport is torn down and rebuilt
         after a 30-second cooldown.
+
+        IMPORTANT: This method must NEVER raise — it is called from inside
+        ``except Exception`` blocks in hot-path loops.  An unhandled
+        exception here would escape the except handler and kill the
+        asyncio task, crashing the bot via ``gather(return_exceptions=False)``.
         """
-        log.warning("suspend_and_reset_begin")
-
-        # 1. Pause order chasers via the fast-kill event
-        self._fast_kill_event.clear()
-
-        # 2. Cleanly stop the WebSocket pool
-        if self._ws is not None:
-            try:
-                await self._ws.stop()
-            except Exception:
-                log.warning("ws_stop_error_during_reset", exc_info=True)
-
-        # Cancel the WS task from self._tasks (if present)
-        for task in list(self._tasks):
-            if task.get_name() == "ws" and not task.done():
-                task.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(task), timeout=3,
-                    )
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
-
-        # 3. Cooldown penalty
-        log.info("suspend_cooldown_start", cooldown_s=30)
-        await asyncio.sleep(30)
-
-        # 4. Re-initialise WebSocket connections with the same asset set
-        if self._ws is not None:
-            asset_ids = self._ws.asset_ids
-            self._ws = MarketWebSocketPool(
-                asset_ids,
-                self._trade_queue,
-                book_queue=self._book_queue,
-                recorder=self._recorder,
-            )
-            ws_task = asyncio.create_task(self._ws.start(), name="ws")
-            # Replace the old WS task in self._tasks
-            self._tasks = [
-                t for t in self._tasks if t.get_name() != "ws" or not t.done()
-            ]
-            self._tasks.append(ws_task)
-
-        # 5. Reset the circuit breakers so they can trip again on new errors
-        self._trade_loop_breaker.reset()
-        self._stale_bar_breaker.reset()
-        self._retrigger_breaker.reset()
-        self._tp_rescale_breaker.reset()
-        self._ghost_breaker.reset()
-        self._timeout_breaker.reset()
-
-        # 6. Resume chasers
-        self._fast_kill_event.set()
-
-        log.warning("suspend_and_reset_complete")
         try:
-            await self.telegram.send(
-                "✅ <b>WS Hard-Reset complete</b> — chasers resumed, "
-                "risk state preserved."
-            )
+            log.warning("suspend_and_reset_begin")
+
+            # 1. Pause order chasers via the fast-kill event
+            self._fast_kill_event.clear()
+
+            # 2. Cleanly stop the WebSocket pool
+            if self._ws is not None:
+                try:
+                    await self._ws.stop()
+                except Exception:
+                    log.warning("ws_stop_error_during_reset", exc_info=True)
+
+            # Let the event loop process the WS task completion naturally.
+            # DO NOT cancel the WS task explicitly — it is part of the
+            # top-level asyncio.gather() in start().  Cancelling it causes
+            # gather to propagate CancelledError, which terminates start()
+            # and crashes the entire bot process.
+            await asyncio.sleep(0)  # yield so the WS task can finalise
+
+            # Wait briefly for the WS task to finish after stop()
+            for task in list(self._tasks):
+                if task.get_name() == "ws" and not task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), timeout=5,
+                        )
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+
+            # 3. Cooldown penalty
+            log.info("suspend_cooldown_start", cooldown_s=30)
+            await asyncio.sleep(30)
+
+            # 4. Re-initialise WebSocket connections with the same asset set
+            if self._ws is not None:
+                asset_ids = self._ws.asset_ids
+                self._ws = MarketWebSocketPool(
+                    asset_ids,
+                    self._trade_queue,
+                    book_queue=self._book_queue,
+                    recorder=self._recorder,
+                )
+                ws_task = asyncio.create_task(self._ws.start(), name="ws")
+                # Replace the old WS task in self._tasks
+                self._tasks = [
+                    t for t in self._tasks if t.get_name() != "ws" or not t.done()
+                ]
+                self._tasks.append(ws_task)
+
+            # 5. Reset the circuit breakers so they can trip again on new errors
+            self._trade_loop_breaker.reset()
+            self._stale_bar_breaker.reset()
+            self._retrigger_breaker.reset()
+            self._tp_rescale_breaker.reset()
+            self._ghost_breaker.reset()
+            self._timeout_breaker.reset()
+            self._oracle_breaker.reset()
+
+            # 6. Resume chasers
+            self._fast_kill_event.set()
+
+            log.warning("suspend_and_reset_complete")
+            try:
+                await self.telegram.send(
+                    "✅ <b>WS Hard-Reset complete</b> — chasers resumed, "
+                    "risk state preserved."
+                )
+            except Exception:
+                pass
+
+        except asyncio.CancelledError:
+            raise  # never swallow task cancellation
         except Exception:
-            pass
+            log.error("suspend_and_reset_error", exc_info=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: cancel orders, flatten, stop tasks."""
@@ -2237,6 +2331,349 @@ class TradingBot:
                     )
                     await self._suspend_and_reset()
 
+    # ── SI-8: Oracle Latency Arbitrage ─────────────────────────────────────
+
+    async def _oracle_polling_loop(self) -> None:
+        """Poll off-chain oracle APIs and fire fast-strike taker signals.
+
+        Parses ``oracle_market_configs`` JSON from StrategyParams,
+        instantiates adapters via the registry, spawns each adapter's
+        polling loop as a sub-task, and consumes ``OracleSnapshot``
+        objects from the shared queue.
+
+        Each snapshot is evaluated by ``OracleSignalEngine`` against
+        the current CLOB price; if a signal fires it is routed into
+        ``_on_oracle_signal()`` which calls
+        ``PositionManager.open_rpe_position()`` with
+        ``latency_healthy=True`` to enable the fast-strike taker path.
+
+        Circuit breaker: ``self._oracle_breaker`` (threshold=5,
+        window=60 s).  On trip → ``_suspend_and_reset()``.
+        """
+        import json as _json
+
+        strat = settings.strategy
+        try:
+            configs_raw = _json.loads(strat.oracle_market_configs)
+        except _json.JSONDecodeError:
+            log.error("oracle_market_configs_invalid_json", raw=strat.oracle_market_configs)
+            return
+
+        if not configs_raw:
+            log.info("oracle_polling_loop_no_configs")
+            return
+
+        oracle_queue: asyncio.Queue[OracleSnapshot] = asyncio.Queue(maxsize=500)
+
+        # Instantiate adapters and spawn their polling sub-tasks
+        for cfg_dict in configs_raw:
+            try:
+                mc = OracleMarketConfig(
+                    market_id=cfg_dict.get("market_id", ""),
+                    oracle_type=cfg_dict.get("oracle_type", ""),
+                    oracle_params=cfg_dict.get("oracle_params", {}),
+                    yes_asset_id=cfg_dict.get("yes_asset_id", ""),
+                    no_asset_id=cfg_dict.get("no_asset_id", ""),
+                    event_id=cfg_dict.get("event_id", ""),
+                )
+                adapter = self._oracle_registry.create(
+                    mc.oracle_type,
+                    mc,
+                    on_trip=self._oracle_adapter_tripped,
+                )
+                task = asyncio.create_task(
+                    adapter.start(oracle_queue),
+                    name=f"oracle_{mc.oracle_type}_{mc.market_id[:12]}",
+                )
+                task.add_done_callback(_safe_task_done_callback)
+                self._oracle_adapter_tasks.append(task)
+                log.info(
+                    "oracle_adapter_spawned",
+                    oracle_type=mc.oracle_type,
+                    market_id=mc.market_id,
+                )
+            except KeyError:
+                log.error(
+                    "oracle_adapter_unknown_type",
+                    oracle_type=cfg_dict.get("oracle_type", ""),
+                )
+            except Exception:
+                log.error("oracle_adapter_init_error", exc_info=True)
+
+        if not self._oracle_adapter_tasks:
+            log.warning("oracle_polling_loop_no_adapters_created")
+            return
+
+        log.info(
+            "oracle_polling_loop_started",
+            adapter_count=len(self._oracle_adapter_tasks),
+        )
+
+        # ── Consumer loop ──────────────────────────────────────────────
+        while self._running:
+            try:
+                try:
+                    snapshot = await asyncio.wait_for(oracle_queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                # Look up oracle config for asset IDs
+                oc = self._find_oracle_config(snapshot.market_id, configs_raw)
+                if oc is None:
+                    continue
+
+                # Look up market info in lifecycle
+                market = self._find_market(snapshot.market_id)
+                if market is None:
+                    log.debug("oracle_market_not_tracked", market_id=snapshot.market_id)
+                    continue
+
+                # Gate: market must be tradeable and accepting orders
+                if not self.lifecycle.is_tradeable(market.condition_id):
+                    continue
+                if not market.accepting_orders:
+                    continue
+
+                # Get current YES price from book or aggregator
+                yes_agg = self._yes_aggs.get(market.yes_token_id)
+                yes_price = yes_agg.current_price if yes_agg else 0.0
+                if yes_price <= 0:
+                    continue
+
+                # Get current spread for spread-width gate
+                spread_cents = 0.0
+                no_book = self._book_trackers.get(market.no_token_id)
+                if no_book and no_book.has_data:
+                    snap = no_book.snapshot()
+                    spread_cents = (snap.best_ask - snap.best_bid) * 100.0 if snap.best_ask > 0 and snap.best_bid > 0 else 0.0
+
+                # Evaluate signal
+                signal = self._oracle_signal_engine.evaluate(
+                    snapshot,
+                    market_price=yes_price,
+                    spread_cents=spread_cents,
+                )
+
+                if signal:
+                    await self._on_oracle_signal(signal, market, oc)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error("oracle_polling_loop_error", exc_info=True)
+                if self._oracle_breaker.record():
+                    log.critical(
+                        "oracle_polling_circuit_breaker_tripped",
+                        errors_in_window=self._oracle_breaker.recent_errors,
+                    )
+                    await self.telegram.send(
+                        "🟡 <b>CIRCUIT BREAKER</b>: oracle_poll tripped "
+                        "(5 errors in 60s) — suspend & hard-reset WS."
+                    )
+                    await self._suspend_and_reset()
+                    return
+
+        # Cleanup adapter sub-tasks on shutdown
+        for t in self._oracle_adapter_tasks:
+            if not t.done():
+                t.cancel()
+
+    async def _oracle_adapter_tripped(self) -> None:
+        """Callback invoked when an individual oracle adapter's breaker trips."""
+        log.critical("oracle_adapter_breaker_tripped_callback")
+        try:
+            await self.telegram.send(
+                "🟡 <b>Oracle adapter circuit breaker tripped</b> — "
+                "adapter stopped, bot continues."
+            )
+        except Exception:
+            pass
+
+    def _find_oracle_config(
+        self, market_id: str, configs_raw: list[dict],
+    ) -> dict | None:
+        """Find the oracle config dict for a given market_id."""
+        for cfg in configs_raw:
+            if cfg.get("market_id") == market_id:
+                return cfg
+        return None
+
+    def _find_market(self, market_id: str) -> MarketInfo | None:
+        """Find tracked MarketInfo by condition_id."""
+        for m in list(self._markets):
+            if m.condition_id == market_id:
+                return m
+        return None
+
+    async def _on_oracle_signal(
+        self,
+        signal: SignalResult,
+        market: MarketInfo,
+        oracle_config: dict,
+    ) -> None:
+        """Handle an oracle divergence signal — routes into the RPE execution funnel.
+
+        Mirrors ``_on_rpe_signal()`` with oracle-specific gates, then
+        calls ``PositionManager.open_rpe_position()`` with
+        ``latency_healthy=True`` to enable the SI-7 fast-strike taker
+        path.  The existing ``_fair_vs_clob > 0.02`` check in
+        ``_open_rpe_position_inner()`` still gates whether fast-strike
+        actually fires.
+        """
+        meta = signal.metadata
+        direction = meta.get("direction", "buy_no")
+        model_prob = meta.get("model_probability", 0.5)
+        confidence = meta.get("confidence", 0.0)
+        shadow = settings.strategy.oracle_shadow_mode
+        strat = settings.strategy
+
+        # ── Per-market cooldown ────────────────────────────────────
+        now = time.monotonic()
+        last_fire = self._oracle_last_signal.get(market.condition_id, 0.0)
+        if now - last_fire < strat.oracle_cooldown_seconds:
+            log.debug(
+                "oracle_cooldown_active",
+                market=market.condition_id,
+                seconds_remaining=round(strat.oracle_cooldown_seconds - (now - last_fire), 1),
+            )
+            return
+
+        # ── Stamp cooldown ─────────────────────────────────────────
+        self._oracle_last_signal[market.condition_id] = now
+
+        # ── Telegram notification ──────────────────────────────────
+        mode_label = "👻 SHADOW" if shadow else "🔴 LIVE"
+        _safe_fire_and_forget(
+            self.telegram.send(
+                f"{mode_label} <b>Oracle Signal</b>\n"
+                f"Market: <code>{market.condition_id[:16]}…</code>\n"
+                f"Question: {market.question[:80]}\n"
+                f"Direction: {direction}\n"
+                f"Model P: {model_prob:.4f}\n"
+                f"Confidence: {confidence:.3f}\n"
+                f"Phase: {meta.get('oracle_event_phase', '?')}\n"
+                f"Adapter: {meta.get('model_name', '?')}"
+            ),
+            name="oracle_telegram_notify",
+        )
+
+        # ── Data recorder ──────────────────────────────────────────
+        if self._recorder is not None:
+            self._recorder.enqueue("oracle_signal", {
+                "market": market.condition_id,
+                "model_probability": model_prob,
+                "confidence": confidence,
+                "direction": direction,
+                "shadow": shadow,
+                "event_phase": meta.get("oracle_event_phase"),
+                "adapter": meta.get("model_name"),
+                "resolved_outcome": meta.get("resolved_outcome"),
+            })
+
+        if shadow:
+            log.info(
+                "oracle_signal_shadow",
+                market=market.condition_id,
+                model_prob=round(model_prob, 4),
+                confidence=round(confidence, 3),
+                direction=direction,
+                event_phase=meta.get("oracle_event_phase"),
+            )
+            return
+
+        # ── Live-mode gates ────────────────────────────────────────
+
+        # Gate: Position deduplication
+        positioned = self._positioned_asset_ids()
+        if market.yes_token_id in positioned or market.no_token_id in positioned:
+            log.info(
+                "oracle_already_positioned",
+                market=market.condition_id,
+            )
+            return
+
+        # Gate: Determine entry price from appropriate book
+        if direction == "buy_no":
+            book = self._book_trackers.get(market.no_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                no_agg = self._no_aggs.get(market.no_token_id)
+                entry_price = round(no_agg.current_price, 2) if no_agg else 0.0
+        else:
+            book = self._book_trackers.get(market.yes_token_id)
+            if book and book.has_data:
+                snap = book.snapshot()
+                entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            else:
+                yes_agg = self._yes_aggs.get(market.yes_token_id)
+                entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
+
+        if entry_price <= 0:
+            return
+
+        # Gate: Minimum ask depth
+        if book and book.has_data:
+            snap_depth = book.snapshot()
+            min_depth = strat.min_ask_depth_usd
+            if snap_depth.ask_depth_usd < min_depth:
+                log.info(
+                    "oracle_rejected_thin_asks",
+                    market=market.condition_id,
+                    ask_depth_usd=round(snap_depth.ask_depth_usd, 2),
+                    min_required=min_depth,
+                )
+                return
+
+        fee_enabled = self._is_fee_enabled(market)
+
+        # Days to resolution
+        days_to_resolution = 1
+        if market.end_date:
+            delta = market.end_date - datetime.now(tz=timezone.utc)
+            days_to_resolution = max(1, delta.days)
+
+        oracle_signal_meta = dict(meta)
+        oracle_signal_meta["signal_source"] = "si8_oracle"
+
+        # ── Route into the RPE execution funnel with latency_healthy=True ──
+        # Pass latency_healthy=True to enable the fast-strike taker gate.
+        # The existing _fair_vs_clob > 0.02 check in _open_rpe_position_inner()
+        # still gates whether the +1¢ bump and taker execution actually fires.
+        pos = await self.positions.open_rpe_position(
+            market_id=market.condition_id,
+            yes_asset_id=oracle_config.get("yes_asset_id", market.yes_token_id),
+            no_asset_id=oracle_config.get("no_asset_id", market.no_token_id),
+            direction=direction,
+            model_probability=model_prob,
+            confidence=confidence,
+            entry_price=entry_price,
+            event_id=oracle_config.get("event_id", market.event_id),
+            days_to_resolution=days_to_resolution,
+            fee_enabled=fee_enabled,
+            book=book,
+            signal_metadata=oracle_signal_meta,
+            latency_healthy=True,
+        )
+
+        if pos:
+            # Fast-strike positions skip the OrderChaser — order placed as
+            # a taker to immediately consume stale CLOB liquidity.
+            if getattr(pos, 'fast_strike', False):
+                log.info(
+                    "oracle_fast_strike_no_chaser",
+                    pos_id=pos.id,
+                    market=market.condition_id,
+                )
+            elif book and book.has_data:
+                chaser_task = asyncio.create_task(
+                    self._entry_chaser_flow(pos, book),
+                    name=f"chaser_entry_oracle_{pos.id}",
+                )
+                chaser_task.add_done_callback(_safe_task_done_callback)
+                pos.entry_chaser_task = chaser_task
+
     def _check_paper_fills(self, event: TradeEvent) -> None:
         """Check if any paper orders should fill based on this trade."""
         filled_orders = self.executor.check_paper_fill(event.asset_id, event.price)
@@ -2646,13 +3083,20 @@ class TradingBot:
                             # Force-exit any open positions in this market
                             for pos in self.positions.get_open_positions():
                                 if pos.market_id == cid:
-                                    if pos.state == PositionState.EXIT_PENDING:
-                                        await self.positions.force_stop_loss(pos)
-                                    elif pos.state == PositionState.ENTRY_PENDING:
-                                        if pos.entry_order:
-                                            await self.executor.cancel_order(pos.entry_order)
-                                        pos.state = PositionState.CANCELLED
-                                        pos.exit_reason = "ghost_liquidity"
+                                    try:
+                                        if pos.state == PositionState.EXIT_PENDING:
+                                            await self.positions.force_stop_loss(pos)
+                                        elif pos.state == PositionState.ENTRY_PENDING:
+                                            if pos.entry_order:
+                                                await self.executor.cancel_order(pos.entry_order)
+                                            pos.state = PositionState.CANCELLED
+                                            pos.exit_reason = "ghost_liquidity"
+                                    except Exception as fex:
+                                        log.warning(
+                                            "ghost_force_exit_error",
+                                            pos_id=pos.id,
+                                            error=str(fex),
+                                        )
 
                             log.warning(
                                 "ghost_liquidity_detected",
@@ -2672,14 +3116,62 @@ class TradingBot:
                                 f"Depth drop: {abs(dv)*100:.0f}% in {ghost_window}s\n"
                                 f"Emergency drain activated."
                             )
+
+                            # ── Vacuum stink-bid exploit ───────────────────
+                            # Place deeply OTM POST_ONLY orders on both sides
+                            # to catch flash-crash wicks during the vacuum.
+                            if settings.strategy.vacuum_stink_bid_enabled and am:
+                                no_tracker = self._book_trackers.get(am.info.no_token_id)
+                                mid = 0.0
+                                no_ask = 0.0
+                                if no_tracker and no_tracker.has_data:
+                                    snap = no_tracker.snapshot()
+                                    mid = snap.mid_price
+                                    no_ask = snap.best_ask
+                                if mid > 0:
+                                    vsig = VacuumSignal(
+                                        market_id=cid,
+                                        no_asset_id=am.info.no_token_id,
+                                        no_best_ask=no_ask,
+                                        depth_velocity=dv,
+                                        baseline_depth=baseline_pre,
+                                        yes_asset_id=am.info.yes_token_id,
+                                        mid_price=mid,
+                                        signal_source="VACUUM_GhostLiquidity",
+                                    )
+                                    try:
+                                        vac_positions = await self.positions.open_vacuum_stink_bids(
+                                            vsig, event_id=am.info.event_id,
+                                        )
+                                        if vac_positions:
+                                            await self.telegram.send(
+                                                f"🎯 <b>Vacuum Stink Bids</b> placed: "
+                                                f"{len(vac_positions)} orders on "
+                                                f"<code>{cid[:16]}</code>"
+                                            )
+                                    except Exception as vex:
+                                        log.error("vacuum_stink_bid_error", error=str(vex))
+
                             break  # only need one token to trigger per market
 
                 # Check emergency markets for recovery
                 recovered = self.lifecycle.check_emergency_recovery(self._book_trackers)
                 for cid in recovered:
-                    log.info("ghost_liquidity_recovered", condition_id=cid)
+                    # Cancel any unfilled vacuum stink bids — structural
+                    # advantage has disappeared now that depth recovered.
+                    try:
+                        n_cancelled = await self.positions.cancel_vacuum_stink_bids(cid)
+                    except Exception:
+                        log.warning("cancel_vacuum_bids_error", condition_id=cid, exc_info=True)
+                        n_cancelled = 0
+                    log.info(
+                        "ghost_liquidity_recovered",
+                        condition_id=cid,
+                        vacuum_bids_cancelled=n_cancelled,
+                    )
                     await self.telegram.send(
                         f"✅ <b>Ghost recovered</b>: <code>{cid[:16]}</code> back to ACTIVE"
+                        + (f"\n🗑 Cancelled {n_cancelled} vacuum stink bid(s)" if n_cancelled else "")
                     )
 
             except asyncio.CancelledError:
@@ -2874,14 +3366,18 @@ class TradingBot:
                 log.error("paper_summary_error", error=str(exc))
 
     async def _health_reporter(self) -> None:
-        """Every 60 seconds, write ``system_health.json`` to the log dir.
+        """Every 300 seconds, write ``system_health.json`` to the log dir.
 
         Tracks memory usage, WebSocket reconnect counts, SQLite lock
         retries, latency guard state, and heartbeat status — critical
         telemetry for the long-running data-harvesting soak test.
+
+        Load shedding: samples up to 5 random L2 books per cycle instead
+        of iterating every book, to reduce IPC overhead on large universes.
         """
         import json as _json
         import os as _os
+        import random as _random
         import tempfile
         from pathlib import Path as _Path
 
@@ -2901,8 +3397,10 @@ class TradingBot:
         except (ImportError, Exception):
             _process = None
 
+        _HEALTH_SAMPLE_SIZE = 5  # max L2 books to sample per cycle
+
         while self._running:
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)
             try:
                 ws_reconnects = (
                     getattr(self._ws, "reconnect_count", 0)
@@ -2940,27 +3438,55 @@ class TradingBot:
                     "observing_markets": len(self.lifecycle.observing),
                 }
 
-                # Aggregate L2 book health metrics across all tracked books
+                # Aggregate L2 book health metrics across all tracked books.
+                # In multicore mode, the actual L2 books live in worker
+                # processes — read health from shared-memory readers instead
+                # of the stale main-process book objects.
                 l2_total_deltas = 0
                 l2_total_desyncs = 0
                 l2_synced_count = 0
-                for book in self._l2_books.values():
-                    l2_total_deltas += book.delta_count
-                    l2_total_desyncs += book.desync_total
-                    if book.state == BookState.SYNCED:
-                        l2_synced_count += 1
+                l2_unreliable_count = 0
+                l2_total_count = len(self._l2_books)
+
+                # Load shedding: sample up to _HEALTH_SAMPLE_SIZE
+                # random books instead of reading all of them.
+                if (
+                    self._multicore_enabled
+                    and self._process_manager is not None
+                ):
+                    readers = self._process_manager.get_all_readers()
+                    l2_total_count = max(l2_total_count, len(readers))
+                    reader_items = list(readers.values())
+                    if len(reader_items) > _HEALTH_SAMPLE_SIZE:
+                        reader_items = _random.sample(reader_items, _HEALTH_SAMPLE_SIZE)
+                    for reader in reader_items:
+                        snap = reader.read_header()
+                        l2_total_deltas += snap.delta_count
+                        l2_total_desyncs += snap.desync_total
+                        if snap.state == 2:  # BookState.SYNCED
+                            l2_synced_count += 1
+                        if not snap.is_reliable:
+                            l2_unreliable_count += 1
+                else:
+                    book_items = list(self._l2_books.values())
+                    if len(book_items) > _HEALTH_SAMPLE_SIZE:
+                        book_items = _random.sample(book_items, _HEALTH_SAMPLE_SIZE)
+                    for book in book_items:
+                        l2_total_deltas += book.delta_count
+                        l2_total_desyncs += book.desync_total
+                        if book.state == BookState.SYNCED:
+                            l2_synced_count += 1
+                        if not book.is_reliable:
+                            l2_unreliable_count += 1
 
                 health["l2_total_deltas"] = l2_total_deltas
                 health["l2_total_desyncs"] = l2_total_desyncs
                 health["l2_synced_books"] = l2_synced_count
-                health["l2_total_books"] = len(self._l2_books)
+                health["l2_total_books"] = l2_total_count
                 health["l2_seq_gap_rate"] = round(
                     l2_total_desyncs / max(1, l2_total_deltas), 6
                 )
-                health["l2_unreliable_books"] = sum(
-                    1 for book in self._l2_books.values()
-                    if not book.is_reliable
-                )
+                health["l2_unreliable_books"] = l2_unreliable_count
 
                 # Atomic write: offload blocking file I/O to a thread
                 await asyncio.to_thread(
@@ -3013,6 +3539,11 @@ class TradingBot:
                 open_markets = self.positions.get_open_market_ids()
                 whale_tokens = self.whale_monitor.get_whale_tokens()
 
+                # Snapshot tier counts before refresh for delta tracking
+                prev_active = len(self.lifecycle.active)
+                prev_observing = len(self.lifecycle.observing)
+                prev_draining = len(self.lifecycle.draining)
+
                 newly_added, evicted = await self.lifecycle.refresh(
                     orderbook_trackers=self._book_trackers,
                     trade_counts=self._trade_counts,
@@ -3024,6 +3555,7 @@ class TradingBot:
 
                 # Evict markets
                 for cid in evicted:
+                    self._l2_active_set.discard(cid)
                     for m in list(self._markets):
                         if m.condition_id == cid:
                             if self._ws:
@@ -3036,6 +3568,15 @@ class TradingBot:
                                 )
                             self._unwire_market(m)
                             break
+
+                # Re-evaluate L2 active set before wiring new markets
+                # so _wire_market knows which markets get full L2
+                l2_limit = settings.strategy.max_active_l2_markets
+                all_tracked = self.lifecycle.get_all_tracked()
+                all_tracked.sort(key=lambda m: m.daily_volume_usd, reverse=True)
+                self._l2_active_set = {
+                    m.condition_id for m in all_tracked[:l2_limit]
+                }
 
                 # Wire + subscribe new markets
                 new_asset_ids: list[str] = []
@@ -3104,20 +3645,27 @@ class TradingBot:
                 total = len(self.lifecycle.active)
                 obs = len(self.lifecycle.observing)
                 drn = len(self.lifecycle.draining)
+                universe = total + obs + drn
+                discovered = len(newly_added)
+                dropped = len(evicted) + len(stale_evicted)
 
-                if newly_added or evicted:
+                if newly_added or evicted or stale_evicted:
                     log.info(
                         "market_refresh_done",
-                        added=len(newly_added),
-                        evicted=len(evicted),
+                        discovered=discovered,
+                        dropped=dropped,
                         active=total,
                         observing=obs,
                         draining=drn,
                     )
+                    # Separate universe-level deltas from tier breakdown
+                    promoted = max(0, total - prev_active)
                     await self.telegram.send(
                         f"🔄 <b>Market refresh</b>\n"
-                        f"Active: {total}  |  Observing: {obs}  |  Draining: {drn}\n"
-                        f"+{len(newly_added)} new  |  -{len(evicted)} evicted"
+                        f"Universe: {universe} tracked "
+                        f"(+{discovered} discovered, -{dropped} dropped)\n"
+                        f"Active: {total} (+{promoted} promoted)  |  "
+                        f"Observing: {obs}  |  Draining: {drn}"
                     )
 
             except asyncio.CancelledError:
@@ -3193,3 +3741,148 @@ class TradingBot:
                 break
             except Exception as exc:
                 log.error("cleanup_loop_error", error=str(exc), exc_info=True)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  SI-9: Combinatorial Arbitrage Loop
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def _combo_arbitrage_loop(self) -> None:
+        """Scan negRisk clusters for mis-priced arb, place multi-leg orders.
+
+        Runs every ``si9_scan_interval_ms``.  For each active cluster:
+          1. Evaluate via ``ComboArbDetector.evaluate_cluster()``.
+             Passes wallet_balance so ComboSizer can enforce share-count
+             pegging (NOT Kelly USD sizing).
+          2. If signal emitted, place combo via ``open_combo_position()``.
+          3. Monitor existing combos for fill status and leg timeout.
+          4. On timeout → ``abandon_combo()`` runs the Hanging Leg State
+             Machine (State 1: clean cancel / State 2: emergency hedge
+             or dump).
+
+        Circuit breaker: ``self._combo_breaker`` (threshold=5, window=60s).
+        """
+        strat = settings.strategy
+        interval = strat.si9_scan_interval_ms / 1000.0
+        max_leg_delay_s = strat.si9_max_leg_delay_ms / 1000.0
+
+        log.info("combo_arb_loop_started", scan_interval_ms=strat.si9_scan_interval_ms)
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+
+                # Skip if no detector wired (safety)
+                if self._combo_detector is None:
+                    continue
+
+                # ── 1. Scan clusters for new arb signals ──────────────
+                # Pass wallet_balance so ComboSizer can compute uniform
+                # share counts constrained by available capital.
+                wallet_bal = self.positions._wallet_balance_usd
+
+                for cluster in self._cluster_mgr.active_clusters:
+                    # Skip if we already have a combo for this event
+                    existing = self._combo_positions.get(cluster.event_id)
+                    if existing and existing.state in (
+                        ComboState.ENTRY_PENDING,
+                        ComboState.PARTIAL_FILL,
+                        ComboState.ALL_FILLED,
+                    ):
+                        continue
+
+                    signal = self._combo_detector.evaluate_cluster(
+                        cluster, wallet_balance=wallet_bal,
+                    )
+                    if signal is None:
+                        continue
+
+                    combo = await self.positions.open_combo_position(
+                        signal, self._combo_positions,
+                    )
+                    if combo is not None:
+                        self._combo_positions[cluster.event_id] = combo
+                        await self.telegram.send(
+                            f"🎯 <b>SI-9 Combo Arb</b>\n"
+                            f"Event: {cluster.event_id[:16]}\n"
+                            f"Legs: {combo.n_legs} | "
+                            f"Shares: {signal.target_shares} | "
+                            f"Edge: {signal.edge_cents:.1f}¢ | "
+                            f"Σbids: {signal.sum_best_bids:.4f} | "
+                            f"Collateral: ${signal.total_collateral:.2f}"
+                        )
+
+                # ── 2. Monitor existing combos ────────────────────────
+                now = time.time()
+                for event_id, combo in list(self._combo_positions.items()):
+                    if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
+                        continue
+
+                    # Check for order fills by polling order status
+                    for pos in combo.legs.values():
+                        if pos.state == PositionState.ENTRY_PENDING and pos.entry_order:
+                            status = await self.executor.get_order_status(pos.entry_order)
+                            if status == OrderStatus.MATCHED:
+                                pos.state = PositionState.ENTRY_FILLED
+                                pos.filled_size = pos.entry_size
+                                log.info(
+                                    "combo_leg_filled",
+                                    combo_id=combo.combo_id,
+                                    market_id=pos.market_id[:16],
+                                )
+
+                    # Update combo state
+                    if combo.all_filled:
+                        if combo.state != ComboState.ALL_FILLED:
+                            combo.state = ComboState.ALL_FILLED
+                            log.info(
+                                "combo_all_filled",
+                                combo_id=combo.combo_id,
+                                pnl_cents=round(combo.pnl_cents_if_resolved, 2),
+                            )
+                            await self.telegram.send(
+                                f"✅ <b>SI-9 Combo Filled</b>\n"
+                                f"Combo: {combo.combo_id}\n"
+                                f"PnL at resolution: "
+                                f"{combo.pnl_cents_if_resolved:.1f}¢"
+                            )
+                    elif len(combo.filled_legs) > 0 and combo.state == ComboState.ENTRY_PENDING:
+                        combo.state = ComboState.PARTIAL_FILL
+
+                    # ── Leg timeout → Hanging Leg State Machine ────────
+                    # abandon_combo() handles the two states:
+                    #   State 1 (0 fills): safe cancel of all resting orders
+                    #   State 2 (partial fills): emergency taker hedge or
+                    #     dump of filled legs to eliminate directional risk
+                    elapsed = now - combo.created_at
+                    if (
+                        elapsed > max_leg_delay_s
+                        and combo.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL)
+                        and not combo.all_filled
+                    ):
+                        log.warning(
+                            "combo_leg_timeout",
+                            combo_id=combo.combo_id,
+                            elapsed_s=round(elapsed, 1),
+                            filled=len(combo.filled_legs),
+                            pending=len(combo.pending_legs),
+                        )
+                        await self.positions.abandon_combo(combo, reason="leg_timeout")
+                        await self.telegram.send(
+                            f"⚠️ <b>SI-9 Abandon</b>\n"
+                            f"Combo: {combo.combo_id}\n"
+                            f"State: {combo.state.value}\n"
+                            f"Filled: {len(combo.filled_legs)} | "
+                            f"Elapsed: {elapsed:.0f}s"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("combo_arb_loop_error", error=str(exc), exc_info=True)
+                if self._combo_breaker.record():
+                    log.critical(
+                        "combo_breaker_tripped",
+                        recent_errors=self._combo_breaker.recent_errors,
+                    )
+                    await self._suspend_and_reset()
+                    break

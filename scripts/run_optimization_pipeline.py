@@ -39,12 +39,38 @@ import json
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
+import httpx
+
 from src.backtest.wfo_optimizer import SEARCH_SPACE
+from src.core.config import settings
 from src.core.logger import get_logger
 
 log = get_logger(__name__)
+
+
+# ── Telegram helpers (sync) ───────────────────────────────────────────────
+
+def _notify(message: str) -> None:
+    """Send a Telegram message synchronously.  Fails silently."""
+    token = settings.telegram_bot_token
+    chat_id = settings.telegram_chat_id
+    if not token or not chat_id:
+        log.warning("telegram_not_configured")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = httpx.post(
+            url,
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning("telegram_send_failed", status=resp.status_code)
+    except Exception as exc:
+        log.warning("telegram_send_error", error=str(exc))
 
 # ── Defaults ──────────────────────────────────────────────────────────────
 LOGS_DIR = Path("logs")
@@ -177,7 +203,7 @@ PHASE3_DEFAULTS = {"max_markets": 31, "train_days": 30, "n_trials": 1}
 
 # Smoke-test overrides (minimal resources for local validation)
 SMOKE_OVERRIDES = {
-    "max_markets": 1, "train_days": 2, "n_trials": 2,
+    "max_markets": 1, "train_days": 5, "n_trials": 10,
     "max_workers": 1, "test_days": 2, "step_days": 30,
 }
 
@@ -327,6 +353,12 @@ def main() -> None:
         default=False,
         help="Use minimal parameters (1 market, 2 days, 2 trials) for local validation.",
     )
+    parser.add_argument(
+        "--test-alert",
+        action="store_true",
+        default=False,
+        help="Send a test Telegram alert and exit.",
+    )
     args = parser.parse_args()
 
     phase_overrides = SMOKE_OVERRIDES if args.smoke_test else None
@@ -344,17 +376,80 @@ def main() -> None:
         smoke_test=args.smoke_test,
     )
 
-    if start_idx <= 0:
-        run_phase1(args.data_dir, overrides=phase_overrides)
+    # ── Milestone 0: Test alert mode ──────────────────────────────────
+    if args.test_alert:
+        _notify("🔔 <b>WFO Test Alert</b>\nTelegram integration is working.")
+        print("Test alert sent — check Telegram.")
+        return
 
-    if start_idx <= 1:
-        run_bounds_narrowing()
+    # ── Milestone 1: Pipeline Start ───────────────────────────────────
+    try:
+        _notify(
+            "🚀 <b>WFO Pipeline Started</b>\n"
+            f"Target: <code>{args.data_dir}</code>\n"
+            "Optimizing for Sharpe Ratio across 3 Phases."
+        )
+    except Exception:
+        pass  # non-critical
 
-    if start_idx <= 2:
-        run_phase2(args.data_dir, overrides=phase_overrides)
+    try:
+        if start_idx <= 0:
+            run_phase1(args.data_dir, overrides=phase_overrides)
 
-    if start_idx <= 3:
-        run_phase3(args.data_dir, overrides=phase_overrides)
+            # ── Milestone 2: Phase 1 Complete ─────────────────────────
+            try:
+                p1 = _load_json(PHASE1_OUTPUT)
+                n_candidates = len(p1.get("params", {}))
+                _notify(
+                    "✅ <b>Phase 1 (Discovery) Complete</b>\n"
+                    f"Found <b>{n_candidates}</b> valid parameter candidates.\n"
+                    "Moving to Phase 2 Refinement."
+                )
+            except Exception:
+                pass
+
+        if start_idx <= 1:
+            run_bounds_narrowing()
+
+        if start_idx <= 2:
+            run_phase2(args.data_dir, overrides=phase_overrides)
+
+            # ── Milestone 3: Phase 2 Complete ─────────────────────────
+            try:
+                p2 = _load_json(PHASE2_OUTPUT)
+                best_sharpe = p2.get("value", p2.get("sharpe", "N/A"))
+                if isinstance(best_sharpe, (int, float)):
+                    best_sharpe = f"{best_sharpe:.2f}"
+                _notify(
+                    "🎯 <b>Phase 2 (Refinement) Complete</b>\n"
+                    f"Best Sharpe: <b>{best_sharpe}</b>\n"
+                    "Starting Phase 3 Out-of-Sample Validation."
+                )
+            except Exception:
+                pass
+
+        if start_idx <= 3:
+            run_phase3(args.data_dir, overrides=phase_overrides)
+
+    except SystemExit as exc:
+        # ── Milestone 5: Critical Failure ─────────────────────────────
+        tb = traceback.format_exc()
+        snippet = tb[-500:] if len(tb) > 500 else tb
+        _notify(
+            "⚠️ <b>WFO PIPELINE CRASHED</b>\n"
+            f"<pre>{snippet}</pre>\n"
+            "Check logs/pipeline.log."
+        )
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        snippet = tb[-500:] if len(tb) > 500 else tb
+        _notify(
+            "⚠️ <b>WFO PIPELINE CRASHED</b>\n"
+            f"<pre>{snippet}</pre>\n"
+            "Check logs/pipeline.log."
+        )
+        raise
 
     elapsed = time.monotonic() - pipeline_t0
     log.info(
@@ -362,6 +457,23 @@ def main() -> None:
         elapsed_s=round(elapsed, 1),
         phase3_output=str(PHASE3_OUTPUT),
     )
+
+    # ── Milestone 4: Pipeline Finished ────────────────────────────────
+    try:
+        p3 = _load_json(PHASE3_OUTPUT)
+        champion_sharpe = p3.get("value", p3.get("sharpe", "N/A"))
+        total_trades = p3.get("total_trades", p3.get("n_trades", "N/A"))
+        if isinstance(champion_sharpe, (int, float)):
+            champion_sharpe = f"{champion_sharpe:.2f}"
+        _notify(
+            "🏆 <b>WFO Successfully Finished!</b>\n"
+            f"  • Champion Sharpe: <b>{champion_sharpe}</b>\n"
+            f"  • Total Trades: <b>{total_trades}</b>\n"
+            f"  • Configuration saved to <code>phase3_locked_bounds.json</code>\n"
+            f"  • Elapsed: {elapsed:.0f}s"
+        )
+    except Exception:
+        pass
 
     print(f"\n{'='*70}")
     print("  OPTIMIZATION PIPELINE COMPLETE")

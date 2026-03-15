@@ -41,7 +41,7 @@ class TestConfigDefaults:
         assert settings.strategy.min_edge_score == 40.0
 
     def test_no_discount_factor_tightened(self):
-        assert settings.strategy.no_discount_factor == 0.98
+        assert settings.strategy.no_discount_factor == 0.995
 
     def test_max_loss_per_trade_cents_exists(self):
         assert settings.strategy.max_loss_per_trade_cents == 1500.0
@@ -305,15 +305,18 @@ class TestZScoreDiminishingReturns:
 
     def test_extreme_zscore_still_differentiated(self):
         """z=2 and z=4 should produce different signal qualities."""
+        # Use explicit threshold so test is independent of config default.
         edge_z2 = compute_edge_score(
             entry_price=0.30, no_vwap=0.50,
             zscore=2.0, volume_ratio=1.0,
             fee_enabled=False,
+            zscore_threshold=0.80,
         )
         edge_z4 = compute_edge_score(
             entry_price=0.30, no_vwap=0.50,
             zscore=4.0, volume_ratio=1.0,
             fee_enabled=False,
+            zscore_threshold=0.80,
         )
         # The log-concave curve should still differentiate these
         assert edge_z4.signal_quality > edge_z2.signal_quality

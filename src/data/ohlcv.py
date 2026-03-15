@@ -223,6 +223,12 @@ class OHLCVAggregator:
         # Guard against zero prices
         closes = np.maximum(closes, 1e-8)
         log_returns = np.diff(np.log(closes))
+        # Cap extreme per-bar log-returns to prevent outlier bars (e.g.
+        # backfill artefacts with prices near 0 or 1) from inflating σ.
+        # ±ln(3) ≈ ±1.1 allows a price to triple/third per bar — well
+        # beyond normal binary-market dynamics.
+        _LR_CAP = 1.1
+        log_returns = np.clip(log_returns, -_LR_CAP, _LR_CAP)
         self.rolling_volatility = float(log_returns.std()) if len(log_returns) > 1 else 0.0
 
         # ── EWMA volatility (RiskMetrics λ=0.94) ────────────────────────

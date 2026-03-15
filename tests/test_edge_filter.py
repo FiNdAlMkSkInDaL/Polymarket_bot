@@ -281,6 +281,7 @@ class TestSignalQuality:
             volume_ratio=1.5,
             whale_confluence=False,
             min_score=0.0,
+            zscore_threshold=0.80,
         )
         whale = compute_edge_score(
             entry_price=0.30,
@@ -289,6 +290,7 @@ class TestSignalQuality:
             volume_ratio=1.5,
             whale_confluence=True,
             min_score=0.0,
+            zscore_threshold=0.80,
         )
         assert whale.signal_quality > base.signal_quality
         assert whale.score > base.score
@@ -314,6 +316,7 @@ class TestSignalQuality:
             volume_ratio=1.5,
             iceberg_active=False,
             min_score=0.0,
+            zscore_threshold=0.80,
         )
         iceberg = compute_edge_score(
             entry_price=0.30,
@@ -322,10 +325,11 @@ class TestSignalQuality:
             volume_ratio=1.5,
             iceberg_active=True,
             min_score=0.0,
+            zscore_threshold=0.80,
         )
         assert iceberg.signal_quality > base.signal_quality
         assert iceberg.signal_quality == pytest.approx(
-            base.signal_quality + 0.15, abs=0.01
+            min(base.signal_quality + 0.15, 1.0), abs=0.01
         )
         assert iceberg.score > base.score
 
@@ -368,9 +372,10 @@ class TestSignalQuality:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFeeDisabled:
-    """Political markets charge 0% fees — fee efficiency should be 1.0."""
+    """Political markets charge 0% entry fees but exit is always modeled
+    as taker (spread-crossing cost is real regardless of category)."""
 
-    def test_no_fee_market_full_efficiency(self):
+    def test_no_fee_market_exit_still_modeled(self):
         ea = compute_edge_score(
             entry_price=0.40,
             no_vwap=0.55,
@@ -379,9 +384,10 @@ class TestFeeDisabled:
             fee_enabled=False,
             min_score=0.0,
         )
-        assert ea.expected_fee_cents == 0.0
-        assert ea.fee_efficiency == pytest.approx(1.0)
-        assert ea.expected_net_cents == ea.expected_gross_cents
+        # Entry fee is 0 (fee_enabled=False), but exit fee is always modeled
+        assert ea.expected_fee_cents > 0.0
+        assert ea.fee_efficiency < 1.0
+        assert ea.expected_net_cents < ea.expected_gross_cents
 
     def test_fee_disabled_helps_marginal_trades(self):
         """A trade that fails with fees should pass without them."""
@@ -498,10 +504,12 @@ class TestMonotonicity:
         s1 = compute_edge_score(
             entry_price=0.30, no_vwap=0.45,
             zscore=1.3, volume_ratio=1.6, min_score=0.0,
+            zscore_threshold=0.80,
         )
         s2 = compute_edge_score(
             entry_price=0.30, no_vwap=0.45,
             zscore=2.5, volume_ratio=1.6, min_score=0.0,
+            zscore_threshold=0.80,
         )
         assert s2.score > s1.score
 
@@ -573,6 +581,68 @@ class TestDiagnostics:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Maker execution mode — exit fee modelling
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMakerExitFee:
+    """Step 1 fix: maker mode must still charge exit fees (exits are taker
+    ~87.5% of the time).  Without this, the hard negative-EV veto is
+    bypassed and the bot accepts guaranteed losers."""
+
+    def test_maker_mode_still_charges_exit_fee(self):
+        """A tight spread at max-fee price (p=0.50) should be vetoed even
+        in maker mode, because the exit is taker."""
+        ea = compute_edge_score(
+            entry_price=0.50,
+            no_vwap=0.53,
+            zscore=3.0,
+            volume_ratio=5.0,
+            execution_mode="maker",
+            min_score=0.0,
+        )
+        # Exit fee should be non-zero — the old bug zeroed it
+        assert ea.expected_fee_cents > 0.0
+        # Hard veto should fire: fee_cents >= gross_cents at p=0.50
+        assert ea.score == 0.0
+        assert ea.rejection_reason == "negative_ev_after_fees"
+
+    def test_maker_entry_fee_is_zero(self):
+        """Maker entry should still be free — only exit is modelled as taker."""
+        # Use a wide spread so the trade passes
+        ea = compute_edge_score(
+            entry_price=0.20,
+            no_vwap=0.40,
+            zscore=3.0,
+            volume_ratio=5.0,
+            execution_mode="maker",
+            min_score=0.0,
+        )
+        # Maker mode should have lower fees than taker mode (entry is free)
+        ea_taker = compute_edge_score(
+            entry_price=0.20,
+            no_vwap=0.40,
+            zscore=3.0,
+            volume_ratio=5.0,
+            execution_mode="taker",
+            min_score=0.0,
+        )
+        assert ea.expected_fee_cents < ea_taker.expected_fee_cents
+        assert ea.expected_fee_cents > 0.0  # exit fee still charged
+
+    def test_maker_mode_not_free_ride(self):
+        """Maker mode must not give fee_efficiency=1.0 — that was the old bug."""
+        ea = compute_edge_score(
+            entry_price=0.30,
+            no_vwap=0.45,
+            zscore=3.0,
+            volume_ratio=5.0,
+            execution_mode="maker",
+            min_score=0.0,
+        )
+        assert ea.fee_efficiency < 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Parametric: entropy × fee alignment across price range
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -613,12 +683,12 @@ class TestModelConfidence:
         mediocre zscore/volume_ratio."""
         ea_default = compute_edge_score(
             entry_price=0.40, no_vwap=0.55,
-            zscore=1.5, volume_ratio=1.5,
+            zscore=0.9, volume_ratio=0.6,
             min_score=0.0,
         )
         ea_conf = compute_edge_score(
             entry_price=0.40, no_vwap=0.55,
-            zscore=1.5, volume_ratio=1.5,
+            zscore=0.9, volume_ratio=0.6,
             min_score=0.0,
             model_confidence=0.95,
         )

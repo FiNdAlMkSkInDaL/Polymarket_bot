@@ -26,7 +26,7 @@ Table of Contents:
   15. Important Design Patterns & Gotchas
   16. Pillar System (Feature Numbering)
   17. Volume Expansion Architecture (V1-V4)
-  18. Signal Intelligence (SI-1 through SI-7)
+  18. Signal Intelligence (SI-1 through SI-9)
   19. Cross-Module Dependencies Graph
   20. Change History Evolution
 
@@ -114,7 +114,11 @@ src/                      — main bot package
     orderbook.py          — OrderbookTracker (top-of-book), L2OrderBookAdapter
     ohlcv.py              — OHLCVAggregator (1-min bars, VWAP, EWMA vol ~240 lines)
     spread_score.py       — SpreadScore (0-100 L2 quality metric)
-    market_discovery.py   — 3-tier discovery (CLOB→Gamma events→Gamma markets)
+    market_discovery.py   — 3-tier discovery (CLOB→Gamma events→Gamma markets);
+                            MarketInfo.neg_risk field added; conditional negRisk
+                            passthrough gated by si9_arb_enabled (SI-9)
+    arb_clusters.py       — ArbCluster dataclass + ArbitrageClusterManager; groups
+                            negRisk markets by event_id into tradeable clusters (SI-9)
     market_lifecycle.py   — observing→active→draining→emergency state machine
     market_scorer.py      — 7-component composite quality score
     prep_data.py          — JSONL→Parquet conversion with health auditing
@@ -123,21 +127,26 @@ src/                      — main bot package
   signals/                — alpha generation
     panic_detector.py     — PanicDetector (z-score + 5 gates → PanicSignal)
     drift_signal.py       — MeanReversionDrift (6 gates → DriftSignal, V3)
+    oracle_signal.py      — OracleSignalEngine: OracleSnapshot → SignalResult (SI-8)
     edge_filter.py        — EQS scoring (geometric mean), ConfluenceContext, confluence discount
     adverse_selection_guard.py — Fast-kill (4 microstructure signals, 2-of-4 composite)
     regime_detector.py    — RegimeDetector (autocorr/vol-ratio/persistence → MR/trending)
       whale_monitor.py      — WhaleMonitor (Polygon CTF WebSocket log streaming, ABI decoding, wallet clustering, REST fallback)
     cross_market.py       — CrossMarketSignalGenerator (correlated pairs stat-arb, SI-3)
+    combinatorial_arb.py  — ComboSizer (share-count-pegged sizing), ComboArbDetector,
+                            ComboLeg, ComboArbSignal — SI-9 Dutch Book arb detection
     iceberg_detector.py   — IcebergDetector (L2 refill pattern detection, SI-2)
     tag_prior_registry.py — TagPriorRegistry (stateless tag→Beta(α,β) routing, DPGE)
     resolution_probability.py — RPE (CryptoPriceModel + GenericBayesianModel/DPGE, Pillar 14)
-    signal_framework.py   — BaseSignal dataclass (market_id, no_asset_id, no_best_ask), SignalGenerator ABC, CompositeSignalEvaluator, MetaStrategyController (SI-6)
+    signal_framework.py   — BaseSignal dataclass (market_id, no_asset_id, no_best_ask, is_shadow, signal_source), SignalGenerator ABC, CompositeSignalEvaluator, MetaStrategyController (SI-6)
 
   trading/                — execution and risk
     executor.py           — OrderExecutor (paper/live), OrderStatusPoller
     chaser.py             — OrderChaser (passive-aggressive POST_ONLY + escalation)
     stealth_executor.py   — StealthExecutor (VWAP/POV-aware time-sliced order splitting, SI-4)
-    position_manager.py   — PositionManager (~1730 lines, full lifecycle + risk gates + cascade harvesting)
+    position_manager.py   — PositionManager (~1800 lines, full lifecycle + risk gates +
+                            cascade harvesting + SI-9: open_combo_position, abandon_combo
+                            Hanging Leg SM, combo_positions_for_pce)
     sizer.py              — Kelly sizing, depth-aware sizing, cold-start blend
     fees.py               — Parabolic fee curve, roundtrip fee, adaptive stop-loss
     fee_cache.py          — Per-token fee cache with TTL + per-token locks
@@ -198,7 +207,7 @@ tests/
   helpers.py              — make_trade, build_bar_history, make_position
   test_whale_wss.py       — 24 tests for topic decoding, TransferSingle/Batch ABI
                             parsing, start-mode selection, REST fallback, and stale trim
-  51 test files           — 1536 tests total
+  52 test files           — 1590 tests total
 
 data/
   market_map.json         — 31 actionable markets with YES/NO token IDs
@@ -294,6 +303,15 @@ CONCURRENT TASKS (18+):
   worker_health       — (conditional) ProcessManager.health_check_loop() — monitors
                         L2 + PCE worker liveness via WorkerHeartbeatChecker;
                         triggers emergency stop on stale/dead workers
+  oracle_poll         — (conditional, SI-8) _oracle_polling_loop(); gated by
+                        oracle_arb_enabled; spawns per-adapter sub-tasks; consumer
+                        loop with _oracle_breaker (threshold=5, window_s=60s);
+                        reset in _suspend_and_reset()
+  combo_arb           — (conditional, SI-9) _combo_arbitrage_loop(); gated by
+                        si9_arb_enabled; polls ArbitrageClusterManager every
+                        si9_scan_interval_ms; passes wallet_balance to ComboArbDetector;
+                        guarded by _combo_breaker (threshold=5, window_s=60s);
+                        reset in _suspend_and_reset()
 
 THE THREE SIGNAL PATHS:
 
@@ -352,7 +370,9 @@ Key parameter groups (~160 total):
     max_tradeable_price = 0.95    (ceiling — near resolution)
 
   PANIC DETECTOR:
-    zscore_threshold = 1.0        (z-score trigger — lowered from 1.5, 3x EV)
+    zscore_threshold = 1.0        (general z-score threshold — used for older/legacy gates)
+    panic_zscore_threshold = 0.684 (decoupled z-score threshold specifically for PanicDetector;
+                                   lowered from shared threshold to capture more signals)
     volume_ratio_threshold = 0.8  (volume trigger — lowered from 1.2, +64% signals)
     lookback_minutes = 60         (rolling window)
     no_discount_factor = 0.98     (NO must trade ≥2% below its VWAP — restored 2026-03-10; was 1.005 which inverted the check)
@@ -483,6 +503,23 @@ Key parameter groups (~160 total):
     l2_enabled = True
     l2_max_levels = 50
     l2_max_seq_gap_rate = 0.02    (2% threshold for reliability)
+    max_active_l2_markets = 25    (deploy_params override from default 50; reduced to prevent
+                                   L2 delta storms on low-volume markets)
+      Only the top N markets by daily_volume_usd get full L2OrderBook
+      reconstruction + IcebergDetector. Remaining markets fall back to the
+      lightweight OrderbookTracker (price/trade only). See Section 6 → L2
+      Load Shedding and scripts/deploy_params.py.
+
+  TIMEOUTS & COOLDOWNS:
+    exit_timeout_seconds = 900    (deploy_params override from default 1800; MR half-life
+                                   is ~15 min, so 15-min timeout is more realistic than 30 min)
+    signal_cooldown_minutes = 5.0 (deploy_params override; prevents rapid re-entry)
+    stop_loss_cooldown_s = 300.0  (5 min inter-signal pause after SL / timeout /
+      preemptive drain exits — see Section 8 → PositionManager)
+
+  MARKET QUALITY:
+    min_days_to_resolution = 3    (markets resolving within 3 days are hard-blocked
+      in discovery — see Section 6 → Market Discovery)
 
   RPE (Pillar 14) — Dynamic Prior Generation Engine (DPGE):
     rpe_shadow_mode = False           (live by default now)
@@ -496,6 +533,39 @@ Key parameter groups (~160 total):
     rpe_theta_half = 0.15             (sigmoid inflection point, t_half = 15% through life)
     rpe_probe_divergence_min = 0.12   (min model vs market divergence for model-probe)
     rpe_dynamic_prior_enabled = True  (use tag-based priors; False = legacy prior_k)
+
+  SI-8: Oracle Latency Arbitrage (all disabled/shadow by default):
+    oracle_arb_enabled = False
+    oracle_shadow_mode = True
+    oracle_default_poll_ms = 1000
+    oracle_critical_poll_ms = 200
+    oracle_idle_poll_ms = 30000
+    oracle_confidence_threshold = 0.06
+    oracle_min_confidence = 0.80
+    oracle_cooldown_seconds = 300
+    oracle_max_spread_cents = 15.0
+    oracle_market_configs = "[]"
+    oracle_ap_api_key = ""
+    oracle_ap_api_url = ""
+    oracle_sports_api_key = ""
+    oracle_sports_api_url = ""
+
+  SI-9: Combinatorial Arbitrage (all disabled by default):
+    si9_arb_enabled             = False   (master kill-switch; also gates negRisk market discovery)
+    si9_min_margin_cents        = 2.0     (min edge: Σ(YES best_bids) ≤ 1.0 − margin/100)
+    si9_margin_buffer_cents     = 1.0     (safety buffer added to min margin)
+    si9_max_legs                = 6       (max legs per combo)
+    si9_max_concurrent_combos   = 2       (max simultaneously open combos)
+    si9_max_total_exposure_usd  = 50.0    (total portfolio exposure cap)
+    si9_max_per_combo_usd       = 25.0    (per-combo size cap)
+    si9_target_size_usd         = 10.0    (budget passed to ComboSizer: S = budget / Σ prices)
+    si9_max_leg_delay_ms        = 30000   (abandon combo if any leg unfilled for this long)
+    si9_max_leg_chase_cents     = 2.0     (max taker price improvement when chasing a leg)
+    si9_chase_interval_ms       = 500     (re-quote interval when chasing unfilled legs)
+    si9_scan_interval_ms        = 500     (cluster scan polling interval)
+    si9_min_leg_depth_usd       = 50.0    (minimum ask-side depth for a leg to qualify)
+    si9_emergency_taker_max_cents = 4.0   (max allowed taker fee for emergency hedge cross)
+    si9_emergency_max_spread_cents = 5.0  (max spread before dumping filled legs as taker)
 
   PCE (Pillar 15):
     pce_shadow_mode = False       (ACTIVE enforcement since March 5th)
@@ -532,6 +602,25 @@ Settings dataclass (outer wrapper):
            whale_threshold_shares=50000, whale_ws_heartbeat_s=30
   - validate_credentials() → list[str] (missing fields for live modes)
   - __repr__ masks secrets: shows first 4 chars + ***
+
+WFO Parameter Deployment (scripts/deploy_params.py):
+  Reads logs/final_validation_tearsheet.json (WFO champion params), selects a
+  conservative subset, and appends them to .env as environment overrides.
+
+  Deployed WFO params:
+    zscore_threshold, alpha_default, min_edge_score, kelly_fraction,
+    stop_loss_cents, drift_z_threshold
+
+  Skipped as overfit: trend_guard_pct (7× default), pce_max_portfolio_var_usd
+    (2× default)
+
+  Manual overrides (hardcoded in MANUAL_OVERRIDES dict):
+    EXIT_TIMEOUT_SECONDS    = 900   (down from 1800 default; MR half-life ~15 min)
+    MAX_ACTIVE_L2_MARKETS   = 25    (down from 50 default; prevents L2 delta overload)
+    SIGNAL_COOLDOWN_MINUTES = 5.0   (prevents rapid re-entry on same market)
+
+  Usage: python scripts/deploy_params.py        (dry-run, prints diff)
+         python scripts/deploy_params.py --apply (writes .env with backup)
 
 
 ================================================================================
@@ -672,10 +761,20 @@ Market Discovery (src/data/market_discovery.py):
     2. acceptingOrders=True
     3. negRisk=False (if reject_neg_risk config)
     4. len(tokens) == 2 (binary only)
-    5. volume_num_24hr ≥ min_daily_volume_usd
-    6. liquidity ≥ min_liquidity_usd (if min > 0)
-    7. days_to_resolution ≥ min_days_to_resolution
-    8. token_id non-empty for both YES and NO (missing_token_id rejection)
+    5. Hard-block: end_date is None → reject (reason: "missing_end_date")
+       Markets with no parseable end_date are permanently excluded. The CLOB
+       API sometimes returns markets with null or missing end_date fields;
+       these are untradeable for a mean-reversion strategy because there is
+       no time-to-resolution anchor for decay scoring.
+    6. Hard-block: end_date < now() → reject (reason: "already_resolved")
+       Markets whose end_date is in the past are blocked regardless of the
+       API's active/closed flags, which are known to be unreliable (Tier 1
+       CLOB returns stale 2023-era closed markets).
+    7. days_to_resolution ≥ min_days_to_resolution (default: 3)
+       (reason: "resolves_too_soon"; days_left and threshold logged)
+    8. volume_num_24hr ≥ min_daily_volume_usd
+    9. liquidity ≥ min_liquidity_usd (if min > 0)
+    10. token_id non-empty for both YES and NO (missing_token_id rejection)
 
   Token extraction (_normalize_gamma_market):
     - Preferred path: native `tokens` list if present (forward-compat with
@@ -683,11 +782,21 @@ Market Discovery (src/data/market_discovery.py):
     - Fallback: clobTokenIds + outcomes JSON-encoded strings (current Gamma
       schema). Both fields JSON-parsed if str, empty list on decode error.
 
-  Discovery tier status (as of 2026-03-10):
+  Discovery tier status (as of 2026-03-12):
     Tier 1 (CLOB): broken — server ignores active/closed filters, returns
       stale 2023 closed markets. Falls through to Tier 2 every cycle.
     Tier 2 (Gamma /events): primary active path, yields ~150 markets/cycle.
     Tier 3 (Gamma /markets): dormant fallback.
+
+  L2 Load Shedding (src/bot.py):
+    Markets are ranked by daily_volume_usd descending. Only the top
+    max_active_l2_markets (deploy override: 25) receive full L2OrderBook
+    reconstruction + IcebergDetector wiring. All remaining markets are
+    assigned lightweight OrderbookTracker instances (price/trade only,
+    no depth data). This prevents L2 delta storms from overloading the
+    event loop on low-volume shards that yield negligible depth alpha.
+    Load shedding is logged at startup: "load_shedding_applied" with
+    total_markets, l2_active count, and l2_limit.
 
 Market Lifecycle (src/data/market_lifecycle.py):
   4-tier state machine: observing → active → draining → emergency
@@ -713,6 +822,24 @@ Data Recording (src/backtest/data_recorder.py):
 SECTION 7: SIGNAL LAYER (Alpha Generation)
 ================================================================================
 
+BaseSignal (src/signals/signal_framework.py):
+  ABSTRACT BASE — inherited by all position-entry signal dataclasses.
+  Fields:
+    market_id:      Condition ID of the Polymarket market.
+    no_asset_id:    Token ID for the NO outcome token.
+    no_best_ask:    Current best-ask price for NO (entry reference).
+    is_shadow:      bool (default False). When True, the signal is routed to the
+                    Shadow Performance Tracker (SPT) pipeline instead of live
+                    execution. The PositionManager checks this field — no
+                    hardcoded strategy names are needed.
+    signal_source:  str (default ""). Unique grouping key for the SPT database,
+                    e.g. "PRIMARY_Panic", "V3_MeanRevDrift", "SI-3_CrossMarket".
+                    Every signal generator must populate this on instantiation
+                    so the SPT can attribute P&L and metrics per-strategy.
+
+  Subclasses: PanicSignal, DriftSignal, VacuumSignal, ComboArbSignal.
+  Standalone signals with matching fields: CrossMarketSignal, IcebergSignal.
+
 PanicDetector (src/signals/panic_detector.py):
   PRIMARY SIGNAL — fires on YES price/volume spikes.
   Returns PanicSignal: market_id, yes_asset_id, no_asset_id, yes_price, yes_vwap,
@@ -725,7 +852,8 @@ PanicDetector (src/signals/panic_detector.py):
     4. Intra-bar retracement discount: if price already reverting within bar
        (close in lower half), discounts z-score by 0.70-0.85
     5. Volume ratio: bar.volume / avg_bar_volume
-    6. Z-score gate: zscore ≥ zscore_threshold
+    6. Z-score gate: zscore ≥ panic_zscore_threshold (decoupled from general
+       zscore_threshold; default 0.684 — specifically tuned for panic detection)
     7. Volume ratio gate: v_ratio ≥ volume_ratio_threshold
     8. NO discount check: no_best_ask < no_vwap × no_discount_factor
        (NO must actually be discounted vs its VWAP)
@@ -931,6 +1059,13 @@ PositionManager (src/trading/position_manager.py, ~1613 lines):
   Position states: ENTRY_PENDING → ENTRY_FILLED → EXIT_PENDING → CLOSED
                                                                 → CANCELLED
 
+  Stop-loss cooldown: a per-market 300s cooldown is recorded after ANY of
+    these exit reasons: "stop_loss", "preemptive_liquidity_drain", "timeout".
+    (As of 2026-03-12, timeout exits correctly trigger the cooldown — previously
+    they did not, causing a loser-loop where the bot immediately re-entered
+    markets it had just timed out of.)
+    Checked via is_stop_loss_cooled_down(market_id) before new entry signals.
+
   Position dataclass fields (27+): id, market_id, no_asset_id, event_id,
     state, entry/exit orders, prices, sizes, times, target_price, tp_result,
     signal, sizing/kelly results, fee info, chaser tasks, pnl_cents,
@@ -1102,8 +1237,35 @@ Fee Model (src/trading/fees.py):
   Polymarket dynamic curve: f(p) = f_max × 4 × p × (1 − p)
   Peak 2.00% at p=0.50, zero at tails. Maker = always 0 bps.
 
-  compute_net_pnl_cents(entry, exit, size, fee_enabled):
-    PnL = [(exit - entry) - Fee_entry - Fee_exit] × size × 100
+  CRITICAL FEE MODELING FIX (2026-03-12):
+    Exit fees are ALWAYS modeled as taker in EQS scoring (compute_edge_score)
+    and paper PnL accounting, regardless of execution_mode or market fee status.
+    Reason: ~87.5% of exits cross the spread due to OrderChaser escalation,
+    TP target movement, or timeout impatience. The old logic zero-ed exit fees
+    in maker mode or no-fee markets, allowing guaranteed-loss trades to pass
+    the negative-EV gate (fee_cents ≥ gross_cents). The bot was accepting
+    3¢ spreads at p=0.50 (where round-trip fee is 4¢) and bleeding capital.
+    
+    Implementation: compute_edge_score() and PositionManager TP check both
+    call get_fee_rate(exit_price, fee_enabled=True) unconditionally, even
+    when entry is maker or the market is tagged no-fee (political category).
+
+  compute_net_pnl_cents(entry, exit, size, *, fee_enabled,
+                        is_maker_entry=False, is_maker_exit=False):
+    entry_fee = 0.0 if is_maker_entry else get_fee_rate(entry)
+    exit_fee  = 0.0 if is_maker_exit  else get_fee_rate(exit)
+    PnL = [(exit - entry) - entry_fee - exit_fee] × size × 100
+
+    The is_maker_entry / is_maker_exit flags (added 2026-03-12) allow
+    accurate paper PnL accounting. Previously the function always applied
+    the dynamic curve fee to BOTH legs regardless of execution mode, which
+    over-penalised maker entries by ~2% at mid-price and under-reported
+    true round-trip cost for taker exits. Callers (e.g. EdgeFilter paper
+    scoring, PositionManager exit logging) now pass the actual execution
+    mode so simulated PnL matches live fills.
+
+  compute_roundtrip_fee_cents also accepts is_maker_entry / is_maker_exit
+    with identical semantics (entry_fee = 0 when maker, else curve fee).
 
   compute_adaptive_stop_loss_cents(sl_base, entry, fee_enabled):
     trigger   = sl_stretched − fee_drag_cents
@@ -1123,6 +1285,18 @@ Take Profit (src/trading/take_profit.py):
     4. Time decay: < 14d → −0.05
     5. VWAP proximity: > 10% discount → +0.04, < 2% → −0.05
     6. Clamp to [alpha_min, alpha_max]
+
+  Dynamic fee-aware alpha_min floor (added 2026-03-12):
+    At low entry prices (< 0.30) where the quadratic fee curve is steep,
+    a dynamic alpha_min is computed so the TP target covers ≥ 2× round-trip
+    fees. Formula:
+      rt_fee = get_fee_rate(entry) + get_fee_rate(entry + 0.04)
+      required_spread = 2.0 × rt_fee
+      dynamic_alpha_min = required_spread / (VWAP_no − entry)
+      alpha = max(alpha, dynamic_alpha_min)
+      alpha = min(alpha, alpha_max)
+    This prevents the bot from accepting TP targets in the fee-dead-zone
+    where round-trip costs exceed the expected reversion profit.
 
   Fee-floor enforcement: Newton step to widen target if spread < fees
 
@@ -1258,6 +1432,18 @@ TelegramAlerter (src/monitoring/telegram.py):
   Message truncation at 4096 chars.
   Convenience methods: signal, entry, exit, stats, RPE, PCE, paper summary, kill
 
+Logging (src/core/logger.py):
+  Structured JSON logging via structlog with async-safe QueueHandler.
+  RotatingFileHandler: 10 MB per file, 5 backups.
+  
+  Log isolation (added 2026-03-12):
+    setup_logging() now accepts log_file parameter (default: "bot.jsonl").
+    The WFO command calls setup_logging(log_file="wfo.jsonl") to write
+    optimization logs to logs/wfo.jsonl instead of the default logs/bot.jsonl.
+    This prevents WFO runs from contaminating the live bot's operational log
+    stream, allowing clean separation of backtest/optimization events from
+    production trading events.
+
 
 ================================================================================
 SECTION 10: BACKTEST SYSTEM
@@ -1391,7 +1577,9 @@ Phase-2 narrowing semantics (March 15 fix):
 
 Composite objective:
   Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
-  Returns -inf when fills < min_trades
+  Returns -10.0 when fills < min_trades (finite penalty so Optuna TPE can learn;
+  -inf would make the sampler treat all zero-trade regions as equally bad and
+  never learn to avoid them)
 
 Fold generation: rolling/anchored IS window with embargo gap
 Warm-start: seeds from previous fold's best params
@@ -1646,6 +1834,13 @@ Key test files:
                                      ABI parsing, start-mode, REST fallback, stale trim (24 tests)
   test_backfill_data.py          — PMXTArchiveAdapter, snapshot synthesis, delta coalescing,
                                      book resilience (56 tests)
+  test_oracle.py                 — SI-8 oracle system (48 tests): OracleSnapshot, registry,
+                                     adapter circuit breaker, dynamic polling intervals, polling
+                                     push-to-queue, OracleSignalEngine (direction, latch, spread
+                                     filter, confidence gate, metadata format), APElectionAdapter
+                                     (confidence bands, interval phases), SportsAdapter
+                                     (winner/over_goals market types, 12 test cases),
+                                     SI-8 config field existence + defaults
 
 
 ================================================================================
@@ -1893,6 +2088,26 @@ SECTION 15: IMPORTANT DESIGN PATTERNS & GOTCHAS
     Verified fix on March 9 VPS audit: stale_bar_flush_error dropped from
     27 events (old bot) to 0 after restart with the patch applied.
 
+21. SHADOW MODE ROUTING & FUTURE ALPHAS
+    Polymorphic Routing: The PositionManager must never contain hardcoded
+    strategy names.  Routing is determined entirely by the signal's fields,
+    not by ``isinstance()`` checks or string-matching on signal class names.
+
+    The ``is_shadow`` Switch: Signals are routed to the Shadow Performance
+    Tracker (SPT) pipeline strictly by checking ``signal.is_shadow is True``.
+    When a signal carries ``is_shadow=True``, the PositionManager logs it
+    to the SPT database (keyed by ``signal.signal_source``) and skips
+    live order placement.  When ``is_shadow=False``, the signal flows
+    through the normal execution path unchanged.
+
+    Future-Proofing: Any new strategy simply inherits from BaseSignal (or
+    includes ``is_shadow`` and ``signal_source`` fields for standalone
+    dataclasses), sets ``is_shadow = True`` via its config flag, and
+    populates ``signal_source`` with a unique identifier.  The SPT handles
+    the rest automatically — shadow P&L tracking, Sharpe computation, and
+    promotion readiness gating all key off ``signal_source`` with zero
+    changes to the PositionManager.
+
 
 ================================================================================
 SECTION 16: PILLAR SYSTEM (Feature Numbering)
@@ -1965,7 +2180,7 @@ FLAW GUARDS (discovered and patched post-V1-V4):
 
 
 ================================================================================
-SECTION 18: SIGNAL INTELLIGENCE (SI-1 through SI-7)
+SECTION 18: SIGNAL INTELLIGENCE (SI-1 through SI-9)
 ================================================================================
 
 SI-1 — REGIME DETECTOR:
@@ -2079,16 +2294,199 @@ SI-7 — RPE FAST-STRIKE TAKER PATH (ACTIVE):
   Config gate: latency_healthy is evaluated live in _on_rpe_signal() from
     self.latency_guard.state before calling open_rpe_position().
 
-SI-6 — META-STRATEGY HYBRID CONTROLLER (ACTIVE):
-  Regime-aware master switch in signal_framework.MetaStrategyController.
-  Evaluates (signal_type, regime_score) → MetaDecision with weight/veto.
-  Decision matrix:
-    RegimeScore ≥ 0.8 (Deep MR): panic/drift → 1.5× weight, RPE → 0.5×
-    RegimeScore 0.3–0.8 (Neutral): all signals → 1.0× weight
-    RegimeScore < 0.3 (Trending): panic/drift → vetoed, RPE → 1.0×
-      (100% capital shifts to RPE model path in trending regime)
-  Wired in bot.py: evaluates before every panic, drift, and RPE entry.
-  Config: DEEP_MR_THRESHOLD=0.8, TRENDING_THRESHOLD=0.3
+SI-8 — GENERALISED ORACLE LATENCY ARBITRAGE (DISABLED BY DEFAULT):
+  Extends the SI-7 fast-strike taker path to off-chain real-world API feeds
+  (AP Election results, live sports scores), triggering the same execution
+  funnel before the UMA oracle resolves the corresponding Polymarket market.
+  Disabled by default (oracle_arb_enabled=False, oracle_shadow_mode=True).
+  Requires explicit env-var config to activate in production.
+
+  Architecture:
+    OffChainOracleAdapter (ABC) — src/data/oracle_adapter.py
+      Abstract base for any off-chain data source. Each adapter owns its own
+      ExceptionCircuitBreaker (threshold=5, window_s=60s); a breaker trip
+      kills only that adapter — NOT the bot.
+      Dynamic polling interval property:
+        default:  oracle_default_poll_ms   (1000ms)
+        critical: oracle_critical_poll_ms  (200ms, e.g. AP call just came in)
+        idle:     oracle_idle_poll_ms      (30000ms, e.g. half-time)
+      Polling loop pushes OracleSnapshot objects to a shared asyncio.Queue
+      consumed by _oracle_polling_loop() in bot.py.
+
+    OracleSnapshot — src/data/oracle_adapter.py
+      Dataclass: adapter_name, market_id, raw_state, resolved_outcome,
+        confidence, event_phase, timestamp.
+
+    OracleMarketConfig — src/data/oracle_adapter.py
+      Manual mapping loaded from oracle_market_configs JSON env var:
+        market_id → oracle_type, external_id, target_outcome, market_type,
+        goal_line (for over/under sports markets).
+
+    OracleAdapterRegistry — src/data/oracle_adapter.py
+      Type-name → class registry; used by _oracle_polling_loop() to
+      instantiate adapters from JSON config.
+
+    APElectionAdapter — src/data/adapters/ap_election_adapter.py
+      Polls AP Elections REST API. Graduated confidence from reportingPct:
+        < 50% reporting   → 0.70
+        ≥ 50% reporting   → 0.82
+        ≥ 90% reporting   → 0.90
+        AP race called    → 0.97
+        Multi-desk consensus → 0.99
+      Event phases: pre_event (5s poll), in_progress (2s), critical (200ms),
+        final (1s).
+
+    SportsAdapter — src/data/adapters/sports_adapter.py
+      Polls live sports score API. Graduated confidence:
+        Goal scored + live          → 0.85
+        2-goal lead + red card + >80min → 0.92
+        Full-time result            → 0.98
+      Market types: winner (home/away/draw) and over_goals (goal_line).
+      Event phases: pre_event (5s), in_progress (1s), critical (200ms),
+        idle/halftime (30s), final (5s).
+
+    OracleSignalEngine — src/signals/oracle_signal.py
+      Converts OracleSnapshot → SignalResult.
+      Gates (all must pass):
+        1. resolved_outcome is not None
+        2. confidence ≥ oracle_min_confidence (default 0.80)
+        3. Monotonic state latch — suppresses repeated snapshots with the
+           same (market_id, resolved_outcome) pair (prevents order spam)
+        4. Spread width < oracle_max_spread_cents (default 15¢)
+      Probability mapping:
+        outcome=YES → model_probability = confidence
+        outcome=NO  → model_probability = 1 − confidence
+      Adaptive threshold (same logic as RPE):
+        base × (1 + (1 − confidence))
+      Direction: buy_yes if clob_price < model_prob, buy_no if clob_price > model_prob
+      Output: SignalResult with metadata keys:
+        model_probability, confidence, divergence, direction, model_name,
+        oracle_event_phase, oracle_raw_state
+
+  bot.py integration:
+    _oracle_polling_loop() spawns one per-adapter asyncio task and runs a
+    consumer loop. Guarded by self._oracle_breaker (threshold=5, window_s=60s).
+    Breaker reset wired into _suspend_and_reset().
+    _on_oracle_signal(): mirrors _on_rpe_signal(); applies SI-6 meta-weight,
+    cooldown gate (oracle_cooldown_seconds=300), calls open_rpe_position
+    with latency_healthy=True (always enables fast-strike path), skips
+    OrderChaser for fast_strike positions.
+    _oracle_adapter_tripped(): callback from adapter circuit breaker fires
+    Telegram alert and logs adapter name.
+    _find_oracle_config(), _find_market(): config/market lookup utilities.
+
+  Config fields (src/core/config.py, SI-8 block):
+    oracle_arb_enabled        = False   (master kill-switch)
+    oracle_shadow_mode        = True    (log-only, no real orders)
+    oracle_default_poll_ms    = 1000
+    oracle_critical_poll_ms   = 200
+    oracle_idle_poll_ms       = 30000
+    oracle_confidence_threshold = 0.06  (min divergence to fire signal)
+    oracle_min_confidence     = 0.80   (min adapter confidence to emit)
+    oracle_cooldown_seconds   = 300    (per-market cooldown after a signal)
+    oracle_max_spread_cents   = 15.0   (spread filter; wide spread → skip)
+    oracle_market_configs     = "[]"   (JSON array of OracleMarketConfig dicts)
+    oracle_ap_api_key         = ""     (AP Elections API key)
+    oracle_ap_api_url         = ""     (AP Elections endpoint)
+    oracle_sports_api_key     = ""     (sports data API key)
+    oracle_sports_api_url     = ""     (sports data endpoint)
+
+SI-9 — MUTUALLY EXCLUSIVE COMBINATORIAL ARBITRAGE (DISABLED BY DEFAULT):
+  Dutch Book arbitrage across negRisk (mutually exclusive) Polymarket markets.
+  When the sum of all YES best-bids across an event's legs falls below 1.0 − margin,
+  buying YES on every leg locks in a riskless profit equal to 1 − Σ(prices) − fees.
+  Disabled by default (si9_arb_enabled=False). All negRisk market discovery is
+  also gated by this flag.
+
+  Alpha source:
+    negRisk markets on the same event_id are mutually exclusive (exactly one YES
+    resolves to $1, all others to $0). Dutch Book: if Σ(YES best_bids) < 1.0 then
+    buying S shares of every YES token at those prices guarantees a net positive
+    payoff regardless of which leg resolves.
+
+  Architecture:
+    ArbitrageClusterManager (src/data/arb_clusters.py)
+      Groups MarketInfo objects by event_id into ArbCluster dataclasses.
+      update_cluster(market_info): upserts a market into its cluster.
+      get_clusters(): returns all clusters with ≥ 2 legs.
+      Each ArbCluster holds: event_id, List[MarketInfo], best_bid per leg.
+
+    ComboArbDetector (src/signals/combinatorial_arb.py)
+      evaluate(cluster, wallet_balance) → Optional[ComboArbSignal]
+      Gates: si9_arb_enabled, min_legs ≥ 2, max_legs ≤ si9_max_legs,
+             min depth per leg ≥ si9_min_leg_depth_usd,
+             Σ(best_bids) < 1.0 − si9_min_margin_cents/100.
+      Delegates sizing to ComboSizer.
+
+    ComboSizer (src/signals/combinatorial_arb.py)
+      Share-count-pegged sizing: S = min(budget, si9_max_per_combo_usd) / Σ(prices)
+      All N legs receive identical share count S — the fundamental Dutch Book
+      invariant. NOT Kelly / NOT USD-uniform across legs.
+      Respects si9_max_per_combo_usd and si9_max_total_exposure_usd.
+      wallet_balance passed in from bot._combo_arbitrage_loop() so the sizer
+      can enforce si9_max_total_exposure_usd against real available capital.
+
+    ComboLeg / ComboArbSignal (src/signals/combinatorial_arb.py)
+      ComboLeg: market_id, yes_asset_id, price, size (shares)
+      ComboArbSignal: event_id, legs: List[ComboLeg], expected_profit_cents,
+        margin_cents, total_cost_usd
+
+  Execution — bot._combo_arbitrage_loop():
+    Polls ArbitrageClusterManager every si9_scan_interval_ms.
+    On ComboArbSignal: calls PositionManager.open_combo_position(signal).
+    Guarded by _combo_breaker (threshold=5, window_s=60s).
+    Breaker reset in _suspend_and_reset().
+
+  Hanging Leg State Machine — PositionManager.abandon_combo():
+    Called when any leg remains unfilled beyond si9_max_leg_delay_ms.
+    State 1 (zero fills across all legs):
+      Safe cancel — cancel all resting maker orders; no net exposure.
+    State 2 (≥1 filled leg):
+      Attempt emergency hedge: cross the spread on each unfilled leg
+      (taker), up to si9_emergency_taker_max_cents above best_ask.
+      If spread too wide (> si9_emergency_max_spread_cents): dump all
+      filled legs via taker sell (accept loss to close net exposure).
+    Position transitions: ENTRY_PENDING → ACTIVE (full fill) or
+      ABANDONED (partial/zero fill after abandon).
+
+  PCE integration — combo_positions_for_pce():
+    Returns each combo leg as a full _MinimalPosition-compatible dict
+    (NOT tuples) with keys: market_id, entry_price, size, filled_size,
+    trade_asset_id, no_asset_id, event_id. Included in _check_var_remote()
+    alongside standard positions for unified VaR accounting.
+
+  MarketInfo.neg_risk field:
+    Added to MarketInfo dataclass. Set from Gamma API negRisk boolean.
+    _parse_market() allows negRisk=True markets through only when
+    si9_arb_enabled=True (otherwise skipped with reason="neg_risk_disabled").
+
+  Config fields (src/core/config.py, SI-9 block):
+    si9_arb_enabled             = False (master kill-switch)
+    si9_min_margin_cents        = 2.0
+    si9_margin_buffer_cents     = 1.0
+    si9_max_legs                = 6
+    si9_max_concurrent_combos   = 2
+    si9_max_total_exposure_usd  = 50.0
+    si9_max_per_combo_usd       = 25.0
+    si9_target_size_usd         = 10.0
+    si9_max_leg_delay_ms        = 30000
+    si9_max_leg_chase_cents     = 2.0
+    si9_chase_interval_ms       = 500
+    si9_scan_interval_ms        = 500
+    si9_min_leg_depth_usd       = 50.0
+    si9_emergency_taker_max_cents  = 4.0
+    si9_emergency_max_spread_cents = 5.0
+
+  New files:
+    src/data/arb_clusters.py       — ArbCluster, ArbitrageClusterManager
+    src/signals/combinatorial_arb.py — ComboSizer, ComboArbDetector, ComboLeg, ComboArbSignal
+
+  Modified files:
+    src/trading/position_manager.py — open_combo_position, abandon_combo (Hanging Leg SM),
+                                      combo_positions_for_pce
+    src/bot.py                      — _combo_arbitrage_loop, _combo_breaker
+    src/core/config.py              — 15 new si9_* fields
+    src/data/market_discovery.py    — MarketInfo.neg_risk, conditional negRisk passthrough
 
 SI-6 — META-STRATEGY HYBRID CONTROLLER:
   Regime-aware master switch replacing binary is_mean_revert gate.
@@ -2127,9 +2525,12 @@ bot.py (orchestrator)
   ├── data/l2_book.py (L2OrderBook → feeds OrderbookTracker via Adapter)
   ├── data/orderbook.py (OrderbookTracker, L2OrderBookAdapter)
   ├── data/ohlcv.py (OHLCVAggregator → feeds PanicDetector, RegimeDetector, DriftSignal)
-  ├── data/market_discovery.py (MarketInfo → feeds lifecycle, scoring)
+  ├── data/market_discovery.py (MarketInfo + neg_risk field → feeds lifecycle, scoring; SI-9 negRisk gating)
   ├── data/market_lifecycle.py (state machine → manages market tiers)
   ├── data/market_scorer.py (scoring → drives lifecycle decisions)
+  ├── data/oracle_adapter.py (OffChainOracleAdapter + OracleAdapterRegistry → SI-8 adapter base)
+  ├── data/adapters/ap_election_adapter.py (APElectionAdapter → aiohttp REST → OracleSnapshot)
+  ├── data/adapters/sports_adapter.py (SportsAdapter → aiohttp REST → OracleSnapshot)
   │
   ├── signals/panic_detector.py (PanicSignal → triggers open_position)
   ├── signals/drift_signal.py (DriftSignal → inherits BaseSignal → open_position directly)
@@ -2140,6 +2541,8 @@ bot.py (orchestrator)
   ├── signals/cross_market.py (shadow signals → future alpha)
   ├── signals/iceberg_detector.py (L2 intelligence → OrderChaser iceberg peg routing)
   ├── signals/resolution_probability.py (RPE → open_rpe_position)
+  ├── signals/oracle_signal.py (OracleSignalEngine → bot._on_oracle_signal → open_rpe_position)
+  ├── signals/combinatorial_arb.py (ComboArbDetector → bot._combo_arbitrage_loop → open_combo_position)
   ├── signals/signal_framework.py (composite → spread-compression entries)
   │
   ├── trading/executor.py (OrderExecutor → places/cancels orders)
@@ -2185,6 +2588,16 @@ Key data flows:
   StopLossMonitor.on_probe_breakeven → PositionManager.scale_probe_to_full()
     → StealthExecutor.place_stealth_order() (if stealth_enabled)
     → sliced BUY orders with drift + fill-pct abandonment guards
+
+  [SI-8] OffChainOracleAdapter.start() → asyncio.Queue → bot._oracle_polling_loop()
+    → OracleSignalEngine.evaluate() → SignalResult → bot._on_oracle_signal()
+    → PositionManager.open_rpe_position(latency_healthy=True) → fast-strike taker path
+
+  [SI-9] ArbitrageClusterManager.get_clusters() → bot._combo_arbitrage_loop()
+    → ComboArbDetector.evaluate(cluster, wallet_balance) → ComboArbSignal
+    → PositionManager.open_combo_position(signal)
+    → per-leg OrderExecutor maker orders (share-count pegged, S = budget / Σ prices)
+    → on timeout: abandon_combo() → State 1 (cancel) or State 2 (emergency hedge/dump)
 
 
 ================================================================================
@@ -2837,6 +3250,590 @@ March 10th — Market Discovery: Token ID Validation Hardening:
   rejections. 1534 passed, 0 regressions.
 
 
-================================================================================
-END OF DOCUMENT
-================================================================================
+March 10th — Hard Negative-EV Veto in Edge Scoring (commit 61858a7):
+  Problem: Trades could be admitted where the expected gross profit was
+  mathematically incapable of covering the round-trip taker fee, meaning the
+  bot was taking positions with guaranteed negative expected value before
+  market uncertainty was even factored in.
+
+  Changes across src/trading/fees.py, src/trading/chaser.py,
+  src/trading/stop_loss.py, src/trading/take_profit.py, src/bot.py,
+  src/core/config.py, src/data/l2_book.py, src/signals/edge_filter.py:
+  - compute_edge_score now performs a hard pre-filter: if
+    expected_gross_profit < round_trip_taker_fee the trade is vetoed and
+    the function returns score=0 with is_signal=False. No downstream code
+    is reached for such trades.
+  - OrderChaser fee calculations conservatively assume taker exit fees
+    (worst-case fill assumption) rather than optimistic maker fees.
+  - Adaptive stop-loss gains a dynamic fee-aware floor of 2.5 cents,
+    preventing premature exits when the remaining profit margin is
+    less than the cost of unwinding.
+  - probe sizing is skipped in PENNY_LIVE mode to preserve probe math
+    integrity; probing only fires in full production runs.
+  - Take-profit alpha contributions are capped so targets remain reachable
+    under typical market conditions.
+  All 19 affected test files were updated to match the new fee/stop-loss
+  behaviour. 1534 passed, 0 regressions.
+
+
+March 10th — Config Parameter Recalibration + signal_q Clamp Fix (commit ab51f26):
+  Problem 1 (signal_q clamping): iceberg and whale confluence bonuses were
+  being added to signal_quality without a per-bonus intermediate clamp, so
+  the whale bonus could push signal_quality above 1.0 before the iceberg
+  bonus was applied. Tests were asserting `base + 0.15` without the clamp,
+  causing them to fail when a high-sigma input already saturated the base.
+  Fix: each bonus is now applied as `min(1.0, current + bonus)` and the
+  test assertions were updated to use the same expression.
+
+  Problem 2 (panic detector dimensionality): the z-score formula computed
+  `delta_p = bar.close - vwap` (raw price difference) and divided by sigma
+  (a log-return standard deviation). Because numerator and denominator had
+  different units, the z-score was wrongly scaled.
+  Fix in src/signals/panic_detector.py:
+    delta_p = (bar.close - vwap) / vwap   # fractional deviation (dimensionless)
+    zscore  = delta_p / sigma              # sigma also dimensionless
+  This also corrected the default thresholds:
+    zscore_threshold:      1.0 → 0.8   (tighter trigger after unit fix)
+    volume_ratio_threshold: 0.8 → 0.5
+
+  Additional parameter recalibrations in src/core/config.py:
+    signal_cooldown_minutes: 0.5 → 0.25  (halved, faster re-arm)
+    no_discount_factor:     0.98 → 0.995  (requires tighter discount at entry)
+    eqs_vol_adaptive:       True → False  (disabled; proxy ratio was
+                                           always 10-96×, jamming the ±25%
+                                           adjuster; value is noise)
+    drift_vol_ceiling:      0.05 → 0.35  (raised to reflect actual median
+                                          market EWMA vol of 0.72)
+
+
+March 10th — Ops: Scorched Earth Reset Script (commit beb6516):
+  Added scripts/scorched_earth_reset.sh — a comprehensive VPS reset procedure
+  for use when the system must be returned to a clean state. Steps executed:
+    1. SIGTERM all src.cli / polybot / wfo_optimizer / optuna processes.
+    2. Remove all /dev/shm/pmb_* shared-memory segments.
+    3. Kill tmux server (terminates bot_prod and wfo_prod sessions).
+    4. Stop systemd polymarket-bot.service if active.
+    5. Verify no residual Python processes remain.
+    6. Wipe logs/ (except .env), clear Optuna SQLite databases.
+    7. Re-create logs/ directories; confirm parquet data is present.
+    8. Show current git commit (no implicit git pull — keeps deploy explicit).
+    9. Validate .env configuration.
+   10. Reinstall Python dependencies into .venv.
+   11. Run full pytest suite (must pass before restart).
+   12. Launch fresh tmux sessions: wfo_prod (WFO pipeline) + bot_prod (live bot).
+  The script is idempotent; steps that find nothing to do print a "not found"
+  notice rather than erroring.
+
+
+March 10th — UTF-8 BOM Strip + scorched_earth_reset Hardening (commit 6c27df6):
+  Problem: Both src/signals/adverse_selection_guard.py and
+  scripts/run_diagnostics.py were saved with a UTF-8 BOM (0xEF 0xBB 0xBF)
+  as their first byte. On Linux/Python this causes the docstring's opening
+  triple-quote to be misread, producing a SyntaxError or UnicodeDecodeError
+  on import.
+  Fix: BOM removed from both files (re-saved as plain UTF-8). Zero
+  functional changes.
+
+  scorched_earth_reset.sh step 2.5 was originally performing a hard
+  `git fetch; git reset --hard origin/main`, which would silently overwrite
+  any uncommitted local changes before the operator had a chance to review
+  them. Changed to a passive version-check:
+    echo "  current commit: $(git log --oneline -1)"
+  Deploys are now always explicit (operator runs `git pull` separately).
+
+
+March 10th — IPC: Stale Shared-Memory Segment Cleanup (commit 39d871b):
+  Problem: On VPS restart (or after a crash) the previous bot process left
+  /dev/shm/pmb_<asset_id> segments allocated. When the new bot called
+  allocate_shm(), shared_memory.SharedMemory(create=True) raised
+  FileExistsError because the name was already registered, preventing
+  the bot from starting.
+
+  Fix in src/core/ipc.py — allocate_shm() now attempts to attach to and
+  immediately unlink any pre-existing segment with the same name before
+  calling create=True:
+    try:
+        stale = SharedMemory(name=name, create=False)
+        stale.close()
+        stale.unlink()
+    except FileNotFoundError:
+        pass          # normal case: no stale segment present
+  This is safe because the unlink is performed only if the segment exists
+  with the expected name, and the subsequent create=True call then succeeds.
+  The scorched_earth_reset.sh STEP 1 also explicitly `rm -f /dev/shm/pmb_*`
+  as a belt-and-suspenders belt ahead of any Python startup.
+
+
+March 11th — Active/Passive L2 Tracking (Load Shedding for 150+ Markets):
+  Problem: With 150+ active markets (300+ asset IDs), maintaining full-depth
+  L2 order book reconstruction for every market is computationally infeasible
+  on the VPS.  WebSocket connections are sharded (MAX_SUBSCRIPTIONS_PER_SOCKET
+  = 50 per physical WS connection), and each L2OrderBook maintains a full
+  state machine (EMPTY → BUFFERING → SYNCED ↔ DESYNCED) with seq gap tracking.
+
+  Solution: The bot tiers markets into Active and Passive categories based on
+  24-hour volume ranking.  `max_active_l2_markets` (config) caps the number
+  of markets receiving full L2 reconstruction via dedicated worker subprocesses
+  (ProcessManager → start_l2_workers → SharedBookWriter → shared memory).
+  Markets beyond the cap get lightweight top-of-book tracking only.
+
+  Architecture:
+  - MarketWebSocketPool chunks asset IDs across multiple WS connections
+    (50 subs per socket), feeding a shared trade_queue and book_queue.
+  - L2 workers (l2_worker.py) run as subprocesses, each managing an asset
+    shard via L2WebSocket + L2OrderBook → SharedBookWriter to /dev/shm.
+  - ProcessManager monitors worker health via WorkerHeartbeatChecker,
+    restarting stale workers automatically.
+  - Bot main loop sorts markets by volume, top N get full L2 + SpreadScore
+    + IcebergDetector, the rest get OrderbookTracker (BBO only).
+  - L2OrderBook reliability gate: seq_gap_rate < l2_max_seq_gap_rate (2%)
+    must hold for L2 data to be considered reliable.
+
+  Config: l2_enabled=True, l2_max_levels=50, l2_max_seq_gap_rate=0.02,
+  max_active_l2_markets (controls the tiering cutoff).
+
+March 11th — Ghost Liquidity Vacuum (VacuumSignal + POST_ONLY Stink Bids):
+  New alpha source: detects "ghost liquidity" events where >50% of order book
+  depth vanishes within a 2-second window — a signature of spoofing (fake
+  orders placed then cancelled) or market-maker risk-off.
+
+  Signal: VacuumSignal (src/signals/signal_framework.py)
+    Fires when ghost-liquidity detector sees >50% depth drop.
+    Fields: depth_velocity (negative = drop), baseline_depth (pre-drop USD),
+    yes_asset_id, mid_price at detection moment.
+
+  Strategy: POST_ONLY stink bids placed at mid - offset (default 8¢ below).
+  - PositionManager.open_vacuum_stink_bids():
+    Calculates yes_bid = max(0.01, mid - offset), no_bid = max(0.01, (1-mid) - offset)
+    Risk-gated: _check_risk_gates + hard cap at vacuum_stink_bid_max_risk_usd ($2).
+    Places POST_ONLY limit orders via OrderExecutor.
+    Position created with prefix "VACUUM-", target_price = side_mid.
+  - PositionManager.cancel_vacuum_stink_bids():
+    Cancels unfilled ENTRY_PENDING stink bids when depth recovers
+    (ghost_recovery_s=60 seconds), reason="ghost_recovered".
+
+  Config:
+    ghost_depth_drop_threshold=0.50 (50% drop trigger)
+    ghost_window_s=2.0 (measurement window)
+    ghost_recovery_s=60.0 (recovery period)
+    ghost_check_interval_ms=500 (polling interval)
+    vacuum_stink_bid_enabled=True
+    vacuum_stink_bid_offset_cents=8.0 (entry 8¢ below mid)
+    vacuum_stink_bid_max_risk_usd=2.0 (position size cap)
+
+  Rationale: Ghost liquidity events create temporary dislocations.
+  By placing cheap limit orders during the panic, the bot harvests
+  mean-reversion once depth refills. POST_ONLY ensures maker fees
+  (rebates) rather than taker fees.
+
+March 11th — WFO Penalty Logic: Zero-Trade Rejection Returns -10.0:
+  Previous behavior: compute_wfo_score() returned float("-inf") when
+  total_fills < min_trades (default 5).  This prevented Optuna's TPE
+  sampler from learning which parameter regions produce zero trades,
+  because -inf makes all such regions look equally terrible.
+
+  New behavior: Returns -10.0 (a finite, severely negative score).
+  This allows the TPE sampler to model the density of zero-trade
+  parameter space and steer subsequent trials away from it.  The
+  improvement is visible in the WFO database: 62 of 254 completed
+  trials scored -10.0 (penalty), while the sampler still found the
+  best Sharpe of 4.16 — demonstrating that it successfully learned
+  to concentrate exploration in productive parameter regions.
+
+  Also applied to worker error paths: data-loading failures and
+  unexpected exceptions also return -10.0 via study.tell(trial, -10.0)
+  to prevent zombie RUNNING trials from corrupting the study.
+
+  Test suite updated: 9 tests updated to match new -10.0 semantics,
+  search space bounds (zscore_threshold [0.05, 2.5], min_edge_score >= 20),
+  normalised zscore formula ((close-vwap)/vwap/σ), and config defaults
+  (no_discount_factor=0.995, drift_vol_ceiling=0.35).
+  1542 passed, 0 failed.
+
+March 11th — CRITICAL: Ghost Liquidity Crash-Loop Fix (3 bugs):
+  Problem: Bot was trapped in a continuous crash-and-restart loop.  The
+  external watchdog / systemd service kept triggering cold boots evidenced by
+  recurring "Bot starting in PAPER mode" log entries.  Every restart was
+  preceded by a cluster of 5-6 ghost_liquidity_detected events, perfectly
+  aligning with the _ghost_breaker threshold of 5 errors per 60 seconds.
+
+  Root-cause analysis identified three cascading bugs in src/bot.py:
+
+  Bug 1 — Fatal: _suspend_and_reset() killed the process (CRITICAL)
+    _suspend_and_reset() called task.cancel() on the WS task (line ~847).
+    That task is part of asyncio.gather(*self._tasks, return_exceptions=False)
+    in start().  When a gather-managed task is cancelled, gather propagates
+    the CancelledError upward.  start() caught it, exited the try block,
+    returned — event loop tore down — process died — watchdog restarted.
+    This is the primary crash vector.  All circuit-breaker handlers in all 6
+    hot-path loops trigger _suspend_and_reset(), so any breaker trip produced
+    a guaranteed kill.
+
+  Bug 2 — Unprotected breaker-trip handlers
+    All 6 except-Exception blocks called `await self._suspend_and_reset()`
+    with no wrapper.  If _suspend_and_reset() itself raised (e.g. a network
+    error during ws.stop()), the exception escaped the except handler, killed
+    the async task, and crashed the process through gather.
+
+  Bug 3 — Unprotected force-exit calls in ghost loop
+    Inside the emergency drain path, force_stop_loss() and cancel_order()
+    were called without try/except.  These are network/executor calls that
+    can fail (API errors, timeouts), producing raw exceptions that accumulated
+    against the _ghost_breaker threshold.  Within 60 seconds of sustained
+    ghost detections, 5 executor errors tripped the breaker → called
+    _suspend_and_reset() → killed the process (Bug 1).
+
+  Crash sequence:
+    1. Force-exit calls during ghost drain throw executor exceptions (Bug 3)
+    2. Each exception caught → _ghost_breaker.record() increments
+    3. After 5th error, breaker trips → calls _suspend_and_reset()
+    4. _suspend_and_reset() cancels WS task inside gather (Bug 1)
+    5. gather propagates CancelledError → start() exits → process dies
+    6. Watchdog restarts → "Bot starting in PAPER mode"
+
+  Fixes applied to src/bot.py:
+
+  Fix 1 — Remove task.cancel() from _suspend_and_reset():
+    Replaced explicit `task.cancel()` with `ws.stop()` + yield to event loop
+    (`await asyncio.sleep(0)`) + wait for natural task completion via
+    `asyncio.wait_for(asyncio.shield(task), timeout=5)`.
+    The WS task is no longer forcibly cancelled, so gather never receives an
+    unsolicted CancelledError from within _suspend_and_reset().
+
+  Fix 2 — Wrap entire _suspend_and_reset() in try/except:
+    Added outer try/except(Exception) around the full body of
+    _suspend_and_reset() so any internal failure logs via log.error() and
+    returns cleanly.  CancelledError is explicitly re-raised to preserve
+    correct task cancellation semantics.  Updated docstring to document the
+    "must never raise" contract.
+
+  Fix 3 — Wrap per-position force-exit calls in ghost loop:
+    Each call to force_stop_loss() / cancel_order() during the emergency
+    drain position-force-exit block is now wrapped in try/except(Exception)
+    with a log.warning("ghost_force_exit_error").  A failed executor call for
+    one position no longer propagates and feeds the circuit breaker.
+
+  Fix 4 — Wrap cancel_vacuum_stink_bids() in recovery section:
+    The call to positions.cancel_vacuum_stink_bids(cid) in the recovery loop
+    is wrapped with try/except; n_cancelled defaults to 0 on failure so the
+    Telegram message still sends.
+
+  Post-deploy verification (PID 244523, 02:33 UTC):
+    l2_synced events flowing across 27 markets, same PID held for 25+ seconds.
+    Zero ghost_liquidity_error, zero circuit_breaker_tripped, zero restart
+    events in the observation window.  Crash loop confirmed resolved.
+  112 targeted tests passed (test_market_lifecycle, test_position_manager,
+  test_system, test_integration, test_resilience, test_risk_controls), 0 failed.
+
+─── Patch 2026-03-11 — PCE Worker AttributeError & PAPER-Mode Lock ────────────
+
+  Date: 2026-03-11 ~06:49 UTC (overnight session 2026-03-10 20:00 → 03-11 08:00)
+
+  Symptoms:
+    1. Bot executed zero real trades overnight (599 paper orders, 0 fills).
+    2. Bot experienced repeated emergency resets every ~20 minutes.
+    3. Specific reset at 06:49:02 UTC triggered investigation.
+
+  Root Cause 1 — _MinimalPosition missing entry_size attribute:
+    The pce_worker's _MinimalPosition class (lightweight cross-process stand-in
+    for Position) did not include the entry_size field. Position.entry_size was
+    serialized as "size" in the dict (position_manager.py:314), and
+    _MinimalPosition correctly read it as self.size. However,
+    portfolio_correlation.py:1376 (_build_exposure_list) and line 928
+    (compute_concentration_haircut) both access pos.entry_size, which triggered
+    AttributeError: '_MinimalPosition' object has no attribute 'entry_size'.
+    This error fired 5 times within 1 second, tripping the pce_worker circuit
+    breaker → emergency_stop_triggered → systemd restart.  The cycle repeated
+    every ~20 minutes (111 var_gate_error events, ~15 emergency stops overnight).
+
+  Root Cause 2 — Service file forced PAPER mode:
+    scripts/polymarket-bot.service ExecStart used the legacy --paper flag:
+      ExecStart=... python -m src.cli run --paper
+    This overrode the .env DEPLOYMENT_ENV=PENNY_LIVE setting, causing every
+    restart to boot in PAPER mode.  All 599 orders were paper trades (PAPER-1
+    through PAPER-599), with zero real CLOB interaction.
+
+  Also noted:
+    - trade_side field was missing from the positions serialization dict sent
+      to the pce_worker, causing _build_exposure_list to always default to "NO"
+      via getattr() fallback.  This silently miscalculated directional exposure
+      for YES-side positions.
+
+  Fixes applied:
+
+  Fix 1 — Add entry_size and trade_side to _MinimalPosition (pce_worker.py):
+    Added self.entry_size = kwargs.get("entry_size", self.size) to map from
+    either the direct "entry_size" key or the "size" key used by serialization.
+    Added self.trade_side = kwargs.get("trade_side", "NO") for correct
+    directional exposure in _build_exposure_list.
+
+  Fix 2 — Include trade_side in position serialization (position_manager.py):
+    Added "trade_side": p.trade_side to the positions_data dict at line 314+
+    so the pce_worker receives the actual trade direction.
+
+  Fix 3 — Change service file to PENNY_LIVE mode (polymarket-bot.service):
+    Replaced: ExecStart=... python -m src.cli run --paper
+    With:     ExecStart=... python -m src.cli run --env PENNY_LIVE
+    Bot now starts in PENNY_LIVE mode as intended by .env configuration.
+
+March 11th (~12:00 UTC) — PENNY_LIVE "Live Fire" Validation:
+  Wallet 0x9F16...18a59c fully funded with POL (gas) and ~30.69 USDC.e.
+  Token approvals completed via approve_usdc.py (CTF Exchange spender).
+  Bot running in PENNY_LIVE mode via tmux (PID 252215, started 10:49 UTC).
+
+  Diagnostic results:
+
+  1. Balance Recognition — PASS (with caveat):
+     DeploymentGuard.get_wallet_balance() returns synthetic $75.00 for
+     PENNY_LIVE (max_trade_size_usd × 5), not the real on-chain balance.
+     The insufficient_balance warnings in bot.jsonl originated from the
+     concurrent WFO backtester process (which shares the same log sink),
+     NOT the live bot.  The live bot (bot_fresh.log) has zero
+     insufficient_balance events.
+
+  2. Order Execution — PASS (pipeline verified, no fills yet):
+     DeploymentGuard correctly clamps every order to $1.00 USD max.
+     penny_live_size_clamped events logged at 11:09, 11:19, 11:29, 11:49,
+     12:00 UTC — confirming the sizing pipeline is active and the $1.00
+     hardcap is enforced.
+     Vacuum stink bids are being submitted to the real CLOB with
+     post_only=True.  All bids returned OrderStatus.CANCELLED by the
+     exchange (vacuum_stink_bid_rejected_post_only) — pricing is currently
+     at or above the best ask, so POST_ONLY prevents taker fills.  This
+     confirms the full signing → submission → exchange response pipeline
+     is operational.  No fills yet; pricing offsets need tuning.
+
+  3. Signature Health — PASS:
+     Zero auth_signature_error or eip712_signing_failed events in any log
+     file.  The eoa_private_key is correctly signing L2 CLOB requests.
+     Confirmed by the exchange returning valid CANCELLED responses to our
+     signed POST_ONLY orders (authentication succeeded).
+
+  4. WebSocket Connectivity — PASS:
+     MarketWebSocketPool maintaining stable l2_synced status across all
+     active markets.  All synced events show seq_gap_rate: 0.0 — zero
+     sequence gaps.  periodic_server_snapshot resync events flowing
+     normally (last observed 12:06 UTC).
+
+  5. WFO Synchronization — PASS (running, no alpha found yet):
+     Walk-Forward Optimizer active with 2 worker processes (~96% CPU each).
+     Phase 1 discovery running: --n-trials 50, --max-markets 5,
+     --train-days 14.  Multiple wfo_complete events logged with folds=1-2.
+     Current results: oos_sharpe=0.0, oos_pnl=0.0 across all folds — the
+     backtest data has not yet produced a champion parameter set.
+     The bot is wired to reload champion params from
+     logs/phase1_champion.json when a new best-performer is found.
+
+  Cleanup:
+     Removed scripts/approve_usdc.py and /tmp/fix_tests.py from VPS.
+
+  Status: Bot is fully operational in PENNY_LIVE mode.  The signing,
+  sizing, clamping, and CLOB submission pipeline is verified end-to-end.
+  No real fills yet — market-eligible vacuum bids are being POST_ONLY
+  rejected due to aggressive pricing relative to current spreads.
+
+March 11th (Session 3) — Live Fire Stabilization & Execution Fixes:
+  Consolidated session covering all architectural repairs made to bring the bot
+  from a crash-looping PAPER-mode state into stable, fully-funded PENNY_LIVE
+  execution.
+
+  - Ghost Liquidity Crash Loop Resolved (Bugfix): Fixed a fatal
+    asyncio.gather propagation bug that caused the bot process to die on
+    every circuit-breaker trip.  The root cause was explicit task.cancel()
+    calls inside _suspend_and_reset(): cancelling a task that is managed
+    by gather(return_exceptions=False) causes gather to propagate the
+    CancelledError upward, tearing down the entire event loop.  Fix:
+    removed all task.cancel() calls from _suspend_and_reset().  Additionally,
+    wrapped _suspend_and_reset() and all network-bound force-exit calls
+    (force_stop_loss, cancel_order, cancel_vacuum_stink_bids) in targeted
+    try/except blocks so that API timeouts and executor errors cannot
+    accumulate against the _ghost_breaker threshold and re-trigger the
+    crash sequence.
+
+  - PCE Worker Serialization Mismatch Fixed (Bugfix): Fixed an
+    AttributeError that caused the pce_worker to crash on every VaR check
+    and subsequently trigger emergency_stop_triggered.  The _MinimalPosition
+    class in pce_worker.py was missing the entry_size and trade_side fields
+    that portfolio_correlation.py accesses at runtime.  Synchronized
+    _MinimalPosition attribute definitions (entry_size, trade_side) with
+    the cross-process serialization dicts produced by position_manager.py,
+    ensuring the pce_worker consistently receives all required fields.
+
+  - DevOps --paper Override Removed (Config): Fixed an issue where the bot
+    simulated all trades despite DEPLOYMENT_ENV=PENNY_LIVE being set in
+    .env.  The hardcoded --paper flag in scripts/polymarket-bot.service and
+    scripts/scorched_earth_reset.sh was overriding the environment variable
+    on every systemd start and scorched-earth relaunch.  Removed --paper
+    from both files and replaced with --env PENNY_LIVE, allowing .env to
+    correctly route orders through the live CLOB.
+
+  - Test Suite Config Drift Repaired (Testing): Fixed 13 failing tests
+    caused by parameter-tuning commits that landed after the test suite was
+    last updated.  Changes: updated WFO zero-trade penalty assertions from
+    float("-inf") to -10.0, corrected the Z-score relative normalisation
+    formula in unit tests to (close - vwap) / vwap / σ (dimensionless),
+    updated WFO search space bounds (zscore_threshold range [0.05, 2.5],
+    min_edge_score lower bound ≥ 20), and patched DEPLOYMENT_ENV state
+    bleed in pytest fixtures that was causing PENNY_LIVE guard logic to
+    activate in unrelated test cases.
+
+  - Spread-Aware Vacuum Stink Bids (Logic Change): Fixed an issue where
+    POST_ONLY stink bids were unconditionally rejected by the CLOB because
+    mid - offset was priced at or above the best ask during liquidity
+    vacuums (when the spread is blown out, mid is not a reliable reference).
+    Updated open_vacuum_stink_bids() with spread-aware clamping:
+      bid_price = min(max(0.01, mid - offset), best_ask - 0.01)
+    This ensures maker orders are always mathematically priced below the
+    best ask, satisfying the POST_ONLY constraint regardless of how wide
+    the spread becomes during a ghost-liquidity event.
+
+  System successfully funded with POL/USDC.e, contracts approved, and
+  verified fully operational in PENNY_LIVE mode with $1.00 DeploymentGuard
+  clamping active.
+
+March 11th — SI-8: Generalised Oracle Latency Arbitrage (New Feature):
+  Extends the SI-7 RPE fast-strike taker path to off-chain real-world API
+  feeds (AP Election results, live sports scores). When an external data
+  source indicates a likely resolution outcome before the UMA oracle has
+  settled, the bot fires the same fast-strike taker execution path to
+  acquire a position ahead of the CLOB re-pricing.
+
+  New modules:
+    src/data/oracle_adapter.py      — OffChainOracleAdapter ABC, OracleSnapshot,
+                                      OracleMarketConfig, OracleAdapterRegistry
+    src/data/adapters/__init__.py   — adapters package
+    src/data/adapters/ap_election_adapter.py — AP Elections adapter with 5-tier
+                                      graduated confidence (0.70 → 0.99)
+    src/data/adapters/sports_adapter.py — Sports adapter with winner and
+                                      over_goals market types (confidence 0.85 → 0.98)
+    src/signals/oracle_signal.py    — OracleSignalEngine: monotonic state latch,
+                                      spread filter, adaptive threshold, SignalResult output
+
+  bot.py additions:
+    _oracle_polling_loop() — spawns per-adapter async tasks; consumer loop with
+      own ExceptionCircuitBreaker; reset in _suspend_and_reset().
+    _on_oracle_signal() — mirrors _on_rpe_signal(); SI-6 meta-weight; cooldown gate;
+      open_rpe_position(latency_healthy=True) for fast-strike; skips chaser for
+      fast_strike positions.
+    _oracle_adapter_tripped() — adapter breaker callback (Telegram alert).
+
+  Config: 15 new StrategyParams fields under SI-8 block (all disabled/shadow
+    by default — zero impact on existing behaviour).
+
+  Dependencies: aiohttp added to .venv for HTTP adapter polling.
+
+  Test coverage: tests/test_oracle.py — 48 new tests across 7 classes
+    (adapter registry, dynamic intervals, circuit breaker, polling push,
+    signal engine gates, APElectionAdapter, SportsAdapter, config fields).
+  Full regression: 1590/1590 tests pass, 0 regressions.
+
+March 11th (Session 4) — PENNY_LIVE Math Fix & PAPER Mode Revert:
+  Date: 2026-03-11 ~15:45–16:10 UTC
+  Scope: Infrastructure patch to resolve Polymarket exchange rejection
+  issues in PENNY_LIVE mode, plus tactical revert to PAPER mode to
+  dedicate VPS resources to the running WFO pipeline.
+
+  1. PENNY_LIVE_MAX_TRADE_USD Raised (config.py):
+     Changed the hardcoded constant from $1.00 to $5.00.  The previous
+     $1.00 cap was causing most trades to fall below the Polymarket
+     exchange minimum of $1.00 total / 5 shares after the guard's
+     rounding logic trimmed them down.  At $5.00 the guard produces
+     share counts comfortably above exchange minimums for typical
+     prediction-market prices ($0.10–$0.90 per share).
+
+  2. Exchange Minimum Guards Added (config.py, guard.py):
+     Two new constants:
+       EXCHANGE_MIN_USD   = 1.0   — Polymarket rejects orders < $1 notional
+       EXCHANGE_MIN_SHARES = 5.0  — Polymarket rejects orders < 5 shares
+     DeploymentGuard.get_allowed_trade_shares() now enforces both floors
+     for all live phases (PENNY_LIVE and PRODUCTION).  If the clamped
+     result falls below either floor, the trade is vetoed with reason
+     "BELOW_EXCHANGE_MINIMUM" and logged via veto_below_exchange_minimum.
+     This prevents wasted CLOB round-trips and signing gas for orders
+     that the exchange will reject anyway.
+
+  3. Rounding Logic Refactor (guard.py):
+     Replaced the fragile iterative loop that subtracted 0.01 from the
+     share count (up to 100 iterations) with deterministic integer
+     flooring: int(allowed_usd / entry_price).  The old loop could
+     over-subtract below the $1.00 exchange minimum while trying to
+     stay under the USD cap — a lose-lose outcome where the trade was
+     small enough to be rejected but the loop consumed CPU.  The new
+     logic produces whole-share counts that are guaranteed to be under
+     the USD cap on the first pass, then the exchange-minimum check
+     (item 2) catches anything too small.
+
+  4. PAPER Mode Revert (VPS .env):
+     Changed DEPLOYMENT_ENV from PENNY_LIVE to PAPER in the VPS .env
+     file (/home/botuser/polymarket-bot/.env).  Purpose: prevent CPU
+     starvation and latency blocks while the 2-worker WFO pipeline
+     (wfo_fresh tmux session) runs Phase 2 refinement.  The paper-mode
+     bot still connects to the live CLOB WebSocket for data collection
+     but routes all orders through the PaperExchange mock (OrderExecutor
+     with paper_mode=True), so no ClobClient is initialised and no real
+     capital is at risk.
+
+  5. Test Suite Updated (tests/test_deployment_guard.py):
+     - PENNY_LIVE_MAX_TRADE_USD assertion changed from 1.0 to 5.0
+     - All share-clamping test expectations recalculated for $5.00 cap
+     - Three new exchange-minimum tests added:
+       test_exchange_minimum_shares_veto (4 shares → vetoed)
+       test_exchange_minimum_usd_veto ($0.50 notional → vetoed)
+       test_exchange_minimum_both_met (5 shares × $0.50 → passes)
+     Full regression: 1593/1593 tests pass, 0 regressions.
+
+  Current State: Bot running in PAPER mode (bot_paper tmux session).
+  WFO pipeline healthy in wfo_fresh tmux session (Phase 2 refinement,
+  ~160/900 trials complete, 2 parallel workers active).  PENNY_LIVE
+  infrastructure patch is deployed and ready for re-activation once
+  WFO completes.
+
+March 11th — SI-9: Mutually Exclusive Combinatorial Arbitrage (New Feature):
+  Alpha: Dutch Book across negRisk (mutually exclusive) Polymarket event legs.
+    Condition: Σ(YES best_bids across all legs) < 1.0 − si9_min_margin_cents/100.
+    Buying S shares of every YES token at those prices guarantees positive payoff
+    regardless of which outcome resolves (exactly one resolves to $1).
+
+  ComboSizer: share-count-pegged sizing (S = budget / Σ prices). NOT Kelly/USD.
+    All N legs receive identical share count S — the fundamental Dutch Book
+    invariant ensuring uniform payoff regardless of which leg resolves.
+    budget = min(si9_target_size_usd, si9_max_per_combo_usd), subject to
+    si9_max_total_exposure_usd wallet cap (wallet_balance passthrough from bot.py).
+
+  Hanging Leg State Machine in abandon_combo():
+    State 1 (0 fills across all legs): safe cancel of all resting maker orders.
+    State 2 (≥1 filled leg): emergency taker cross to complete arb (up to
+      si9_emergency_taker_max_cents above best_ask), OR taker-sell dump of all
+      filled legs if spread > si9_emergency_max_spread_cents (accept loss to
+      close net exposure).
+
+  ArbitrageClusterManager (src/data/arb_clusters.py):
+    Groups negRisk markets by event_id into ArbCluster dataclasses.
+    update_cluster() / get_clusters() provide the polling surface for
+    _combo_arbitrage_loop() in bot.py.
+
+  ComboArbDetector (src/signals/combinatorial_arb.py):
+    evaluate(cluster, wallet_balance) applies all gates (min_margin, max_legs,
+    min_leg_depth_usd) and delegates to ComboSizer. Returns ComboArbSignal.
+
+  combo_positions_for_pce(): serializes combo legs as full _MinimalPosition-
+    compatible dicts (NOT tuples) for safe PCE worker IPC, matching the same
+    7-key schema as standard positions.
+
+  MarketInfo.neg_risk field added; _parse_market() allows negRisk markets
+    through only when si9_arb_enabled=True.
+
+  New config: 15 si9_* params all disabled by default:
+    si9_arb_enabled=False, si9_min_margin_cents=2.0, si9_margin_buffer_cents=1.0,
+    si9_max_legs=6, si9_max_concurrent_combos=2, si9_max_total_exposure_usd=50.0,
+    si9_max_per_combo_usd=25.0, si9_target_size_usd=10.0, si9_max_leg_delay_ms=30000,
+    si9_max_leg_chase_cents=2.0, si9_chase_interval_ms=500, si9_scan_interval_ms=500,
+    si9_min_leg_depth_usd=50.0, si9_emergency_taker_max_cents=4.0,
+    si9_emergency_max_spread_cents=5.0.
+
+  New files: src/data/arb_clusters.py, src/signals/combinatorial_arb.py.
+  Modified: position_manager.py (open_combo_position, abandon_combo, combo_positions_for_pce),
+    bot.py (_combo_arbitrage_loop, _combo_breaker), config.py (15 fields),
+    market_discovery.py (neg_risk field + conditional passthrough).
+  Tests: 1593/1593 passed, 0 regressions.
+

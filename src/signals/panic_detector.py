@@ -95,8 +95,10 @@ class PanicDetector:
         if sigma <= 0 or vwap <= 0:
             return None
 
-        # Z-score of the current bar close vs rolling VWAP
-        delta_p = bar.close - vwap
+        # Z-score of the current bar close vs rolling VWAP.
+        # Normalise delta_p by vwap so numerator (relative price deviation)
+        # and denominator (log-return σ) share the same dimensionless scale.
+        delta_p = (bar.close - vwap) / vwap
         zscore = delta_p / sigma
 
         # ── Intra-bar momentum confirmation ────────────────────────────
@@ -215,6 +217,7 @@ class PanicDetector:
             volume_ratio=v_ratio,
             no_best_ask=no_best_ask,
             whale_confluence=whale_confluence,
+            signal_source="PRIMARY_Panic",
         )
 
         log.info(

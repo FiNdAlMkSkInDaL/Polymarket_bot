@@ -15,7 +15,7 @@ ExecStartPre=/bin/chown botuser:botuser /dev/shm/secrets
 ExecStartPre=/bin/bash -c 'age -d -o /dev/shm/secrets/.env /home/botuser/polymarket-bot/.env.age || true'
 # Clean stale shared-memory segments from prior SIGKILL / OOM-kill
 ExecStartPre=/bin/bash -c 'rm -f /dev/shm/pmb_*'
-ExecStart=/home/botuser/polymarket-bot/.venv/bin/python -m src.cli run --paper
+ExecStart=/home/botuser/polymarket-bot/.venv/bin/python -m src.cli run --env PENNY_LIVE
 ExecStopPost=/bin/bash -c 'rm -f /dev/shm/secrets/.env'
 
 # Restart policy
