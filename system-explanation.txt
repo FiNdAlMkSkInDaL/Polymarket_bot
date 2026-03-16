@@ -1163,7 +1163,12 @@ StealthExecutor (src/trading/stealth_executor.py):
        Checked AFTER inter-slice sleep.
 
 OrderExecutor (src/trading/executor.py):
-  Paper mode: records locally, simulates fills with slippage
+  Paper mode: records locally, simulates fills with adverse slippage AND
+    queue-aware gating (not touch-fill optimistic):
+    - Requires opposite-side aggressor flow (event side + taker context)
+    - Drains paper_queue_ahead before own order can receive size
+    - Requires minimum touch count (paper_min_touches, default 2)
+    - Fills only after cumulative executable volume >= order.size
   Live mode: py-clob-client → create_order + post_order
   POST_ONLY rejection detection: status="rejected" → CANCELLED + "would_cross"
   Balance/allowance fail-fast breaker:
@@ -1675,10 +1680,10 @@ scripts/run_optimization_pipeline.py:
   as subprocesses with phase-appropriate arguments, manages JSON artefact
   handoffs, and computes the search-space narrowing between phases.
 
-  Phase 1 — Discovery: 5 markets, 14 days, 50 trials, 2 workers on the VPS.
+  Phase 1 - Discovery: 5 markets, 14 days, 50 trials, 1 worker on the VPS.
     Output: logs/phase1_champion.json
 
-  Phase 2 — Refinement: 10 markets, 30 days, 100 trials, 2 workers on the VPS.
+  Phase 2 - Refinement: 10 markets, 30 days, 100 trials, 1 worker on the VPS.
     Search space narrowed to strict ±15% around Phase 1 champion via
     compute_narrowed_bounds() (multiplicative, then absolute-bound clamp).
     Warm-started from Phase 1 output.
@@ -1704,7 +1709,7 @@ scripts/run_optimization_pipeline.py:
     --skip-to      Resume at {"phase1", "narrowing", "phase2", "phase3"}
 
   March 9, 2026 operational fixes:
-    - Phase 1 and Phase 2 defaults were pinned to 2 workers on the 2-core VPS
+    - Phase 1 and Phase 2 defaults were pinned explicitly in the pipeline
       instead of relying on generic WfoConfig defaults through ad hoc manual
       invocation patterns.
     - Parallel workers use the race-safe manual ask/tell loop in
@@ -1712,6 +1717,17 @@ scripts/run_optimization_pipeline.py:
     - A full production rerun was explicitly restarted from Phase 1 after
       deleting all per-phase DBs, champion/bounds JSON artefacts, and the
       prior pipeline log to guarantee no carry-over from earlier attempts.
+
+  March 16, 2026 OOM remediation:
+    - Post-mortem confirmed an interrupted Phase-2 run on a 3.7 GiB VPS with
+      zero swap where the tmux session vanished without a Python traceback,
+      consistent with system-level termination under memory pressure.
+    - scripts/run_optimization_pipeline.py defaults were reduced to
+      max_workers=1 for both Phase 1 and Phase 2 to reduce peak RAM pressure.
+    - Recovery runbook (no Phase 1 rerun):
+      1) delete logs/wfo_phase2.db and logs/phase2_bounds.json,
+      2) restart pipeline with --skip-to narrowing in tmux.
+    - VPS now has an 8 GiB swap safety net provisioned by admin.
 
   Smoke test validated 2026-03-08: exit code 0, all 5 artefacts produced.
   See change-report.txt "3-Stage WFO Optimization Pipeline" entry for
@@ -2653,6 +2669,90 @@ March 16th — Hard State Reset + Pristine 48h PAPER Relaunch:
   - Exact clean-start timestamp:
       2026-03-16T02:18:32.286679Z
   - This timestamp is the anchor for the current pristine PAPER run window.
+
+March 16th — Paper Execution Forensic Remediation (Touch Fill + Duplicate Close):
+  - Forensic audit approved after suspicious 24h paper sample (84.4% WR,
+    90 trades, +$91.82) showed simulator optimism and lifecycle inflation risk.
+  - Root issue A (Touch Fill Illusion): paper fills were previously gated only by
+    price cross + fixed slippage; queue priority and consumed trade volume were
+    not modeled.
+  - Fix A deployed:
+    * Order fields added: paper_queue_ahead, paper_volume_at_price,
+      paper_touch_count.
+    * check_paper_fill() now consumes queue ahead using trade_size, enforces
+      opposite-side aggressor flow using trade_side/is_taker, applies minimum
+      touches, and only fills once executable volume reaches order size.
+    * _check_paper_fills() in bot.py now passes event.size/event.side/
+      event.is_taker into executor simulation.
+  - Root issue B (Duplicate Close Inflation): duplicate exit callbacks could
+    close/book a position more than once in edge timing races.
+  - Fix B deployed:
+    * bot._handle_exit_fill() now ignores fills unless state==EXIT_PENDING.
+    * PositionManager.on_exit_filled() now hard-guards already CLOSED positions.
+  - VPS deployment and reset runbook executed (botuser@135.181.85.32):
+    * Patched files pushed via scp:
+        src/trading/executor.py
+        src/bot.py
+        src/trading/position_manager.py
+    * Integrity verified by local/remote SHA256 match for all three files.
+    * Corrupted state purged:
+        pkill -f "python -m src.cli run"
+        rm -f /dev/shm/pmb_*
+        rm -f /home/botuser/polymarket-bot/logs/trades.db
+        rm -f /home/botuser/polymarket-bot/data/trades.db
+    * Rigorous relaunch in tmux (correct interpreter on VPS):
+        tmux has-session -t bot_fresh 2>/dev/null || tmux new-session -d -s bot_fresh
+        tmux send-keys -t bot_fresh "cd /home/botuser/polymarket-bot && ulimit -n 65536 && .venv/bin/python -m src.cli run --env PAPER > logs/bot_fresh.log 2>&1" C-m
+  - New clean session observed running at ~2026-03-16T13:06Z with fresh
+    logs/trades.db recreation (0 trades at initialization).
+
+  Paper Simulator Integrity Checklist (pre-run + early-run):
+    Use this checklist before trusting any PAPER performance metrics.
+
+    A) Code and deployment integrity
+    [ ] VPS files match local patches (hash compare):
+      src/trading/executor.py
+      src/bot.py
+      src/trading/position_manager.py
+    [ ] OrderExecutor includes queue-aware paper fields:
+      paper_queue_ahead, paper_volume_at_price, paper_touch_count
+    [ ] bot._check_paper_fills passes trade_size/trade_side/is_taker
+      into executor.check_paper_fill()
+    [ ] Duplicate-close guards present in BOTH places:
+      bot._handle_exit_fill (EXIT_PENDING gate)
+      PositionManager.on_exit_filled (already-closed guard)
+
+    B) State hygiene before launch
+    [ ] No active bot process from prior run:
+      ps -ef | grep "python -m src.cli run" | grep -v grep
+    [ ] Shared memory cleared:
+      rm -f /dev/shm/pmb_*
+    [ ] Old DBs removed:
+      rm -f /home/botuser/polymarket-bot/logs/trades.db
+      rm -f /home/botuser/polymarket-bot/data/trades.db
+
+    C) Correct launch path
+    [ ] tmux session exists (create if needed):
+      tmux has-session -t bot_fresh 2>/dev/null || tmux new-session -d -s bot_fresh
+    [ ] Launch uses venv interpreter (NOT bare python on this VPS):
+      .venv/bin/python -m src.cli run --env PAPER > logs/bot_fresh.log 2>&1
+    [ ] File descriptor limit applied:
+      ulimit -n 65536
+
+    D) First 1-5 minutes sanity checks
+    [ ] No syntax/import/runtime crash in bot_fresh.log tail
+    [ ] Process remains alive after startup grace window
+    [ ] logs/trades.db recreated and trade count begins at 0
+    [ ] l2_synced events flowing (data plane healthy)
+    [ ] No rapid duplicate position_closed events for same pos_id
+
+    E) 24h realism acceptance gates
+    [ ] Win rate / expectancy materially below prior inflated baseline
+    [ ] Trade velocity reduced vs touch-fill optimistic run
+    [ ] Vacuum/stink-bid outcomes show fewer instant extreme fills
+    [ ] Gross-minus-net PnL deltas remain non-zero (fees/slippage present)
+    [ ] If metrics still look too-good-to-be-true, run forensic replay
+      before enabling PENNY_LIVE/PRODUCTION.
 
 March 2nd: Initial calibration
   - Z-score, edge score, L2 reliability, heartbeat, ghost liquidity

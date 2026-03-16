@@ -1560,6 +1560,10 @@ class PositionManager:
     # ── Handle exit fill ───────────────────────────────────────────────────
     def on_exit_filled(self, pos: Position, reason: str = "target") -> None:
         """Close the position after exit fill or forced liquidation."""
+        if pos.state == PositionState.CLOSED:
+            log.warning("position_already_closed_ignore_fill", pos_id=pos.id, reason=reason)
+            return
+
         pos.state = PositionState.CLOSED
         pos.exit_price = (
             pos.exit_order.filled_avg_price if pos.exit_order else pos.target_price

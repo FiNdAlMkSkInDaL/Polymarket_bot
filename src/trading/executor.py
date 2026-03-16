@@ -49,6 +49,10 @@ class Order:
     clob_order_id: str = ""
     post_only: bool = False
     rejection_reason: str = ""          # "would_cross" if POST_ONLY rejected
+    # Paper-only queue model state (ignored in live mode)
+    paper_queue_ahead: float = 0.0
+    paper_volume_at_price: float = 0.0
+    paper_touch_count: int = 0
 
 
 class OrderExecutor:
@@ -319,6 +323,10 @@ class OrderExecutor:
                 self._orders[order.order_id] = order
                 return order
         else:
+            # Model queue priority in paper mode so touch != instant fill.
+            q_mult = float(getattr(settings.strategy, "paper_queue_ahead_mult", 1.0))
+            q_min = float(getattr(settings.strategy, "paper_queue_ahead_min_shares", 0.0))
+            order.paper_queue_ahead = max(q_min, round(size * q_mult, 4))
             log.info(
                 "order_placed_paper",
                 order_id=order.order_id,
@@ -326,6 +334,7 @@ class OrderExecutor:
                 price=price,
                 size=size,
                 asset=asset_id[:16],
+                queue_ahead=order.paper_queue_ahead,
             )
             self._reset_balance_allowance_error_streak()
 
@@ -374,18 +383,33 @@ class OrderExecutor:
         return len(to_cancel)
 
     # ── Paper-mode fill simulation ──────────────────────────────────────────
-    def check_paper_fill(self, asset_id: str, market_price: float) -> list[Order]:
+    def check_paper_fill(
+        self,
+        asset_id: str,
+        market_price: float,
+        trade_size: float | None = None,
+        trade_side: str | None = None,
+        is_taker: bool | None = None,
+    ) -> list[Order]:
         """Simulate fills for paper orders when the market crosses.
 
         Applies configurable adverse slippage (``paper_slippage_cents``)
         to avoid overstating paper-mode performance.  Buy orders fill at
         ``limit + slippage`` and sell orders at ``limit - slippage``,
         clamped to [0.01, 0.99].
+
+        Queue/flow model:
+        - Resting orders only progress when aggressor flow is on the opposite side.
+        - Trades first consume queue ahead before our size can fill.
+        - A minimum touch count is required to reduce one-tick blip fills.
         """
         if not self.paper_mode:
             return []
 
         slippage = settings.strategy.paper_slippage_cents / 100.0  # cents → dollars
+        min_touches = max(1, int(getattr(settings.strategy, "paper_min_touches", 2)))
+        side_norm = (trade_side or "").lower()
+        executed_size = max(0.0, float(trade_size or 0.0))
 
         filled: list[Order] = []
         for order in self._orders.values():
@@ -394,11 +418,33 @@ class OrderExecutor:
             if order.status != OrderStatus.LIVE:
                 continue
 
-            should_fill = False
+            touched = False
             if order.side == OrderSide.BUY and market_price <= order.price:
-                should_fill = True
+                # Our resting bid is only hit by sell aggressors.
+                touched = side_norm in ("", "sell") and (is_taker in (None, True))
             elif order.side == OrderSide.SELL and market_price >= order.price:
-                should_fill = True
+                # Our resting ask is only hit by buy aggressors.
+                touched = side_norm in ("", "buy") and (is_taker in (None, True))
+
+            should_fill = False
+            if touched:
+                order.paper_touch_count += 1
+
+                remaining_flow = executed_size
+                if remaining_flow > 0 and order.paper_queue_ahead > 0:
+                    consumed = min(order.paper_queue_ahead, remaining_flow)
+                    order.paper_queue_ahead -= consumed
+                    remaining_flow -= consumed
+
+                if remaining_flow > 0 and order.paper_queue_ahead <= 0:
+                    order.paper_volume_at_price += remaining_flow
+
+                if (
+                    order.paper_touch_count >= min_touches
+                    and order.paper_queue_ahead <= 0
+                    and order.paper_volume_at_price >= order.size
+                ):
+                    should_fill = True
 
             if should_fill:
                 # Apply adverse slippage
@@ -420,6 +466,8 @@ class OrderExecutor:
                     fill_price=round(fill_price, 4),
                     slippage_cents=round(slippage * 100, 1),
                     size=order.size,
+                    touches=order.paper_touch_count,
+                    queue_remaining=round(max(0.0, order.paper_queue_ahead), 4),
                 )
                 filled.append(order)
 

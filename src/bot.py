@@ -2676,7 +2676,13 @@ class TradingBot:
 
     def _check_paper_fills(self, event: TradeEvent) -> None:
         """Check if any paper orders should fill based on this trade."""
-        filled_orders = self.executor.check_paper_fill(event.asset_id, event.price)
+        filled_orders = self.executor.check_paper_fill(
+            event.asset_id,
+            event.price,
+            trade_size=event.size,
+            trade_side=event.side,
+            is_taker=event.is_taker,
+        )
         for order in filled_orders:
             # Find the position that owns this order
             for pos in self.positions.get_open_positions():
@@ -2724,6 +2730,14 @@ class TradingBot:
 
     def _handle_exit_fill(self, pos: Any) -> None:
         """Exit order filled — close position and record."""
+        if pos.state != PositionState.EXIT_PENDING:
+            log.warning(
+                "duplicate_exit_fill_ignored",
+                pos_id=getattr(pos, "id", "?"),
+                state=str(getattr(pos, "state", "?")),
+            )
+            return
+
         self.positions.on_exit_filled(pos, reason="target")
         # Refresh lifecycle cooldown from close time (not signal fire time)
         self.lifecycle.record_signal(pos.market_id)

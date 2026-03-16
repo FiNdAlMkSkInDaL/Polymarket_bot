@@ -197,8 +197,8 @@ def compute_narrowed_bounds(
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Production defaults per phase ─────────────────────────────────────────
-PHASE1_DEFAULTS = {"max_markets": 5, "train_days": 14, "n_trials": 50, "max_workers": 2}
-PHASE2_DEFAULTS = {"max_markets": 10, "train_days": 30, "n_trials": 100, "max_workers": 2}
+PHASE1_DEFAULTS = {"max_markets": 5, "train_days": 14, "n_trials": 50, "max_workers": 1}
+PHASE2_DEFAULTS = {"max_markets": 10, "train_days": 30, "n_trials": 100, "max_workers": 1}
 PHASE3_DEFAULTS = {"max_markets": 31, "train_days": 30, "n_trials": 1}
 
 # Smoke-test overrides (minimal resources for local validation)
