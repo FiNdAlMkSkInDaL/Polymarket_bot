@@ -3468,6 +3468,134 @@ March 10th — Config Parameter Recalibration + signal_q Clamp Fix (commit ab51f
                                           market EWMA vol of 0.72)
 
 
+  March 16th — Local Queue-Starvation Forensics, Aggression Tuning, and VPS PAPER Bake Rollout:
+    Scope:
+    - End-to-end operational session across local PAPER diagnostics, local config
+    pivots, read-only WFO champion extraction from VPS, and controlled VPS PAPER
+    launch for a 48h bake window.
+
+    1) Local funnel forensics (strict queue-aware PAPER):
+    - Anchored 1h window (last-hour slice from logs/bot.jsonl):
+      rows_last_hour: 7850
+      panic_signal_fired: 14
+      drift_signal_fired: 31
+      zscore_near_miss: 85
+      market_rejected_total: 60
+      eqs_rejected_total: 10
+      order_placed_paper: 17
+      order_cancelled: 17
+      entry_timeout: 12
+      entry_chaser_cancelled: 4
+      fills_like_events: 0
+      queue_ahead_avg: 14.59
+      queue_ahead_max: 62
+    - Interpretation: two-stage blockage.
+      A) upstream filtering pressure at z-score and EQS gates,
+      B) downstream queue starvation after placement (17 placed, 0 fills).
+
+    2) Local aggression override pass (first pivot):
+    - .env updates applied locally:
+      DRIFT_Z_THRESHOLD=0.90
+      CHASER_MAX_REJECTIONS=1
+      CHASER_ESCALATION_TICKS=2
+    - New script added:
+      scripts/local_30m_delta_audit.py
+    Purpose:
+      compare strict pre-window (1h before restart) vs aggressive post-window
+      (30m after restart), tallying panic/drift signals, order_placed_paper,
+      entry_chaser_cancelled, chaser_escalating, fills-like events, and
+      position_opened.
+
+    3) First 30m delta result after aggression overrides (restart 15:16Z):
+    - strict_1h vs aggr_30m:
+      panic_signals: 0 -> 5
+      drift_signals: 0 -> 9
+      order_placed_paper: 0 -> 2
+      fills_like_events: 0 -> 0
+      position_opened: 0 -> 0
+    - Additional diagnostics in aggressive window:
+      entry_timeout: 2
+      chaser_escalating: 0
+      edge_assessment_count: 13
+      viable: True=1, False=12
+      avg net_cents: -0.3072
+    - Conclusion: top-of-funnel increased; conversion still 0; chaser escalation
+    did not materially engage.
+
+    4) Read-only VPS WFO champion extraction (guardrail-compliant):
+    - Host: botuser@135.181.85.32
+    - Guardrail behavior:
+      no process kill,
+      no tmux attach,
+      no remote file mutation during extraction.
+    - Artifact selection:
+      logs/phase2_champion.json present (preferred over phase1 fallback).
+    - Extracted phase2 champion params (selected core set synced locally):
+      zscore_threshold: 0.4423507563885553
+      drift_z_threshold: 1.3066627484606006
+      min_edge_score: 23.736276695893917
+      alpha_default: 0.33338011285079194
+      kelly_fraction: 0.07472803149087086
+    - Additional extracted context:
+      phase2 champion metadata indicated weak OOS profile in the JSON
+      (oos_sharpe negative); still used as directed for live bake comparison.
+
+    5) Local sync to champion + maker-fee pivot:
+    - .env updates applied locally:
+      ZSCORE_THRESHOLD=0.4423507563885553
+      ALPHA_DEFAULT=0.33338011285079194
+      MIN_EDGE_SCORE=23.736276695893917
+      KELLY_FRACTION=0.07472803149087086
+      DRIFT_Z_THRESHOLD=1.3066627484606006
+      VACUUM_STINK_BID_ENABLED=True
+    - Rationale:
+      preserve data-driven WFO settings while explicitly enabling stink-bid
+      maker behavior to reduce taker-fee drag during panic-liquidity moments.
+
+    6) Second 30m delta result under WFO champion (restart 16:05Z):
+    - strict_1h vs aggr_30m:
+      panic_signals: 13 -> 4
+      drift_signals: 33 -> 6
+      order_placed_paper: 6 -> 0
+      fills_like_events: 0 -> 0
+      position_opened: 3 -> 0
+    - Champion-window diagnostics (16:05-16:35Z):
+      edge_assessment_count: 7
+      viable: True=0, False=7
+      eqs_rejected: 7
+      reasons: no_mean_reversion_target=3, sub_tick_spread=2,
+           negative_ev_after_fees=2
+      vacuum_stink_bid_events: 0
+      maker_queue_order_placed_paper: 0
+    - Conclusion:
+      no execution unlock in this local 30m slice; blockage shifted heavily
+      upstream (viability and structure) with no fills.
+
+    7) 48h VPS PAPER bake rollout using local champion .env:
+    - Local cleanup:
+      terminated local src.cli run processes (strict match) before rollout.
+    - Config sync:
+      scp .env -> /home/botuser/polymarket-bot/.env (remote timestamp updated).
+    - VPS safety and launch sequence:
+      confirmed active WFO process remained running throughout
+      (src.cli wfo, PID observed as 384918 during checks),
+      cleared /dev/shm/pmb_* for clean multicore boot,
+      ensured tmux session bot_fresh exists,
+      launched PAPER bot in bot_fresh:
+      .venv/bin/python -m src.cli run --env PAPER > logs/bot_fresh.log 2>&1
+    - Verification:
+      src.cli run process active on VPS after launch,
+      bot_fresh.log actively updating with ws_subscribed and repeated l2_synced
+      events,
+      WFO tmux/worker state left undisturbed.
+
+    8) Operational note (PowerShell -> SSH -> tmux send-keys):
+    - Cross-shell quoting can collapse spaces when issuing tmux send-keys from
+    Windows PowerShell to remote bash. Reliable pattern in this session was to
+    use explicit Space key tokens (or carefully isolated command sends) to
+    prevent malformed commands such as cd/home/... or ulimit-n65536.
+
+
 March 10th — Ops: Scorched Earth Reset Script (commit beb6516):
   Added scripts/scorched_earth_reset.sh — a comprehensive VPS reset procedure
   for use when the system must be returned to a clean state. Steps executed:
