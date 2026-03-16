@@ -162,6 +162,11 @@ class MarketWebSocket:
                 "channel": "market",
                 "assets_ids": self.asset_ids,
             }
+            log.info(
+                "ws_subscribe_payload",
+                payload=subscribe_msg,
+                asset_count=len(self.asset_ids),
+            )
             await ws.send(json.dumps(subscribe_msg))
             for asset_id in self.asset_ids:
                 log.info("ws_subscribed", asset_id=asset_id, channels="market")
@@ -203,14 +208,32 @@ class MarketWebSocket:
 
     async def _handle_message(self, msg: dict | list) -> None:
         """Parse incoming WS messages and emit TradeEvents."""
-        if self._recorder and isinstance(msg, dict):
-            self._recorder.enqueue("trade", msg)
-
         # Polymarket may send batch messages as a JSON array
         if isinstance(msg, list):
             for sub in msg:
                 if isinstance(sub, dict):
                     await self._handle_message(sub)
+            return
+
+        if not isinstance(msg, dict):
+            return
+
+        # Some gateways wrap the actual market payload under ``payload``.
+        # Unwrap so event_type parsing and trade extraction work uniformly.
+        if isinstance(msg.get("payload"), dict):
+            envelope = msg
+            inner = dict(msg["payload"])
+            if "asset_id" not in inner and "asset_id" in envelope:
+                inner["asset_id"] = envelope.get("asset_id")
+            if "market" not in inner and "market" in envelope:
+                inner["market"] = envelope.get("market")
+            msg = inner
+
+        if self._recorder:
+            self._recorder.enqueue("trade", msg)
+
+        if "error" in msg:
+            log.error("ws_server_error", error=msg.get("error"), payload=msg)
             return
 
         event_type = msg.get("event_type") or msg.get("type", "")
@@ -226,8 +249,40 @@ class MarketWebSocket:
                 if event:
                     await self._enqueue(event)
 
-        elif event_type in ("price_change", "book"):
-            # Route orderbook events to the book queue
+        elif event_type == "price_change":
+            # Route orderbook delta to the book queue.
+            try:
+                self.book_queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                try:
+                    self.book_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self.book_queue.put_nowait(msg)
+
+            # Polymarket embeds executed prints under price_changes[].
+            # Treat each item as a trade tick for OHLCV/alpha pipeline.
+            trade_rows = msg.get("price_changes", [])
+            if isinstance(trade_rows, dict):
+                trade_rows = [trade_rows]
+
+            root_ts = msg.get("timestamp") or msg.get("ts")
+            root_market = msg.get("market") or msg.get("condition_id")
+            for row in trade_rows:
+                if not isinstance(row, dict):
+                    continue
+                trade_data = dict(row)
+                if root_ts is not None and "timestamp" not in trade_data:
+                    trade_data["timestamp"] = root_ts
+                if root_market is not None and "market" not in trade_data:
+                    trade_data["market"] = root_market
+
+                event = self._parse_trade(trade_data, msg)
+                if event:
+                    await self._enqueue(event)
+
+        elif event_type == "book":
+            # Route full book snapshots to the book queue.
             try:
                 self.book_queue.put_nowait(msg)
             except asyncio.QueueFull:

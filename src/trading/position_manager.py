@@ -354,7 +354,7 @@ class PositionManager:
         max_trade: float,
         trade_direction: str,
     ) -> tuple[bool, float, bool]:
-        """Send VaR check to PCE worker and await response (50ms timeout).
+        """Send VaR check to PCE worker and await response (500ms timeout).
 
         Fail-closed: if the worker doesn't respond, block the trade.
         Returns (allowed, max_trade, var_was_bisected).
@@ -380,12 +380,13 @@ class PositionManager:
         except _queue_mod.Full:
             log.warning("var_request_queue_full", market_id=market_id)
             return False, 0.0, False  # fail-closed
-        # Poll response queue with 50ms total timeout
-        deadline = time.monotonic() + 0.05
+        # Poll response queue with 500ms total timeout to absorb short
+        # VPS scheduling hiccups without tripping false fail-closed blocks.
+        deadline = time.monotonic() + 0.50
         while time.monotonic() < deadline:
             try:
                 msg = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._var_response_q.get(timeout=0.01),
+                    None, lambda: self._var_response_q.get(timeout=0.05),
                 )
                 if msg[0] == "var_result" and msg[1] == req_id:
                     allowed = msg[2]

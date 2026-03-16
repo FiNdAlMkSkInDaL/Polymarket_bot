@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 15, 2026
+  Last updated: March 16, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -2605,6 +2605,54 @@ SECTION 20: CHANGE HISTORY EVOLUTION
 ================================================================================
 
 The system has evolved through several major phases:
+
+March 16th — WebSocket Trade Routing Fix (price_change → trade_queue):
+  - Root cause of zero-fill starvation identified from raw WS captures:
+    many trade-like payloads arrive as event_type="price_change" with
+    entries inside price_changes[], not only as explicit trade/tick events.
+  - src/data/websocket_client.py _handle_message() updated to dual-route:
+      1) Keep existing book routing for price_change.
+      2) Iterate price_changes[] rows, inherit root timestamp/market when
+         missing, parse via _parse_trade(), enqueue valid TradeEvent into
+         trade_queue.
+  - Legacy handlers for last_trade_price, trade, and tick preserved.
+  - Added/retained WS telemetry for diagnostics:
+      ws_subscribe_payload, ws_server_error.
+  - Operational result: parser mismatch removed; trade ingestion path is now
+    schema-compatible with Polymarket price_change envelopes.
+
+March 16th — Cold-Start Volatility Hardening (MIN_VOLATILITY floor):
+  - Problem: waking from low-data starvation could produce microscopic
+    volatility sigma, causing explosive z-scores and unstable drift
+    displacement magnitudes.
+  - src/signals/panic_detector.py:
+      MIN_VOLATILITY = 0.0001
+      gate changed from sigma <= 0 to sigma < MIN_VOLATILITY.
+  - src/signals/drift_signal.py:
+      MIN_VOLATILITY = 0.0001
+      EWMA gate changed from ewma_vol <= 0 to ewma_vol < MIN_VOLATILITY
+      and logs vol_too_low in drift_eval rejection diagnostics.
+      Sigma gate changed from sigma <= 0 to sigma < MIN_VOLATILITY.
+  - Effect: detector outputs are suppressed until volatility context is
+    non-trivial, preventing false extremes immediately after cold starts.
+
+March 16th — POS-1 Forensic Lifecycle (Paper session):
+  - position_opened POS-1 at 01:56:10Z with target 0.423.
+  - exit_order_placed at 01:56:11Z (paper order PAPER-3, SELL @ 0.423).
+  - latency_force_blocked fired (heartbeat_stale), followed by
+    heartbeat_escalate_cancel at ~10.2s and order_cancelled PAPER-3.
+  - entry_chaser_cancelled and exit_chaser_cancelled for POS-1 observed.
+  - POS-1 absent from live_positions in logs/trades.db after the sequence.
+
+March 16th — Hard State Reset + Pristine 48h PAPER Relaunch:
+  - Correct VPS runbook executed on botuser@135.181.85.32:
+      pkill bot process, rm -f /dev/shm/pmb_*, delete logs/data trades.db,
+      remove bot_fresh.log and bot_console.log, relaunch in tmux bot_fresh
+      with ulimit -n 65536.
+  - New clean boot log confirmed with flowing l2_synced events.
+  - Exact clean-start timestamp:
+      2026-03-16T02:18:32.286679Z
+  - This timestamp is the anchor for the current pristine PAPER run window.
 
 March 2nd: Initial calibration
   - Z-score, edge score, L2 reliability, heartbeat, ghost liquidity

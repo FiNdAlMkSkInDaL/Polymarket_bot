@@ -30,6 +30,9 @@ from src.signals.signal_framework import BaseSignal
 
 log = get_logger(__name__)
 
+# Cold-start volatility floor to prevent unstable displacement from tiny σ.
+MIN_VOLATILITY = 0.0001
+
 
 @dataclass
 class DriftSignal(BaseSignal):
@@ -150,12 +153,12 @@ class MeanReversionDrift:
 
         # Gate 4: EWMA volatility must be below ceiling (low-vol only)
         ewma_vol = no_aggregator.rolling_volatility_ewma or 0.0
-        if ewma_vol <= 0 or ewma_vol >= self.vol_ceiling:
+        if ewma_vol < MIN_VOLATILITY or ewma_vol >= self.vol_ceiling:
             return _reject(
                 "ewma_vol_bounds",
                 ewma_vol=round(ewma_vol, 8),
                 vol_ceiling=self.vol_ceiling,
-                vol_is_zero=(ewma_vol <= 0),
+                vol_too_low=(ewma_vol < MIN_VOLATILITY),
             )
 
         # Gate 5: No bar in the window should have high volume ratio
@@ -175,7 +178,7 @@ class MeanReversionDrift:
         # from rolling VWAP, normalised by σ
         vwap = no_aggregator.rolling_vwap
         sigma = no_aggregator.rolling_volatility
-        if sigma <= 0 or vwap <= 0:
+        if sigma < MIN_VOLATILITY or vwap <= 0:
             return _reject(
                 "sigma_vwap_invalid",
                 sigma=round(sigma, 8) if sigma else 0.0,

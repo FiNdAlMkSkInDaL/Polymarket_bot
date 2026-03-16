@@ -3249,16 +3249,29 @@ class TradingBot:
             await asyncio.sleep(30)
             try:
                 now = time.time()
-                for yes_agg in self._yes_aggs.values():
+                yes_flushed = 0
+                no_flushed = 0
+                for yes_agg in list(self._yes_aggs.values()):
                     bar = yes_agg.flush_stale_bar(now)
                     if bar:
+                        yes_flushed += 1
                         # Drive the same signal evaluation as a normal bar close
                         asset_id = yes_agg.asset_id
                         latency_state = self.latency_guard.check(now)
                         if latency_state != LatencyState.BLOCKED:
                             await self._on_yes_bar_closed(asset_id, bar)
-                for no_agg in self._no_aggs.values():
-                    no_agg.flush_stale_bar(now)
+                for no_agg in list(self._no_aggs.values()):
+                    bar = no_agg.flush_stale_bar(now)
+                    if bar:
+                        no_flushed += 1
+
+                log.info(
+                    "stale_bar_flush_tick",
+                    yes_aggs=len(self._yes_aggs),
+                    no_aggs=len(self._no_aggs),
+                    yes_bars_flushed=yes_flushed,
+                    no_bars_flushed=no_flushed,
+                )
 
                 # SI-3: Cross-market divergence scan after all bars updated
                 # In multicore mode, PCE worker handles scanning autonomously

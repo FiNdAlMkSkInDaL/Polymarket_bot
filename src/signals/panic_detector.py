@@ -14,6 +14,9 @@ from src.signals.signal_framework import BaseSignal
 
 log = get_logger(__name__)
 
+# Cold-start volatility floor to prevent explosive z-scores on microscopic σ.
+MIN_VOLATILITY = 0.0001
+
 
 @dataclass
 class PanicSignal(BaseSignal):
@@ -92,7 +95,7 @@ class PanicDetector:
         vwap = self.yes_agg.rolling_vwap
         sigma = self.yes_agg.rolling_volatility
 
-        if sigma <= 0 or vwap <= 0:
+        if sigma < MIN_VOLATILITY or vwap <= 0:
             return None
 
         # Z-score of the current bar close vs rolling VWAP.
