@@ -162,7 +162,7 @@ class L2WebSocket:
                 try:
                     msg = {
                         "type": "subscribe",
-                        "channel": "market",
+                        "channel": "book",
                         "assets_ids": [asset_id],
                     }
                     await self._ws.send(json.dumps(msg))
@@ -187,7 +187,7 @@ class L2WebSocket:
                 try:
                     msg = {
                         "type": "unsubscribe",
-                        "channel": "market",
+                        "channel": "book",
                         "assets_ids": [aid],
                     }
                     await self._ws.send(json.dumps(msg))
@@ -212,19 +212,17 @@ class L2WebSocket:
             self._last_message_time = time.time()
             log.info("l2_ws_connected", url=self._ws_url)
 
-            # Subscribe to market channel for all tracked assets.
-            # Polymarket sends L2 deltas (price_change events) on the
-            # "market" channel — there is no dedicated "book" channel.
+            # Subscribe to book channel for all tracked assets
             asset_ids = list(self._books.keys())
             if asset_ids:
                 subscribe_msg = {
                     "type": "subscribe",
-                    "channel": "market",
+                    "channel": "book",
                     "assets_ids": asset_ids,
                 }
                 await ws.send(json.dumps(subscribe_msg))
                 for aid in asset_ids:
-                    log.info("l2_ws_subscribed", asset_id=aid, channel="market")
+                    log.info("l2_ws_subscribed", asset_id=aid, channel="book")
 
             # Only snapshot assets that aren't already SYNCED.
             # On first connect everything is EMPTY so all get snapshots.
@@ -285,41 +283,17 @@ class L2WebSocket:
             return
 
         event_type = msg.get("event_type") or msg.get("type", "")
+        asset_id = msg.get("asset_id") or ""
 
-        if event_type in _DELTA_EVENTS:
-            # Polymarket sends price_change events with per-asset deltas
-            # inside a top-level "price_changes" array.  Each entry
-            # contains its own asset_id, price, size, and side.
-            price_changes = msg.get("price_changes") or []
-            if price_changes:
-                for pc in price_changes:
-                    aid = pc.get("asset_id") or ""
-                    book = self._books.get(aid)
-                    if book is None:
-                        continue
-                    # Wrap the individual change so on_delta sees a
-                    # single-change message with the expected schema.
-                    delta_msg = {
-                        "event_type": event_type,
-                        "asset_id": aid,
-                        "timestamp": msg.get("timestamp"),
-                        "changes": [pc],
-                    }
-                    book.on_delta(delta_msg)
-            else:
-                # Fallback: asset_id at top level (legacy / other sources)
-                asset_id = msg.get("asset_id") or ""
-                book = self._books.get(asset_id)
-                if book:
-                    book.on_delta(msg)
+        book = self._books.get(asset_id)
+        if not book:
             return
 
-        if event_type in _SNAPSHOT_EVENTS:
-            asset_id = msg.get("asset_id") or ""
-            book = self._books.get(asset_id)
-            if not book:
-                return
-            # Server-pushed full snapshot — apply directly
+        if event_type in _DELTA_EVENTS:
+            book.on_delta(msg)
+        elif event_type in _SNAPSHOT_EVENTS:
+            # Some WS implementations push full snapshots inline
+            # Treat as snapshot data
             try:
                 result = book.load_snapshot(
                     msg, trigger="periodic_server_snapshot",

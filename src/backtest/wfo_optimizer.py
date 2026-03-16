@@ -326,12 +326,11 @@ class WfoReport:
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
 SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
     # Core signal parameters
-    # Relaxed bounds (March 10): observed z-scores max ~0.43 (price-unit
-    # delta_p / log-return σ mismatch suppresses values).  Prior floor of
-    # 1.0 produced 0 trades.  Allow 0.05–2.5 so WFO can find viable range.
-    "zscore_threshold": ("suggest_float", 0.05, 2.5),
+    # Hardened bounds (March 9 WFO Reset): admit only statistically
+    # significant panics.  Prior [0.15, 1.5] allowed sub-σ noise entries.
+    "zscore_threshold": ("suggest_float", 0.2, 2.5),
     "spread_compression_pct": ("suggest_float", 0.02, 0.30, True),     # log-scale
-    "volume_ratio_threshold": ("suggest_float", 0.1, 2.0),
+    "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
     "trend_guard_pct": ("suggest_float", 0.05, 1.0),
     # Risk management
@@ -344,9 +343,8 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     # Take-profit
     "alpha_default": ("suggest_float", 0.25, 0.75),
     "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
-    # Edge quality — floor lowered (March 10) to allow WFO to find
-    # baseline.  Prior 50.0 floor blocked marginal signals entirely.
-    "min_edge_score": ("suggest_float", 20.0, 85.0),
+    # Edge quality — institutional filter (hardened March 9)
+    "min_edge_score": ("suggest_float", 50.0, 85.0),
     # RPE (Pillar 14)
     "rpe_confidence_threshold": ("suggest_float", 0.03, 0.20),
     "rpe_bayesian_obs_weight": ("suggest_float", 1.0, 15.0),
@@ -763,9 +761,7 @@ def compute_wfo_score(
         \\text{Score} = \\text{Composite} \\times \\max\\!\\left(0,\\;
         1 - \\frac{\\text{MaxDD}}{\\text{MaxAcceptableDD}}\\right)
 
-    Returns ``-10.0`` when ``total_fills < min_trades`` (inactivity gate).
-    A finite numeric penalty is used instead of ``-inf`` so that
-    Optuna's TPE sampler can learn from these trials.
+    Returns ``-inf`` when ``total_fills < min_trades`` (inactivity gate).
     If ``max_drawdown >= max_acceptable_drawdown`` the score collapses
     to 0, forcing Optuna to discard catastrophic parameter sets.
 
@@ -775,10 +771,9 @@ def compute_wfo_score(
     rewards parameter sets that generate more trades for statistical
     significance.
     """
-    # Gate: reject parameter sets that produce too few trades.
-    # Return a finite penalty so Optuna's TPE sampler can learn.
+    # Gate: reject parameter sets that produce too few trades
     if total_fills < min_trades:
-        return -10.0
+        return float("-inf")
 
     # Drawdown penalty: linear collapse from 1 → 0
     dd_penalty = max(0.0, 1.0 - (max_drawdown / max_acceptable_drawdown))
@@ -830,7 +825,7 @@ def _objective(
         )
 
     if metrics is None:
-        return -10.0
+        return float("-inf")
 
     sharpe = metrics.get("sharpe_ratio", 0.0)
     sortino = metrics.get("sortino_ratio", 0.0)
@@ -856,7 +851,7 @@ def _objective(
     log.info(
         "wfo_trial",
         trial=trial.number,
-        score=round(score, 4),
+        score=round(score, 4) if score != float("-inf") else "-inf",
         sharpe=round(sharpe, 4),
         sortino=round(sortino, 4),
         max_dd=round(mdd, 4),
@@ -900,27 +895,24 @@ def _worker(
         try:
             trial = study.ask()
             value = _objective(trial, train_dates, wfo_cfg, market_configs, bounds_override)
-            # Guarantee a finite float so the TPE sampler can learn.
-            if not math.isfinite(value):
-                value = -10.0
-            study.tell(trial, float(value))
+            study.tell(trial, value)
         except ValueError as exc:
             if "COMPLETE" in str(exc):
                 # Race: another worker already completed this trial — skip it.
                 log.warning("wfo_worker_trial_race", error=str(exc))
             else:
-                # Unexpected ValueError: record a penalty so trial doesn't stay RUNNING.
+                # Unexpected ValueError: mark trial failed so it doesn't stay RUNNING.
                 if trial is not None:
                     try:
-                        study.tell(trial, -10.0)
+                        study.tell(trial, float("-inf"))
                     except Exception:
                         pass
                 raise
         except Exception:
-            # Any other error: record a penalty before re-raising.
+            # Any other error: mark trial failed before re-raising.
             if trial is not None:
                 try:
-                    study.tell(trial, -10.0)
+                    study.tell(trial, float("-inf"))
                 except Exception:
                     pass
             raise

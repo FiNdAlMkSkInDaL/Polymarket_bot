@@ -193,15 +193,6 @@ class OHLCVAggregator:
         if bar is None:
             return None
 
-        log.info(
-            "bar_closed",
-            asset_id=self.asset_id,
-            open_time=bar.open_time,
-            close=bar.close,
-            volume=bar.volume,
-            trade_count=bar.trade_count,
-        )
-
         self.bars.append(bar)
         self._recompute_stats()
         return bar
