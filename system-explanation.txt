@@ -1440,14 +1440,10 @@ TelegramAlerter (src/monitoring/telegram.py):
 Logging (src/core/logger.py):
   Structured JSON logging via structlog with async-safe QueueHandler.
   RotatingFileHandler: 10 MB per file, 5 backups.
-  
-  Log isolation (added 2026-03-12):
-    setup_logging() now accepts log_file parameter (default: "bot.jsonl").
-    The WFO command calls setup_logging(log_file="wfo.jsonl") to write
-    optimization logs to logs/wfo.jsonl instead of the default logs/bot.jsonl.
-    This prevents WFO runs from contaminating the live bot's operational log
-    stream, allowing clean separation of backtest/optimization events from
-    production trading events.
+
+  Current behavior (commit 5e4125f, 2026-03-16):
+    The `wfo` CLI path no longer overrides logger setup to `wfo.jsonl`.
+    Unless externally redirected, logs use the default configured stream.
 
 
 ================================================================================
@@ -1582,9 +1578,7 @@ Phase-2 narrowing semantics (March 15 fix):
 
 Composite objective:
   Score = (w_S·Sharpe + w_So·Sortino + w_PF·ln(1+PF)) × max(0, 1 - DD/MaxDD)
-  Returns -10.0 when fills < min_trades (finite penalty so Optuna TPE can learn;
-  -inf would make the sampler treat all zero-trade regions as equally bad and
-  never learn to avoid them)
+  Returns float("-inf") when fills < min_trades (hard inactivity gate).
 
 Fold generation: rolling/anchored IS window with embargo gap
 Warm-start: seeds from previous fold's best params
@@ -2706,6 +2700,26 @@ March 16th — Paper Execution Forensic Remediation (Touch Fill + Duplicate Clos
   - New clean session observed running at ~2026-03-16T13:06Z with fresh
     logs/trades.db recreation (0 trades at initialization).
 
+March 16th — WFO/Process/L2 Hardening (commit 5e4125f):
+  - src/backtest/wfo_optimizer.py:
+    * SEARCH_SPACE tightened/hardened:
+        zscore_threshold: [0.2, 2.5]
+        volume_ratio_threshold: [0.1, 4.0]
+        min_edge_score: [50.0, 85.0]
+    * Inactivity gate reverted to hard reject:
+        compute_wfo_score() returns float("-inf") when total_fills < min_trades
+      (_objective and worker error/tell paths now propagate -inf instead of -10).
+  - src/cli.py:
+    * Removed `shadow-report` CLI command.
+    * Removed WFO-specific setup_logging(log_file="wfo.jsonl") override.
+  - src/core/process_manager.py:
+    * stop_workers() cleanup path simplified; dead workers are skipped without
+      extra join/reap branch and post-kill join removed.
+  - src/data/l2_websocket.py:
+    * WebSocket subscription channel switched from `market` to `book`.
+    * Delta handling simplified to direct per-asset messages keyed by top-level
+      asset_id (removed price_changes fan-out wrapper path).
+
   Paper Simulator Integrity Checklist (pre-run + early-run):
     Use this checklist before trusting any PAPER performance metrics.
 
@@ -3574,7 +3588,7 @@ March 11th — Ghost Liquidity Vacuum (VacuumSignal + POST_ONLY Stink Bids):
   mean-reversion once depth refills. POST_ONLY ensures maker fees
   (rebates) rather than taker fees.
 
-March 11th — WFO Penalty Logic: Zero-Trade Rejection Returns -10.0:
+March 11th — WFO Penalty Logic: Zero-Trade Rejection Returns -10.0 (historical, later reverted):
   Previous behavior: compute_wfo_score() returned float("-inf") when
   total_fills < min_trades (default 5).  This prevented Optuna's TPE
   sampler from learning which parameter regions produce zero trades,
