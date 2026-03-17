@@ -1,0 +1,556 @@
+﻿Available dates: 2025-12-05 to 2026-03-08 (91 days)
+Diagnosing dates: 2025-12-05 to 2025-12-11 (7 days)
+Markets found in map: 31
+
+======================================================================
+  MARKET: 0x06b066958f047d9f68...
+  YES ID: 31817818387484449402...
+  NO  ID: 90243643522266968974...
+======================================================================
+
+  Total events from DataLoader: 7,000
+  Event types: {'trade': 7000}
+  Events per asset:
+    YES (31817818387484449402...): 3,500
+    NO (90243643522266968974...): 3,500
+
+  YES trades: 3,500
+  NO  trades: 3,500
+{"total": 7000, "skipped": 210000, "event": "dataloader_done", "level": "info", "timestamp": "2026-03-17T15:45:53.234617Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.272079Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.305747Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.336937Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.475646Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.510997Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.543203Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.713795Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.748880Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.781900Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.917130Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.950968Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:53.979094Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.114480Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.147507Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.176527Z"}
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.315316Z"}
+
+  YES aggregator bars closed: 65
+  NO  aggregator bars closed: 65
+  YES rolling VWAP:  0.8932
+  YES rolling ¤â:     0.459525
+  NO  rolling VWAP:  0.8932
+  NO  rolling ¤â:     0.459525
+  NO  EWMA ¤â:        0.479828
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  GATE FUNNEL (bars entering each gate)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G01_near_resolved               rejected    504  ( 14.4%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G02_price_band                  rejected     49  (  1.4%)  
+  G03_cooldown                    rejected    105  (  3.0%)  Ôûê
+  G04_max_positions               rejected      0  (  0.0%)  
+  G05_no_best_ask_zero            rejected     61  (  1.7%)  
+  G06_panic_detector              rejected  2,738  ( 78.3%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G07_no_best_bid_zero            rejected      0  (  0.0%)  
+  G08_spread_too_narrow           rejected     21  (  0.6%)  
+  G09_eqs_not_viable              rejected      7  (  0.2%)  
+  G10_size_too_small              rejected      0  (  0.0%)  
+
+  PASSED ALL GATES                    14  (  0.4%)
+  Total YES bars evaluated:      3,499
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  PANIC DETECTOR SUB-GATE BREAKDOWN (2738 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G06a_history_lt5                     0  (  0.0%)  
+  G06b_sigma_zero                      0  (  0.0%)  
+  G06c_zscore_low                  1,996  ( 72.9%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06d_volume_ratio_low              630  ( 23.0%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06e_no_vwap_zero                    0  (  0.0%)  
+  G06f_no_not_discounted              49  (  1.8%)  
+  G06g_trend_guard                    63  (  2.3%)  Ôûê
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS REJECTION BREAKDOWN (7 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G09a_no_mean_reversion               0  (  0.0%)
+  G09b_sub_tick                        0  (  0.0%)
+  G09c_fees_exceed                     0  (  0.0%)
+  G09d_low_entropy                     0  (  0.0%)
+  G09e_below_threshold                 0  (  0.0%)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  Z-SCORE DISTRIBUTION (post price-band, pre-detector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  2,780
+  Mean:       0.166
+  Std:        1.252
+  Min:        -2.541
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.349716Z"}
+  P25:        -0.594
+  Median:     -0.152
+  P75:        0.576
+  P90:        1.564
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.378087Z"}
+  P95:        2.456
+  P99:        4.195
+  Max:        10.906
+  Threshold:  0.4423507563885553
+  % above threshold: 28.2%
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS SCORE DISTRIBUTION (signals that passed PanicDetector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  21
+  Mean:       49.3
+  Min:        0.0
+  Max:        86.2
+  Threshold:  23.736276695893917
+
+  GROSS CENTS (expected alpha spread):
+  Mean:       3.543
+{"entry": 0.53, "vwap": 0.7096237798148906, "score": 86.17, "regime": 0.9974, "fee_eff": 0.6768, "tick_margin": 3, "tick_viab": 1.0, "signal_q": 0.814, "gross_cents": 5.9883, "fee_cents": 1.9354, "net_cents": 4.0529, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.510952Z"}
+{"entry": 0.48999998853658167, "vwap": 0.5993818883886918, "score": 61.62, "regime": 0.9997, "fee_eff": 0.4531, "tick_margin": 1, "tick_viab": 0.3352, "signal_q": 0.8299, "gross_cents": 3.6466, "fee_cents": 1.9944, "net_cents": 1.6522, "viable": true, "reason": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.544698Z"}
+{"entry": 0.6, "vwap": 0.6298421293508264, "score": 0.0, "gross_cents": 0.9949, "fee_cents": 1.9033, "net_cents": -0.9084, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:54.572224Z"}
+  Median:     3.647
+  Max:        5.988
+  % positive: 100.0%
+
+======================================================================
+
+
+======================================================================
+  MARKET: 0x0ea8005efbc4603783...
+  YES ID: 71552623345730992280...
+  NO  ID: 48266425622404486484...
+======================================================================
+
+  Total events from DataLoader: 7,000
+  Event types: {'trade': 7000}
+  Events per asset:
+    YES (71552623345730992280...): 3,500
+    NO (48266425622404486484...): 3,500
+
+  YES trades: 3,500
+  NO  trades: 3,500
+{"total": 7000, "skipped": 210000, "event": "dataloader_done", "level": "info", "timestamp": "2026-03-17T15:45:56.421261Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:56.595217Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:56.636792Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:56.790473Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:56.826871Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:56.977001Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.013623Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.159530Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.196066Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.341357Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.377894Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.523685Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.559708Z"}
+
+  YES aggregator bars closed: 65
+  NO  aggregator bars closed: 65
+  YES rolling VWAP:  0.5170
+  YES rolling ¤â:     0.710236
+  NO  rolling VWAP:  0.5170
+  NO  rolling ¤â:     0.710236
+  NO  EWMA ¤â:        0.645363
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  GATE FUNNEL (bars entering each gate)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G01_near_resolved               rejected    602  ( 17.2%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G02_price_band                  rejected    273  (  7.8%)  ÔûêÔûêÔûê
+  G03_cooldown                    rejected     26  (  0.7%)  
+  G04_max_positions               rejected      0  (  0.0%)  
+  G05_no_best_ask_zero            rejected     42  (  1.2%)  
+  G06_panic_detector              rejected  2,543  ( 72.7%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G07_no_best_bid_zero            rejected      0  (  0.0%)  
+  G08_spread_too_narrow           rejected      0  (  0.0%)  
+  G09_eqs_not_viable              rejected     13  (  0.4%)  
+  G10_size_too_small              rejected      0  (  0.0%)  
+
+  PASSED ALL GATES                     0  (  0.0%)
+  Total YES bars evaluated:      3,499
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  PANIC DETECTOR SUB-GATE BREAKDOWN (2543 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G06a_history_lt5                     0  (  0.0%)  
+  G06b_sigma_zero                      0  (  0.0%)  
+  G06c_zscore_low                  2,081  ( 81.8%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06d_volume_ratio_low              419  ( 16.5%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06e_no_vwap_zero                    0  (  0.0%)  
+  G06f_no_not_discounted               9  (  0.4%)  
+  G06g_trend_guard                    34  (  1.3%)  
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS REJECTION BREAKDOWN (13 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G09a_no_mean_reversion               0  (  0.0%)
+  G09b_sub_tick                        0  (  0.0%)
+  G09c_fees_exceed                     0  (  0.0%)
+  G09d_low_entropy                     0  (  0.0%)
+  G09e_below_threshold                 0  (  0.0%)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  Z-SCORE DISTRIBUTION (post price-band, pre-detector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  2,556
+  Mean:       -0.115
+  Std:        0.620
+  Min:        -1.832
+  P25:        -0.549
+  Median:     -0.122
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:57.705797Z"}
+  P75:        0.303
+  P90:        0.665
+  P95:        0.896
+  P99:        1.352
+  Max:        1.466
+  Threshold:  0.4423507563885553
+  % above threshold: 18.6%
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS SCORE DISTRIBUTION (signals that passed PanicDetector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  13
+  Mean:       0.0
+  Min:        0.0
+  Max:        0.0
+  Threshold:  23.736276695893917
+
+  GROSS CENTS (expected alpha spread):
+  Mean:       1.209
+  Median:     1.710
+  Max:        1.710
+  % positive: 100.0%
+
+======================================================================
+
+
+======================================================================
+  MARKET: 0x169b0433d0a55dcd21...
+  YES ID: 66859092956085604985...
+  NO  ID: 82553093104791328450...
+======================================================================
+
+  Total events from DataLoader: 7,000
+  Event types: {'trade': 7000}
+  Events per asset:
+    YES (66859092956085604985...): 3,500
+    NO (82553093104791328450...): 3,500
+
+  YES trades: 3,500
+  NO  trades: 3,500
+{"total": 7000, "skipped": 210000, "event": "dataloader_done", "level": "info", "timestamp": "2026-03-17T15:45:59.459699Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:59.632066Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:59.668088Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:59.813907Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:59.848898Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:45:59.998747Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.039052Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.187385Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.228300Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.379440Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.416079Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.566719Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.601773Z"}
+
+  YES aggregator bars closed: 65
+  NO  aggregator bars closed: 65
+  YES rolling VWAP:  0.5170
+  YES rolling ¤â:     0.710236
+  NO  rolling VWAP:  0.5170
+  NO  rolling ¤â:     0.710236
+  NO  EWMA ¤â:        0.645363
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  GATE FUNNEL (bars entering each gate)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G01_near_resolved               rejected    602  ( 17.2%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G02_price_band                  rejected    273  (  7.8%)  ÔûêÔûêÔûê
+  G03_cooldown                    rejected     26  (  0.7%)  
+  G04_max_positions               rejected      0  (  0.0%)  
+  G05_no_best_ask_zero            rejected     42  (  1.2%)  
+  G06_panic_detector              rejected  2,543  ( 72.7%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G07_no_best_bid_zero            rejected      0  (  0.0%)  
+  G08_spread_too_narrow           rejected      0  (  0.0%)  
+  G09_eqs_not_viable              rejected     13  (  0.4%)  
+  G10_size_too_small              rejected      0  (  0.0%)  
+
+  PASSED ALL GATES                     0  (  0.0%)
+  Total YES bars evaluated:      3,499
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  PANIC DETECTOR SUB-GATE BREAKDOWN (2543 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G06a_history_lt5                     0  (  0.0%)  
+  G06b_sigma_zero                      0  (  0.0%)  
+  G06c_zscore_low                  2,081  ( 81.8%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06d_volume_ratio_low              419  ( 16.5%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06e_no_vwap_zero                    0  (  0.0%)  
+  G06f_no_not_discounted               9  (  0.4%)  
+  G06g_trend_guard                    34  (  1.3%)  
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS REJECTION BREAKDOWN (13 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G09a_no_mean_reversion               0  (  0.0%)
+  G09b_sub_tick                        0  (  0.0%)
+  G09c_fees_exceed                     0  (  0.0%)
+  G09d_low_entropy                     0  (  0.0%)
+  G09e_below_threshold                 0  (  0.0%)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  Z-SCORE DISTRIBUTION (post price-band, pre-detector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  2,556
+  Mean:       -0.115
+  Std:        0.620
+  Min:        -1.832
+  P25:        -0.549
+  Median:     -0.122
+  P75:        0.303
+  P90:        0.665
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:00.747143Z"}
+  P95:        0.896
+  P99:        1.352
+  Max:        1.466
+  Threshold:  0.4423507563885553
+  % above threshold: 18.6%
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS SCORE DISTRIBUTION (signals that passed PanicDetector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  13
+  Mean:       0.0
+  Min:        0.0
+  Max:        0.0
+  Threshold:  23.736276695893917
+
+  GROSS CENTS (expected alpha spread):
+  Mean:       1.209
+  Median:     1.710
+  Max:        1.710
+  % positive: 100.0%
+
+======================================================================
+
+
+======================================================================
+  MARKET: 0x1a659ad30363047271...
+  YES ID: 44816229620748629831...
+  NO  ID: 25537301018568558689...
+======================================================================
+
+  Total events from DataLoader: 7,000
+  Event types: {'trade': 7000}
+  Events per asset:
+    YES (44816229620748629831...): 3,500
+    NO (25537301018568558689...): 3,500
+
+  YES trades: 3,500
+  NO  trades: 3,500
+{"total": 7000, "skipped": 210000, "event": "dataloader_done", "level": "info", "timestamp": "2026-03-17T15:46:02.450463Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:02.620327Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:02.655718Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:02.800634Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:02.835461Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:02.980563Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.015790Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.160257Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.195681Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.347402Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.383909Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.532097Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.568211Z"}
+
+  YES aggregator bars closed: 65
+  NO  aggregator bars closed: 65
+  YES rolling VWAP:  0.5170
+  YES rolling ¤â:     0.710236
+  NO  rolling VWAP:  0.5170
+  NO  rolling ¤â:     0.710236
+  NO  EWMA ¤â:        0.645363
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  GATE FUNNEL (bars entering each gate)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G01_near_resolved               rejected    602  ( 17.2%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G02_price_band                  rejected    273  (  7.8%)  ÔûêÔûêÔûê
+  G03_cooldown                    rejected     26  (  0.7%)  
+  G04_max_positions               rejected      0  (  0.0%)  
+  G05_no_best_ask_zero            rejected     42  (  1.2%)  
+  G06_panic_detector              rejected  2,543  ( 72.7%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G07_no_best_bid_zero            rejected      0  (  0.0%)  
+  G08_spread_too_narrow           rejected      0  (  0.0%)  
+  G09_eqs_not_viable              rejected     13  (  0.4%)  
+  G10_size_too_small              rejected      0  (  0.0%)  
+
+  PASSED ALL GATES                     0  (  0.0%)
+  Total YES bars evaluated:      3,499
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  PANIC DETECTOR SUB-GATE BREAKDOWN (2543 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G06a_history_lt5                     0  (  0.0%)  
+  G06b_sigma_zero                      0  (  0.0%)  
+  G06c_zscore_low                  2,081  ( 81.8%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06d_volume_ratio_low              419  ( 16.5%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06e_no_vwap_zero                    0  (  0.0%)  
+  G06f_no_not_discounted               9  (  0.4%)  
+  G06g_trend_guard                    34  (  1.3%)  
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS REJECTION BREAKDOWN (13 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G09a_no_mean_reversion               0  (  0.0%)
+  G09b_sub_tick                        0  (  0.0%)
+  G09c_fees_exceed                     0  (  0.0%)
+  G09d_low_entropy                     0  (  0.0%)
+  G09e_below_threshold                 0  (  0.0%)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  Z-SCORE DISTRIBUTION (post price-band, pre-detector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  2,556
+  Mean:       -0.115
+  Std:        0.620
+  Min:        -1.832
+  P25:        -0.549
+  Median:     -0.122
+  P75:        0.303
+  P90:        0.665
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:03.717719Z"}
+  P95:        0.896
+  P99:        1.352
+  Max:        1.466
+  Threshold:  0.4423507563885553
+  % above threshold: 18.6%
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS SCORE DISTRIBUTION (signals that passed PanicDetector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  13
+  Mean:       0.0
+  Min:        0.0
+  Max:        0.0
+  Threshold:  23.736276695893917
+
+  GROSS CENTS (expected alpha spread):
+  Mean:       1.209
+  Median:     1.710
+  Max:        1.710
+  % positive: 100.0%
+
+======================================================================
+
+
+======================================================================
+  MARKET: 0x1d54eb5eac2cee8f59...
+  YES ID: 82991837887127223585...
+  NO  ID: 24394670903706558879...
+======================================================================
+
+  Total events from DataLoader: 7,000
+  Event types: {'trade': 7000}
+  Events per asset:
+    YES (82991837887127223585...): 3,500
+    NO (24394670903706558879...): 3,500
+
+  YES trades: 3,500
+  NO  trades: 3,500
+{"total": 7000, "skipped": 210000, "event": "dataloader_done", "level": "info", "timestamp": "2026-03-17T15:46:05.502897Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:05.673302Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:05.708988Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:05.854692Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:05.891861Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.037406Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.073997Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.221635Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.258295Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.405024Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.442843Z"}
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.594925Z"}
+{"entry": 0.61, "vwap": 0.628750056283522, "score": 0.0, "gross_cents": 0.6251, "fee_cents": 1.8919, "net_cents": -1.2668, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.629785Z"}
+
+  YES aggregator bars closed: 65
+  NO  aggregator bars closed: 65
+  YES rolling VWAP:  0.5170
+  YES rolling ¤â:     0.710236
+  NO  rolling VWAP:  0.5170
+  NO  rolling ¤â:     0.710236
+  NO  EWMA ¤â:        0.645363
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  GATE FUNNEL (bars entering each gate)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G01_near_resolved               rejected    602  ( 17.2%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G02_price_band                  rejected    273  (  7.8%)  ÔûêÔûêÔûê
+  G03_cooldown                    rejected     26  (  0.7%)  
+  G04_max_positions               rejected      0  (  0.0%)  
+  G05_no_best_ask_zero            rejected     42  (  1.2%)  
+  G06_panic_detector              rejected  2,543  ( 72.7%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G07_no_best_bid_zero            rejected      0  (  0.0%)  
+  G08_spread_too_narrow           rejected      0  (  0.0%)  
+  G09_eqs_not_viable              rejected     13  (  0.4%)  
+  G10_size_too_small              rejected      0  (  0.0%)  
+
+  PASSED ALL GATES                     0  (  0.0%)
+  Total YES bars evaluated:      3,499
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  PANIC DETECTOR SUB-GATE BREAKDOWN (2543 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G06a_history_lt5                     0  (  0.0%)  
+  G06b_sigma_zero                      0  (  0.0%)  
+  G06c_zscore_low                  2,081  ( 81.8%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06d_volume_ratio_low              419  ( 16.5%)  ÔûêÔûêÔûêÔûêÔûêÔûêÔûêÔûê
+  G06e_no_vwap_zero                    0  (  0.0%)  
+  G06f_no_not_discounted               9  (  0.4%)  
+  G06g_trend_guard                    34  (  1.3%)  
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS REJECTION BREAKDOWN (13 rejections)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  G09a_no_mean_reversion               0  (  0.0%)
+  G09b_sub_tick                        0  (  0.0%)
+  G09c_fees_exceed                     0  (  0.0%)
+  G09d_low_entropy                     0  (  0.0%)
+  G09e_below_threshold                 0  (  0.0%)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  Z-SCORE DISTRIBUTION (post price-band, pre-detector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  2,556
+  Mean:       -0.115
+  Std:        0.620
+  Min:        -1.832
+  P25:        -0.549
+  Median:     -0.122
+{"entry": 0.529999999081081, "vwap": 0.5813061552482223, "score": 0.0, "gross_cents": 1.7104, "fee_cents": 1.9822, "net_cents": -0.2718, "viable": false, "reason": "negative_ev_after_fees", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T15:46:06.777184Z"}
+  P75:        0.303
+  P90:        0.665
+  P95:        0.896
+  P99:        1.352
+  Max:        1.466
+  Threshold:  0.4423507563885553
+  % above threshold: 18.6%
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  EQS SCORE DISTRIBUTION (signals that passed PanicDetector)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  N samples:  13
+  Mean:       0.0
+  Min:        0.0
+  Max:        0.0
+  Threshold:  23.736276695893917
+
+  GROSS CENTS (expected alpha spread):
+  Mean:       1.209
+  Median:     1.710
+  Max:        1.710
+  % positive: 100.0%
+
+======================================================================
+
