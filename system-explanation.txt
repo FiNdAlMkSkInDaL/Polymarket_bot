@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 16, 2026
+  Last updated: March 17, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -1785,6 +1785,30 @@ scripts/vps_setup.sh:            VPS provisioning
 scripts/decrypt_secrets.sh:      Secret decryption
 scripts/watchdog.sh:             Process watchdog
 
+Root-level operational helpers (March 17, 2026):
+  peek_wfo.py / peek_json.py:
+    Lightweight Optuna inspectors for remote WFO phase DBs.
+    - peek_wfo.py prints study/trial/best-params summaries.
+    - peek_json.py exports study summaries to JSON for offline review.
+  safe_restart.sh:
+    Minimal VPS restart helper for PAPER runs: terminate bot process,
+    clear /dev/shm/pmb_* shared-memory segments, relaunch in tmux.
+  check_folds.sh / check_wfo.sh:
+    Fast operational wrappers for WFO/fold verification commands.
+  scripts/dry_run_screener.py:
+    Live Gamma API screener to estimate zero-fee vs fee-bearing active
+    market distribution and print tagged examples.
+  scripts/vps_update_env*.py (phase1..phase7):
+    Phased .env mutation helpers used during SI-8 sports-oracle rollout
+    and provider migration/reversion testing (legacy nested oracle_params
+    vs flat external_id/target_outcome schema).
+
+Temporary SI-8 rollout artifacts (March 17, 2026):
+  _tmp_apply_oracle_env.sh, _tmp_si8_standby.sh, _tmp_si8_vps_apply.sh,
+  _tmp_vps_fix_bot.sh, _tmp_find_match.py, _tmp_vps_bot.py,
+  si8_flat_schema.patch.
+  These are operator/deployment aids and not part of the runtime bot path.
+
 
 ================================================================================
 SECTION 13: TEST INFRASTRUCTURE
@@ -2615,6 +2639,70 @@ SECTION 20: CHANGE HISTORY EVOLUTION
 ================================================================================
 
 The system has evolved through several major phases:
+
+March 17th — Commit Range 46aeaa4 -> 52261f0 (latest audited range):
+  Audited commits:
+    46aeaa4152d4e301d74e59fb83fd1047e10d3938
+    a984ddcdaba1b0bc16fb55a3c7f38b6cb30fd686
+    d44fce551ff479fe2b9626d9bff5616620b3300c
+    3edfc1d4416766ed92fe04820ffd89345d812a49
+    52261f0cd42c6e9fa4d71e6919c6793f0727a294
+
+  Commit 46aeaa4 — Ops/WFO observability utility drop:
+  - Added root helper scripts and captured artifacts for operational
+    diagnostics and WFO snapshot inspection.
+  - Added exported/captured run outputs (WFO checks, tmux captures,
+    JSON exports) used for forensic and deployment workflows.
+
+  Commit a984ddc — Test realignment for zero-fee pivot math:
+  - Updated test expectations in:
+      tests/test_edge_filter.py
+      tests/test_take_profit.py
+      tests/test_unit_math.py
+  - Test fixtures now mock fee-rate calls to return 0.0 where appropriate,
+    shifting expected rejection reasons and alpha/TP numerics from
+    fee-constrained to zero-fee behavior.
+  - Assertions changed from strict fee-drag assumptions (e.g.
+    negative_ev_after_fees) toward sub-tick/structure gating in
+    no-fee scenarios.
+
+  Commit d44fce5 — Phased VPS env tooling + market screener:
+  - Added scripts/dry_run_screener.py for live Gamma API fee-structure
+    distribution checks.
+  - Added scripts/vps_update_env.py and phase2..phase7 variants for
+    staged SI-8 environment updates (endpoint swaps, market config
+    rewrites, polling interval adjustments, rollback testing).
+  - Added supporting shell wrappers and text artifacts used during
+    phased rollout execution/audit.
+
+  Commit 3edfc1d — SI-8 flat oracle market schema migration (code path):
+  - src/data/oracle_adapter.py: OracleMarketConfig expanded with flat fields:
+      external_id, target_outcome, market_type, goal_line
+    while preserving legacy oracle_params for backward compatibility.
+  - src/bot.py: oracle market-config assembly now maps both flat keys and
+    legacy nested keys (fallback bridge), enabling dual-schema ingestion.
+  - src/data/adapters/sports_adapter.py: switched from nested
+    market_config.oracle_params to flat config attributes.
+
+  Commit 52261f0 — SI-8 sports adapter provider support expansion:
+  - src/data/adapters/sports_adapter.py enhancements:
+      * Added The Odds API polling path for NBA scores.
+      * Added target-game selection by exact external event ID and
+        fallback team-code matching.
+      * Added normalization layer from provider payload -> internal
+        OracleSnapshot-compatible match schema.
+      * Added status derivation using commence_time (TIMED vs IN_PLAY)
+        and one-time oracle-health logging.
+      * Pre-event polling now uses oracle_critical_poll_ms.
+  - Added deployment helpers and patch artifacts for live SI-8 rollout.
+
+  Net effect of audited range:
+  - SI-8 sports oracle integration moved to a flat, more portable config
+    schema with compatibility bridges and provider normalization.
+  - Operational rollout tooling expanded substantially (VPS env mutators,
+    dry-run fee screening, WFO/ops quick-inspection scripts).
+  - Test suite expectations were synchronized with zero-fee modeling
+    assumptions in edge scoring and take-profit math.
 
 March 16th — WebSocket Trade Routing Fix (price_change → trade_queue):
   - Root cause of zero-fill starvation identified from raw WS captures:
