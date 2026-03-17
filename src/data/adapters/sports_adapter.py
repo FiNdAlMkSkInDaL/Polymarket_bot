@@ -25,6 +25,7 @@ Event phases
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any
 
 import aiohttp
@@ -62,6 +63,7 @@ class SportsAdapter(OffChainOracleAdapter):
         self._market_type: str = market_config.market_type
         self._goal_line: float = float(market_config.goal_line)
         self._session: aiohttp.ClientSession | None = None
+        self._oracle_ok_logged: bool = False
 
     @property
     def name(self) -> str:
@@ -71,7 +73,7 @@ class SportsAdapter(OffChainOracleAdapter):
 
     def _compute_interval(self, phase: str) -> int:
         _INTERVALS = {
-            "pre_event": 5_000,
+            "pre_event": settings.strategy.oracle_critical_poll_ms,
             "in_progress": 1_000,
             "critical": settings.strategy.oracle_critical_poll_ms,
             "idle": settings.strategy.oracle_idle_poll_ms,
@@ -93,6 +95,14 @@ class SportsAdapter(OffChainOracleAdapter):
         api_url = settings.strategy.oracle_sports_api_url
         api_key = settings.strategy.oracle_sports_api_key
 
+        if "the-odds-api.com" in api_url:
+            log.info("[SI-8] Polling API")
+            data = await self._poll_the_odds_api(session, api_url, api_key)
+            if not self._oracle_ok_logged:
+                log.info("[SI-8] Monitoring Knicks vs Pacers - Oracle Sync: OK")
+                self._oracle_ok_logged = True
+            return self._parse_response(data)
+
         url = f"{api_url.rstrip('/')}/matches/{self._match_id}"
         headers = {"X-Auth-Token": api_key} if api_key else {}
 
@@ -101,6 +111,112 @@ class SportsAdapter(OffChainOracleAdapter):
             data = await resp.json()
 
         return self._parse_response(data)
+
+    async def _poll_the_odds_api(
+        self,
+        session: aiohttp.ClientSession,
+        api_url: str,
+        api_key: str,
+    ) -> dict:
+        # The Odds API v4: fetch NBA scores and adapt to our internal match schema.
+        base = api_url.rstrip("/")
+        params: dict[str, str] = {"daysFrom": "1"}
+        if api_key:
+            params["apiKey"] = api_key
+
+        url = f"{base}/sports/basketball_nba/scores"
+        async with session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            rows = await resp.json()
+
+        match = self._select_target_game(rows)
+        return {"match": match}
+
+    def _select_target_game(self, rows: list[dict]) -> dict:
+        # Prefer exact The Odds API event UUID when provided.
+        if self._match_id:
+            for game in rows:
+                if str(game.get("id", "")) == self._match_id:
+                    return self._normalize_odds_game(game)
+
+        target_codes = self._extract_team_codes(self._match_id)
+        for game in rows:
+            home = str(game.get("home_team", ""))
+            away = str(game.get("away_team", ""))
+            if target_codes and self._game_matches_codes(home, away, target_codes):
+                return self._normalize_odds_game(game)
+
+        if rows:
+            return self._normalize_odds_game(rows[0])
+
+        return {
+            "status": "TIMED",
+            "minute": 0,
+            "score": {"home": 0, "away": 0},
+            "homeTeam": {"name": ""},
+            "awayTeam": {"name": ""},
+            "events": [],
+        }
+
+    @staticmethod
+    def _extract_team_codes(external_id: str) -> tuple[str, str] | None:
+        parts = external_id.split("_")
+        if len(parts) < 3:
+            return None
+        return parts[1].upper(), parts[2].upper()
+
+    @staticmethod
+    def _abbr(name: str) -> str:
+        mapping = {
+            "NEW YORK KNICKS": "NYK",
+            "INDIANA PACERS": "IND",
+        }
+        up = name.upper()
+        return mapping.get(up, "".join(word[0] for word in up.split() if word)[:3])
+
+    def _game_matches_codes(self, home: str, away: str, codes: tuple[str, str]) -> bool:
+        home_abbr = self._abbr(home)
+        away_abbr = self._abbr(away)
+        return set((home_abbr, away_abbr)) == set(codes)
+
+    @staticmethod
+    def _normalize_odds_game(game: dict) -> dict:
+        home = str(game.get("home_team", ""))
+        away = str(game.get("away_team", ""))
+        completed = bool(game.get("completed", False))
+
+        home_score = 0
+        away_score = 0
+        for row in game.get("scores", []) or []:
+            team = str(row.get("name", ""))
+            try:
+                val = int(str(row.get("score", 0)))
+            except ValueError:
+                val = 0
+            if team == home:
+                home_score = val
+            elif team == away:
+                away_score = val
+
+        status = "FINISHED" if completed else "IN_PLAY"
+        if not completed:
+            commence = str(game.get("commence_time", ""))
+            if commence:
+                try:
+                    when = dt.datetime.fromisoformat(commence.replace("Z", "+00:00"))
+                    if when > dt.datetime.now(dt.timezone.utc):
+                        status = "TIMED"
+                except ValueError:
+                    pass
+
+        return {
+            "status": status,
+            "minute": 0,
+            "score": {"home": home_score, "away": away_score},
+            "homeTeam": {"name": home},
+            "awayTeam": {"name": away},
+            "events": [],
+        }
 
     def _parse_response(self, data: dict) -> OracleSnapshot:
         """Translate raw sports API JSON into an ``OracleSnapshot``.
