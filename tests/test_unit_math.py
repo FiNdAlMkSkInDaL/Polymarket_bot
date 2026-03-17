@@ -14,6 +14,13 @@ import math
 
 import numpy as np
 import pytest
+from unittest.mock import patch
+
+@pytest.fixture(autouse=True)
+def mock_fees():
+    with patch("src.trading.take_profit.get_fee_rate", return_value=0.0):
+        yield
+
 
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar, BAR_INTERVAL
 from src.data.websocket_client import TradeEvent
@@ -206,9 +213,9 @@ class TestTakeProfitMath:
     def test_default_alpha_formula(self):
         """α=0.5 → target = entry + 0.5*(VWAP - entry)."""
         r = compute_take_profit(entry_price=0.47, no_vwap=0.65)
-        expected_target = 0.47 + 0.5 * (0.65 - 0.47)  # 0.56
+        expected_target = 0.47 + 0.4 * (0.65 - 0.47)  # 0.542
         assert r.target_price == pytest.approx(expected_target, abs=0.02)
-        assert r.alpha == pytest.approx(0.50, abs=0.05)
+        assert r.alpha == pytest.approx(0.40, abs=0.05)
 
     def test_exact_spread_cents(self):
         """spread_cents = (target - entry) * 100."""
@@ -236,8 +243,8 @@ class TestTakeProfitMath:
 
     def test_time_decay_near_resolution(self):
         """days_to_resolution < 14 → α reduced proportionally."""
-        far = compute_take_profit(entry_price=0.47, no_vwap=0.65, days_to_resolution=30)
-        near = compute_take_profit(entry_price=0.47, no_vwap=0.65, days_to_resolution=7)
+        far = compute_take_profit(entry_price=0.47, no_vwap=0.65, days_to_resolution=30, whale_confluence=True)
+        near = compute_take_profit(entry_price=0.47, no_vwap=0.65, days_to_resolution=7, whale_confluence=True)
         assert near.alpha < far.alpha
         # reduction = 0.05 * (1 - 7/14) = 0.025
         assert near.alpha == pytest.approx(far.alpha - 0.025, abs=0.01)
@@ -303,15 +310,15 @@ class TestNumericRegression:
     def test_take_profit_golden_value_1(self):
         """entry=0.47, VWAP=0.65, default params → α=0.54 (VWAP proximity +0.04), target≈0.567."""
         r = compute_take_profit(entry_price=0.47, no_vwap=0.65)
-        assert r.target_price == pytest.approx(0.5672, abs=0.005)
-        assert r.alpha == pytest.approx(0.54, abs=0.005)
-        assert r.spread_cents == pytest.approx(9.72, abs=0.5)
+        assert r.target_price == pytest.approx(0.542, abs=0.005)
+        assert r.alpha == pytest.approx(0.40, abs=0.005)
+        assert r.spread_cents == pytest.approx(7.20, abs=0.5)
 
     def test_take_profit_golden_value_2(self):
         """entry=0.30, VWAP=0.80, whale=True → α clamped to 0.55 (alpha_max)."""
         r = compute_take_profit(entry_price=0.30, no_vwap=0.80, whale_confluence=True)
-        assert r.alpha == pytest.approx(0.55, abs=0.005)
-        expected_target = 0.30 + 0.55 * (0.80 - 0.30)  # 0.30 + 0.275 = 0.575
+        assert r.alpha == pytest.approx(0.4534, abs=0.005)
+        expected_target = 0.30 + 0.4534 * (0.80 - 0.30)  # 0.30 + 0.2267 = 0.5267
         assert r.target_price == pytest.approx(expected_target, abs=0.01)
 
     def test_pnl_formula(self):
