@@ -1,0 +1,28 @@
+botuser   384918  384912 99 Mar16 pts/5    23:20:38 /home/botuser/polymarket-bot/.venv/bin/python -m src.cli wfo --data-dir /home/botuser/polymarket-bot/data/vps_march2026 --max-markets 10 --train-days 30 --n-trials 100 --max-workers 1 --storage sqlite:///logs/wfo_phase2.db --search-space-bounds logs/phase2_bounds.json --output-params logs/phase2_champion.json
+---TOP---
+top - 12:21:08 up 17 days, 18:20,  4 users,  load average: 1.08, 1.15, 1.16
+Tasks: 141 total,   3 running, 138 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 61.9 us,  4.8 sy,  0.0 ni, 33.3 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st 
+MiB Mem :   3814.4 total,    340.7 free,    995.3 used,   2777.6 buff/cache     
+MiB Swap:   8192.0 total,   8187.7 free,      4.2 used.   2819.1 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 384918 botuser   20   0  342900 146060  20864 R 100.0   3.7     23,20 python
+ 404546 botuser   20   0 1075568 222440  23296 R   9.1   5.7   1:13.97 python
+ 405010 botuser   20   0   11928   5632   3584 R   9.1   0.1   0:00.01 top
+      1 root      20   0   22260  13184   9344 S   0.0   0.3   2:01.89 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.32 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+      7 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+     10 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+     12 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+     13 root      20   0       0      0      0 I   0.0   0.0   0:00.00 rcu_tas+
+---DB---
+-rw-r--r-- 1 botuser botuser 2330624 Mar 13 20:50 /home/botuser/polymarket-bot/logs/wfo_phase1.db
+-rw-r--r-- 1 botuser botuser 3088384 Mar 17 12:20 /home/botuser/polymarket-bot/logs/wfo_phase2.db
+---TMUX---
+bot_fresh: 1 windows (created Mon Mar 16 16:46:37 2026)
+polybot_wfo: 1 windows (created Mon Mar 16 13:09:58 2026)

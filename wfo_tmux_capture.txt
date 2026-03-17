@@ -1,0 +1,24 @@
+ "zscore": 0.713, "v_ratio": 17.37, "yes_price": 0.68, "no_ask": 0.07, "whale":
+false, "event": "panic_signal_fired", "level": "info", "timestamp": "2026-03-17T
+12:22:55.407674Z"}
+{"entry": 0.07, "vwap": 0.8198794260943418, "score": 68.88, "regime": 0.3659, "f
+ee_eff": 0.9324, "tick_margin": 24, "tick_viab": 1.0, "signal_q": 1.0, "gross_ce
+nts": 26.2992, "fee_cents": 1.7769, "net_cents": 24.5223, "viable": true, "reaso
+n": "", "event": "edge_assessment", "level": "info", "timestamp": "2026-03-17T12
+:22:55.407742Z"}
+{"market": "0x1a659ad303630472713278ed1f3d6489eaaaa0171098dba04df2793dfc16a302",
+ "zscore": 0.321, "threshold": 0.36450180570973834, "gap": 0.044, "v_ratio": 0.7
+5, "event": "zscore_near_miss", "level": "info", "timestamp": "2026-03-17T12:22:
+55.455741Z"}
+{"market": "0x1a659ad303630472713278ed1f3d6489eaaaa0171098dba04df2793dfc16a302",
+ "zscore": 0.453, "v_ratio": 0.21, "yes_price": 0.8099999854199988, "no_ask": 0.
+06, "whale": false, "event": "panic_signal_fired", "level": "info", "timestamp":
+ "2026-03-17T12:22:55.456205Z"}
+{"total": 30000, "skipped": 900000, "event": "dataloader_done", "level": "info",
+ "timestamp": "2026-03-17T12:22:55.578189Z"}
+{"total_positions": 0, "open_remaining": 0, "total_pnl_net": 0, "pce_enabled": f
+alse, "event": "adapter_summary", "level": "info", "timestamp": "2026-03-17T12:2
+2:55.578415Z"}
+{"events": 30000, "pnl": -2.9694, "sharpe": 10.12, "max_dd": 0.0622, "event": "b
+acktest_done", "level": "info", "timestamp": "2026-03-17T12:22:55.578784Z"}
+
