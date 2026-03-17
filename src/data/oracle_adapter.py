@@ -99,7 +99,15 @@ class OracleMarketConfig:
     oracle_type:
         Adapter type key (e.g. ``"ap_election"``, ``"sports"``).
     oracle_params:
-        Adapter-specific parameters (e.g. race ID, match ID, target team).
+        Legacy adapter-specific nested parameters (deprecated).
+    external_id:
+        Flat-schema external event identifier (e.g. match/race id).
+    target_outcome:
+        Flat-schema target outcome label mapped to YES.
+    market_type:
+        Flat-schema market shape (e.g. ``"winner"`` or ``"over_goals"``).
+    goal_line:
+        Flat-schema total-goals threshold for over/under style markets.
     yes_asset_id, no_asset_id:
         Token IDs for the YES/NO outcome tokens.
     event_id:
@@ -109,6 +117,10 @@ class OracleMarketConfig:
     market_id: str = ""
     oracle_type: str = ""
     oracle_params: dict = field(default_factory=dict)
+    external_id: str = ""
+    target_outcome: str = ""
+    market_type: str = "winner"
+    goal_line: float = 2.5
     yes_asset_id: str = ""
     no_asset_id: str = ""
     event_id: str = ""

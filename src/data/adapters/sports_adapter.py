@@ -41,11 +41,11 @@ _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 class SportsAdapter(OffChainOracleAdapter):
     """Polls a sports API for live match state.
 
-    Expects ``oracle_params`` in the market config to contain::
+    Expects flat market config fields::
 
         {
-            "match_id": "<API match identifier>",
-            "team": "<team name whose win maps to YES>",
+            "external_id": "<API match identifier>",
+            "target_outcome": "<team name whose win maps to YES>",
             "market_type": "winner"   // "winner" or "over_goals"
             "goal_line": 2.5          // only for market_type == "over_goals"
         }
@@ -57,10 +57,10 @@ class SportsAdapter(OffChainOracleAdapter):
         **kwargs: Any,
     ) -> None:
         super().__init__(market_config, **kwargs)
-        self._match_id: str = market_config.oracle_params.get("match_id", "")
-        self._team: str = market_config.oracle_params.get("team", "")
-        self._market_type: str = market_config.oracle_params.get("market_type", "winner")
-        self._goal_line: float = float(market_config.oracle_params.get("goal_line", 2.5))
+        self._match_id: str = market_config.external_id
+        self._team: str = market_config.target_outcome
+        self._market_type: str = market_config.market_type
+        self._goal_line: float = float(market_config.goal_line)
         self._session: aiohttp.ClientSession | None = None
 
     @property
