@@ -379,6 +379,9 @@ class TradingBot:
             )
             return
 
+        tracked_limit = settings.strategy.max_active_l2_markets
+        self._markets.sort(key=lambda market: market.daily_volume_usd, reverse=True)
+        self._markets = self._markets[:tracked_limit]
         log.info("markets_selected", count=len(self._markets))
 
         # 3. Build per-market aggregators, detectors & book trackers
@@ -814,6 +817,38 @@ class TradingBot:
         self._total_counts.pop(m.no_token_id, None)
         self._recent_trade_volume.pop(m.condition_id, None)
         self._markets = [x for x in self._markets if x.condition_id != m.condition_id]
+
+    async def _reconcile_tracked_markets(self, target_markets: list[MarketInfo]) -> None:
+        """Keep wired/subscribed markets aligned to the tracked universe cap."""
+        target_by_id = {market.condition_id: market for market in target_markets}
+
+        for market in list(self._markets):
+            if market.condition_id in target_by_id:
+                continue
+            if self._ws:
+                await self._ws.remove_assets([market.yes_token_id, market.no_token_id])
+            if self._l2_ws:
+                await self._l2_ws.remove_assets([market.yes_token_id, market.no_token_id])
+            self._unwire_market(market)
+
+        new_asset_ids: list[str] = []
+        new_l2_books: dict[str, L2OrderBook] = {}
+        current_ids = {market.condition_id for market in self._markets}
+        for market in target_markets:
+            if market.condition_id in current_ids:
+                continue
+            self._wire_market(market)
+            new_asset_ids.extend([market.yes_token_id, market.no_token_id])
+            for token_id in (market.yes_token_id, market.no_token_id):
+                if token_id in self._l2_books:
+                    new_l2_books[token_id] = self._l2_books[token_id]
+
+        if self._ws and new_asset_ids:
+            await self._ws.add_assets(new_asset_ids)
+        if self._l2_ws and new_l2_books:
+            await self._l2_ws.add_assets(new_l2_books)
+
+        self._markets = list(target_markets)
 
     def _positioned_asset_ids(self) -> set[str]:
         """Return asset IDs that currently have open positions.
@@ -3508,21 +3543,12 @@ class TradingBot:
                     m.condition_id for m in all_tracked[:l2_limit]
                 }
 
-                # Wire + subscribe new markets
-                new_asset_ids: list[str] = []
-                new_l2_books: dict[str, L2OrderBook] = {}
-                for m in newly_added:
-                    self._wire_market(m)
-                    new_asset_ids.extend([m.yes_token_id, m.no_token_id])
-                    # Collect L2 books for dynamic subscription
-                    for token_id in (m.yes_token_id, m.no_token_id):
-                        if token_id in self._l2_books:
-                            new_l2_books[token_id] = self._l2_books[token_id]
-
-                if self._ws and new_asset_ids:
-                    await self._ws.add_assets(new_asset_ids)
-                if self._l2_ws and new_l2_books:
-                    await self._l2_ws.add_assets(new_l2_books)
+                tracked_markets = sorted(
+                    (am.info for am in self.lifecycle.active.values()),
+                    key=lambda market: market.daily_volume_usd,
+                    reverse=True,
+                )[:l2_limit]
+                await self._reconcile_tracked_markets(tracked_markets)
 
                 # ── Stale trade eviction ──────────────────────────────
                 stale_evicted = self.lifecycle.check_stale_markets(
@@ -3566,11 +3592,6 @@ class TradingBot:
                         bars=bars,
                         spread_cents=spread,
                     )
-
-                # Update _markets list with promoted markets
-                for cid, am in self.lifecycle.active.items():
-                    if am.info not in self._markets:
-                        self._markets.append(am.info)
 
                 total = len(self.lifecycle.active)
                 obs = len(self.lifecycle.observing)
