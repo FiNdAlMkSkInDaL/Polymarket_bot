@@ -18,7 +18,11 @@ import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from src.backtest.strategy import BotReplayAdapter
+from src.backtest.strategy import (
+    LEGACY_BACKTEST_SIGNAL_DEFAULTS,
+    BotReplayAdapter,
+    split_strategy_and_legacy_params,
+)
 from src.backtest.wfo_optimizer import (
     FoldResult,
     WfoConfig,
@@ -256,7 +260,7 @@ class TestWfoScore:
             sharpe_ratio=3.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=2, min_trades=5,
         )
-        assert score == -10.0
+        assert score == float("-inf")
 
     def test_exactly_min_trades_passes(self):
         """Exactly min_trades should pass the gate."""
@@ -272,7 +276,7 @@ class TestWfoScore:
             sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=0,
         )
-        assert score == -10.0
+        assert score == float("-inf")
 
     # ── Multi-metric composite tests ───────────────────────────────────
 
@@ -327,8 +331,8 @@ class TestWfoScore:
         score = compute_wfo_score(
             sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
         )
-        # With default min_trades=5 and total_fills=0, should be -10.0
-        assert score == -10.0
+        # With default min_trades=5 and total_fills=0, should be rejected.
+        assert score == float("-inf")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,20 +347,21 @@ class TestParameterInjection:
         adapter = BotReplayAdapter(
             market_id="MKT", yes_asset_id="YES", no_asset_id="NO"
         )
-        assert adapter._params.zscore_threshold == StrategyParams().zscore_threshold
         assert adapter._params.kelly_fraction == StrategyParams().kelly_fraction
+        assert adapter._legacy_signal_params == LEGACY_BACKTEST_SIGNAL_DEFAULTS
 
     def test_custom_params_used(self):
         """Injected StrategyParams override defaults."""
-        custom = StrategyParams(zscore_threshold=1.7, kelly_fraction=0.10)
+        custom = StrategyParams(kelly_fraction=0.10)
         adapter = BotReplayAdapter(
             market_id="MKT",
             yes_asset_id="YES",
             no_asset_id="NO",
             params=custom,
+            legacy_signal_params={"zscore_threshold": 1.7},
         )
-        assert adapter._params.zscore_threshold == 1.7
         assert adapter._params.kelly_fraction == 0.10
+        assert adapter._legacy_signal_params["zscore_threshold"] == 1.7
 
     def test_alpha_default_injected(self):
         """The target-price alpha should read from params."""
@@ -674,7 +679,7 @@ class TestSearchSpace:
             assert key in params, f"Missing parameter: {key}"
 
     def test_suggested_params_build_strategy_params(self):
-        """Suggested params can be passed to StrategyParams constructor."""
+        """Suggested params partition cleanly into live and legacy buckets."""
         from src.backtest.wfo_optimizer import _suggest_params
 
         mock_trial = MagicMock()
@@ -683,10 +688,11 @@ class TestSearchSpace:
         )
 
         params = _suggest_params(mock_trial)
-        sp = StrategyParams(**params)
+        strategy_params, legacy_params = split_strategy_and_legacy_params(params)
+        sp = StrategyParams(**strategy_params)
 
-        assert sp.zscore_threshold == (0.05 + 2.5) / 2
         assert sp.kelly_fraction == (0.03 + 0.40) / 2
+        assert legacy_params["zscore_threshold"] == (0.2 + 2.5) / 2
 
     def test_expanded_search_space_has_new_params(self):
         """Search space includes the new parameters."""

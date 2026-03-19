@@ -51,6 +51,8 @@ from src.trading.take_profit import TakeProfitResult, compute_take_profit
 
 log = get_logger(__name__)
 
+LEGACY_SIGNAL_ZSCORE_THRESHOLD = 0.20
+
 
 class PositionState(str, Enum):
     ENTRY_PENDING = "ENTRY_PENDING"
@@ -155,12 +157,26 @@ class ComboPosition:
     event_id: str
     state: ComboState = ComboState.ENTRY_PENDING
     target_size: float = 0.0                           # uniform shares per leg
+    maker_market_id: str = ""
     legs: dict[str, Position] = field(default_factory=dict)   # market_id → Position
+    planned_collateral: float = 0.0
+    sweep_triggered: bool = False
     created_at: float = field(default_factory=time.time)
 
     @property
     def n_legs(self) -> int:
         return len(self.legs)
+
+    @property
+    def maker_position(self) -> Position | None:
+        return self.legs.get(self.maker_market_id)
+
+    @property
+    def taker_positions(self) -> list[Position]:
+        return [
+            pos for market_id, pos in self.legs.items()
+            if market_id != self.maker_market_id
+        ]
 
     @property
     def filled_legs(self) -> list[Position]:
@@ -172,10 +188,14 @@ class ComboPosition:
 
     @property
     def all_filled(self) -> bool:
-        return all(p.state == PositionState.ENTRY_FILLED for p in self.legs.values())
+        return bool(self.legs) and all(
+            p.state == PositionState.ENTRY_FILLED for p in self.legs.values()
+        )
 
     @property
     def total_collateral(self) -> float:
+        if self.planned_collateral > 0:
+            return self.planned_collateral
         return sum(p.entry_price * p.entry_size for p in self.legs.values())
 
     @property
@@ -248,6 +268,8 @@ class PositionManager:
         self._probe_scaled_set: set[str] = set()
         # Per-market cooldown after stop-loss to prevent rapid re-entry
         self._stop_loss_cooldowns: dict[str, float] = {}
+        # Combo order routing: order_id → (event_id, market_id)
+        self._combo_order_map: dict[str, tuple[str, str]] = {}
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -256,6 +278,137 @@ class PositionManager:
     @property
     def circuit_breaker_active(self) -> bool:
         return self._circuit_breaker_tripped
+
+    def is_combo_order(self, order_id: str) -> bool:
+        return order_id in self._combo_order_map
+
+    def _register_combo_order(self, combo: ComboPosition, pos: Position) -> None:
+        if pos.entry_order is None:
+            return
+        self._combo_order_map[pos.entry_order.order_id] = (combo.event_id, pos.market_id)
+
+    def _unregister_combo_order(self, order_id: str | None) -> None:
+        if order_id:
+            self._combo_order_map.pop(order_id, None)
+
+    def _sync_combo_state(self, combo: ComboPosition) -> None:
+        if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
+            return
+        if combo.all_filled:
+            combo.state = ComboState.ALL_FILLED
+        elif combo.sweep_triggered or combo.filled_legs:
+            combo.state = ComboState.PARTIAL_FILL
+        else:
+            combo.state = ComboState.ENTRY_PENDING
+
+    async def _trigger_combo_taker_sweep(self, combo: ComboPosition) -> None:
+        """Cross all deferred taker legs once the maker leg fully fills."""
+        if combo.sweep_triggered:
+            return
+
+        strat = settings.strategy
+        aggression = strat.si9_emergency_taker_max_cents / 100.0
+        combo.sweep_triggered = True
+
+        log.info(
+            "combo_taker_sweep_triggered",
+            combo_id=combo.combo_id,
+            event_id=combo.event_id,
+            n_takers=len(combo.taker_positions),
+        )
+
+        for pos in combo.taker_positions:
+            asset_id = pos.yes_asset_id or pos.trade_asset_id
+            book = self._book_trackers.get(asset_id)
+            best_ask = book.best_ask if book is not None else 0.0
+            reference_ask = best_ask if best_ask > 0 else pos.entry_price
+            cross_price = round(min(0.99, max(reference_ask, 0.01) + aggression), 2)
+
+            order = await self.executor.place_limit_order(
+                market_id=pos.market_id,
+                asset_id=asset_id,
+                side=OrderSide.BUY,
+                price=cross_price,
+                size=pos.entry_size,
+                post_only=False,
+            )
+            pos.entry_order = order
+            pos.entry_time = time.time()
+            pos.entry_price = cross_price
+            self._positions[pos.id] = pos
+
+            if order.status != OrderStatus.CANCELLED:
+                self._register_combo_order(combo, pos)
+
+            if self.executor.paper_mode and order.status == OrderStatus.LIVE:
+                order.status = OrderStatus.FILLED
+                order.filled_size = pos.entry_size
+                order.filled_avg_price = cross_price
+                order.updated_at = time.time()
+
+            if order.status == OrderStatus.FILLED:
+                pos.state = PositionState.ENTRY_FILLED
+                pos.filled_size = order.filled_size or pos.entry_size
+                pos.entry_price = order.filled_avg_price or cross_price
+                log.info(
+                    "combo_taker_leg_filled",
+                    combo_id=combo.combo_id,
+                    market_id=pos.market_id[:16],
+                    price=pos.entry_price,
+                )
+            elif order.status == OrderStatus.CANCELLED:
+                pos.exit_reason = "taker_sweep_rejected"
+                log.warning(
+                    "combo_taker_sweep_rejected",
+                    combo_id=combo.combo_id,
+                    market_id=pos.market_id[:16],
+                    price=cross_price,
+                )
+
+        self._sync_combo_state(combo)
+
+    async def on_combo_order_update(
+        self,
+        order: Order,
+        combo_positions: dict[str, "ComboPosition"],
+    ) -> bool:
+        """Process maker/taker combo fills outside the single-position path."""
+        combo_ref = self._combo_order_map.get(order.order_id)
+        if combo_ref is None:
+            return False
+
+        event_id, market_id = combo_ref
+        combo = combo_positions.get(event_id)
+        if combo is None:
+            return False
+
+        pos = combo.legs.get(market_id)
+        if pos is None:
+            return False
+
+        pos.entry_order = order
+        if order.filled_size > 0:
+            pos.filled_size = order.filled_size
+
+        if order.status == OrderStatus.FILLED:
+            pos.state = PositionState.ENTRY_FILLED
+            pos.filled_size = order.filled_size or pos.entry_size
+            pos.entry_price = order.filled_avg_price or order.price or pos.entry_price
+
+            if market_id == combo.maker_market_id and not combo.sweep_triggered:
+                log.info(
+                    "combo_maker_leg_filled",
+                    combo_id=combo.combo_id,
+                    event_id=combo.event_id,
+                    market_id=market_id[:16],
+                )
+                await self._trigger_combo_taker_sweep(combo)
+
+            self._sync_combo_state(combo)
+            return True
+
+        self._sync_combo_state(combo)
+        return True
 
     def reset_daily_pnl(self) -> None:
         """Call at UTC midnight to reset the daily loss tracker."""
@@ -804,7 +957,7 @@ class PositionManager:
         # Normalise signal strength to 0.0–1.0 for Kelly sizer.
         # For PanicSignal: map z-score excess above threshold to [0, 1].
         # For DriftSignal: use pre-normalised score directly.
-        z_threshold = strat.zscore_threshold
+        z_threshold = LEGACY_SIGNAL_ZSCORE_THRESHOLD
         signal_score = min(1.0, max(0.0, (_zscore - z_threshold) / z_threshold)) if z_threshold > 0 else 0.5
 
         # Inject rolling expectancy for adaptive cold-start sizing
@@ -2324,11 +2477,12 @@ class PositionManager:
         signal: Any,
         combo_positions: dict[str, "ComboPosition"],
     ) -> ComboPosition | None:
-        """Place all legs of a combinatorial arb as POST_ONLY BUY orders.
+        """Quote only the maker leg and defer taker legs until filled.
 
-        Uses ComboSizer (share-count pegging) — every leg receives the
-        SAME number of shares.  Bypasses Kelly/EQS sizing entirely
-        because this is a structural arb (risk-free if all legs fill).
+        The upgraded SI-9 flow is maker-first:
+          1. Quote the bottleneck leg passively via POST_ONLY.
+          2. Cache the taker legs locally but do not execute them yet.
+          3. When the maker leg fully fills, immediately sweep the takers.
 
         Parameters
         ----------
@@ -2398,76 +2552,102 @@ class PositionManager:
                 log.warning("combo_blocked_wallet", collateral=round(new_collateral, 2))
                 return None
 
-            # ── Place all leg orders ───────────────────────────────────
-            # Share count is UNIFORM across all legs (ComboSizer guarantee).
+            if signal.maker_leg is None:
+                log.warning("combo_missing_maker_leg", event_id=signal.cluster_event_id)
+                return None
+
+            # ── Quote only the maker leg ───────────────────────────────
             combo_id = f"COMBO-{signal.cluster_event_id[:12]}-{self._next_id}"
             self._next_id += 1
             legs: dict[str, Position] = {}
             uniform_shares = signal.target_shares
 
-            for leg in signal.legs:
-                order = await self.executor.place_limit_order(
-                    market_id=leg.market_id,
-                    asset_id=leg.yes_token_id,
-                    side=OrderSide.BUY,
-                    price=leg.target_price,
-                    size=uniform_shares,
-                    post_only=True,
-                )
+            maker_leg = signal.maker_leg
+            maker_order = await self.executor.place_limit_order(
+                market_id=maker_leg.market_id,
+                asset_id=maker_leg.yes_token_id,
+                side=OrderSide.BUY,
+                price=maker_leg.target_price,
+                size=uniform_shares,
+                post_only=True,
+            )
 
-                # If POST_ONLY was rejected, re-place at best_bid (never cross)
-                if order.status == OrderStatus.CANCELLED and order.rejection_reason == "would_cross":
-                    fallback_price = round(leg.best_bid, 2)
-                    if fallback_price <= 0:
-                        continue
-                    order = await self.executor.place_limit_order(
-                        market_id=leg.market_id,
-                        asset_id=leg.yes_token_id,
+            if (
+                maker_order.status == OrderStatus.CANCELLED
+                and maker_order.rejection_reason == "would_cross"
+            ):
+                fallback_price = round(maker_leg.best_bid, 2)
+                if fallback_price > 0:
+                    maker_order = await self.executor.place_limit_order(
+                        market_id=maker_leg.market_id,
+                        asset_id=maker_leg.yes_token_id,
                         side=OrderSide.BUY,
                         price=fallback_price,
                         size=uniform_shares,
                         post_only=True,
                     )
-                    if order.status == OrderStatus.CANCELLED:
-                        continue
 
-                pos_id = f"{combo_id}-L{len(legs)}"
+            if maker_order.status == OrderStatus.CANCELLED:
+                log.warning("combo_no_legs_placed", event_id=signal.cluster_event_id)
+                return None
+
+            maker_pos = Position(
+                id=f"{combo_id}-L0",
+                market_id=maker_leg.market_id,
+                no_asset_id=maker_leg.no_token_id,
+                event_id=signal.cluster_event_id,
+                state=PositionState.ENTRY_PENDING,
+                entry_order=maker_order,
+                entry_price=maker_order.price,
+                entry_size=uniform_shares,
+                entry_time=time.time(),
+                trade_asset_id=maker_leg.yes_token_id,
+                trade_side="YES",
+                yes_asset_id=maker_leg.yes_token_id,
+                signal_type="combo_arb",
+                fee_enabled=False,
+            )
+            self._positions[maker_pos.id] = maker_pos
+            legs[maker_pos.market_id] = maker_pos
+
+            for idx, leg in enumerate(signal.taker_legs, start=1):
                 pos = Position(
-                    id=pos_id,
+                    id=f"{combo_id}-L{idx}",
                     market_id=leg.market_id,
                     no_asset_id=leg.no_token_id,
                     event_id=signal.cluster_event_id,
                     state=PositionState.ENTRY_PENDING,
-                    entry_order=order,
+                    entry_order=None,
                     entry_price=leg.target_price,
                     entry_size=uniform_shares,
-                    entry_time=time.time(),
+                    entry_time=0.0,
                     trade_asset_id=leg.yes_token_id,
                     trade_side="YES",
                     yes_asset_id=leg.yes_token_id,
                     signal_type="combo_arb",
-                    fee_enabled=False,  # maker = 0 bps
+                    fee_enabled=True,
                 )
-                self._positions[pos.id] = pos
-                legs[leg.market_id] = pos
-
-            if not legs:
-                log.warning("combo_no_legs_placed", event_id=signal.cluster_event_id)
-                return None
+                legs[pos.market_id] = pos
 
             combo = ComboPosition(
                 combo_id=combo_id,
                 event_id=signal.cluster_event_id,
                 state=ComboState.ENTRY_PENDING,
                 target_size=uniform_shares,
+                maker_market_id=maker_leg.market_id,
                 legs=legs,
+                planned_collateral=new_collateral,
             )
+            self._register_combo_order(combo, maker_pos)
 
             log.info(
                 "combo_position_opened",
                 combo_id=combo_id,
                 event_id=signal.cluster_event_id,
                 n_legs=len(legs),
+                maker_market_id=maker_leg.market_id,
+                pending_takers=len(signal.taker_legs),
+                routing_reason=maker_leg.routing_reason,
                 collateral=round(new_collateral, 2),
                 edge_cents=signal.edge_cents,
                 shares=uniform_shares,
@@ -2520,26 +2700,79 @@ class PositionManager:
         max_taker_cents = strat.si9_emergency_taker_max_cents
         max_spread_cents = strat.si9_emergency_max_spread_cents
 
-        filled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_FILLED]
-        unfilled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_PENDING]
+        maker_pos = combo.maker_position
 
-        # ── STATE 1: No fills — safe cancel ────────────────────────────
-        if not filled:
+        # ── Maker-first safe timeout: no maker fill, no taker sweep ────
+        if (
+            not combo.sweep_triggered
+            and maker_pos is not None
+            and maker_pos.state == PositionState.ENTRY_PENDING
+            and (maker_pos.entry_order is None or maker_pos.entry_order.filled_size <= 0)
+        ):
             combo.state = ComboState.ABANDONED
-            for pos in unfilled:
+            for pos in combo.legs.values():
                 if pos.entry_order and pos.entry_order.status in (
                     OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
                 ):
                     await self.executor.cancel_order(pos.entry_order)
+                    self._unregister_combo_order(pos.entry_order.order_id)
                 pos.state = PositionState.CANCELLED
                 pos.exit_reason = reason
             log.info(
-                "combo_abandoned_clean",
+                "combo_abandoned_safe",
                 combo_id=combo.combo_id,
                 event_id=combo.event_id,
                 reason=reason,
+                note="maker_unfilled_no_taker_exposure",
             )
             return
+
+        # ── Partial maker fill before sweep: flatten only the maker ────
+        if (
+            not combo.sweep_triggered
+            and maker_pos is not None
+            and maker_pos.entry_order is not None
+            and 0 < maker_pos.entry_order.filled_size < maker_pos.entry_size
+        ):
+            if maker_pos.entry_order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED):
+                await self.executor.cancel_order(maker_pos.entry_order)
+                self._unregister_combo_order(maker_pos.entry_order.order_id)
+
+            maker_pos.filled_size = maker_pos.entry_order.filled_size
+            maker_pos.state = PositionState.ENTRY_FILLED
+
+            book = self._book_trackers.get(maker_pos.yes_asset_id or maker_pos.trade_asset_id)
+            bid = book.best_bid if book is not None else 0.01
+            bid = max(0.01, bid)
+
+            exit_order = await self.executor.place_limit_order(
+                market_id=maker_pos.market_id,
+                asset_id=maker_pos.yes_asset_id or maker_pos.trade_asset_id,
+                side=OrderSide.SELL,
+                price=round(bid, 2),
+                size=maker_pos.filled_size,
+                post_only=False,
+            )
+            maker_pos.exit_order = exit_order
+            maker_pos.state = PositionState.EXIT_PENDING
+            maker_pos.exit_reason = f"{reason}_partial_maker_dump"
+
+            for pos in combo.taker_positions:
+                pos.state = PositionState.CANCELLED
+                pos.exit_reason = reason
+
+            combo.state = ComboState.ABANDONED
+            log.warning(
+                "combo_abandoned_partial_maker_dump",
+                combo_id=combo.combo_id,
+                event_id=combo.event_id,
+                filled_size=maker_pos.filled_size,
+                sell_price=round(bid, 2),
+            )
+            return
+
+        filled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_FILLED]
+        unfilled = [p for p in combo.legs.values() if p.state == PositionState.ENTRY_PENDING]
 
         # ── STATE 2: Partial fills — emergency hedge required ──────────
         # First, cancel all still-resting unfilled orders so they can't
@@ -2549,6 +2782,7 @@ class PositionManager:
                 OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED,
             ):
                 await self.executor.cancel_order(pos.entry_order)
+                self._unregister_combo_order(pos.entry_order.order_id)
 
         # Attempt to CROSS THE SPREAD on each unfilled leg to complete arb.
         # Track which legs we successfully taker-fill vs which are too wide.
@@ -2587,6 +2821,8 @@ class PositionManager:
                     post_only=False,  # TAKER — deliberately crossing
                 )
                 pos.entry_order = taker_order
+                if taker_order.status != OrderStatus.CANCELLED:
+                    self._register_combo_order(combo, pos)
                 if taker_order.status == OrderStatus.CANCELLED:
                     # Taker order also failed — treat as hedge failure
                     hedge_failures.append(pos)
@@ -2697,6 +2933,8 @@ class PositionManager:
                 continue
             for pos in combo.legs.values():
                 if pos.state not in (PositionState.ENTRY_PENDING, PositionState.ENTRY_FILLED):
+                    continue
+                if pos.entry_order is None and pos.state != PositionState.ENTRY_FILLED:
                     continue
                 result.append({
                     "market_id": pos.market_id,

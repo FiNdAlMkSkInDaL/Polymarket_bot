@@ -64,6 +64,9 @@ from src.trading.fees import get_fee_rate
 
 log = get_logger(__name__)
 
+LEGACY_ZSCORE_THRESHOLD = 0.20
+LEGACY_VOLUME_RATIO_THRESHOLD = 0.5
+
 # ── Component weights (must sum to 1.0) ────────────────────────────────────
 W_REGIME = 0.35
 W_FEE = 0.30
@@ -300,12 +303,12 @@ def compute_edge_score(
     z_thresh = (
         zscore_threshold
         if zscore_threshold is not None
-        else strat.zscore_threshold
+        else LEGACY_ZSCORE_THRESHOLD
     )
     v_thresh = (
         volume_ratio_threshold
         if volume_ratio_threshold is not None
-        else strat.volume_ratio_threshold
+        else LEGACY_VOLUME_RATIO_THRESHOLD
     )
     threshold = min_score if min_score is not None else strat.min_edge_score
 

@@ -14,6 +14,12 @@ from src.signals.signal_framework import BaseSignal
 
 log = get_logger(__name__)
 
+LEGACY_ZSCORE_THRESHOLD = 0.20
+LEGACY_VOLUME_RATIO_THRESHOLD = 0.5
+LEGACY_TREND_GUARD_PCT = 0.08
+LEGACY_TREND_GUARD_BARS = 15
+LEGACY_NO_DISCOUNT_FACTOR = 0.995
+
 # Cold-start volatility floor to prevent explosive z-scores on microscopic σ.
 MIN_VOLATILITY = 0.0001
 
@@ -62,10 +68,10 @@ class PanicDetector:
         self.yes_agg = yes_aggregator
         self.no_agg = no_aggregator
 
-        self.z_thresh = zscore_threshold if zscore_threshold is not None else settings.strategy.zscore_threshold
-        self.v_thresh = volume_ratio_threshold if volume_ratio_threshold is not None else settings.strategy.volume_ratio_threshold
-        self._trend_guard_pct = trend_guard_pct if trend_guard_pct is not None else settings.strategy.trend_guard_pct
-        self._trend_guard_bars = trend_guard_bars if trend_guard_bars is not None else settings.strategy.trend_guard_bars
+        self.z_thresh = zscore_threshold if zscore_threshold is not None else LEGACY_ZSCORE_THRESHOLD
+        self.v_thresh = volume_ratio_threshold if volume_ratio_threshold is not None else LEGACY_VOLUME_RATIO_THRESHOLD
+        self._trend_guard_pct = trend_guard_pct if trend_guard_pct is not None else LEGACY_TREND_GUARD_PCT
+        self._trend_guard_bars = trend_guard_bars if trend_guard_bars is not None else LEGACY_TREND_GUARD_BARS
         self._ofi_veto_threshold = ofi_veto_threshold
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -163,13 +169,13 @@ class PanicDetector:
                 market=self.market_id,
             )
             return None
-        if no_best_ask >= no_vwap * settings.strategy.no_discount_factor:
+        if no_best_ask >= no_vwap * LEGACY_NO_DISCOUNT_FACTOR:
             log.debug(
                 "spike_check_fail_no_not_discounted",
                 market=self.market_id,
                 no_ask=no_best_ask,
                 no_vwap=round(no_vwap, 4),
-                discount_factor=settings.strategy.no_discount_factor,
+                discount_factor=LEGACY_NO_DISCOUNT_FACTOR,
             )
             return None
 

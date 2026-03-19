@@ -12,6 +12,7 @@ def mock_fees():
 
 
 from src.trading.fees import compute_net_pnl_cents
+from src.core.config import settings
 from src.trading.take_profit import compute_take_profit, TakeProfitResult
 
 
@@ -60,8 +61,8 @@ class TestTakeProfit:
             entry_price=0.47, no_vwap=0.65,
             whale_confluence=True, iceberg_active=True,
         )
-        # whale +0.08, iceberg +0.05 → combined adjustments without pushing up against fees
-        assert both.alpha == pytest.approx(0.5034, abs=0.005)
+        expected_alpha = min(settings.strategy.alpha_max, base.alpha + 0.13)
+        assert both.alpha == pytest.approx(expected_alpha, abs=0.005)
 
     def test_near_resolution_reduces_alpha(self):
         """Close to resolution → lower α (less mean reversion expected)."""

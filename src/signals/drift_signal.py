@@ -24,7 +24,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from src.core.config import settings
 from src.core.logger import get_logger
 from src.signals.signal_framework import BaseSignal
 
@@ -32,6 +31,10 @@ log = get_logger(__name__)
 
 # Cold-start volatility floor to prevent unstable displacement from tiny σ.
 MIN_VOLATILITY = 0.0001
+LEGACY_DRIFT_LOOKBACK_BARS = 10
+LEGACY_DRIFT_Z_THRESHOLD = 0.8
+LEGACY_DRIFT_VOL_CEILING = 0.35
+LEGACY_DRIFT_COOLDOWN_S = 60.0
 
 
 @dataclass
@@ -81,11 +84,10 @@ class MeanReversionDrift:
         vol_ceiling: float | None = None,
         max_bar_volume_ratio: float = 1.5,
     ):
-        strat = settings.strategy
         self.market_id = market_id
-        self.lookback_bars = lookback_bars or strat.drift_lookback_bars
-        self.z_threshold = z_threshold or strat.drift_z_threshold
-        self.vol_ceiling = vol_ceiling or strat.drift_vol_ceiling
+        self.lookback_bars = lookback_bars or LEGACY_DRIFT_LOOKBACK_BARS
+        self.z_threshold = z_threshold or LEGACY_DRIFT_Z_THRESHOLD
+        self.vol_ceiling = vol_ceiling or LEGACY_DRIFT_VOL_CEILING
         self.max_bar_volume_ratio = max_bar_volume_ratio
 
     def evaluate(

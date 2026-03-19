@@ -81,6 +81,7 @@ from src.data.oracle_adapter import (
 from src.data.adapters.ap_election_adapter import APElectionAdapter
 from src.data.adapters.sports_adapter import SportsAdapter
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
+from src.strategies.pure_market_maker import PureMarketMaker
 
 # Data recording (lazy import — only used when RECORD_DATA=true)
 try:
@@ -124,7 +125,7 @@ def _safe_fire_and_forget(coro, *, name: str | None = None) -> asyncio.Task:
 
 
 class TradingBot:
-    """Top-level orchestrator for the mean-reversion market maker."""
+    """Top-level orchestrator for the live quoting and execution stack."""
 
     def __init__(
         self,
@@ -310,16 +311,14 @@ class TradingBot:
             "bot_starting",
             mode=mode_label,
             **self.guard.startup_summary(),
-            zscore_threshold=strat.zscore_threshold,
-            panic_zscore_threshold=strat.panic_zscore_threshold,
-            volume_ratio_threshold=strat.volume_ratio_threshold,
             min_edge_score=strat.min_edge_score,
             signal_cooldown_min=strat.signal_cooldown_minutes,
             heartbeat_stale_ms=strat.heartbeat_stale_ms,
             heartbeat_stale_count=strat.heartbeat_stale_count,
             ws_silence_timeout=strat.ws_silence_timeout_s,
             min_kelly_trades=strat.min_kelly_trades,
-            spread_signal_enabled=strat.spread_signal_enabled,
+            pure_mm_enabled=strat.pure_mm_enabled,
+            pure_mm_max_markets=strat.pure_mm_max_markets,
             rpe_shadow_mode=strat.rpe_shadow_mode,
             rpe_generic_enabled=strat.rpe_generic_enabled,
             kelly_fraction=strat.kelly_fraction,
@@ -578,6 +577,17 @@ class TradingBot:
         )
         # Wire monitor into PositionManager for exec-mode downgrade on suspension
         self.positions._maker_monitor = self._maker_monitor
+        self._pure_mm = PureMarketMaker(
+            executor=self.executor,
+            get_active_markets=lambda: [am.info for am in self.lifecycle.active.values()],
+            get_l2_books=lambda: self._l2_books,
+            get_book_trackers=lambda: self._book_trackers,
+            get_l2_active_set=lambda: self._l2_active_set,
+            latency_guard=self.latency_guard,
+            fast_kill_event=self._fast_kill_event,
+            maker_monitor=self._maker_monitor,
+            iceberg_detectors=self._iceberg_detectors,
+        )
         # Wire stealth executor into PositionManager for sliced probe scale-ups
         if self._stealth is not None:
             self.positions._stealth = self._stealth
@@ -603,6 +613,11 @@ class TradingBot:
             asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
+
+        if settings.strategy.pure_mm_enabled:
+            self._tasks.append(
+                asyncio.create_task(self._pure_mm.run(), name="pure_market_maker")
+            )
 
         # SI-8: Oracle Latency Arbitrage polling loop (if enabled)
         if settings.strategy.oracle_arb_enabled:
@@ -719,26 +734,6 @@ class TradingBot:
         self._yes_aggs[m.yes_token_id] = yes_agg
         self._no_aggs[m.no_token_id] = no_agg
 
-        detector = PanicDetector(
-            market_id=m.condition_id,
-            yes_asset_id=m.yes_token_id,
-            no_asset_id=m.no_token_id,
-            yes_aggregator=yes_agg,
-            no_aggregator=no_agg,
-            zscore_threshold=settings.strategy.panic_zscore_threshold,
-        )
-        self._detectors[m.condition_id] = detector
-
-        # Spread-based composite signal evaluator (Problem 3)
-        if settings.strategy.spread_signal_enabled:
-            imbalance_sig = OrderbookImbalanceSignal(m.condition_id)
-            spread_comp_sig = SpreadCompressionSignal(m.condition_id)
-            evaluator = CompositeSignalEvaluator(
-                generators=[(imbalance_sig, 0.6), (spread_comp_sig, 0.4)],
-                min_composite_score=settings.strategy.min_composite_signal_score,
-            )
-            self._spread_evaluators[m.condition_id] = evaluator
-
         # RPE: Resolution Probability Engine (Pillar 14)
         # Wiring is handled by the singleton self._rpe;
         # no per-market instance needed.
@@ -746,10 +741,6 @@ class TradingBot:
         # SI-1: Per-market regime detector
         if settings.strategy.regime_enabled:
             self._regime_detectors[m.condition_id] = RegimeDetector(m.condition_id)
-
-        # V3: Per-market drift signal detector
-        if settings.strategy.drift_signal_enabled:
-            self._drift_detectors[m.condition_id] = MeanReversionDrift(m.condition_id)
 
         # PCE: register market for correlation tracking (Pillar 15)
         self.pce.register_market(
@@ -1019,6 +1010,8 @@ class TradingBot:
             self._order_poller.stop()
         if hasattr(self, "_stop_loss_monitor"):
             self._stop_loss_monitor.stop()
+        if hasattr(self, "_pure_mm") and self._pure_mm is not None:
+            await self._pure_mm.stop()
 
         try:
             stats = await asyncio.wait_for(self.trade_store.get_stats(), timeout=5)
@@ -1053,6 +1046,27 @@ class TradingBot:
         entry fill → :meth:`_handle_entry_fill`, exit fill → :meth:`_handle_exit_fill`.
         """
         from src.trading.executor import Order  # avoid circular at module-level
+
+        if hasattr(self, "_pure_mm") and self._pure_mm is not None:
+            if await self._pure_mm.on_order_fill(order):
+                if (
+                    self._maker_monitor is not None
+                    and getattr(order, "post_only", False)
+                    and order.filled_avg_price > 0
+                    and order.filled_size > 0
+                ):
+                    fill_rec = make_fill_record(
+                        market_id=order.market_id,
+                        asset_id=order.asset_id,
+                        fill_price=order.filled_avg_price,
+                        fill_side=order.side.value,
+                        size_usd=order.filled_avg_price * order.filled_size,
+                    )
+                    self._maker_monitor.record_maker_fill(fill_rec)
+                return
+
+        if await self.positions.on_combo_order_update(order, self._combo_positions):
+            return
 
         for pos in self.positions.get_open_positions():
             if pos.entry_order and pos.entry_order.order_id == order.order_id:
@@ -1160,9 +1174,7 @@ class TradingBot:
                 no_agg = self._no_aggs.get(event.asset_id)
 
                 if yes_agg:
-                    bar = yes_agg.on_trade(event)
-                    if bar and not is_blocked:
-                        await self._on_yes_bar_closed(event.asset_id, bar)
+                    yes_agg.on_trade(event)
 
                 if no_agg:
                     no_agg.on_trade(event)
@@ -1370,146 +1382,6 @@ class TradingBot:
         if self._maker_monitor is not None:
             await self._maker_monitor.tick()
 
-        # ── Spread-based signal evaluation (Problem 3) ─────────────────
-        if not settings.strategy.spread_signal_enabled:
-            return
-
-        market_info = self._market_map.get(asset_id)
-        if not market_info:
-            return
-
-        # Only evaluate on NO-token BBO changes
-        if asset_id != market_info.no_token_id:
-            return
-
-        # Only trade active-tier markets
-        if not self.lifecycle.is_tradeable(market_info.condition_id):
-            return
-
-        # Signal cooldown check (lifecycle cooldown)
-        if not self.lifecycle.is_cooled_down(market_info.condition_id):
-            return
-
-        # Stop-loss cooldown — prevent re-entry into recently stopped-out markets
-        if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
-            return
-
-        # Per-signal-source cooldown (configurable, default 30s)
-        now = time.time()
-        last_fire = self._spread_cooldowns.get(market_info.condition_id, 0.0)
-        if now - last_fire < settings.strategy.spread_signal_cooldown_s:
-            return
-
-        # Check minimum spread
-        strat = settings.strategy
-        if score.raw_spread_cents < strat.min_spread_cents:
-            return
-
-        no_book = self._book_trackers.get(market_info.no_token_id)
-        if not no_book or not no_book.has_data:
-            return
-
-        evaluator = self._spread_evaluators.get(market_info.condition_id)
-        if not evaluator:
-            return
-
-        actionable, composite_score, fired = evaluator.is_actionable(
-            no_book=no_book,
-        )
-
-        if not actionable:
-            return
-
-        # Generate a synthetic PanicSignal to enter the standard flow
-        no_agg = self._no_aggs.get(market_info.no_token_id)
-        if not no_agg:
-            return
-
-        snap = no_book.snapshot()
-        no_best_ask = snap.best_ask if snap.best_ask > 0 else no_agg.current_price
-        if no_best_ask <= 0:
-            return
-
-        yes_agg = self._yes_aggs.get(market_info.yes_token_id)
-        yes_price = yes_agg.current_price if yes_agg else 0.50
-        yes_vwap = yes_agg.rolling_vwap if yes_agg else 0.50
-
-        # ── Price band guard (consistent with _on_yes_bar_closed) ──────
-        strat_band = settings.strategy
-        if yes_price <= strat_band.min_tradeable_price or yes_price >= strat_band.max_tradeable_price:
-            return
-        if yes_price >= 0.97 or yes_price <= 0.03:
-            self.lifecycle.drain_market(market_info.condition_id, reason="near_resolved_price")
-            return
-        if not market_info.accepting_orders:
-            self.lifecycle.drain_market(market_info.condition_id, reason="not_accepting_orders")
-            return
-
-        # Build synthetic signal with moderate values
-        synthetic_sig = PanicSignal(
-            market_id=market_info.condition_id,
-            yes_asset_id=market_info.yes_token_id,
-            no_asset_id=market_info.no_token_id,
-            yes_price=yes_price,
-            yes_vwap=yes_vwap,
-            zscore=strat.zscore_threshold * 1.2,  # just above threshold
-            volume_ratio=strat.volume_ratio_threshold * 1.1,
-            no_best_ask=no_best_ask,
-            whale_confluence=False,
-        )
-
-        # Build signal metadata with uncertainty from evaluator +
-        # a sizing multiplier of 50% (lower conviction)
-        spread_metadata: dict[str, Any] = {}
-        if fired:
-            spread_metadata = dict(fired[0].metadata)
-        spread_metadata["signal_source"] = "spread_opportunity"
-        spread_metadata["spread_sizing_mult"] = 0.50
-
-        self._spread_cooldowns[market_info.condition_id] = now
-
-        log.info(
-            "spread_signal_fired",
-            market=market_info.condition_id,
-            composite_score=round(composite_score, 3),
-            signal_source="spread_opportunity",
-            raw_spread_cents=round(score.raw_spread_cents, 2),
-        )
-
-        self.lifecycle.record_signal(market_info.condition_id)
-
-        # Compute days to resolution
-        days = 30
-        if market_info.end_date:
-            days = max(1, (market_info.end_date - datetime.now(timezone.utc)).days)
-
-        # Get real book depth ratio if available
-        book_depth = 1.0
-        if no_book and no_book.has_data:
-            book_depth = no_book.book_depth_ratio
-
-        # Determine fee category
-        fee_enabled = self._is_fee_enabled(market_info)
-
-        pos = await self.positions.open_position(
-            synthetic_sig,
-            no_agg,
-            no_book=no_book,
-            event_id=market_info.event_id,
-            days_to_resolution=days,
-            book_depth_ratio=book_depth,
-            fee_enabled=fee_enabled,
-            signal_metadata=spread_metadata,
-        )
-        if pos:
-            if no_book and no_book.has_data:
-                chaser_task = asyncio.create_task(
-                    self._entry_chaser_flow(pos, no_book),
-                    name=f"chaser_entry_{pos.id}",
-                )
-                chaser_task.add_done_callback(_safe_task_done_callback)
-                pos.entry_chaser_task = chaser_task
-
     def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
         """Callback from basic OrderbookTracker when the BBO changes.
 
@@ -1671,13 +1543,13 @@ class TradingBot:
             # ── V3: Drift signal (low-volatility mean-reversion) ───────────
             # Only evaluate when PanicDetector did NOT fire — ensures
             # uncorrelated signal source.  Requires MR regime.
-            if not sig and settings.strategy.drift_signal_enabled:
+            if not sig and False:
                 drift_det = self._drift_detectors.get(market_info.condition_id)
                 if drift_det and no_agg:
                     # Drift cooldown
                     now_drift = time.time()
                     last_drift = self._drift_cooldowns.get(market_info.condition_id, 0.0)
-                    if now_drift - last_drift >= settings.strategy.drift_cooldown_s:
+                    if now_drift - last_drift >= 60.0:
                         # Check L2 reliability
                         l2_no = self._l2_books.get(market_info.no_token_id)
                         l2_ok = l2_no is None or l2_no.is_reliable
@@ -2702,6 +2574,19 @@ class TradingBot:
             is_taker=event.is_taker,
         )
         for order in filled_orders:
+            if hasattr(self, "_pure_mm") and self._pure_mm is not None:
+                _safe_fire_and_forget(
+                    self._pure_mm.on_order_fill(order),
+                    name=f"pure_mm_fill_{order.order_id}",
+                )
+
+            if self.positions.is_combo_order(order.order_id):
+                _safe_fire_and_forget(
+                    self.positions.on_combo_order_update(order, self._combo_positions),
+                    name=f"combo_fill_{order.order_id}",
+                )
+                continue
+
             # Find the position that owns this order
             for pos in self.positions.get_open_positions():
                 if pos.entry_order and pos.entry_order.order_id == order.order_id:
@@ -3861,19 +3746,6 @@ class TradingBot:
                 for event_id, combo in list(self._combo_positions.items()):
                     if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
                         continue
-
-                    # Check for order fills by polling order status
-                    for pos in combo.legs.values():
-                        if pos.state == PositionState.ENTRY_PENDING and pos.entry_order:
-                            status = await self.executor.get_order_status(pos.entry_order)
-                            if status == OrderStatus.MATCHED:
-                                pos.state = PositionState.ENTRY_FILLED
-                                pos.filled_size = pos.entry_size
-                                log.info(
-                                    "combo_leg_filled",
-                                    combo_id=combo.combo_id,
-                                    market_id=pos.market_id[:16],
-                                )
 
                     # Update combo state
                     if combo.all_filled:

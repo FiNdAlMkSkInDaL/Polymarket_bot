@@ -41,8 +41,14 @@ class TestOrderExecutorPaper:
         assert len(filled) == 0
         assert order.status == OrderStatus.LIVE
 
-        # Price at or below → fill
-        filled = executor.check_paper_fill("NO_TOKEN", 0.45)
+        # Queue-aware paper fills require opposing taker flow and two touches.
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.45, trade_size=20.0, trade_side="sell", is_taker=True
+        )
+        assert len(filled) == 0
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.45, trade_size=1.0, trade_side="sell", is_taker=True
+        )
         assert len(filled) == 1
         assert filled[0].order_id == order.order_id
         assert order.status == OrderStatus.FILLED
@@ -61,8 +67,14 @@ class TestOrderExecutorPaper:
         filled = executor.check_paper_fill("NO_TOKEN", 0.55)
         assert len(filled) == 0
 
-        # Price at or above → fill
-        filled = executor.check_paper_fill("NO_TOKEN", 0.60)
+        # Queue-aware paper fills require opposing taker flow and two touches.
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.60, trade_size=20.0, trade_side="buy", is_taker=True
+        )
+        assert len(filled) == 0
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.60, trade_size=1.0, trade_side="buy", is_taker=True
+        )
         assert len(filled) == 1
         assert order.status == OrderStatus.FILLED
 
@@ -79,7 +91,9 @@ class TestOrderExecutorPaper:
         assert order.status == OrderStatus.CANCELLED
 
         # Cancelled order should not fill
-        filled = executor.check_paper_fill("NO_TOKEN", 0.40)
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.40, trade_size=20.0, trade_side="sell", is_taker=True
+        )
         assert len(filled) == 0
 
     @pytest.mark.asyncio
