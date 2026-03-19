@@ -209,7 +209,13 @@ class TestVirtualSell:
 
         # Step 2: Simulate entry fill
         entry_order = pos.entry_order
-        filled = executor.check_paper_fill("NO_TOKEN", 0.44)
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.44, trade_size=entry_order.size * 2.0, trade_side="sell", is_taker=True
+        )
+        assert len(filled) == 0
+        filled = executor.check_paper_fill(
+            "NO_TOKEN", 0.44, trade_size=1.0, trade_side="sell", is_taker=True
+        )
         assert len(filled) == 1
 
         # Step 3: Process entry fill → place exit
@@ -219,7 +225,13 @@ class TestVirtualSell:
         assert pos.exit_order.side == OrderSide.SELL
 
         # Step 4: Simulate exit fill
-        exit_filled = executor.check_paper_fill("NO_TOKEN", pos.target_price)
+        exit_filled = executor.check_paper_fill(
+            "NO_TOKEN", pos.target_price, trade_size=pos.exit_order.size * 2.0, trade_side="buy", is_taker=True
+        )
+        assert len(exit_filled) == 0
+        exit_filled = executor.check_paper_fill(
+            "NO_TOKEN", pos.target_price, trade_size=1.0, trade_side="buy", is_taker=True
+        )
         assert len(exit_filled) == 1
 
         # Step 5: Process exit fill

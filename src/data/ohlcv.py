@@ -102,7 +102,7 @@ class OHLCVAggregator:
         lookback_minutes: int | None = None,
     ):
         self.asset_id = asset_id
-        self.lookback = lookback_minutes or settings.strategy.lookback_minutes
+        self.lookback = lookback_minutes or 60
 
         # Rolling bar history (bounded by lookback window)
         self.bars: Deque[OHLCVBar] = deque(maxlen=self.lookback + 5)

@@ -355,7 +355,8 @@ class TestExecutorEdgeCases:
         """Cannot cancel a filled order."""
         executor = OrderExecutor(paper_mode=True)
         order = await executor.place_limit_order("MKT", "T1", OrderSide.BUY, 0.45, 10)
-        executor.check_paper_fill("T1", 0.40)  # Fill it
+        executor.check_paper_fill("T1", 0.40, trade_size=20.0, trade_side="sell", is_taker=True)
+        executor.check_paper_fill("T1", 0.40, trade_size=1.0, trade_side="sell", is_taker=True)
         assert order.status == OrderStatus.FILLED
         await executor.cancel_order(order)
         assert order.status == OrderStatus.FILLED  # Still filled
@@ -365,8 +366,9 @@ class TestExecutorEdgeCases:
         """A filled order should not fill again on subsequent price crosses."""
         executor = OrderExecutor(paper_mode=True)
         order = await executor.place_limit_order("MKT", "T1", OrderSide.BUY, 0.45, 10)
-        executor.check_paper_fill("T1", 0.40)  # First fill
-        filled_again = executor.check_paper_fill("T1", 0.30)  # Second cross
+        executor.check_paper_fill("T1", 0.40, trade_size=20.0, trade_side="sell", is_taker=True)
+        executor.check_paper_fill("T1", 0.40, trade_size=1.0, trade_side="sell", is_taker=True)
+        filled_again = executor.check_paper_fill("T1", 0.30, trade_size=20.0, trade_side="sell", is_taker=True)
         assert len(filled_again) == 0
 
     @pytest.mark.asyncio
@@ -376,7 +378,9 @@ class TestExecutorEdgeCases:
         o1 = await executor.place_limit_order("MKT", "T1", OrderSide.BUY, 0.45, 10)
         o2 = await executor.place_limit_order("MKT", "T1", OrderSide.BUY, 0.40, 5)
 
-        filled = executor.check_paper_fill("T1", 0.42)
+        filled = executor.check_paper_fill("T1", 0.42, trade_size=20.0, trade_side="sell", is_taker=True)
+        assert len(filled) == 0
+        filled = executor.check_paper_fill("T1", 0.42, trade_size=1.0, trade_side="sell", is_taker=True)
         # Only o1 (price 0.45) should fill at 0.42
         assert len(filled) == 1
         assert filled[0].order_id == o1.order_id

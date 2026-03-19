@@ -87,10 +87,10 @@ def _env_bool(key: str, default: bool = True) -> bool:
 # ── Strategy defaults ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class StrategyParams:
-    """Tunable knobs for the mean-reversion strategy.
+    """Tunable knobs for the live strategy stack.
 
     Every field can be overridden via its corresponding env-var
-    (e.g.  ZSCORE_THRESHOLD=2.5  in .env).
+    when a runtime override is required.
     """
 
     # Tradeable price band — markets outside this range are too close
@@ -98,17 +98,8 @@ class StrategyParams:
     min_tradeable_price: float = _env_float("MIN_TRADEABLE_PRICE", 0.05)
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
-    # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 0.20)
-    panic_zscore_threshold: float = _env_float("PANIC_ZSCORE_THRESHOLD", 0.684)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.5)
-    lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
-
-    # Trend regime guard (suppress signals during sustained up-trends).
-    # Suppresses panic signals when YES has risen ≥8% over trend_guard_bars.
-    # Prevents buying NO into genuine breakouts / institutional momentum.
-    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.08)
-    trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
+    # Whale monitor adaptive polling threshold.
+    whale_zscore_threshold: float = _env_float("WHALE_ZSCORE_THRESHOLD", 0.20)
 
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
@@ -218,6 +209,16 @@ class StrategyParams:
     # Load shedding: maximum markets with full L2 book reconstruction.
     # Remaining discovered markets use lightweight price/trade-only tracking.
     max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 50)
+
+    # Pure maker quoting universe and sizing.
+    pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
+    pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
+    pure_mm_quote_size_usd: float = _env_float("PURE_MM_QUOTE_SIZE_USD", 5.0)
+    pure_mm_inventory_cap_usd: float = _env_float("PURE_MM_INVENTORY_CAP_USD", 15.0)
+    pure_mm_loop_ms: int = _env_int("PURE_MM_LOOP_MS", 250)
+    pure_mm_toxic_ofi_ratio: float = _env_float("PURE_MM_TOXIC_OFI_RATIO", 0.80)
+    pure_mm_depth_window_s: float = _env_float("PURE_MM_DEPTH_WINDOW_S", 2.0)
+    pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.75)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
@@ -403,14 +404,6 @@ class StrategyParams:
     spread_signal_enabled: bool = _env_bool("SPREAD_SIGNAL_ENABLED", True)
     spread_signal_cooldown_s: float = _env_float("SPREAD_SIGNAL_COOLDOWN_S", 30.0)
 
-    # ── Panic detector NO-discount gate ────────────────────────────────────
-    # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
-    # Lower = stricter (0.98 means NO must be 2% below VWAP).
-    # Requires a genuine 2% discount before entry to ensure the
-    # contrarian edge exists.  Without this, entries at full VWAP
-    # have no mean-reversion cushion and bleed on fees + spread.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.995)
-
     # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
     # Exponentially-weighted moving average of 1-min log-return variance.
     # Reacts to regime changes in ~6 bars vs ~30 for equal-weight std.
@@ -519,14 +512,6 @@ class StrategyParams:
     # independently.
     stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 1800.0)
 
-    # ── V3: Low-volatility drift signal ───────────────────────────────────
-    # Captures slow-bleed mean-reversion in sideways markets where
-    # PanicDetector is silent.  Requires MR regime + low EWMA σ.
-    drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
-    drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
-    drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 0.8)
-    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.35)
-    drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 60.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)
@@ -637,7 +622,8 @@ class StrategyParams:
     # low liquidity.
     oracle_max_spread_cents: float = _env_float("ORACLE_MAX_SPREAD_CENTS", 15.0)
     # JSON-encoded list of oracle market bindings.  Each entry:
-    #   {"market_id": "...", "oracle_type": "ap_election"|"sports",
+    #   {"market_id": "...", "oracle_type": "ap_election"|"sports"
+    #    |"odds_api_ws"|"tree_news_ws",
     #    "oracle_params": {...}, "yes_asset_id": "...", "no_asset_id": "...",
     #    "event_id": "..."}
     oracle_market_configs: str = _env("ORACLE_MARKET_CONFIGS", "[]")
@@ -647,6 +633,12 @@ class StrategyParams:
     # Sports API credentials
     oracle_sports_api_key: str = _env("ORACLE_SPORTS_API_KEY")
     oracle_sports_api_url: str = _env("ORACLE_SPORTS_API_URL")
+    # Odds API WebSocket credentials
+    oracle_odds_api_ws_url: str = _env("ORACLE_ODDS_API_WS_URL")
+    oracle_odds_api_ws_key: str = _env("ORACLE_ODDS_API_WS_KEY")
+    # Tree News WebSocket credentials
+    oracle_tree_news_ws_url: str = _env("ORACLE_TREE_NEWS_WS_URL")
+    oracle_tree_news_ws_key: str = _env("ORACLE_TREE_NEWS_WS_KEY")
     # Shadow mode — evaluate and log oracle signals without placing orders.
     # Enabled by default for safe rollout; disable to go live.
     oracle_shadow_mode: bool = _env_bool("ORACLE_SHADOW_MODE", True)

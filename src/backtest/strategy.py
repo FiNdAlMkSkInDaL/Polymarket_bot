@@ -18,6 +18,7 @@ The backtest engine only knows about ``StrategyABC``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
 from src.core.config import StrategyParams
@@ -34,6 +35,30 @@ if TYPE_CHECKING:
     from src.backtest.matching_engine import Fill, SimOrder
 
 log = get_logger(__name__)
+
+LEGACY_BACKTEST_SIGNAL_DEFAULTS: dict[str, float | int] = {
+    "zscore_threshold": 0.20,
+    "volume_ratio_threshold": 0.5,
+    "trend_guard_pct": 0.08,
+    "trend_guard_bars": 15,
+}
+
+
+def split_strategy_and_legacy_params(
+    overrides: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, float | int]]:
+    """Partition WFO/backtest overrides into live config vs legacy signal knobs."""
+    overrides = overrides or {}
+    strategy_field_names = {field.name for field in fields(StrategyParams)}
+    strategy_params = {
+        name: value for name, value in overrides.items() if name in strategy_field_names
+    }
+    legacy_params = {
+        name: value
+        for name, value in overrides.items()
+        if name in LEGACY_BACKTEST_SIGNAL_DEFAULTS
+    }
+    return strategy_params, legacy_params
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -150,6 +175,7 @@ class BotReplayAdapter(StrategyABC):
         fee_enabled: bool = True,
         initial_bankroll: float = 1000.0,
         params: StrategyParams | None = None,
+        legacy_signal_params: dict[str, float | int] | None = None,
     ) -> None:
         self._market_id = market_id
         self._yes_asset_id = yes_asset_id
@@ -157,6 +183,9 @@ class BotReplayAdapter(StrategyABC):
         self._fee_enabled = fee_enabled
         self._initial_bankroll = initial_bankroll
         self._params = params or StrategyParams()
+        self._legacy_signal_params = dict(LEGACY_BACKTEST_SIGNAL_DEFAULTS)
+        if legacy_signal_params:
+            self._legacy_signal_params.update(legacy_signal_params)
 
         # Aggregators and detector (created on init)
         self._yes_agg: OHLCVAggregator | None = None
@@ -205,10 +234,10 @@ class BotReplayAdapter(StrategyABC):
             no_asset_id=self._no_asset_id,
             yes_aggregator=self._yes_agg,
             no_aggregator=self._no_agg,
-            zscore_threshold=self._params.zscore_threshold,
-            volume_ratio_threshold=self._params.volume_ratio_threshold,
-            trend_guard_pct=self._params.trend_guard_pct,
-            trend_guard_bars=self._params.trend_guard_bars,
+            zscore_threshold=float(self._legacy_signal_params["zscore_threshold"]),
+            volume_ratio_threshold=float(self._legacy_signal_params["volume_ratio_threshold"]),
+            trend_guard_pct=float(self._legacy_signal_params["trend_guard_pct"]),
+            trend_guard_bars=int(self._legacy_signal_params["trend_guard_bars"]),
         )
 
         # Register market with PCE if enabled
@@ -325,7 +354,7 @@ class BotReplayAdapter(StrategyABC):
             whale_confluence=sig.whale_confluence,
             fee_enabled=self._fee_enabled,
             alpha=self._params.alpha_default,
-            zscore_threshold=self._params.zscore_threshold,
+            zscore_threshold=float(self._legacy_signal_params["zscore_threshold"]),
             min_score=self._params.min_edge_score,
             current_ewma_vol=self._no_agg.rolling_volatility_ewma or None,
             execution_mode=exec_mode,

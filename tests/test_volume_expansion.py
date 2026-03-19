@@ -23,7 +23,14 @@ from src.signals.edge_filter import (
     compute_confluence_discount,
     compute_edge_score,
 )
-from src.signals.drift_signal import DriftSignal, MeanReversionDrift
+from src.signals.drift_signal import (
+    DriftSignal,
+    LEGACY_DRIFT_COOLDOWN_S,
+    LEGACY_DRIFT_LOOKBACK_BARS,
+    LEGACY_DRIFT_VOL_CEILING,
+    LEGACY_DRIFT_Z_THRESHOLD,
+    MeanReversionDrift,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -545,12 +552,11 @@ class TestConfigFields:
         assert params.confluence_regime_discount == 0.0
 
     def test_v3_drift_defaults(self):
-        params = StrategyParams()
-        assert params.drift_signal_enabled is True
-        assert params.drift_lookback_bars == 10
-        assert params.drift_z_threshold == 0.8
-        assert params.drift_vol_ceiling == 0.35
-        assert params.drift_cooldown_s == 60.0
+        det = MeanReversionDrift("test_market")
+        assert det.lookback_bars == LEGACY_DRIFT_LOOKBACK_BARS
+        assert det.z_threshold == LEGACY_DRIFT_Z_THRESHOLD
+        assert det.vol_ceiling == LEGACY_DRIFT_VOL_CEILING
+        assert LEGACY_DRIFT_COOLDOWN_S == 60.0
 
     def test_v4_probe_defaults(self):
         params = StrategyParams()

@@ -362,6 +362,16 @@ class OrderChaser:
         self._iceberg_peg_price = None
         return bbo
 
+    def quote_price(self) -> float | None:
+        """Public wrapper for top-of-book quote selection."""
+        return self._optimal_quote()
+
+    def should_cancel_quote(self) -> bool:
+        """Whether a resting maker quote should be pulled immediately."""
+        return self._should_abort_toxicity() or (
+            self._iceberg_peg_active and self._should_preemptive_exit()
+        )
+
     def _drift_cents(self, current_quote: float) -> float:
         """How far the current BBO has drifted from the anchor (in cents)."""
         if self.side == OrderSide.BUY:

@@ -685,7 +685,7 @@ def _run_single_backtest(
     the gap/stale-data ratio exceeds ``gap_threshold``.
     """
     from src.backtest.engine import BacktestConfig, BacktestEngine
-    from src.backtest.strategy import BotReplayAdapter
+    from src.backtest.strategy import BotReplayAdapter, split_strategy_and_legacy_params
     from src.core.config import StrategyParams
 
     loader = _build_data_loader(
@@ -706,7 +706,10 @@ def _run_single_backtest(
             )
             return None
 
-    params = StrategyParams(**param_overrides)
+    strategy_param_overrides, legacy_signal_params = split_strategy_and_legacy_params(
+        param_overrides
+    )
+    params = StrategyParams(**strategy_param_overrides)
 
     strategy = BotReplayAdapter(
         market_id=market_id,
@@ -715,6 +718,7 @@ def _run_single_backtest(
         fee_enabled=fee_enabled,
         initial_bankroll=initial_cash,
         params=params,
+        legacy_signal_params=legacy_signal_params,
     )
 
     config = BacktestConfig(

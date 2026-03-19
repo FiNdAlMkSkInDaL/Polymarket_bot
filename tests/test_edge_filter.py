@@ -22,9 +22,10 @@ def mock_fees():
         yield
 
 
-from src.core.config import settings
 from src.signals.edge_filter import (
     EdgeAssessment,
+    LEGACY_VOLUME_RATIO_THRESHOLD,
+    LEGACY_ZSCORE_THRESHOLD,
     W_FEE,
     W_REGIME,
     W_SIGNAL,
@@ -258,13 +259,11 @@ class TestSignalQuality:
 
     def test_baseline_at_threshold(self):
         """z = z_thresh, v = v_thresh → signal_quality = 0.5 baseline."""
-        z_thresh = settings.strategy.zscore_threshold
-        v_thresh = settings.strategy.volume_ratio_threshold
         ea = compute_edge_score(
             entry_price=0.30,
             no_vwap=0.45,
-            zscore=z_thresh,       # exactly at threshold
-            volume_ratio=v_thresh,  # exactly at threshold
+            zscore=LEGACY_ZSCORE_THRESHOLD,
+            volume_ratio=LEGACY_VOLUME_RATIO_THRESHOLD,
             min_score=0.0,
         )
         assert ea.signal_quality == pytest.approx(0.5, abs=0.01)
