@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 17, 2026
+  Last updated: March 19, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -1798,7 +1798,8 @@ Root-level operational helpers (March 17, 2026):
   scripts/dry_run_screener.py:
     Live Gamma API screener to estimate zero-fee vs fee-bearing active
     market distribution and print tagged examples.
-  scripts/vps_update_env*.py (phase1..phase7):
+  scripts/vps_update_env.py and scripts/vps_update_env_phase2.py through
+  scripts/vps_update_env_phase7.py:
     Phased .env mutation helpers used during SI-8 sports-oracle rollout
     and provider migration/reversion testing (legacy nested oracle_params
     vs flat external_id/target_outcome schema).
@@ -1815,7 +1816,7 @@ SECTION 13: TEST INFRASTRUCTURE
 ================================================================================
 
 Framework: pytest 8.0+, pytest-asyncio 0.23+ (asyncio_mode = "auto")
-Total: 1536 tests across 51 test files
+Total: 1598 tests across 55 test files
 
 conftest.py fixtures (all function-scoped):
   paper_executor  — OrderExecutor(paper_mode=True)
@@ -2371,12 +2372,17 @@ SI-8 — GENERALISED ORACLE LATENCY ARBITRAGE (DISABLED BY DEFAULT):
         final (1s).
 
     SportsAdapter — src/data/adapters/sports_adapter.py
-      Polls live sports score API. Graduated confidence:
+      Polls a sports REST score feed using flat per-market config fields
+      (external_id, target_outcome, market_type, goal_line). Supports both
+      football-data-style match endpoints and The Odds API NBA scores feed,
+      with provider payloads normalised into a common internal match schema.
+      Target-game selection prefers exact external event ID, then falls back
+      to team-code matching for NBA feeds. Graduated confidence:
         Goal scored + live          → 0.85
         2-goal lead + red card + >80min → 0.92
         Full-time result            → 0.98
       Market types: winner (home/away/draw) and over_goals (goal_line).
-      Event phases: pre_event (5s), in_progress (1s), critical (200ms),
+      Event phases: pre_event (200ms), in_progress (1s), critical (200ms),
         idle/halftime (30s), final (5s).
 
     OracleSignalEngine — src/signals/oracle_signal.py
