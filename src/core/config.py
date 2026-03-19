@@ -218,7 +218,7 @@ class StrategyParams:
     pure_mm_loop_ms: int = _env_int("PURE_MM_LOOP_MS", 250)
     pure_mm_toxic_ofi_ratio: float = _env_float("PURE_MM_TOXIC_OFI_RATIO", 0.80)
     pure_mm_depth_window_s: float = _env_float("PURE_MM_DEPTH_WINDOW_S", 2.0)
-    pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.75)
+        pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.20)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
