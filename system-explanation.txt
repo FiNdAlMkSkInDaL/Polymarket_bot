@@ -67,8 +67,10 @@ The live bot consumes and maintains:
 
 The system load-sheds aggressively:
 
-- only the top L2 markets by volume receive full depth reconstruction
-- the remaining markets can be tracked in lighter-weight modes
+- the live paper deployment hard-caps the tracked market universe at 25 markets
+- those tracked markets are selected by volume and reconciled on refresh so the
+  bot does not silently grow back to a 100+ market event-loop workload
+- full L2 reconstruction runs only on the top tracked markets inside that cap
 
 L2 processing is first-class infrastructure, not an optional add-on.
 Worker processes can reconstruct books off the main asyncio loop and publish
@@ -100,12 +102,40 @@ Risk enforcement is continuous:
 - inventory caps for market making
 - wallet and exposure caps
 
+Current live paper thresholds were deliberately relaxed after VPS runtime
+verification showed normal Polymarket jitter could otherwise trip the breaker:
+
+- LATENCY_BLOCK_MS = 5000
+- HEARTBEAT_STALE_MS = 15000
+
+Those values are now part of the intended PAPER deployment posture, not an
+accidental local override.
+
 3.4 Monitoring and recovery
 
 The system records fills and checkpoints, logs structured events, sends
 Telegram alerts, and relies on circuit breakers around hot loops. If a core
 loop repeatedly fails, the bot suspends and resets instead of continuing in a
 half-broken state.
+
+Current deployment reality:
+
+- the live paper bot on the VPS is now managed by systemd
+- the canonical service is polymarket-bot.service
+- the service runs src.cli in PAPER mode, not an ad-hoc nohup shell
+- Restart=always is part of the intended operating model so the process comes
+  back after crashes or host reboots
+- service stdout and stderr stay in native journald
+- bot.log is not the canonical live operations log and should not be treated as
+  the source of truth for current system state
+
+Operational implication:
+
+- if you are restarting, checking health, or reviewing uptime on the VPS,
+  systemctl and journalctl are the source of truth
+- if journal output and bot.log disagree, trust journalctl
+- a stray nohup-style background process should be treated as operational
+  drift, not the desired deployment state
 
 
 4. ACTIVE STRATEGY 1 - PURE MARKET MAKER
@@ -115,7 +145,8 @@ This is the primary live engine.
 
 What it does:
 
-- selects the highest-volume L2 markets
+- selects the highest-volume tracked markets, with the live tracked universe
+  currently capped at 25
 - quotes the NO token passively
 - posts a best-bid-style passive buy quote
 - only posts the ask when inventory already exists
@@ -125,7 +156,10 @@ Important implementation details:
 
 - quoting is inventory-aware, so the engine does not rely on naked asks
 - quote size is capped by a per-market-maker inventory budget
-- selected markets come from the active L2 universe, not from bar signals
+- selected markets come from the capped active tracked universe, not from bar
+  signals
+- startup and refresh both reconcile the tracked set so universe bloat does not
+  reappear after discovery refreshes
 - the engine runs in a tight loop suitable for HFT quote maintenance
 
 Why it can make money:
@@ -262,6 +296,19 @@ The current live system depends on L2 information for:
 For the current bot, L2 is not optional historical enrichment. It is core
 strategy data.
 
+Current recording format:
+
+- live forward-test data is written under data/raw_ticks/YYYY-MM-DD/
+- each asset writes a JSONL file of raw recorded events
+- the recorder now persists both:
+  - ongoing price_change L2 deltas from the WebSocket path
+  - authoritative full-depth book snapshots fetched through the REST L2 sync
+    path
+
+This distinction matters. Earlier forward data could contain only deltas in a
+sampled slice, but the hardened live recorder is expected to capture both
+event families over the course of normal operation.
+
 
 8. BACKTEST AND WFO PIVOT
 ===============================================================================
@@ -298,6 +345,22 @@ If you want valid pure market maker backtests, your dataset must contain:
 - L2 deltas
 - correctly ordered book events over time
 
+Current operational verification path:
+
+- the script scripts/audit_forward_data.py is the forward-data health check
+- it is designed to inspect recent live raw-tick files and verify that fresh
+  data contains both snapshots and deltas
+- the strict gate is --require-wfo-ready
+- passing that audit is the intended proof that the live paper recorder is
+  capturing replayable pure-MM data
+
+Important nuance:
+
+- for a live continuously appended dataset, the correct audit behavior is to
+  sample the recent tail across many recently modified files
+- sampling the oldest records or exhausting the sample budget on one hot file
+  can produce false negatives even when the system is healthy
+
 Trade-only archives may still be useful for limited legacy research, but they
 are not sufficient for the current live pure market making architecture.
 
@@ -309,6 +372,12 @@ If you are an AI agent reading this file later, start with these assumptions:
 
 - the bot is an HFT pure market maker and latency arbitrage engine
 - L2 data is a hard dependency for understanding live behavior
+- the VPS paper deployment is expected to run under systemd, not nohup
+- the live tracked universe is intentionally capped at 25 markets unless that
+  operating assumption is explicitly changed
+- the live PAPER deployment uses relaxed latency thresholds (5s block, 15s
+  heartbeat stale) to tolerate real Polymarket network jitter
+- journald, not bot.log, is the authoritative live logging surface
 - pure market maker is the main passive strategy
 - SI-9 is the maker-first mutually exclusive combo arb module
 - SI-7 and SI-8 are fast-strike stale-book sniping paths
@@ -333,7 +402,14 @@ current system.
 Primary files for the live architecture:
 
 - src/bot.py
-  Main orchestrator. Wires market data, L2, pure MM, SI-7, SI-8, and SI-9.
+  Main orchestrator. Wires market data, L2, pure MM, SI-7, SI-8, and SI-9,
+  and now hard-caps the tracked live universe to the configured operating
+  limit.
+
+- src/core/config.py
+  Runtime operating limits and circuit-breaker thresholds, including the live
+  paper defaults for tracked market count, latency block threshold, and stale
+  heartbeat threshold.
 
 - src/strategies/pure_market_maker.py
   Inventory-aware passive quoting engine.
@@ -357,7 +433,20 @@ Primary files for the live architecture:
   Full depth reconstruction and L2 state management.
 
 - src/data/l2_websocket.py
-  Live L2 snapshot and delta ingestion.
+  Live L2 snapshot and delta ingestion, plus recording of synchronized REST
+  snapshots for forward replay data.
+
+- scripts/polymarket-bot.service
+  Canonical systemd unit for VPS deployment. Runs the bot in PAPER mode during
+  forward data collection and emits logs to journald.
+
+- scripts/install_paper_service.sh
+  One-shot VPS helper that installs/enables/restarts the systemd unit and runs
+  a post-start audit.
+
+- scripts/audit_forward_data.py
+  Forward-data audit script that verifies live raw JSONL files contain both L2
+  snapshots and L2 deltas with real depth arrays.
 
 - src/backtest/strategy.py
   Contains the PureMarketMakerReplayAdapter used for realistic replay.
@@ -380,6 +469,12 @@ The critical design constraint is also clear:
 
 - if you do not have L2 book data, you do not have a valid backtest for the
   current pure market maker
+
+The current operational corollary is also clear:
+
+- if the forward paper deployment is not producing both snapshots and deltas in
+  data/raw_ticks, you are not collecting a defensible pure-MM optimization
+  dataset for next week's WFO
 
 That is the system as it exists now.
 

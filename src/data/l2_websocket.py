@@ -350,6 +350,13 @@ class L2WebSocket:
                 await asyncio.sleep(1.0 * attempt)
                 continue
 
+            if self._recorder and isinstance(data, dict):
+                snapshot_msg = dict(data)
+                snapshot_msg.setdefault("asset_id", asset_id)
+                snapshot_msg.setdefault("event_type", "book")
+                snapshot_msg.setdefault("snapshot_trigger", trigger)
+                self._recorder.enqueue("book_snapshot", snapshot_msg)
+
             success = await book.load_snapshot(data, trigger=trigger)
             if success:
                 return
