@@ -210,9 +210,9 @@ class StrategyParams:
     # Remaining discovered markets use lightweight price/trade-only tracking.
         max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 25)
 
-    # Pure maker quoting universe and sizing.
-    pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
-    pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
+        # Pure maker quoting universe and sizing.
+        pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
+        pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
     pure_mm_quote_size_usd: float = _env_float("PURE_MM_QUOTE_SIZE_USD", 5.0)
     pure_mm_inventory_cap_usd: float = _env_float("PURE_MM_INVENTORY_CAP_USD", 15.0)
     pure_mm_loop_ms: int = _env_int("PURE_MM_LOOP_MS", 250)
@@ -274,8 +274,8 @@ class StrategyParams:
 
     # ── Pillar 4: Stale-Data Kill-Switch ───────────────────────────────────
         latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 5000)
-    latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
-    latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
+        latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
+        latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
     # ── Pillar 5: Anti-Adverse-Selection ("Fast-Kill") ─────────────────────
     #
