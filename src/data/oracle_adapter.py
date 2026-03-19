@@ -10,7 +10,9 @@ Architecture
 ────────────
     OffChainOracleAdapter (ABC)
         ├── APElectionAdapter       — Associated Press election race-call feed
-        └── SportsAdapter           — Live sports match state (football-data.org, etc.)
+        ├── SportsAdapter           — Live sports match state (football-data.org, etc.)
+        ├── OddsAPIWebSocketAdapter — Live sports WebSocket feed
+        └── TreeNewsWebSocketAdapter — News/event-resolution WebSocket feed
 
     OracleAdapterRegistry
         Maps oracle_type strings → adapter classes for config-driven instantiation.
@@ -283,6 +285,18 @@ class OracleAdapterRegistry:
 
     def __init__(self) -> None:
         self._adapters: dict[str, type[OffChainOracleAdapter]] = {}
+        self._register_builtin_adapters()
+
+    def _register_builtin_adapters(self) -> None:
+        from src.data.adapters.ap_election_adapter import APElectionAdapter
+        from src.data.adapters.odds_api_websocket_adapter import OddsAPIWebSocketAdapter
+        from src.data.adapters.sports_adapter import SportsAdapter
+        from src.data.adapters.tree_news_websocket_adapter import TreeNewsWebSocketAdapter
+
+        self.register("ap_election", APElectionAdapter)
+        self.register("sports", SportsAdapter)
+        self.register("odds_api_ws", OddsAPIWebSocketAdapter)
+        self.register("tree_news_ws", TreeNewsWebSocketAdapter)
 
     def register(self, oracle_type: str, cls: type[OffChainOracleAdapter]) -> None:
         self._adapters[oracle_type] = cls
