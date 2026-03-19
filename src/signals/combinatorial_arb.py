@@ -8,9 +8,9 @@ buy every YES token at best_bid (maker), hold to resolution, collect
 the guaranteed $1.00 payout on the winning leg.
 
 This module provides:
-  - ``ComboLeg`` / ``ComboArbSignal`` — data payloads for multi-leg arb.
-  - ``ComboSizer`` — share-count-pegged sizer (NOT Kelly/USD).
-  - ``ComboArbDetector`` — scans clusters and emits signals.
+    - ``ComboLeg`` / ``ComboArbSignal`` — maker/taker-aware combo payloads.
+    - ``ComboSizer`` — share-count-pegged sizer (NOT Kelly/USD).
+    - ``ComboArbDetector`` — scans clusters and emits signals.
 """
 
 from __future__ import annotations
@@ -41,27 +41,41 @@ class ComboLeg:
     yes_token_id: str      # token to BUY
     no_token_id: str       # NO token (needed for emergency unwind reference)
     best_bid: float        # current YES best_bid from book
-    best_ask: float        # current YES best_ask (for emergency hedge costing)
+    best_ask: float        # current YES best_ask
     target_price: float    # price to place the BUY order at
     target_shares: float   # shares to buy (IDENTICAL across all legs)
     question: str = ""     # human label for logging
+    spread_width: float = 0.0
+    bid_depth_usd: float = 0.0
+    bid_depth_shares: float = 0.0
+    market_liquidity_usd: float = 0.0
+    daily_volume_usd: float = 0.0
+    routing_reason: str = ""
 
 
 @dataclass
 class ComboArbSignal(BaseSignal):
     """Emitted when a mutually exclusive cluster is mis-priced.
 
-    Carries the full set of legs and the computed edge so the
-    execution layer can place all orders atomically.
+    Carries the routing split and computed edge so the execution layer
+    can work the bottleneck leg passively and cross the remaining legs.
     """
 
     cluster_event_id: str = ""
-    legs: list[ComboLeg] = field(default_factory=list)
+    maker_leg: ComboLeg | None = None
+    taker_legs: list[ComboLeg] = field(default_factory=list)
     sum_best_bids: float = 0.0   # Σ YES best_bids across legs
     edge_cents: float = 0.0      # (1.0 - sum_best_bids)*100 - min_margin_cents
     margin_used: float = 0.0     # si9_min_margin_cents at evaluation time
     target_shares: float = 0.0   # uniform share count across all legs
     total_collateral: float = 0.0  # Σ(target_price_i * target_shares)
+
+    @property
+    def legs(self) -> list[ComboLeg]:
+        """Backward-compatible all-legs view with maker leg first."""
+        if self.maker_leg is None:
+            return list(self.taker_legs)
+        return [self.maker_leg, *self.taker_legs]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -171,11 +185,68 @@ class ComboArbDetector(SignalGenerator):
         return "combo_arb"
 
     # ── SignalGenerator interface (single-market, not used for combos) ──
-    def evaluate(self, **kwargs: Any) -> SignalResult | None:
-        return None
+    def evaluate(self, **kwargs: Any) -> ComboArbSignal | None:
+        cluster = kwargs.get("cluster")
+        if not isinstance(cluster, ArbCluster):
+            return None
+
+        wallet_balance = float(kwargs.get("wallet_balance", 0.0))
+        return self._evaluate_cluster(cluster, wallet_balance=wallet_balance)
 
     # ── Cluster-level evaluation (called by the combo loop) ────────────
     def evaluate_cluster(
+        self,
+        cluster: ArbCluster,
+        wallet_balance: float = 0.0,
+    ) -> ComboArbSignal | None:
+        return self._evaluate_cluster(cluster, wallet_balance=wallet_balance)
+
+    def _rank_legs_for_routing(self, legs: list[ComboLeg]) -> list[ComboLeg]:
+        """Rank legs so the hardest leg to fill is worked passively first.
+
+        The bottleneck leg is the one with:
+          1. the widest spread
+          2. the thinnest bid-side depth when spreads tie
+        """
+        return sorted(
+            legs,
+            key=lambda leg: (
+                -leg.spread_width,
+                leg.bid_depth_usd,
+                leg.bid_depth_shares,
+                leg.market_liquidity_usd,
+                leg.daily_volume_usd,
+                leg.question,
+            ),
+        )
+
+    def _routing_reason_for_maker(
+        self,
+        maker_leg: ComboLeg,
+        ranked_legs: list[ComboLeg],
+    ) -> str:
+        """Explain why the maker leg was selected for passive routing."""
+        if len(ranked_legs) == 1:
+            return (
+                "widest_spread "
+                f"spread_width={maker_leg.spread_width:.4f}"
+            )
+
+        next_leg = ranked_legs[1]
+        if maker_leg.spread_width > next_leg.spread_width:
+            return (
+                "widest_spread "
+                f"spread_width={maker_leg.spread_width:.4f} "
+                f"next_spread_width={next_leg.spread_width:.4f}"
+            )
+
+        return (
+            "thinnest_bid_depth "
+            f"bid_depth_usd={maker_leg.bid_depth_usd:.2f} "
+            f"spread_width={maker_leg.spread_width:.4f}"
+        )
+
+    def _evaluate_cluster(
         self,
         cluster: ArbCluster,
         wallet_balance: float = 0.0,
@@ -229,10 +300,15 @@ class ComboArbDetector(SignalGenerator):
                 yes_token_id=mkt.yes_token_id,
                 no_token_id=mkt.no_token_id,
                 best_bid=bid,
-                best_ask=ask if ask > 0 else 1.0,
+                best_ask=ask,
                 target_price=0.0,  # computed below
                 target_shares=0.0,  # computed below
                 question=mkt.question[:60],
+                spread_width=round(snap.spread, 4),
+                bid_depth_usd=round(bid_depth_usd, 2),
+                bid_depth_shares=round(depth_shares, 4),
+                market_liquidity_usd=round(mkt.liquidity_usd, 2),
+                daily_volume_usd=round(mkt.daily_volume_usd, 2),
             ))
 
         # ── Arb check: Σ(YES best_bids) < 1.0 - margin ───────────────
@@ -243,18 +319,28 @@ class ComboArbDetector(SignalGenerator):
         edge_dollars = 1.0 - sum_bids
         edge_cents = edge_dollars * 100.0 - strat.si9_min_margin_cents
 
-        # ── Target prices: best_bid, or +1¢ if edge allows ────────────
-        for leg in legs:
-            if edge_dollars > min_margin + buffer:
-                # Extra edge allows joining the queue 1¢ above best bid
-                leg.target_price = round(leg.best_bid + 0.01, 2)
-            else:
-                leg.target_price = round(leg.best_bid, 2)
+        ranked_legs = self._rank_legs_for_routing(legs)
+        maker_leg = ranked_legs[0]
+        taker_legs = ranked_legs[1:]
+        maker_leg.routing_reason = self._routing_reason_for_maker(
+            maker_leg,
+            ranked_legs,
+        )
+
+        # ── Target prices: maker works passively, takers cross ─────────
+        if edge_dollars > min_margin + buffer:
+            maker_leg.target_price = round(min(0.99, maker_leg.best_bid + 0.01), 2)
+        else:
+            maker_leg.target_price = round(maker_leg.best_bid, 2)
+
+        for leg in taker_legs:
+            cross_price = leg.best_ask if leg.best_ask > 0 else leg.best_bid
+            leg.target_price = round(min(0.99, max(cross_price, leg.best_bid)), 2)
 
         # ── Sizing: ComboSizer — share-count pegging ───────────────────
         # CRITICAL: All legs get the SAME share count S.
         # Total collateral = S * Σ(target_price_i).
-        target_prices = [lg.target_price for lg in legs]
+        target_prices = [lg.target_price for lg in ranked_legs]
         shares = self._sizer.compute_shares(
             target_prices=target_prices,
             wallet_balance=wallet_balance,
@@ -267,13 +353,14 @@ class ComboArbDetector(SignalGenerator):
 
         total_collateral = shares * sum(target_prices)
 
-        for leg in legs:
+        for leg in ranked_legs:
             leg.target_shares = shares
 
         signal = ComboArbSignal(
             market_id=cluster.event_id,  # BaseSignal.market_id → event_id
             cluster_event_id=cluster.event_id,
-            legs=legs,
+            maker_leg=maker_leg,
+            taker_legs=taker_legs,
             sum_best_bids=round(sum_bids, 4),
             edge_cents=round(edge_cents, 2),
             margin_used=strat.si9_min_margin_cents,
@@ -284,7 +371,10 @@ class ComboArbDetector(SignalGenerator):
         log.info(
             "combo_arb_signal",
             event_id=cluster.event_id,
-            n_legs=len(legs),
+            maker_leg=maker_leg.yes_token_id,
+            routing_reason=maker_leg.routing_reason,
+            taker_legs=[leg.yes_token_id for leg in taker_legs],
+            n_legs=len(ranked_legs),
             sum_bids=round(sum_bids, 4),
             edge_cents=round(edge_cents, 2),
             shares=shares,
