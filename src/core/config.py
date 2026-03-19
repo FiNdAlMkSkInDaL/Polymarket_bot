@@ -208,7 +208,7 @@ class StrategyParams:
 
     # Load shedding: maximum markets with full L2 book reconstruction.
     # Remaining discovered markets use lightweight price/trade-only tracking.
-    max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 50)
+        max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 25)
 
     # Pure maker quoting universe and sizing.
     pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
@@ -273,7 +273,7 @@ class StrategyParams:
     tp_spread_max_mult: float = _env_float("TP_SPREAD_MAX_MULT", 3.0)
 
     # ── Pillar 4: Stale-Data Kill-Switch ───────────────────────────────────
-    latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 1500)
+        latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 5000)
     latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
     latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
@@ -358,7 +358,7 @@ class StrategyParams:
 
     # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
-    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 5000)
+    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 15000)
     heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 3)
     ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 10.0)
     # L2 uses a separate, longer timeout because low-volume markets
