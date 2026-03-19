@@ -601,6 +601,7 @@ class StrategyParams:
     # Generalised off-chain oracle system.  Polls real-world APIs (election
     # feeds, live sports) and triggers the SI-7 fast-strike taker path when
     # the CLOB price diverges from the oracle-derived probability.
+    # Hard-disabled by default in the zero-overhead architecture.
     oracle_arb_enabled: bool = _env_bool("ORACLE_ARB_ENABLED", False)
     # Default polling interval (ms) for REST-based oracle adapters.
     oracle_default_poll_ms: int = _env_int("ORACLE_DEFAULT_POLL_MS", 1000)
@@ -634,11 +635,11 @@ class StrategyParams:
     oracle_sports_api_key: str = _env("ORACLE_SPORTS_API_KEY")
     oracle_sports_api_url: str = _env("ORACLE_SPORTS_API_URL")
     # Odds API WebSocket credentials
-    oracle_odds_api_ws_url: str = _env("ORACLE_ODDS_API_WS_URL")
-    oracle_odds_api_ws_key: str = _env("ORACLE_ODDS_API_WS_KEY")
+    oracle_odds_api_ws_url: str = _env("ORACLE_ODDS_API_WS_URL", "")
+    oracle_odds_api_ws_key: str = _env("ORACLE_ODDS_API_WS_KEY", "")
     # Tree News WebSocket credentials
-    oracle_tree_news_ws_url: str = _env("ORACLE_TREE_NEWS_WS_URL")
-    oracle_tree_news_ws_key: str = _env("ORACLE_TREE_NEWS_WS_KEY")
+    oracle_tree_news_ws_url: str = _env("ORACLE_TREE_NEWS_WS_URL", "")
+    oracle_tree_news_ws_key: str = _env("ORACLE_TREE_NEWS_WS_KEY", "")
     # Shadow mode — evaluate and log oracle signals without placing orders.
     # Enabled by default for safe rollout; disable to go live.
     oracle_shadow_mode: bool = _env_bool("ORACLE_SHADOW_MODE", True)
