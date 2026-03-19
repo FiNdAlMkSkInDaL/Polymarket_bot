@@ -599,9 +599,9 @@ class StrategyParams:
 
     # ── SI-8: Oracle Latency Arbitrage ─────────────────────────────────────
     # Generalised off-chain oracle system.  Polls real-world APIs (election
-    # feeds, live sports) and triggers the SI-7 fast-strike taker path when
-    # the CLOB price diverges from the oracle-derived probability.
-    # Hard-disabled by default in the zero-overhead architecture.
+    # feeds, live sports, news websockets) and triggers the SI-7 fast-strike
+    # taker path when the CLOB price diverges from the oracle-derived
+    # probability.  Activation is controlled by ORACLE_ARB_ENABLED.
     oracle_arb_enabled: bool = _env_bool("ORACLE_ARB_ENABLED", False)
     # Default polling interval (ms) for REST-based oracle adapters.
     oracle_default_poll_ms: int = _env_int("ORACLE_DEFAULT_POLL_MS", 1000)
