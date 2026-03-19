@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import time
@@ -1028,9 +1029,9 @@ class TestOracleConfig:
         assert hasattr(strat, "oracle_tree_news_ws_key")
         assert hasattr(strat, "oracle_shadow_mode")
 
-    def test_si8_defaults(self):
-        from src.core.config import settings
-        strat = settings.strategy
+    def test_si8_defaults(self, monkeypatch: pytest.MonkeyPatch):
+        config_module = self._reload_config(monkeypatch)
+        strat = config_module.StrategyParams()
         assert strat.oracle_arb_enabled is False
         assert strat.oracle_default_poll_ms == 1000
         assert strat.oracle_critical_poll_ms == 200
@@ -1044,3 +1045,38 @@ class TestOracleConfig:
         assert strat.oracle_tree_news_ws_url == ""
         assert strat.oracle_tree_news_ws_key == ""
         assert strat.oracle_shadow_mode is True
+    @staticmethod
+    def _reload_config(monkeypatch: pytest.MonkeyPatch, **env: str | None):
+        keys = {
+            "ORACLE_ARB_ENABLED",
+            "ORACLE_ODDS_API_WS_URL",
+            "ORACLE_ODDS_API_WS_KEY",
+            "ORACLE_TREE_NEWS_WS_URL",
+            "ORACLE_TREE_NEWS_WS_KEY",
+        }
+        keys.update(env.keys())
+        for key in keys:
+            monkeypatch.setenv(key, "")
+        for key, value in env.items():
+            if value is not None:
+                monkeypatch.setenv(key, value)
+
+        import src.core.config as config_module
+
+        return importlib.reload(config_module)
+
+
+    def test_si8_tree_news_only_env_override(self, monkeypatch: pytest.MonkeyPatch):
+        config_module = self._reload_config(
+            monkeypatch,
+            ORACLE_ARB_ENABLED="true",
+            ORACLE_TREE_NEWS_WS_URL="wss://news.treeofalpha.com/ws",
+            ORACLE_TREE_NEWS_WS_KEY="tree-key",
+        )
+        strat = config_module.StrategyParams()
+
+        assert strat.oracle_arb_enabled is True
+        assert strat.oracle_tree_news_ws_url == "wss://news.treeofalpha.com/ws"
+        assert strat.oracle_tree_news_ws_key == "tree-key"
+        assert strat.oracle_odds_api_ws_url == ""
+        assert strat.oracle_odds_api_ws_key == ""
