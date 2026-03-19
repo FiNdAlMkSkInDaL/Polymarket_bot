@@ -27,6 +27,7 @@ from src.backtest.wfo_optimizer import (
     FoldResult,
     WfoConfig,
     WfoReport,
+    _suggest_params,
     _compute_stitched_metrics,
     _stitch_equity_curves,
     compute_wfo_score,
@@ -856,6 +857,110 @@ class TestSingleFoldSmoke:
         assert len(folds) >= 1
         assert len(folds[0].train_dates) > 0
         assert len(folds[0].test_dates) > 0
+
+
+class TestPureMmWfoHooks:
+    def test_suggest_params_can_be_filtered(self):
+        class _Trial:
+            def suggest_float(self, name, low, high, log=False):
+                return (low + high) / 2.0
+
+            def suggest_int(self, name, low, high):
+                return low
+
+        params = _suggest_params(
+            _Trial(),
+            search_space_params=(
+                "pure_mm_toxic_ofi_ratio",
+                "pure_mm_depth_evaporation_pct",
+            ),
+        )
+
+        assert set(params) == {
+            "pure_mm_toxic_ofi_ratio",
+            "pure_mm_depth_evaporation_pct",
+        }
+
+    def test_run_single_backtest_with_pure_mm_adapter(self, tmp_path: Path):
+        from src.backtest.wfo_optimizer import _run_single_backtest
+
+        tick_dir = tmp_path / "raw_ticks" / "2026-01-15"
+        events = [
+            {
+                "local_ts": 1.0,
+                "source": "l2",
+                "asset_id": "NO",
+                "payload": {
+                    "event_type": "snapshot",
+                    "bids": [{"price": "0.40", "size": "20"}],
+                    "asks": [{"price": "0.42", "size": "20"}],
+                },
+            },
+            {
+                "local_ts": 2.0,
+                "source": "l2",
+                "asset_id": "NO",
+                "payload": {
+                    "event_type": "snapshot",
+                    "bids": [{"price": "0.39", "size": "20"}],
+                    "asks": [{"price": "0.40", "size": "20"}],
+                },
+            },
+        ]
+        _write_events(tick_dir / "NO.jsonl", events)
+
+        result = _run_single_backtest(
+            data_dir=str(tmp_path),
+            dates=["2026-01-15"],
+            param_overrides={
+                "pure_mm_toxic_ofi_ratio": 0.8,
+                "pure_mm_depth_evaporation_pct": 0.75,
+            },
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            initial_cash=1000.0,
+            latency_ms=0.0,
+            fee_max_pct=1.56,
+            fee_enabled=False,
+            strategy_adapter="pure_market_maker",
+        )
+
+        assert result is not None
+        assert result["total_fills"] >= 1
+
+    def test_run_single_backtest_with_pure_mm_adapter_requires_l2(self, tmp_path: Path):
+        from src.backtest.wfo_optimizer import _run_single_backtest
+
+        tick_dir = tmp_path / "raw_ticks" / "2026-01-15"
+        events = [
+            {
+                "local_ts": 1.0,
+                "source": "trade",
+                "asset_id": "NO",
+                "payload": {"price": "0.40", "size": "5", "side": "sell"},
+            }
+        ]
+        _write_events(tick_dir / "NO.jsonl", events)
+
+        result = _run_single_backtest(
+            data_dir=str(tmp_path),
+            dates=["2026-01-15"],
+            param_overrides={
+                "pure_mm_toxic_ofi_ratio": 0.8,
+                "pure_mm_depth_evaporation_pct": 0.75,
+            },
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            initial_cash=1000.0,
+            latency_ms=0.0,
+            fee_max_pct=1.56,
+            fee_enabled=False,
+            strategy_adapter="pure_market_maker",
+        )
+
+        assert result is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

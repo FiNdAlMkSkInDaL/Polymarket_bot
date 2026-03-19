@@ -164,6 +164,13 @@ class WfoConfig:
     # Optional JSON file with narrowed search-space bounds (overrides SEARCH_SPACE)
     search_space_bounds_path: str | None = None
 
+    # Strategy adapter used by the single-backtest runner.
+    # Supported: "bot_replay", "pure_market_maker"
+    strategy_adapter: str = "bot_replay"
+
+    # Optional subset of SEARCH_SPACE parameter names to optimise.
+    search_space_params: tuple[str, ...] | None = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Fold definition
@@ -352,6 +359,9 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     # Drift signal
     "drift_z_threshold": ("suggest_float", 0.5, 2.0),
     "drift_vol_ceiling": ("suggest_float", 0.02, 0.15, True),     # log-scale
+    # Pure market maker microstructure
+    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.4, 1.5),
+    "pure_mm_depth_evaporation_pct": ("suggest_float", 0.2, 0.95),
     # PCE (Pillar 15)
     "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
     "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),
@@ -395,6 +405,7 @@ def _load_search_space_bounds(path: str | None) -> dict[str, tuple[float, float]
 def _suggest_params(
     trial: Any,
     bounds_override: dict[str, tuple[float, float]] | None = None,
+    search_space_params: tuple[str, ...] | None = None,
 ) -> dict[str, float]:
     """Sample hyperparameters from the Optuna trial.
 
@@ -403,7 +414,9 @@ def _suggest_params(
     Supports optional 4th element ``log=True`` for log-uniform sampling.
     """
     params: dict[str, float] = {}
-    for name, spec in SEARCH_SPACE.items():
+    selected_names = search_space_params or tuple(SEARCH_SPACE.keys())
+    for name in selected_names:
+        spec = SEARCH_SPACE[name]
         method = spec[0]
         lo, hi = spec[1], spec[2]
         log_scale = spec[3] if len(spec) > 3 else False  # type: ignore[arg-type]
@@ -613,6 +626,7 @@ def _run_multi_market_backtest(
     latency_ms: float,
     fee_max_pct: float,
     fee_enabled: bool,
+    strategy_adapter: str = "bot_replay",
     gap_threshold: float = 0.01,
     gap_max_interval_s: float = 300.0,
 ) -> dict | None:
@@ -634,6 +648,7 @@ def _run_multi_market_backtest(
             latency_ms=latency_ms,
             fee_max_pct=fee_max_pct,
             fee_enabled=fee_enabled,
+            strategy_adapter=strategy_adapter,
             gap_threshold=gap_threshold,
             gap_max_interval_s=gap_max_interval_s,
         )
@@ -672,6 +687,7 @@ def _run_single_backtest(
     latency_ms: float,
     fee_max_pct: float,
     fee_enabled: bool,
+    strategy_adapter: str = "bot_replay",
     gap_threshold: float = 0.01,
     gap_max_interval_s: float = 300.0,
 ) -> dict[str, Any] | None:
@@ -685,7 +701,11 @@ def _run_single_backtest(
     the gap/stale-data ratio exceeds ``gap_threshold``.
     """
     from src.backtest.engine import BacktestConfig, BacktestEngine
-    from src.backtest.strategy import BotReplayAdapter, split_strategy_and_legacy_params
+    from src.backtest.strategy import (
+        BotReplayAdapter,
+        PureMarketMakerReplayAdapter,
+        split_strategy_and_legacy_params,
+    )
     from src.core.config import StrategyParams
 
     loader = _build_data_loader(
@@ -711,15 +731,26 @@ def _run_single_backtest(
     )
     params = StrategyParams(**strategy_param_overrides)
 
-    strategy = BotReplayAdapter(
-        market_id=market_id,
-        yes_asset_id=yes_asset_id,
-        no_asset_id=no_asset_id,
-        fee_enabled=fee_enabled,
-        initial_bankroll=initial_cash,
-        params=params,
-        legacy_signal_params=legacy_signal_params,
-    )
+    if strategy_adapter == "pure_market_maker":
+        strategy = PureMarketMakerReplayAdapter(
+            market_id=market_id,
+            yes_asset_id=yes_asset_id,
+            no_asset_id=no_asset_id,
+            fee_enabled=fee_enabled,
+            initial_bankroll=initial_cash,
+            params=params,
+            legacy_signal_params=legacy_signal_params,
+        )
+    else:
+        strategy = BotReplayAdapter(
+            market_id=market_id,
+            yes_asset_id=yes_asset_id,
+            no_asset_id=no_asset_id,
+            fee_enabled=fee_enabled,
+            initial_bankroll=initial_cash,
+            params=params,
+            legacy_signal_params=legacy_signal_params,
+        )
 
     config = BacktestConfig(
         initial_cash=initial_cash,
@@ -730,6 +761,14 @@ def _run_single_backtest(
 
     engine = BacktestEngine(strategy=strategy, data_loader=loader, config=config)
     result = engine.run()
+
+    if strategy_adapter == "pure_market_maker" and not getattr(strategy, "has_l2_book", False):
+        log.warning(
+            "wfo_pure_mm_missing_l2",
+            dates=f"{dates[0]}..{dates[-1]}",
+            data_dir=data_dir,
+        )
+        return None
 
     return result.metrics.to_dict()
 
@@ -804,7 +843,11 @@ def _objective(
     bounds_override: dict[str, tuple[float, float]] | None = None,
 ) -> float:
     """Optuna objective — runs an IS backtest and returns the WFO score."""
-    suggested = _suggest_params(trial, bounds_override=bounds_override)
+    suggested = _suggest_params(
+        trial,
+        bounds_override=bounds_override,
+        search_space_params=wfo_cfg.search_space_params,
+    )
 
     _common = dict(
         data_dir=wfo_cfg.data_dir,
@@ -814,6 +857,7 @@ def _objective(
         latency_ms=wfo_cfg.latency_ms,
         fee_max_pct=wfo_cfg.fee_max_pct,
         fee_enabled=wfo_cfg.fee_enabled,
+        strategy_adapter=wfo_cfg.strategy_adapter,
         gap_threshold=wfo_cfg.gap_threshold,
         gap_max_interval_s=wfo_cfg.gap_max_interval_s,
     )
@@ -1096,6 +1140,8 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         "gap_max_interval_s": cfg.gap_max_interval_s,
         "output_params_path": cfg.output_params_path,
         "search_space_bounds_path": cfg.search_space_bounds_path,
+        "strategy_adapter": cfg.strategy_adapter,
+        "search_space_params": cfg.search_space_params,
     }
 
     fold_results: list[FoldResult] = []
@@ -1190,6 +1236,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             latency_ms=cfg.latency_ms,
             fee_max_pct=cfg.fee_max_pct,
             fee_enabled=cfg.fee_enabled,
+            strategy_adapter=cfg.strategy_adapter,
             gap_threshold=cfg.gap_threshold,
             gap_max_interval_s=cfg.gap_max_interval_s,
         )

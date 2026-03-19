@@ -60,6 +60,16 @@ class TreeNewsWebSocketAdapter(WebSocketOracleAdapter):
             return [{"action": "subscribe", "eventId": self._event_id}]
         return []
 
+    def _heartbeat_snapshot(self) -> OracleSnapshot | None:
+        return OracleSnapshot(
+            adapter_name=self.name,
+            market_id=self._config.market_id,
+            raw_state={"type": "keepalive", "transport": "pong"},
+            resolved_outcome=None,
+            confidence=0.0,
+            event_phase="idle",
+        )
+
     async def _payload_to_snapshot(self, websocket: Any, payload: Any) -> OracleSnapshot | None:
         decoded = self._decode_payload(payload)
         if isinstance(decoded, str):
