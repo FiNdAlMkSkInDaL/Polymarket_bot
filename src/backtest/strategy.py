@@ -18,16 +18,17 @@ The backtest engine only knows about ``StrategyABC``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import fields
+from collections import deque
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
-from src.core.config import StrategyParams
+from src.core.config import EXCHANGE_MIN_SHARES, EXCHANGE_MIN_USD, StrategyParams
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar
 from src.data.websocket_client import TradeEvent
 from src.signals.edge_filter import compute_edge_score
 from src.signals.panic_detector import PanicDetector
-from src.trading.executor import OrderSide
+from src.trading.executor import OrderSide, OrderStatus
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 
 if TYPE_CHECKING:
@@ -600,3 +601,395 @@ class BotReplayAdapter(StrategyABC):
             total_pnl_net=round(total_pnl, 4),
             pce_enabled=self._pce is not None,
         )
+
+
+@dataclass(slots=True)
+class _ReplayQuoteState:
+    side: OrderSide
+    order_id: str | None = None
+
+
+class _ReplayOrderBook:
+    """Minimal L2 replay book with live-parity OFI and depth metrics."""
+
+    _OFI_WINDOW_S = 2.0
+
+    def __init__(self, asset_id: str) -> None:
+        self.asset_id = asset_id
+        self._bids: dict[float, float] = {}
+        self._asks: dict[float, float] = {}
+        self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
+        self._ofi_window: deque[tuple[float, float, float]] = deque(maxlen=500)
+        self._ofi_price_window: deque[tuple[float, str, float, float]] = deque(maxlen=1000)
+        self._last_update: float = 0.0
+
+    @property
+    def has_data(self) -> bool:
+        return self._last_update > 0.0
+
+    @property
+    def best_bid(self) -> float:
+        return max(self._bids) if self._bids else 0.0
+
+    @property
+    def best_ask(self) -> float:
+        return min(self._asks) if self._asks else 0.0
+
+    @property
+    def book_depth_ratio(self) -> float:
+        bid_depth = sum(price * size for price, size in sorted(self._bids.items(), reverse=True)[:5])
+        ask_depth = sum(price * size for price, size in sorted(self._asks.items())[:5])
+        if ask_depth <= 0:
+            return 1.0
+        return round(bid_depth / ask_depth, 2)
+
+    def apply_event(self, event_data: dict[str, Any], timestamp: float) -> None:
+        event_type = str(event_data.get("event_type", "")).lower()
+        if event_type in ("book", "snapshot", "book_snapshot", "l2_snapshot"):
+            self._apply_snapshot(event_data, timestamp)
+        else:
+            self._apply_delta(event_data, timestamp)
+        self._last_update = timestamp
+        self._record_depth(timestamp)
+
+    def current_total_depth(self) -> float:
+        bid_depth = sum(price * size for price, size in sorted(self._bids.items(), reverse=True)[:5])
+        ask_depth = sum(price * size for price, size in sorted(self._asks.items())[:5])
+        return round(bid_depth + ask_depth, 2)
+
+    def depth_velocity(self, window_s: float) -> float | None:
+        if len(self._depth_history) < 2:
+            return None
+        target_time = self._last_update - window_s
+        past_depth: float | None = None
+        for ts, depth in self._depth_history:
+            if ts <= target_time:
+                past_depth = depth
+            else:
+                break
+        if past_depth is None or past_depth <= 0:
+            return None
+        return (self.current_total_depth() - past_depth) / past_depth
+
+    def opposing_ofi_at_price(self, price: float, side: str) -> float:
+        self._prune_ofi(self._last_update)
+        consumed = 0.0
+        target_side = side.upper()
+        for _ts, event_side, event_price, delta in self._ofi_price_window:
+            if event_side == target_side and abs(event_price - price) < 1e-6 and delta < 0:
+                consumed += abs(delta)
+        return consumed
+
+    def _apply_snapshot(self, data: dict[str, Any], timestamp: float) -> None:
+        new_bids = self._parse_levels(data.get("bids") or [])
+        new_asks = self._parse_levels(data.get("asks") or [])
+
+        delta_bid_qty = 0.0
+        delta_ask_qty = 0.0
+
+        for price in set(self._bids) | set(new_bids):
+            level_delta = new_bids.get(price, 0.0) - self._bids.get(price, 0.0)
+            if level_delta != 0.0:
+                self._ofi_price_window.append((timestamp, "BUY", price, level_delta))
+                delta_bid_qty += level_delta
+
+        for price in set(self._asks) | set(new_asks):
+            level_delta = new_asks.get(price, 0.0) - self._asks.get(price, 0.0)
+            if level_delta != 0.0:
+                self._ofi_price_window.append((timestamp, "SELL", price, level_delta))
+                delta_ask_qty += level_delta
+
+        self._bids = new_bids
+        self._asks = new_asks
+        self._record_ofi(delta_bid_qty, delta_ask_qty, timestamp)
+
+    def _apply_delta(self, data: dict[str, Any], timestamp: float) -> None:
+        changes = data.get("changes") or data.get("price_changes") or data.get("data") or []
+        if isinstance(changes, dict):
+            changes = [changes]
+        if not changes and data.get("price") is not None:
+            changes = [data]
+
+        delta_bid_qty = 0.0
+        delta_ask_qty = 0.0
+        for change in changes:
+            try:
+                price = float(change.get("price", 0.0))
+                size = float(change.get("size", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+
+            side = str(change.get("side", "")).upper()
+            if side in ("BUY", "BID"):
+                old_size = self._bids.get(price, 0.0)
+                if size <= 0:
+                    self._bids.pop(price, None)
+                else:
+                    self._bids[price] = size
+                level_delta = size - old_size
+                if level_delta != 0.0:
+                    self._ofi_price_window.append((timestamp, "BUY", price, level_delta))
+                    delta_bid_qty += level_delta
+            elif side in ("SELL", "ASK"):
+                old_size = self._asks.get(price, 0.0)
+                if size <= 0:
+                    self._asks.pop(price, None)
+                else:
+                    self._asks[price] = size
+                level_delta = size - old_size
+                if level_delta != 0.0:
+                    self._ofi_price_window.append((timestamp, "SELL", price, level_delta))
+                    delta_ask_qty += level_delta
+
+        self._record_ofi(delta_bid_qty, delta_ask_qty, timestamp)
+
+    @staticmethod
+    def _parse_levels(levels: list[dict[str, Any]]) -> dict[float, float]:
+        parsed: dict[float, float] = {}
+        for level in levels:
+            try:
+                price = float(level["price"])
+                size = float(level["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                parsed[price] = size
+        return parsed
+
+    def _record_depth(self, timestamp: float) -> None:
+        self._depth_history.append((timestamp, self.current_total_depth()))
+
+    def _record_ofi(self, delta_bid_qty: float, delta_ask_qty: float, timestamp: float) -> None:
+        if delta_bid_qty != 0.0 or delta_ask_qty != 0.0:
+            self._ofi_window.append((timestamp, delta_bid_qty, delta_ask_qty))
+        self._prune_ofi(timestamp)
+
+    def _prune_ofi(self, timestamp: float) -> None:
+        cutoff = timestamp - self._OFI_WINDOW_S
+        while self._ofi_window and self._ofi_window[0][0] < cutoff:
+            self._ofi_window.popleft()
+        while self._ofi_price_window and self._ofi_price_window[0][0] < cutoff:
+            self._ofi_price_window.popleft()
+
+
+class PureMarketMakerReplayAdapter(StrategyABC):
+    """Backtest replay harness for the passive pure market maker."""
+
+    def __init__(
+        self,
+        market_id: str,
+        yes_asset_id: str,
+        no_asset_id: str,
+        *,
+        fee_enabled: bool = True,
+        initial_bankroll: float = 1000.0,
+        params: StrategyParams | None = None,
+        legacy_signal_params: dict[str, float | int] | None = None,
+    ) -> None:
+        self._market_id = market_id
+        self._yes_asset_id = yes_asset_id
+        self._no_asset_id = no_asset_id
+        self._fee_enabled = fee_enabled
+        self._initial_bankroll = initial_bankroll
+        self._params = params or StrategyParams()
+        self._legacy_signal_params = legacy_signal_params or {}
+
+        self._book = _ReplayOrderBook(no_asset_id)
+        self._book_update_count = 0
+        self._inventory: float = 0.0
+        self._quote_states: dict[OrderSide, _ReplayQuoteState] = {
+            OrderSide.BUY: _ReplayQuoteState(OrderSide.BUY),
+            OrderSide.SELL: _ReplayQuoteState(OrderSide.SELL),
+        }
+        self._order_to_side: dict[str, OrderSide] = {}
+
+        self._quote_size_usd = self._params.pure_mm_quote_size_usd
+        self._inventory_cap_usd = self._params.pure_mm_inventory_cap_usd
+        self._toxic_ofi_ratio = self._params.pure_mm_toxic_ofi_ratio
+        self._depth_window_s = self._params.pure_mm_depth_window_s
+        self._depth_evaporation_pct = self._params.pure_mm_depth_evaporation_pct
+
+    def on_init(self) -> None:
+        log.info(
+            "pure_mm_replay_adapter_init",
+            market_id=self._market_id,
+            asset_id=self._no_asset_id,
+            quote_size_usd=self._quote_size_usd,
+            inventory_cap_usd=self._inventory_cap_usd,
+        )
+
+    def on_book_update(self, asset_id: str, snapshot: dict) -> None:
+        if asset_id != self._no_asset_id or self.engine is None:
+            return
+
+        event_data = snapshot.get("event_data")
+        if not isinstance(event_data, dict):
+            return
+
+        timestamp = float(snapshot.get("timestamp", 0.0) or self.engine.clock.now())
+        self._book_update_count += 1
+        self._book.apply_event(event_data, timestamp)
+        self._simulate_crossed_fills()
+        self._sync_quotes()
+
+    def on_trade(self, asset_id: str, trade: TradeEvent) -> None:
+        return
+
+    def on_fill(self, fill: "Fill") -> None:
+        side = self._order_to_side.get(fill.order_id)
+        if side is None:
+            return
+
+        if fill.side == OrderSide.BUY:
+            self._inventory += fill.size
+        else:
+            self._inventory = max(0.0, self._inventory - fill.size)
+
+        order = self.engine.matching_engine.get_order(fill.order_id) if self.engine else None
+        if order is None or order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            state = self._quote_states[side]
+            state.order_id = None
+            self._order_to_side.pop(fill.order_id, None)
+
+    def on_end(self) -> None:
+        log.info(
+            "pure_mm_replay_adapter_summary",
+            asset_id=self._no_asset_id,
+            inventory=round(self._inventory, 4),
+            open_quotes=sum(1 for state in self._quote_states.values() if state.order_id),
+            book_updates=self._book_update_count,
+        )
+
+    @property
+    def has_l2_book(self) -> bool:
+        return self._book_update_count > 0
+
+    def _sync_quotes(self) -> None:
+        best_bid = self._book.best_bid
+        best_ask = self._book.best_ask
+        if best_bid <= 0 or best_ask <= 0:
+            self._cancel_all_quotes(reason="empty_bbo")
+            return
+
+        bid_size = self._quote_size_for_bid(best_bid)
+        ask_size = self._quote_size_for_ask(best_ask)
+
+        self._sync_side(OrderSide.BUY, best_bid, bid_size)
+        self._sync_side(OrderSide.SELL, best_ask, ask_size)
+
+    def _simulate_crossed_fills(self) -> None:
+        if self.engine is None:
+            return
+
+        for side, state in self._quote_states.items():
+            order = self._get_live_order(state)
+            if order is None or order.remaining <= 1e-9:
+                continue
+            if order.active_time > self.engine.clock.now():
+                continue
+
+            if side == OrderSide.BUY and self._book.best_ask > 0 and self._book.best_ask <= order.price:
+                self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
+            elif side == OrderSide.SELL and self._book.best_bid > 0 and self._book.best_bid >= order.price:
+                self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
+
+    def _sync_side(self, side: OrderSide, target_price: float, target_size: float) -> None:
+        state = self._quote_states[side]
+        order = self._get_live_order(state)
+
+        if target_size <= 0 or target_price <= 0:
+            self._cancel_state(state, reason="no_target_size")
+            return
+
+        if self._should_cancel_quote(order, target_size, side):
+            self._cancel_state(state, reason="toxic_flow")
+            return
+
+        rounded_price = round(target_price, 2)
+        rounded_size = round(target_size, 2)
+
+        if order is not None:
+            remaining = max(0.0, order.remaining)
+            price_match = abs(order.price - rounded_price) < 1e-9
+            size_match = abs(remaining - rounded_size) < 1e-9
+            if price_match and size_match:
+                return
+            self._cancel_state(state, reason="requote")
+
+        order = self.engine.submit_order(
+            side=side,
+            price=rounded_price,
+            size=rounded_size,
+            order_type="limit",
+            post_only=True,
+        )
+        state.order_id = order.order_id
+        self._order_to_side[order.order_id] = side
+
+    def _should_cancel_quote(
+        self,
+        order: "SimOrder" | None,
+        target_size: float,
+        side: OrderSide,
+    ) -> bool:
+        if order is None:
+            return False
+
+        depth_velocity = self._book.depth_velocity(self._depth_window_s)
+        if depth_velocity is not None and depth_velocity <= -self._depth_evaporation_pct:
+            return True
+
+        quote_side = "BUY" if side == OrderSide.BUY else "SELL"
+        against_flow = self._book.opposing_ofi_at_price(order.price, quote_side)
+        return against_flow >= max(target_size, order.size) * self._toxic_ofi_ratio
+
+    def _get_live_order(self, state: _ReplayQuoteState) -> "SimOrder" | None:
+        if state.order_id is None or self.engine is None:
+            return None
+        order = self.engine.matching_engine.get_order(state.order_id)
+        if order is None or order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            if state.order_id is not None:
+                self._order_to_side.pop(state.order_id, None)
+            state.order_id = None
+            return None
+        return order
+
+    def _cancel_all_quotes(self, *, reason: str) -> None:
+        for state in self._quote_states.values():
+            self._cancel_state(state, reason=reason)
+
+    def _cancel_state(self, state: _ReplayQuoteState, *, reason: str) -> None:
+        order = self._get_live_order(state)
+        if order is None or self.engine is None:
+            return
+        self.engine.cancel_order(order.order_id)
+        self._order_to_side.pop(order.order_id, None)
+        state.order_id = None
+        log.debug(
+            "pure_mm_replay_quote_cancelled",
+            asset_id=self._no_asset_id,
+            side=state.side.value,
+            reason=reason,
+        )
+
+    def _quote_size_for_bid(self, best_bid: float) -> float:
+        if best_bid <= 0:
+            return 0.0
+        inventory_value = self._inventory * best_bid
+        if inventory_value >= self._inventory_cap_usd:
+            return 0.0
+        return self._normalise_size(self._quote_size_usd / best_bid, best_bid)
+
+    def _quote_size_for_ask(self, best_ask: float) -> float:
+        if best_ask <= 0 or self._inventory <= 0:
+            return 0.0
+        return self._normalise_size(min(self._inventory, self._quote_size_usd / best_ask), best_ask)
+
+    @staticmethod
+    def _normalise_size(raw_size: float, price: float) -> float:
+        if raw_size <= 0 or price <= 0:
+            return 0.0
+        min_size = max(EXCHANGE_MIN_SHARES, EXCHANGE_MIN_USD / price)
+        return round(max(raw_size, min_size), 2)

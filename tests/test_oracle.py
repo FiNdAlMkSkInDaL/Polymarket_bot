@@ -1000,12 +1000,95 @@ class TestTreeNewsWebSocketAdapter:
         assert snap.confidence == 0.91
         assert snap.event_phase == "critical"
 
+    @pytest.mark.asyncio
+    async def test_stream_emits_keepalive_snapshot_on_successful_pong(self, monkeypatch):
+        class FakeWebSocket:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+                raise StopAsyncIteration
+
+            async def send(self, payload):
+                return None
+
+            async def ping(self):
+                loop = asyncio.get_running_loop()
+                waiter = loop.create_future()
+                waiter.set_result(None)
+                return waiter
+
+        class FakeConnection:
+            def __init__(self, websocket):
+                self._websocket = websocket
+
+            async def __aenter__(self):
+                return self._websocket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        monkeypatch.setattr(
+            websocket_adapter_base.websockets,
+            "connect",
+            lambda *args, **kwargs: FakeConnection(FakeWebSocket()),
+        )
+
+        adapter = TreeNewsWebSocketAdapter(
+            _mc(
+                oracle_type="tree_news_ws",
+                external_id="",
+                target_outcome="YES",
+                oracle_params={},
+            ),
+            websocket_url="ws://example.test/feed",
+            reconnect_base_s=0.01,
+            reconnect_max_s=0.02,
+            heartbeat_interval_s=0.01,
+            heartbeat_timeout_s=0.5,
+        )
+
+        async def collect_first_snapshot():
+            async for snapshot in adapter.stream_snapshots():
+                adapter.stop()
+                return snapshot
+            return None
+
+        snapshot = await asyncio.wait_for(collect_first_snapshot(), timeout=1.0)
+
+        assert snapshot is not None
+        assert snapshot.raw_state == {"type": "keepalive", "transport": "pong"}
+        assert snapshot.resolved_outcome is None
+        assert snapshot.confidence == 0.0
+        assert snapshot.event_phase == "idle"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Config integration test
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestOracleConfig:
+
+    @staticmethod
+    def _reload_config(monkeypatch: pytest.MonkeyPatch, **env: str | None):
+        keys = {
+            "ORACLE_ARB_ENABLED",
+            "ORACLE_ODDS_API_WS_URL",
+            "ORACLE_ODDS_API_WS_KEY",
+            "ORACLE_TREE_NEWS_WS_URL",
+            "ORACLE_TREE_NEWS_WS_KEY",
+        }
+        keys.update(env.keys())
+        for key in keys:
+            monkeypatch.setenv(key, "")
+        for key, value in env.items():
+            if value is not None:
+                monkeypatch.setenv(key, value)
+
+        import src.core.config as config_module
+
+        return importlib.reload(config_module)
 
     def test_si8_config_fields_exist(self):
         from src.core.config import settings
@@ -1045,26 +1128,6 @@ class TestOracleConfig:
         assert strat.oracle_tree_news_ws_url == ""
         assert strat.oracle_tree_news_ws_key == ""
         assert strat.oracle_shadow_mode is True
-    @staticmethod
-    def _reload_config(monkeypatch: pytest.MonkeyPatch, **env: str | None):
-        keys = {
-            "ORACLE_ARB_ENABLED",
-            "ORACLE_ODDS_API_WS_URL",
-            "ORACLE_ODDS_API_WS_KEY",
-            "ORACLE_TREE_NEWS_WS_URL",
-            "ORACLE_TREE_NEWS_WS_KEY",
-        }
-        keys.update(env.keys())
-        for key in keys:
-            monkeypatch.setenv(key, "")
-        for key, value in env.items():
-            if value is not None:
-                monkeypatch.setenv(key, value)
-
-        import src.core.config as config_module
-
-        return importlib.reload(config_module)
-
 
     def test_si8_tree_news_only_env_override(self, monkeypatch: pytest.MonkeyPatch):
         config_module = self._reload_config(

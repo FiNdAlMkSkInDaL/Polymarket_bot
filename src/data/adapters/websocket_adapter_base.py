@@ -118,18 +118,21 @@ class WebSocketOracleAdapter(OffChainOracleAdapter):
                             if payload is self._QUEUE_SENTINEL:
                                 raise ConnectionError("websocket transport closed")
 
-                            try:
-                                snapshot = await self._payload_to_snapshot(websocket, payload)
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception:
-                                log.error(
-                                    "oracle_websocket_payload_parse_error",
-                                    adapter=self.name,
-                                    market_id=self._config.market_id,
-                                    exc_info=True,
-                                )
-                                continue
+                            if isinstance(payload, OracleSnapshot):
+                                snapshot = payload
+                            else:
+                                try:
+                                    snapshot = await self._payload_to_snapshot(websocket, payload)
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    log.error(
+                                        "oracle_websocket_payload_parse_error",
+                                        adapter=self.name,
+                                        market_id=self._config.market_id,
+                                        exc_info=True,
+                                    )
+                                    continue
 
                             if snapshot is None:
                                 continue
@@ -225,6 +228,9 @@ class WebSocketOracleAdapter(OffChainOracleAdapter):
                 await asyncio.sleep(self._heartbeat_interval_s)
                 pong_waiter = await websocket.ping()
                 await asyncio.wait_for(pong_waiter, timeout=self._heartbeat_timeout_s)
+                snapshot = self._heartbeat_snapshot()
+                if snapshot is not None:
+                    self._put_nowait_drop_oldest(inbound_queue, snapshot)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -272,6 +278,9 @@ class WebSocketOracleAdapter(OffChainOracleAdapter):
 
     def _subscription_messages(self) -> Sequence[str | bytes | dict[str, Any] | list[Any]]:
         return ()
+
+    def _heartbeat_snapshot(self) -> OracleSnapshot | None:
+        return None
 
     @abstractmethod
     async def _payload_to_snapshot(self, websocket: Any, payload: Any) -> OracleSnapshot | None:

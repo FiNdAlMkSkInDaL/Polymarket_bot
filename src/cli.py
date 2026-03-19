@@ -344,6 +344,8 @@ def backtest(
 @click.option("--output-params", default=None, type=str, help="Path to export champion parameters JSON.")
 @click.option("--max-markets", default=None, type=int, help="Limit multi-market universe to N markets (default: all).")
 @click.option("--search-space-bounds", default=None, type=str, help="Path to JSON file with narrowed search-space bounds.")
+@click.option("--strategy-adapter", default="bot_replay", type=click.Choice(["bot_replay", "pure_market_maker"]), help="Strategy adapter used for each replay.")
+@click.option("--search-space-params", default=None, type=str, help="Comma-separated SEARCH_SPACE parameter names to optimise.")
 def wfo(
     data_dir: str,
     train_days: int,
@@ -365,6 +367,8 @@ def wfo(
     output_params: str | None,
     max_markets: int | None,
     search_space_bounds: str | None,
+    strategy_adapter: str,
+    search_space_params: str | None,
 ) -> None:
     """Run Walk-Forward Optimization on recorded historical data."""
     import os
@@ -398,6 +402,10 @@ def wfo(
         output_params_path=output_params,
         max_markets=max_markets,
         search_space_bounds_path=search_space_bounds,
+        strategy_adapter=strategy_adapter,
+        search_space_params=tuple(
+            p.strip() for p in search_space_params.split(",") if p.strip()
+        ) if search_space_params else None,
     )
 
     report = run_wfo(cfg)
