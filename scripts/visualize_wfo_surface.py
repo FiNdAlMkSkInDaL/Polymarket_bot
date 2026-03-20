@@ -15,6 +15,7 @@ python scripts/visualize_wfo_surface.py data/wfo_results.csv
 python scripts/visualize_wfo_surface.py data/wfo_results.json --plot surface
 python scripts/visualize_wfo_surface.py data/wfo_results.json --plot both --agg median
 python scripts/visualize_wfo_surface.py data/wfo_results.json --value-column oos_total_pnl
+python scripts/visualize_wfo_surface.py data/wfo_results.json --plot both --export-html wfo_surface.html
 """
 
 from __future__ import annotations
@@ -37,6 +38,15 @@ except ImportError as exc:  # pragma: no cover - import guard only
     raise SystemExit(
         "matplotlib is required for this script. Install it with `pip install matplotlib`."
     ) from exc
+
+try:
+    import plotly.graph_objects as go
+    import plotly.io as pio
+    from plotly.subplots import make_subplots
+except ImportError:
+    go = None
+    pio = None
+    make_subplots = None
 
 
 X_FIELD = "pure_mm_wide_spread_pct"
@@ -90,6 +100,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Output image path. If --plot both is used, this becomes the file stem and the script "
             "writes *_heatmap.png and *_surface.png."
+        ),
+    )
+    parser.add_argument(
+        "--export-html",
+        default=None,
+        help=(
+            "Optional output path for an interactive standalone Plotly HTML export. "
+            "When used with --plot both, the HTML includes both the heatmap view and the 3D surface."
         ),
     )
     parser.add_argument(
@@ -395,6 +413,244 @@ def resolve_output_paths(input_path: Path, output_arg: str | None, plot_kind: st
     return [input_path.with_name(f"{input_path.stem}_{plot_kind}.png")]
 
 
+def _ensure_plotly_available() -> None:
+    if go is None or pio is None or make_subplots is None:
+        raise SystemExit(
+            "Plotly is required for --export-html. Install it with `pip install plotly`."
+        )
+
+
+def _plotly_colorscale() -> list[list[float | str]]:
+    return [
+        [0.0, "#a50026"],
+        [0.1, "#d73027"],
+        [0.2, "#f46d43"],
+        [0.35, "#fdae61"],
+        [0.5, "#ffffbf"],
+        [0.65, "#d9ef8b"],
+        [0.8, "#66bd63"],
+        [0.9, "#1a9850"],
+        [1.0, "#006837"],
+    ]
+
+
+def _plotly_surface_color_axis(grid: np.ndarray) -> dict[str, float | list[list[float | str]]]:
+    finite_values = grid[np.isfinite(grid)]
+    axis: dict[str, float | list[list[float | str]]] = {
+        "colorscale": _plotly_colorscale(),
+        "cmin": float(np.min(finite_values)),
+        "cmax": float(np.max(finite_values)),
+    }
+    if axis["cmin"] < 0 < axis["cmax"]:
+        axis["cmid"] = 0.0
+    return axis
+
+
+def _plotly_heatmap_color_axis(grid: np.ndarray) -> dict[str, float | list[list[float | str]]]:
+    finite_values = grid[np.isfinite(grid)]
+    axis: dict[str, float | list[list[float | str]]] = {
+        "colorscale": _plotly_colorscale(),
+        "zmin": float(np.min(finite_values)),
+        "zmax": float(np.max(finite_values)),
+    }
+    if axis["zmin"] < 0 < axis["zmax"]:
+        axis["zmid"] = 0.0
+    return axis
+
+
+def _string_grid(values: np.ndarray) -> list[list[str | None]]:
+    output: list[list[str | None]] = []
+    for row in values:
+        formatted_row: list[str | None] = []
+        for value in row:
+            formatted_row.append(None if np.isnan(value) else f"{float(value):.4f}")
+        output.append(formatted_row)
+    return output
+
+
+def build_plotly_heatmap_figure(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    grid: np.ndarray,
+    plateau_scores: np.ndarray,
+    counts: np.ndarray,
+    value_field: str,
+):
+    _ensure_plotly_available()
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=(f"Aggregated {value_field}", "Plateau score (neighborhood mean - std)"),
+        horizontal_spacing=0.12,
+    )
+    value_text = _string_grid(grid)
+    plateau_text = _string_grid(plateau_scores)
+    sample_text = _string_grid(counts)
+
+    figure.add_trace(
+        go.Heatmap(
+            x=x_values,
+            y=y_values,
+            z=grid,
+            colorbar={"title": value_field, "x": 0.44},
+            hovertemplate=(
+                f"{X_FIELD}: %{{x:.4f}}<br>"
+                f"{Y_FIELD}: %{{y:.4f}}<br>"
+                f"{value_field}: %{{z:.4f}}<br>"
+                "samples: %{customdata}<extra></extra>"
+            ),
+            customdata=sample_text,
+            **_plotly_heatmap_color_axis(grid),
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Heatmap(
+            x=x_values,
+            y=y_values,
+            z=plateau_scores,
+            colorscale="Viridis",
+            colorbar={"title": "plateau score", "x": 1.02},
+            hovertemplate=(
+                f"{X_FIELD}: %{{x:.4f}}<br>"
+                f"{Y_FIELD}: %{{y:.4f}}<br>"
+                "plateau_score: %{z:.4f}<br>"
+                f"{value_field}: %{{customdata[0]}}<br>"
+                "samples: %{customdata[1]}<extra></extra>"
+            ),
+            customdata=np.dstack((value_text, sample_text)),
+        ),
+        row=1,
+        col=2,
+    )
+    figure.update_xaxes(title_text=X_FIELD, row=1, col=1)
+    figure.update_xaxes(title_text=X_FIELD, row=1, col=2)
+    figure.update_yaxes(title_text=Y_FIELD, row=1, col=1)
+    figure.update_yaxes(title_text=Y_FIELD, row=1, col=2)
+    figure.update_layout(
+        title="WFO parameter heatmap: broad profitable plateaus beat narrow peaks",
+        template="plotly_white",
+        width=1400,
+        height=600,
+        margin={"l": 60, "r": 60, "t": 80, "b": 60},
+    )
+    return figure
+
+
+def build_plotly_surface_figure(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    grid: np.ndarray,
+    counts: np.ndarray,
+    value_field: str,
+):
+    _ensure_plotly_available()
+    x_mesh, y_mesh = np.meshgrid(x_values, y_values)
+    surface_kwargs = _plotly_surface_color_axis(grid)
+    customdata = np.dstack((x_mesh, y_mesh, counts))
+    figure = go.Figure(
+        data=[
+            go.Surface(
+                x=x_mesh,
+                y=y_mesh,
+                z=grid,
+                customdata=customdata,
+                hovertemplate=(
+                    f"{X_FIELD}: %{{customdata[0]:.4f}}<br>"
+                    f"{Y_FIELD}: %{{customdata[1]:.4f}}<br>"
+                    f"{value_field}: %{{z:.4f}}<br>"
+                    "samples: %{customdata[2]:.0f}<extra></extra>"
+                ),
+                colorbar={"title": value_field},
+                **surface_kwargs,
+            )
+        ]
+    )
+    figure.update_layout(
+        title="WFO profitability surface",
+        template="plotly_white",
+        width=1100,
+        height=800,
+        margin={"l": 20, "r": 20, "t": 70, "b": 20},
+        scene={
+            "xaxis_title": X_FIELD,
+            "yaxis_title": Y_FIELD,
+            "zaxis_title": value_field,
+            "camera": {"eye": {"x": -1.5, "y": -1.7, "z": 0.9}},
+        },
+    )
+    return figure
+
+
+def export_plotly_html(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    grid: np.ndarray,
+    plateau_scores: np.ndarray,
+    counts: np.ndarray,
+    value_field: str,
+    plot_kind: str,
+    output_path: Path,
+) -> None:
+    _ensure_plotly_available()
+    sections: list[str] = []
+
+    if plot_kind in {"heatmap", "both"}:
+        heatmap_figure = build_plotly_heatmap_figure(
+            x_values=x_values,
+            y_values=y_values,
+            grid=grid,
+            plateau_scores=plateau_scores,
+            counts=counts,
+            value_field=value_field,
+        )
+        sections.append(pio.to_html(heatmap_figure, include_plotlyjs=True, full_html=False))
+
+    if plot_kind in {"surface", "both"}:
+        surface_figure = build_plotly_surface_figure(
+            x_values=x_values,
+            y_values=y_values,
+            grid=grid,
+            counts=counts,
+            value_field=value_field,
+        )
+        sections.append(
+            pio.to_html(
+                surface_figure,
+                include_plotlyjs=False if sections else True,
+                full_html=False,
+            )
+        )
+
+    html = "".join(
+        [
+            "<!DOCTYPE html>",
+            "<html lang=\"en\">",
+            "<head>",
+            "<meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<title>WFO Surface Visualizer</title>",
+            "<style>",
+            "body { font-family: Arial, sans-serif; margin: 0; background: #f6f7f9; color: #17202a; }",
+            "main { max-width: 1440px; margin: 0 auto; padding: 24px; }",
+            "h1 { margin: 0 0 8px; font-size: 28px; }",
+            "p { margin: 0 0 20px; line-height: 1.5; }",
+            ".chart { background: white; border-radius: 12px; padding: 12px; margin-bottom: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }",
+            "</style>",
+            "</head>",
+            "<body>",
+            "<main>",
+            "<h1>WFO Surface Visualizer</h1>",
+            f"<p>Interactive inspection for {X_FIELD}, {Y_FIELD}, and {value_field}. Rotate the 3D surface, zoom, and hover to inspect parameter plateaus.</p>",
+        ]
+    )
+    for section in sections:
+        html += f"<section class=\"chart\">{section}</section>"
+    html += "</main></body></html>"
+    output_path.write_text(html, encoding="utf-8")
+
+
 def print_summary(
     input_path: Path,
     rows: list[dict[str, Any]],
@@ -454,6 +710,18 @@ def main(argv: list[str] | None = None) -> int:
         plot_heatmap(x_values, y_values, grid, plateau_scores, value_field, output_paths[0])
         plot_surface(x_values, y_values, grid, value_field, output_paths[1])
 
+    if args.export_html:
+        export_plotly_html(
+            x_values=x_values,
+            y_values=y_values,
+            grid=grid,
+            plateau_scores=plateau_scores,
+            counts=counts,
+            value_field=value_field,
+            plot_kind=args.plot,
+            output_path=Path(args.export_html),
+        )
+
     print_summary(
         input_path=input_path,
         rows=rows,
@@ -465,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for output_path in output_paths:
         print(f"Saved plot to {output_path}")
+    if args.export_html:
+        print(f"Saved interactive HTML to {Path(args.export_html)}")
     return 0
 
 
