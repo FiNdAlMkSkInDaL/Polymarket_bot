@@ -79,8 +79,8 @@ class TestTransportLayer:
         guard, event, executor = components
         now = time.time()
 
-        # Transport: no message for 6 seconds (> 5000ms threshold)
-        transport = _make_transport(now - 6.0)
+        # Transport: no message for 16 seconds (> 15000ms threshold)
+        transport = _make_transport(now - 16.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -108,7 +108,7 @@ class TestTransportLayer:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 6.0)
+        transport = _make_transport(now - 16.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -194,7 +194,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 6.0)
+        transport = _make_transport(now - 16.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -212,7 +212,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 6.0)
+        transport = _make_transport(now - 16.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -236,7 +236,7 @@ class TestConsecutiveStaleCount:
         guard, event, executor = components
         now = time.time()
 
-        transport = _make_transport(now - 6.0)
+        transport = _make_transport(now - 16.0)
         trackers = {"A": _make_tracker("A", last_update=now)}
 
         hb = BookHeartbeat(
@@ -254,14 +254,14 @@ class TestConsecutiveStaleCount:
         assert hb._transport_stale_streak == 0
 
         # Stale check again — streak starts from 1 again
-        transport._last_message_time = time.time() - 6.0
+        transport._last_message_time = time.time() - 16.0
         await hb._check()
         assert hb._transport_stale_streak == 1
         assert hb.is_suspended is False  # only 1, need 3
 
     @pytest.mark.asyncio
     async def test_quiet_market_gap_no_suspend(self, components):
-        """Natural quiet-market gap (1.9s) below 5000ms threshold → no suspend."""
+        """Natural quiet-market gap (1.9s) below 15000ms threshold → no suspend."""
         guard, event, executor = components
         now = time.time()
 
@@ -339,13 +339,13 @@ class TestPositionLayer:
     @pytest.mark.asyncio
     async def test_position_on_stale_book_suspends(self, components):
         """Open position on a book that hasn't updated for 6× threshold → suspend.
-        Default threshold is 5000ms, so position threshold is 30000ms."""
+        Default threshold is 15000ms, so position threshold is 90000ms."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)  # WS is healthy
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 31.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 91.0),
         }
 
         hb = BookHeartbeat(
@@ -359,13 +359,13 @@ class TestPositionLayer:
 
     @pytest.mark.asyncio
     async def test_position_within_6x_threshold_no_suspend(self, components):
-        """Position book stale by 25s (< 6× 5s = 30s) → NOT suspended."""
+        """Position book stale by 80s (< 6× 15s = 90s) → NOT suspended."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 25.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 80.0),
         }
 
         hb = BookHeartbeat(
@@ -399,7 +399,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 6.0),
+            "A": _make_tracker("A", last_update=now - 16.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -428,7 +428,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 6.0),
+            "A": _make_tracker("A", last_update=now - 16.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -447,7 +447,7 @@ class TestLegacyFallback:
         now = time.time()
 
         trackers = {
-            "A": _make_tracker("A", last_update=now - 6.0, server_time=now - 6.0),
+            "A": _make_tracker("A", last_update=now - 16.0, server_time=now - 16.0),
         }
         hb = BookHeartbeat(trackers, guard, event, executor)
 
@@ -505,7 +505,7 @@ class TestGeneralBehaviour:
             side=MagicMock(), price=0.5, size=10.0,
         )
 
-        trackers = {"A": _make_tracker("A", last_update=now - 6.0)}
+        trackers = {"A": _make_tracker("A", last_update=now - 16.0)}
         hb = BookHeartbeat(trackers, guard, event, executor)
 
         # Legacy fallback (no transport) suspends on first check
@@ -526,7 +526,7 @@ class TestGeneralBehaviour:
             side=MagicMock(), price=0.5, size=10.0,
         )
 
-        trackers = {"A": _make_tracker("A", last_update=now - 6.0)}
+        trackers = {"A": _make_tracker("A", last_update=now - 16.0)}
         hb = BookHeartbeat(trackers, guard, event, executor)
 
         # First check suspends

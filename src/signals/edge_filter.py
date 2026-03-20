@@ -58,7 +58,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from src.core.config import settings
+import src.core.config as config
 from src.core.logger import get_logger
 from src.trading.fees import get_fee_rate
 
@@ -174,7 +174,7 @@ def compute_confluence_discount(
     float
         Adjusted EQS threshold (≥ effective floor).
     """
-    strat = settings.strategy
+    strat = config.settings.strategy
 
     # ── Hard gate: L2 reliability (reclassified from discount factor) ──
     # L2 reliability is a data-quality precondition, not an alpha signal.
@@ -273,7 +273,7 @@ def compute_edge_score(
         Whether this market charges dynamic fees.
     alpha:
         Expected mean-reversion fraction α ∈ [0, 1].
-        Defaults to ``settings.strategy.alpha_default``.
+        Defaults to ``config.settings.strategy.alpha_default``.
     zscore_threshold:
         PanicDetector z-score threshold.  Defaults to config.
     volume_ratio_threshold:
@@ -298,7 +298,7 @@ def compute_edge_score(
     EdgeAssessment
         Full diagnostic breakdown of edge quality.
     """
-    strat = settings.strategy
+    strat = config.settings.strategy
     _alpha = alpha if alpha is not None else strat.alpha_default
     z_thresh = (
         zscore_threshold

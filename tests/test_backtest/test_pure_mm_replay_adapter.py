@@ -67,6 +67,33 @@ class TestPureMarketMakerReplayAdapter:
         assert result.all_orders[0].side.value == "BUY"
         assert abs(result.all_orders[0].price - 0.40) < 1e-9
 
+    def test_posts_tight_and_wide_bids(self, tmp_path: Path):
+        events = [_snapshot(1.0, "NO", "0.40", "20", "0.42", "20")]
+        _write_events(tmp_path / "ticks.jsonl", events)
+
+        adapter = PureMarketMakerReplayAdapter(
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            params=StrategyParams(
+                pure_mm_wide_tier_enabled=True,
+                pure_mm_wide_spread_pct=0.15,
+                pure_mm_inventory_cap_usd=1000.0,
+            ),
+        )
+        engine = BacktestEngine(
+            strategy=adapter,
+            data_loader=DataLoader.from_files(tmp_path / "ticks.jsonl"),
+            config=BacktestConfig(initial_cash=1000.0, latency_ms=0.0),
+        )
+
+        result = engine.run()
+
+        bid_orders = [order for order in result.all_orders if order.side.value == "BUY"]
+        assert len(bid_orders) == 2
+        prices = sorted(order.price for order in bid_orders)
+        assert prices == [0.34, 0.4]
+
     def test_fills_resting_bid_when_ask_crosses(self, tmp_path: Path):
         events = [
             _snapshot(1.0, "NO", "0.40", "20", "0.42", "20"),
@@ -122,3 +149,33 @@ class TestPureMarketMakerReplayAdapter:
         bid_orders = [order for order in result.all_orders if order.side.value == "BUY"]
         assert bid_orders
         assert bid_orders[-1].status.value == "CANCELLED"
+
+    def test_cancels_all_bid_tiers_on_toxic_depth_evaporation(self, tmp_path: Path):
+        events = [
+            _snapshot(1.0, "NO", "0.40", "20", "0.42", "20"),
+            _snapshot(2.0, "NO", "0.40", "1", "0.42", "1"),
+        ]
+        _write_events(tmp_path / "ticks.jsonl", events)
+
+        adapter = PureMarketMakerReplayAdapter(
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            params=StrategyParams(
+                pure_mm_wide_tier_enabled=True,
+                pure_mm_inventory_cap_usd=1000.0,
+                pure_mm_depth_window_s=0.5,
+                pure_mm_depth_evaporation_pct=0.1,
+            ),
+        )
+        engine = BacktestEngine(
+            strategy=adapter,
+            data_loader=DataLoader.from_files(tmp_path / "ticks.jsonl"),
+            config=BacktestConfig(initial_cash=1000.0, latency_ms=0.0),
+        )
+
+        result = engine.run()
+
+        bid_orders = [order for order in result.all_orders if order.side.value == "BUY"]
+        assert len(bid_orders) == 2
+        assert all(order.status.value == "CANCELLED" for order in bid_orders)
