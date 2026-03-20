@@ -606,7 +606,20 @@ class BotReplayAdapter(StrategyABC):
 @dataclass(slots=True)
 class _ReplayQuoteState:
     side: OrderSide
+    tier: str
     order_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayIntendedQuote:
+    side: OrderSide
+    tier: str
+    target_price: float
+    target_size: float
+
+
+_REPLAY_TIGHT_TIER = "tight"
+_REPLAY_WIDE_TIER = "wide"
 
 
 class _ReplayOrderBook:
@@ -799,13 +812,13 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         self._book = _ReplayOrderBook(no_asset_id)
         self._book_update_count = 0
         self._inventory: float = 0.0
-        self._quote_states: dict[OrderSide, _ReplayQuoteState] = {
-            OrderSide.BUY: _ReplayQuoteState(OrderSide.BUY),
-            OrderSide.SELL: _ReplayQuoteState(OrderSide.SELL),
-        }
-        self._order_to_side: dict[str, OrderSide] = {}
+        self._quote_states: dict[tuple[OrderSide, str], _ReplayQuoteState] = {}
+        self._order_to_key: dict[str, tuple[OrderSide, str]] = {}
 
         self._quote_size_usd = self._params.pure_mm_quote_size_usd
+        self._wide_tier_enabled = self._params.pure_mm_wide_tier_enabled
+        self._wide_spread_pct = self._params.pure_mm_wide_spread_pct
+        self._wide_size_usd = self._params.pure_mm_wide_size_usd
         self._inventory_cap_usd = self._params.pure_mm_inventory_cap_usd
         self._toxic_ofi_ratio = self._params.pure_mm_toxic_ofi_ratio
         self._depth_window_s = self._params.pure_mm_depth_window_s
@@ -838,9 +851,11 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         return
 
     def on_fill(self, fill: "Fill") -> None:
-        side = self._order_to_side.get(fill.order_id)
-        if side is None:
+        key = self._order_to_key.get(fill.order_id)
+        if key is None:
             return
+
+        side, tier = key
 
         if fill.side == OrderSide.BUY:
             self._inventory += fill.size
@@ -849,9 +864,9 @@ class PureMarketMakerReplayAdapter(StrategyABC):
 
         order = self.engine.matching_engine.get_order(fill.order_id) if self.engine else None
         if order is None or order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
-            state = self._quote_states[side]
+            state = self._quote_states[(side, tier)]
             state.order_id = None
-            self._order_to_side.pop(fill.order_id, None)
+            self._order_to_key.pop(fill.order_id, None)
 
     def on_end(self) -> None:
         log.info(
@@ -873,42 +888,79 @@ class PureMarketMakerReplayAdapter(StrategyABC):
             self._cancel_all_quotes(reason="empty_bbo")
             return
 
-        bid_size = self._quote_size_for_bid(best_bid)
-        ask_size = self._quote_size_for_ask(best_ask)
+        intended_quotes = self._build_intended_quotes(best_bid, best_ask)
+        if self._is_market_toxic(intended_quotes):
+            self._cancel_all_quotes(reason="toxic_flow")
+            return
 
-        self._sync_side(OrderSide.BUY, best_bid, bid_size)
-        self._sync_side(OrderSide.SELL, best_ask, ask_size)
+        active_keys: set[tuple[OrderSide, str]] = set()
+        for intended_quote in intended_quotes:
+            key = (intended_quote.side, intended_quote.tier)
+            active_keys.add(key)
+            self._sync_quote(intended_quote)
+
+        for key, state in list(self._quote_states.items()):
+            if key not in active_keys:
+                self._cancel_state(state, reason="quote_disabled")
 
     def _simulate_crossed_fills(self) -> None:
         if self.engine is None:
             return
 
-        for side, state in self._quote_states.items():
+        for state in self._quote_states.values():
             order = self._get_live_order(state)
             if order is None or order.remaining <= 1e-9:
                 continue
             if order.active_time > self.engine.clock.now():
                 continue
 
-            if side == OrderSide.BUY and self._book.best_ask > 0 and self._book.best_ask <= order.price:
+            if state.side == OrderSide.BUY and self._book.best_ask > 0 and self._book.best_ask <= order.price:
                 self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
-            elif side == OrderSide.SELL and self._book.best_bid > 0 and self._book.best_bid >= order.price:
+            elif state.side == OrderSide.SELL and self._book.best_bid > 0 and self._book.best_bid >= order.price:
                 self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
 
-    def _sync_side(self, side: OrderSide, target_price: float, target_size: float) -> None:
-        state = self._quote_states[side]
+    def _build_intended_quotes(self, best_bid: float, best_ask: float) -> list[_ReplayIntendedQuote]:
+        intended_quotes: list[_ReplayIntendedQuote] = []
+
+        tight_bid_size = self._quote_size_for_bid(best_bid, self._quote_size_usd)
+        tight_ask_size = self._quote_size_for_ask(best_ask, self._quote_size_usd)
+        if tight_bid_size > 0:
+            intended_quotes.append(
+                _ReplayIntendedQuote(OrderSide.BUY, _REPLAY_TIGHT_TIER, best_bid, tight_bid_size)
+            )
+        if tight_ask_size > 0:
+            intended_quotes.append(
+                _ReplayIntendedQuote(OrderSide.SELL, _REPLAY_TIGHT_TIER, best_ask, tight_ask_size)
+            )
+
+        if not self._wide_tier_enabled:
+            return intended_quotes
+
+        wide_bid_size = self._quote_size_for_bid(best_bid, self._wide_size_usd)
+        wide_ask_size = self._quote_size_for_ask(best_ask, self._wide_size_usd)
+        wide_bid_price = best_bid * (1.0 - self._wide_spread_pct)
+        wide_ask_price = best_ask * (1.0 + self._wide_spread_pct)
+        if wide_bid_size > 0 and wide_bid_price > 0:
+            intended_quotes.append(
+                _ReplayIntendedQuote(OrderSide.BUY, _REPLAY_WIDE_TIER, wide_bid_price, wide_bid_size)
+            )
+        if wide_ask_size > 0 and wide_ask_price > 0:
+            intended_quotes.append(
+                _ReplayIntendedQuote(OrderSide.SELL, _REPLAY_WIDE_TIER, wide_ask_price, wide_ask_size)
+            )
+        return intended_quotes
+
+    def _sync_quote(self, intended_quote: _ReplayIntendedQuote) -> None:
+        key = (intended_quote.side, intended_quote.tier)
+        state = self._quote_states.setdefault(key, _ReplayQuoteState(intended_quote.side, intended_quote.tier))
         order = self._get_live_order(state)
 
-        if target_size <= 0 or target_price <= 0:
+        if intended_quote.target_size <= 0 or intended_quote.target_price <= 0:
             self._cancel_state(state, reason="no_target_size")
             return
 
-        if self._should_cancel_quote(order, target_size, side):
-            self._cancel_state(state, reason="toxic_flow")
-            return
-
-        rounded_price = round(target_price, 2)
-        rounded_size = round(target_size, 2)
+        rounded_price = round(intended_quote.target_price, 2)
+        rounded_size = round(intended_quote.target_size, 2)
 
         if order is not None:
             remaining = max(0.0, order.remaining)
@@ -919,31 +971,35 @@ class PureMarketMakerReplayAdapter(StrategyABC):
             self._cancel_state(state, reason="requote")
 
         order = self.engine.submit_order(
-            side=side,
+            side=intended_quote.side,
             price=rounded_price,
             size=rounded_size,
             order_type="limit",
             post_only=True,
         )
         state.order_id = order.order_id
-        self._order_to_side[order.order_id] = side
+        self._order_to_key[order.order_id] = key
 
-    def _should_cancel_quote(
-        self,
-        order: "SimOrder" | None,
-        target_size: float,
-        side: OrderSide,
-    ) -> bool:
-        if order is None:
-            return False
-
+    def _is_market_toxic(self, intended_quotes: list[_ReplayIntendedQuote]) -> bool:
         depth_velocity = self._book.depth_velocity(self._depth_window_s)
         if depth_velocity is not None and depth_velocity <= -self._depth_evaporation_pct:
             return True
 
-        quote_side = "BUY" if side == OrderSide.BUY else "SELL"
-        against_flow = self._book.opposing_ofi_at_price(order.price, quote_side)
-        return against_flow >= max(target_size, order.size) * self._toxic_ofi_ratio
+        checks = [
+            (quote.target_price, quote.side, quote.target_size)
+            for quote in intended_quotes
+        ]
+        for state in self._quote_states.values():
+            order = self._get_live_order(state)
+            if order is not None:
+                checks.append((order.price, state.side, order.size))
+
+        for price, side, size in checks:
+            quote_side = "BUY" if side == OrderSide.BUY else "SELL"
+            against_flow = self._book.opposing_ofi_at_price(price, quote_side)
+            if against_flow >= size * self._toxic_ofi_ratio:
+                return True
+        return False
 
     def _get_live_order(self, state: _ReplayQuoteState) -> "SimOrder" | None:
         if state.order_id is None or self.engine is None:
@@ -951,7 +1007,7 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         order = self.engine.matching_engine.get_order(state.order_id)
         if order is None or order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
             if state.order_id is not None:
-                self._order_to_side.pop(state.order_id, None)
+                self._order_to_key.pop(state.order_id, None)
             state.order_id = None
             return None
         return order
@@ -965,27 +1021,28 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         if order is None or self.engine is None:
             return
         self.engine.cancel_order(order.order_id)
-        self._order_to_side.pop(order.order_id, None)
+        self._order_to_key.pop(order.order_id, None)
         state.order_id = None
         log.debug(
             "pure_mm_replay_quote_cancelled",
             asset_id=self._no_asset_id,
             side=state.side.value,
+            tier=state.tier,
             reason=reason,
         )
 
-    def _quote_size_for_bid(self, best_bid: float) -> float:
+    def _quote_size_for_bid(self, best_bid: float, size_usd: float) -> float:
         if best_bid <= 0:
             return 0.0
         inventory_value = self._inventory * best_bid
         if inventory_value >= self._inventory_cap_usd:
             return 0.0
-        return self._normalise_size(self._quote_size_usd / best_bid, best_bid)
+        return self._normalise_size(size_usd / best_bid, best_bid)
 
-    def _quote_size_for_ask(self, best_ask: float) -> float:
+    def _quote_size_for_ask(self, best_ask: float, size_usd: float) -> float:
         if best_ask <= 0 or self._inventory <= 0:
             return 0.0
-        return self._normalise_size(min(self._inventory, self._quote_size_usd / best_ask), best_ask)
+        return self._normalise_size(min(self._inventory, size_usd / best_ask), best_ask)
 
     @staticmethod
     def _normalise_size(raw_size: float, price: float) -> float:
