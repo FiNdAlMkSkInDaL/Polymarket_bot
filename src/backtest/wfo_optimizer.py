@@ -328,10 +328,11 @@ class WfoReport:
 # ═══════════════════════════════════════════════════════════════════════════
 
 #: Names and ranges for the Optuna search space.
-#: Each entry: (suggest_method, low, high[, log])
+#: Numeric entries use (suggest_method, low, high[, log]).
+#: Categorical entries use ("suggest_categorical", choices).
 #: Log-scale for parameters where relative magnitude matters more than
 #: absolute distance (e.g. kelly_fraction, spread_compression_pct).
-SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool]] = {
+SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     # Core signal parameters
     # Hardened bounds (March 9 WFO Reset): admit only statistically
     # significant panics.  Prior [0.15, 1.5] allowed sub-σ noise entries.
@@ -360,7 +361,9 @@ SEARCH_SPACE: dict[str, tuple[str, float, float] | tuple[str, float, float, bool
     "drift_z_threshold": ("suggest_float", 0.5, 2.0),
     "drift_vol_ceiling": ("suggest_float", 0.02, 0.15, True),     # log-scale
     # Pure market maker microstructure
-    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.4, 1.5),
+    "pure_mm_wide_tier_enabled": ("suggest_categorical", (True,)),
+    "pure_mm_wide_spread_pct": ("suggest_float", 0.05, 0.25),
+    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.60, 0.95),
     "pure_mm_depth_evaporation_pct": ("suggest_float", 0.2, 0.95),
     # PCE (Pillar 15)
     "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
@@ -406,18 +409,28 @@ def _suggest_params(
     trial: Any,
     bounds_override: dict[str, tuple[float, float]] | None = None,
     search_space_params: tuple[str, ...] | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Sample hyperparameters from the Optuna trial.
 
     If *bounds_override* is provided, its ``(lo, hi)`` values replace the
     defaults in ``SEARCH_SPACE`` for the matching parameter names.
     Supports optional 4th element ``log=True`` for log-uniform sampling.
+    Categorical specs use ``("suggest_categorical", choices)``.
     """
-    params: dict[str, float] = {}
+    params: dict[str, Any] = {}
     selected_names = search_space_params or tuple(SEARCH_SPACE.keys())
     for name in selected_names:
         spec = SEARCH_SPACE[name]
         method = spec[0]
+        if method == "suggest_categorical":
+            choices = tuple(spec[1])
+            if hasattr(trial, "suggest_categorical"):
+                params[name] = trial.suggest_categorical(name, choices)
+            elif len(choices) == 1:
+                params[name] = choices[0]
+            else:
+                raise AttributeError(f"Trial does not support suggest_categorical for {name}")
+            continue
         lo, hi = spec[1], spec[2]
         log_scale = spec[3] if len(spec) > 3 else False  # type: ignore[arg-type]
         # Apply bounds override if available

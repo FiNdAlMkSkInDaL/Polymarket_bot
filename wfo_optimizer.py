@@ -16,6 +16,8 @@ DEFAULT_REPORT_PATH = DEFAULT_REPORT_DIR / "wfo_report.json"
 DEFAULT_PARAMS_PATH = DEFAULT_REPORT_DIR / "champion_params.json"
 DEFAULT_STORAGE_PATH = DEFAULT_REPORT_DIR / "wfo_optuna.db"
 TARGET_PARAMS = (
+    "pure_mm_wide_tier_enabled",
+    "pure_mm_wide_spread_pct",
     "pure_mm_toxic_ofi_ratio",
     "pure_mm_depth_evaporation_pct",
 )
