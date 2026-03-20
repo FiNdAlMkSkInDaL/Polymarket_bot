@@ -1,6 +1,6 @@
 ===============================================================================
 POLYMARKET BOT - SYSTEM EXPLANATION
-Last updated: March 19, 2026
+Last updated: March 20, 2026
 ===============================================================================
 
 This repository is no longer a bar-driven directional trading bot.
@@ -72,6 +72,28 @@ The system load-sheds aggressively:
   bot does not silently grow back to a 100+ market event-loop workload
 - full L2 reconstruction runs only on the top tracked markets inside that cap
 
+Current operator workflow for that universe cap:
+
+- scripts/screen_wick_markets.py is the offline pre-trade universe screener for
+  the stink-bid / wick-catching research path
+- it ranks active Gamma markets by a simple wick-potential proxy:
+  24h volume divided by resting liquidity
+- the terminal table is for human review and may show the numeric Gamma market
+  id for readability
+- if --export-json is used, the script must export Polymarket CLOB-compatible
+  conditionId hex strings, not Gamma numeric ids
+- that JSON export is the correct handoff format for config injection because
+  the live bot, subscriptions, and L2 paths key markets by conditionId-style
+  identifiers rather than Gamma's numeric primary key
+- scripts/screen_si9_clusters.py is the offline discovery screener for the
+  SI-9 mutually exclusive negRisk cluster path
+- it queries Gamma /events, filters to active open negRisk-compatible event
+  groups, and ranks clusters by aggregate 24h volume divided by aggregate
+  resting liquidity
+- its JSON export preserves per-leg conditionId hex strings for each cluster so
+  SI-9 downstream consumers stay keyed to CLOB-compatible identifiers rather
+  than Gamma numeric market ids
+
 L2 processing is first-class infrastructure, not an optional add-on.
 Worker processes can reconstruct books off the main asyncio loop and publish
 state back through shared memory so strategy code reads current BBO and depth
@@ -101,6 +123,17 @@ Risk enforcement is continuous:
 - adverse-selection fast-kill logic
 - inventory caps for market making
 - wallet and exposure caps
+
+Current sizing workflow:
+
+- pure_mm_wide_size_usd is a live/replay configuration knob for the wide quote
+  tier
+- that size is not yet optimized directly inside the current WFO search grid
+- the standalone helper scripts/kelly_sizer.py is now the intended offline
+  calculator for translating WFO win-rate and payoff stats into a bankroll-
+  aware pure_mm_wide_size_usd recommendation
+- the script prints both full-Kelly and half-Kelly outputs, with half-Kelly as
+  the intended default risk-management posture
 
 Current live paper thresholds were deliberately relaxed after VPS runtime
 verification showed normal Polymarket jitter could otherwise trip the breaker:
@@ -136,6 +169,16 @@ Operational implication:
 - if journal output and bot.log disagree, trust journalctl
 - a stray nohup-style background process should be treated as operational
   drift, not the desired deployment state
+
+Current latency telemetry workflow:
+
+- scripts/profile_latency_logs.py is the standalone offline profiler for raw
+  text exports captured from journald
+- it is intended to parse processing-latency and heartbeat-delta style events
+  from exported journal output rather than from legacy bot.log files
+- its default histogram view includes a red 5000 ms block-threshold marker so
+  operators can see the current live paper safety margin against the latency
+  guard cutoff
 
 
 4. ACTIVE STRATEGY 1 - PURE MARKET MAKER
@@ -243,6 +286,17 @@ Operational meaning:
 
 - SI-7 is not slow research alpha
 - it is an HFT stale-order sniping path driven by free crypto market data
+
+Offline calibration support:
+
+- scripts/calibrate_si7_pricing.py is the standalone SI-7 research helper for
+  plotting Black-Scholes in-the-money probability curves, specifically N(d2),
+  around a fixed strike
+- it is meant for offline calibration of how Polymarket-style probability
+  should move as spot approaches strike under different implied-volatility
+  regimes
+- it does not replace src/signals/resolution_probability.py and is not part of
+  the live execution path
 
 6.2 SI-8 - News Arbitrage
 
@@ -354,6 +408,40 @@ Current operational verification path:
 - passing that audit is the intended proof that the live paper recorder is
   capturing replayable pure-MM data
 
+Current optimizer grid state:
+
+- the WFO search space is now pre-wired for the wide liquidity tier
+- pure_mm_wide_tier_enabled is forced on in the pure-MM WFO path so the
+  optimizer actually exercises the Tier-2 quote logic
+- pure_mm_wide_spread_pct is bounded to 0.05 through 0.25 for the Monday
+  sweep
+- pure_mm_toxic_ofi_ratio is narrowed to 0.60 through 0.95
+- the focused pure-MM WFO entrypoint at repo root now includes the wide-tier
+  activation flag and wide spread parameter in its target parameter set
+
+Important limitation:
+
+- pure_mm_wide_size_usd exists in live and replay configuration, but it is not
+  yet part of the current optimizer sweep because no explicit search bounds
+  have been locked for it in this repo state
+- position sizing for that parameter is currently a post-WFO operator step,
+  not an in-search optimization dimension
+
+Current offline analysis tooling for that sweep:
+
+- scripts/visualize_wfo_surface.py is the standalone parameter-surface analysis
+  script for the pure-MM wide-tier grid
+- it accepts JSON or CSV exports that contain pure_mm_wide_spread_pct,
+  pure_mm_toxic_ofi_ratio, and a profit-style metric such as PnL, EV, or
+  objective score
+- it can render a static matplotlib heatmap, a static 3D surface, or both
+- it also supports standalone Plotly HTML export for browser-based rotation,
+  zoom, and hover inspection of the same parameter surface
+- the hover contract in that HTML export is intended to show the wide spread,
+  toxic OFI ratio, and the selected profit metric for each grid point
+- the plateau-scoring view is intentional: the goal is to find broad,
+  repeatable profitable regions rather than a single fragile peak
+
 Important nuance:
 
 - for a live continuously appended dataset, the correct audit behavior is to
@@ -363,6 +451,54 @@ Important nuance:
 
 Trade-only archives may still be useful for limited legacy research, but they
 are not sufficient for the current live pure market making architecture.
+
+
+8.5 OFFLINE UNIVERSE SCREENING
+===============================================================================
+
+The repo now includes dedicated offline market-selection helpers for weekly
+universe curation.
+
+Purpose:
+
+- identify markets with high turnover but relatively thin displayed liquidity
+- prioritize books that are more likely to suffer sweeps, vacuums, and wicky
+  temporary dislocations
+- identify mutually exclusive negRisk event clusters suitable for SI-9 maker-
+  first combo arbitrage research
+- produce a machine-readable universe candidate list without modifying the live
+  engine itself
+
+Current tools:
+
+- scripts/screen_wick_markets.py
+- scripts/screen_si9_clusters.py
+
+Current scoring rules:
+
+- wick potential = volume_24h / resting_liquidity
+- SI-9 cluster score = aggregate cluster volume_24h / aggregate cluster
+  resting_liquidity
+
+Current export rules:
+
+- the wick screener JSON export is an array of conditionId hex strings like
+  0x...
+- the SI-9 cluster screener export is a list of cluster objects whose
+  condition_ids and per-leg condition_id fields also preserve those same 0x...
+  conditionId strings
+- this is intentional because src/bot.py and the Polymarket CLOB/L2 plumbing
+  track markets by conditionId-compatible identifiers
+- exporting Gamma numeric ids here would create downstream subscription and
+  config mismatch risk
+
+Operational implication:
+
+- if you are preparing Monday's tracked-market config from the screener, treat
+  the JSON export as the authoritative machine interface
+- treat the printed table as a human ranking surface, not the machine contract
+- if you are preparing an SI-9 research universe, treat the cluster export as
+  the authoritative machine interface for per-leg conditionId membership
 
 
 9. WHAT FUTURE AGENTS SHOULD ASSUME
@@ -375,9 +511,21 @@ If you are an AI agent reading this file later, start with these assumptions:
 - the VPS paper deployment is expected to run under systemd, not nohup
 - the live tracked universe is intentionally capped at 25 markets unless that
   operating assumption is explicitly changed
+- the offline market screener for wick-catching exports conditionId hex strings,
+  not Gamma numeric ids, when generating machine-readable universe files
+- the offline SI-9 cluster screener also exports CLOB-compatible conditionId
+  hex strings per leg, not Gamma numeric ids
+- the pure-MM WFO surface visualizer is an offline standalone script and is
+  not part of the live trading engine or replay execution path
+- if interactive inspection is requested, the expected artifact is a standalone
+  Plotly HTML export rather than a dependency on the live bot UI
+- the SI-7 Black-Scholes pricing calibrator is also offline-only research
+  tooling and does not change the live Resolution Probability Engine path
 - the live PAPER deployment uses relaxed latency thresholds (5s block, 15s
   heartbeat stale) to tolerate real Polymarket network jitter
 - journald, not bot.log, is the authoritative live logging surface
+- the intended offline latency review path for live journald exports is
+  scripts/profile_latency_logs.py
 - pure market maker is the main passive strategy
 - SI-9 is the maker-first mutually exclusive combo arb module
 - SI-7 and SI-8 are fast-strike stale-book sniping paths
@@ -448,11 +596,49 @@ Primary files for the live architecture:
   Forward-data audit script that verifies live raw JSONL files contain both L2
   snapshots and L2 deltas with real depth arrays.
 
+- scripts/screen_wick_markets.py
+  Offline market-universe screener for high-wick-potential books. Ranks active
+  markets by 24h volume divided by resting liquidity and can export a JSON
+  array of conditionId hex strings for config injection.
+
+- scripts/screen_si9_clusters.py
+  Offline SI-9 discovery screener for active mutually exclusive negRisk event
+  clusters. Groups legs by Gamma event, ranks clusters by aggregate 24h volume
+  divided by aggregate resting liquidity, and exports per-leg conditionId hex
+  strings for machine-readable cluster membership.
+
+- scripts/kelly_sizer.py
+  Standalone bankroll-aware sizing helper. Converts WFO win probability,
+  average win, and average loss into full-Kelly and half-Kelly
+  pure_mm_wide_size_usd recommendations.
+
+- scripts/calibrate_si7_pricing.py
+  Standalone offline SI-7 calibration helper. Plots Black-Scholes in-the-money
+  probability curves using N(d2) across a spot range around strike and overlays
+  multiple implied-volatility regimes for calibration work.
+
+- scripts/visualize_wfo_surface.py
+  Standalone WFO analysis tool for the pure-MM wide-tier parameter grid.
+  Accepts JSON or CSV result exports, plots pure_mm_wide_spread_pct against
+  pure_mm_toxic_ofi_ratio, and supports both static matplotlib output and
+  standalone interactive Plotly HTML export for plateau inspection.
+
+- scripts/profile_latency_logs.py
+  Standalone offline telemetry profiler for exported journald logs. Parses
+  latency-like processing and heartbeat delta events from raw text exports,
+  prints summary statistics, and renders a histogram with the 5-second block
+  threshold marked in red.
+
 - src/backtest/strategy.py
   Contains the PureMarketMakerReplayAdapter used for realistic replay.
 
 - src/backtest/wfo_optimizer.py
-  WFO pipeline with pure-MM fail-fast behavior when no L2 data exists.
+  WFO pipeline with pure-MM fail-fast behavior when no L2 data exists and the
+  current pure-MM search grid, including wide-tier parameter support.
+
+- wfo_optimizer.py
+  Convenience pure-MM WFO entrypoint for the PMXT 7-day dataset with the
+  current focused target-parameter list.
 
 
 11. BOTTOM LINE
@@ -475,6 +661,13 @@ The current operational corollary is also clear:
 - if the forward paper deployment is not producing both snapshots and deltas in
   data/raw_ticks, you are not collecting a defensible pure-MM optimization
   dataset for next week's WFO
+
+- once structural edge is established in WFO, position size is currently meant
+  to be set as a separate risk step using scripts/kelly_sizer.py rather than
+  treated as an unconstrained search parameter
+- once a wide-tier WFO sweep completes, scripts/visualize_wfo_surface.py is the
+  intended offline review surface for identifying broad profitable plateaus
+  before any parameter choice is promoted into operator workflow
 
 That is the system as it exists now.
 
