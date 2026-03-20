@@ -673,6 +673,7 @@ class TestSearchSpace:
         mock_trial.suggest_float = MagicMock(
             side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
         )
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         params = _suggest_params(mock_trial)
 
@@ -687,12 +688,14 @@ class TestSearchSpace:
         mock_trial.suggest_float = MagicMock(
             side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
         )
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         params = _suggest_params(mock_trial)
         strategy_params, legacy_params = split_strategy_and_legacy_params(params)
         sp = StrategyParams(**strategy_params)
 
         assert sp.kelly_fraction == (0.03 + 0.40) / 2
+        assert sp.pure_mm_wide_tier_enabled is True
         assert legacy_params["zscore_threshold"] == (0.2 + 2.5) / 2
 
     def test_expanded_search_space_has_new_params(self):
@@ -706,9 +709,18 @@ class TestSearchSpace:
             "min_edge_score",
             "iceberg_eqs_bonus",
             "iceberg_tp_alpha",
+            "pure_mm_wide_tier_enabled",
+            "pure_mm_wide_spread_pct",
         ]
         for p in new_params:
             assert p in SEARCH_SPACE, f"Missing new param: {p}"
+
+    def test_pure_mm_bounds_are_hardened(self):
+        """Pure-MM sweep bounds should match the intended Monday grid."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        assert SEARCH_SPACE["pure_mm_wide_spread_pct"] == ("suggest_float", 0.05, 0.25)
+        assert SEARCH_SPACE["pure_mm_toxic_ofi_ratio"] == ("suggest_float", 0.60, 0.95)
 
     def test_log_scale_params_marked(self):
         """Certain params should use log-scale (4th element = True)."""
@@ -745,6 +757,7 @@ class TestSearchSpace:
 
         mock_trial = MagicMock()
         mock_trial.suggest_float = MagicMock(side_effect=mock_suggest)
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         _suggest_params(mock_trial)
 
@@ -868,18 +881,26 @@ class TestPureMmWfoHooks:
             def suggest_int(self, name, low, high):
                 return low
 
+            def suggest_categorical(self, name, choices):
+                return choices[0]
+
         params = _suggest_params(
             _Trial(),
             search_space_params=(
+                "pure_mm_wide_tier_enabled",
+                "pure_mm_wide_spread_pct",
                 "pure_mm_toxic_ofi_ratio",
                 "pure_mm_depth_evaporation_pct",
             ),
         )
 
         assert set(params) == {
+            "pure_mm_wide_tier_enabled",
+            "pure_mm_wide_spread_pct",
             "pure_mm_toxic_ofi_ratio",
             "pure_mm_depth_evaporation_pct",
         }
+        assert params["pure_mm_wide_tier_enabled"] is True
 
     def test_run_single_backtest_with_pure_mm_adapter(self, tmp_path: Path):
         from src.backtest.wfo_optimizer import _run_single_backtest
