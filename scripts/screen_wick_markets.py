@@ -97,8 +97,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="FILE",
         help=(
-            "Write the top ranked Market ID strings to FILE as a JSON array for "
-            "automated config injection."
+            "Write the top ranked market conditionId hex strings to FILE as a "
+            "JSON array for automated config injection."
         ),
     )
     return parser.parse_args()
@@ -134,6 +134,13 @@ def _market_title(payload: dict[str, Any]) -> str:
     return "<untitled market>"
 
 
+def _condition_id(value: Any) -> str:
+    condition_id = str(value or "").strip()
+    if not condition_id.startswith("0x"):
+        return ""
+    return condition_id
+
+
 def _is_binary_market(payload: dict[str, Any]) -> bool:
     tokens = payload.get("tokens")
     if isinstance(tokens, list) and len(tokens) == 2:
@@ -155,8 +162,8 @@ def _extract_market(payload: dict[str, Any]) -> RankedMarket | None:
         return None
 
     market_id = str(payload.get("id") or "").strip()
-    condition_id = str(payload.get("conditionId") or payload.get("condition_id") or "").strip()
-    if not market_id:
+    condition_id = _condition_id(payload.get("conditionId") or payload.get("condition_id"))
+    if not market_id or not condition_id:
         return None
 
     volume_24h = _safe_float(
@@ -309,7 +316,7 @@ def print_table(markets: list[RankedMarket], *, top_n: int) -> None:
 
 
 def export_market_ids(markets: list[RankedMarket], *, top_n: int, output_path: Path) -> None:
-    selected_ids = [market.market_id for market in markets[:top_n]]
+    selected_ids = [market.condition_id for market in markets[:top_n]]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(selected_ids), encoding="utf-8")
 
@@ -329,7 +336,7 @@ def main() -> int:
     print_table(ranked, top_n=args.top)
     if args.export_json is not None:
         export_market_ids(ranked, top_n=args.top, output_path=args.export_json)
-        print(f"Exported {min(args.top, len(ranked))} market IDs to {args.export_json}")
+        print(f"Exported {min(args.top, len(ranked))} conditionIds to {args.export_json}")
     return 0
 
 
