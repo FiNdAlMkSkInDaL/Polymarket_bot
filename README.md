@@ -106,6 +106,18 @@ The script accepts either raw `.jsonl` captures or prepared `.parquet` files.
 If the selected dataset contains only trade prints and no L2 snapshot or delta
 events, the visualizer exits early because book reconstruction is not possible.
 
+`scripts/screen_wick_markets.py` is a standalone universe-selection screener.
+It queries the public Polymarket Gamma API for active markets, ranks them by
+`24h volume / resting liquidity`, and prints the top high-volume, thin-book
+candidates for next week's wick-catching watchlist.
+
+Example usage:
+
+```bash
+python scripts/screen_wick_markets.py
+python scripts/screen_wick_markets.py --top 25 --min-volume 1000
+```
+
 ## Testing
 
 ```bash
