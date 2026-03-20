@@ -118,6 +118,22 @@ python scripts/screen_wick_markets.py
 python scripts/screen_wick_markets.py --top 25 --min-volume 1000
 ```
 
+`scripts/screen_si9_clusters.py` is the offline SI-9 cluster screener.
+It queries the public Polymarket Gamma `/events` API, filters to active
+mutually exclusive negRisk clusters, groups markets by parent event, and ranks
+those clusters by aggregate `24h volume / resting liquidity`.
+
+Example usage:
+
+```bash
+python scripts/screen_si9_clusters.py
+python scripts/screen_si9_clusters.py --top 10 --min-volume 5000
+python scripts/screen_si9_clusters.py --export-json data/si9_clusters.json
+```
+
+Its JSON export preserves CLOB-compatible `conditionId` hex strings for every
+leg in each cluster, rather than Gamma numeric market IDs.
+
 ## Testing
 
 ```bash
