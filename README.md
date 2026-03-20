@@ -1,27 +1,54 @@
-# Polymarket Mean-Reversion Market Maker — PoC
+# Polymarket HFT Market Maker And Latency Arb Engine
 
-A proof-of-concept automated trading bot that fades retail panic in Polymarket
-prediction markets by buying discounted **NO** shares during spikes and exiting
-via dynamic mean-reversion targets.
+An automated Polymarket trading system centered on high-frequency pure market
+making, maker-first combinatorial arbitrage, and zero-overhead latency
+arbitrage.
 
-## Architecture
+This repo is no longer a mean-reversion panic bot as its primary live design.
+Legacy directional modules still exist for research and compatibility, but the
+current live architecture is driven by L2 market microstructure and external
+latency edges.
+
+## Live Architecture
 
 ```
 src/
-├── core/           # Config, logging
-├── data/           # WebSocket client, OHLCV aggregation, market discovery
-├── signals/        # Panic spike detector, whale wallet monitor
-├── trading/        # Order executor, position manager, take-profit calc
+├── core/           # Config, latency/risk guards, process orchestration
+├── data/           # CLOB streams, L2 books, oracle adapters, discovery
+├── signals/        # RPE, oracle signals, SI-9 combinatorial arb logic
+├── strategies/     # Pure market maker live strategy
+├── trading/        # Executor, position manager, fast-strike path, risk
 ├── monitoring/     # SQLite trade store, Telegram alerts
 ├── bot.py          # Main orchestrator
-└── cli.py          # Click CLI entry point
+└── cli.py          # CLI entry point
 
 scripts/
 ├── vps_setup.sh            # Ubuntu VPS bootstrap
-├── polymarket-bot.service  # systemd unit file
 ├── decrypt_secrets.sh      # Age-encrypted .env decryption
+├── test_ws_oracles.py      # Tree News / oracle websocket smoke tests
 └── watchdog.sh             # Cron-based health check
 ```
+
+## Active Strategies
+
+1. Pure Market Maker
+   Passive NO-token quoting on the highest-volume L2 markets. Uses order flow
+   imbalance and depth evaporation to cancel toxic resting quotes before they
+   are adversely selected.
+
+2. SI-9 Combinatorial Arbitrage
+   Maker-first state machine for mutually exclusive event clusters. Works the
+   bottleneck leg passively before completing the rest of the combo when a
+   Dutch-book style mispricing exists.
+
+3. Latency Arbitrage
+   SI-7 crypto fast-strike uses free BTC and ETH spot feeds plus
+   Black-Scholes-style RPE pricing to snipe stale crypto-linked Polymarket
+   orders.
+
+   SI-8 news arbitrage uses the Tree News WebSocket firehose to front-run the
+   book on breaking news. Paid non-crypto and paid sports feeds are outside the
+   intended zero-overhead live architecture.
 
 ## Quick Start (Local / Paper Trading)
 
@@ -44,13 +71,68 @@ python -m src.cli run --paper
 python -m src.cli stats
 ```
 
-## Strategy Logic
+## Backtesting And WFO
 
-1. **Signal**: Detect Z-score ≥ 2σ spike in YES price + 3× volume surge
-2. **Entry**: GTC limit buy on NO shares at `best_ask - 1¢` (maker)
-3. **Exit**: Dynamic target via `P_entry + α × (VWAP_no - P_entry)`
-   - α ∈ [0.3, 0.7] adjusted by volatility, book depth, whale confluence, time to resolution
-4. **Timeout**: Force market-sell after 30 min if target not hit
+The backtest and walk-forward stack has pivoted with the live strategy.
+
+- Pure market maker replay requires L2 snapshots and deltas.
+- Trade-only data is not sufficient to simulate passive maker fills, OFI, or
+   depth evaporation defensibly.
+- Pure-MM WFO intentionally fails fast when the dataset has no L2 book events.
+
+If you are evaluating the current live architecture, assume L2 data is a hard
+requirement rather than an optional enhancement.
+
+## Offline Tools
+
+`scripts/visualize_l2_wicks.py` is a standalone offline analysis tool for local
+tick captures. It reconstructs the Level 2 top of book from snapshot and delta
+events, plots best bid and best ask over time, overlays trades, and flags
+potential liquidity vacuums or wick trades where executions occur more than 5%
+away from the rolling 1-minute mid-price baseline.
+
+Use it when you want to visually inspect market microstructure, deep sweeps,
+and flash-move executions without running the live bot.
+
+Example usage:
+
+```bash
+python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id>
+python scripts/visualize_l2_wicks.py data/vps_march2026_parquet/2026-03-18 <market_id> --output wick_chart.png
+python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id> --wick-threshold-pct 5 --window-seconds 60 --show
+```
+
+The script accepts either raw `.jsonl` captures or prepared `.parquet` files.
+If the selected dataset contains only trade prints and no L2 snapshot or delta
+events, the visualizer exits early because book reconstruction is not possible.
+
+`scripts/screen_wick_markets.py` is a standalone universe-selection screener.
+It queries the public Polymarket Gamma API for active markets, ranks them by
+`24h volume / resting liquidity`, and prints the top high-volume, thin-book
+candidates for next week's wick-catching watchlist.
+
+Example usage:
+
+```bash
+python scripts/screen_wick_markets.py
+python scripts/screen_wick_markets.py --top 25 --min-volume 1000
+```
+
+`scripts/screen_si9_clusters.py` is the offline SI-9 cluster screener.
+It queries the public Polymarket Gamma `/events` API, filters to active
+mutually exclusive negRisk clusters, groups markets by parent event, and ranks
+those clusters by aggregate `24h volume / resting liquidity`.
+
+Example usage:
+
+```bash
+python scripts/screen_si9_clusters.py
+python scripts/screen_si9_clusters.py --top 10 --min-volume 5000
+python scripts/screen_si9_clusters.py --export-json data/si9_clusters.json
+```
+
+Its JSON export preserves CLOB-compatible `conditionId` hex strings for every
+leg in each cluster, rather than Gamma numeric market IDs.
 
 ## Testing
 

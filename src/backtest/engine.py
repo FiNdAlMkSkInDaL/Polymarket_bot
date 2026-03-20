@@ -192,6 +192,31 @@ class BacktestEngine:
         """Cancel an order by ID."""
         return self.matching_engine.cancel_order(order_id)
 
+    def simulate_fill(
+        self,
+        order_id: str,
+        size: float,
+        price: float | None = None,
+        *,
+        is_maker: bool = True,
+    ) -> Fill | None:
+        """Inject a simulated fill for an existing order.
+
+        Replay adapters use this when a historical L2 snapshot crosses a
+        resting quote but the recorded dataset does not contain the exact
+        public trade print that would have drained the level.
+        """
+        fill = self.matching_engine.simulate_order_fill(
+            order_id,
+            size,
+            price=price,
+            current_time=self.clock.now(),
+            is_maker=is_maker,
+        )
+        if fill is not None:
+            self._process_fills([fill])
+        return fill
+
     def get_asset_best_ask(self, asset_id: str) -> float:
         """Return the best ask for a specific asset.
 
@@ -311,6 +336,8 @@ class BacktestEngine:
             "mid_price": self.matching_engine.mid_price,
             "bid_levels": self.matching_engine.bid_levels(5),
             "ask_levels": self.matching_engine.ask_levels(5),
+            "event_data": event.data,
+            "timestamp": event.timestamp,
         }
 
         # Record per-asset BBO from real book data

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Centralised configuration loaded from environment variables.
 
 Usage:
@@ -17,13 +17,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-# ── Deployment phases ──────────────────────────────────────────────────────
+# â”€â”€ Deployment phases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class DeploymentEnv(str, Enum):
     """Strict 3-phase deployment pipeline.
 
-    PAPER        — simulated fills, mocked wallet, data recorder forced ON.
-    PENNY_LIVE   — real CLOB + real wallet, hardcoded $1 max trade size.
-    PRODUCTION   — all guardrails lifted; defers to Kelly sizer.
+    PAPER        â€” simulated fills, mocked wallet, data recorder forced ON.
+    PENNY_LIVE   â€” real CLOB + real wallet, hardcoded $1 max trade size.
+    PRODUCTION   â€” all guardrails lifted; defers to Kelly sizer.
     """
 
     PAPER = "PAPER"
@@ -31,15 +31,15 @@ class DeploymentEnv(str, Enum):
     PRODUCTION = "PRODUCTION"
 
 
-# Hardcoded — intentionally NOT configurable via env var.
+# Hardcoded â€” intentionally NOT configurable via env var.
 PENNY_LIVE_MAX_TRADE_USD: float = 5.0
 
-# Polymarket exchange minimums — orders below these are rejected.
+# Polymarket exchange minimums â€” orders below these are rejected.
 EXCHANGE_MIN_USD: float = 1.0
 EXCHANGE_MIN_SHARES: float = 5.0
 
 # ---------------------------------------------------------------------------
-# Locate .env — prefer tmpfs (VPS decrypted secrets), fall back to project root
+# Locate .env â€” prefer tmpfs (VPS decrypted secrets), fall back to project root
 # ---------------------------------------------------------------------------
 _TMPFS_ENV = Path("/dev/shm/secrets/.env")
 _LOCAL_ENV = Path(__file__).resolve().parents[2] / ".env"
@@ -84,31 +84,22 @@ def _env_bool(key: str, default: bool = True) -> bool:
     return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
 
 
-# ── Strategy defaults ──────────────────────────────────────────────────────
+# â”€â”€ Strategy defaults â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @dataclass(frozen=True)
 class StrategyParams:
-    """Tunable knobs for the mean-reversion strategy.
+    """Tunable knobs for the live strategy stack.
 
     Every field can be overridden via its corresponding env-var
-    (e.g.  ZSCORE_THRESHOLD=2.5  in .env).
+    when a runtime override is required.
     """
 
-    # Tradeable price band — markets outside this range are too close
+    # Tradeable price band â€” markets outside this range are too close
     # to resolution for mean-reversion alpha to exist.
     min_tradeable_price: float = _env_float("MIN_TRADEABLE_PRICE", 0.05)
     max_tradeable_price: float = _env_float("MAX_TRADEABLE_PRICE", 0.95)
 
-    # Panic spike detector
-    zscore_threshold: float = _env_float("ZSCORE_THRESHOLD", 0.20)
-    panic_zscore_threshold: float = _env_float("PANIC_ZSCORE_THRESHOLD", 0.684)
-    volume_ratio_threshold: float = _env_float("VOLUME_RATIO_THRESHOLD", 0.5)
-    lookback_minutes: int = _env_int("LOOKBACK_MINUTES", 60)
-
-    # Trend regime guard (suppress signals during sustained up-trends).
-    # Suppresses panic signals when YES has risen ≥8% over trend_guard_bars.
-    # Prevents buying NO into genuine breakouts / institutional momentum.
-    trend_guard_pct: float = _env_float("TREND_GUARD_PCT", 0.08)
-    trend_guard_bars: int = _env_int("TREND_GUARD_BARS", 15)
+    # Whale monitor adaptive polling threshold.
+    whale_zscore_threshold: float = _env_float("WHALE_ZSCORE_THRESHOLD", 0.20)
 
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
@@ -125,28 +116,28 @@ class StrategyParams:
     # factor is zero.
     min_edge_score: float = _env_float("MIN_EDGE_SCORE", 40.0)
 
-    # ── V1: Maker routing ─────────────────────────────────────────────────
-    # When True, entries priced as maker (best_ask - 1¢) use 0-fee EQS
+    # â”€â”€ V1: Maker routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # When True, entries priced as maker (best_ask - 1Â¢) use 0-fee EQS
     # scoring and a relaxed viability gate (no slippage/fee drag).
     maker_routing_enabled: bool = _env_bool("MAKER_ROUTING_ENABLED", True)
     # Multiplier on min_edge_score when executing as maker (0.85 = 15% lower).
     maker_eqs_discount: float = _env_float("MAKER_EQS_DISCOUNT", 0.85)
 
-    # ── V2: Multi-factor confluence routing ───────────────────────────────
+    # â”€â”€ V2: Multi-factor confluence routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Dynamic EQS threshold discount when multiple independent signals
-    # confirm simultaneously.  Requires ≥ confluence_min_factors active.
+    # confirm simultaneously.  Requires â‰¥ confluence_min_factors active.
     confluence_eqs_floor: float = _env_float("CONFLUENCE_EQS_FLOOR", 35.0)
     confluence_min_factors: int = _env_int("CONFLUENCE_MIN_FACTORS", 2)
     # Per-factor EQS threshold discounts (points subtracted).
-    # Whale: 5→4 to tighten Sobol S1 variance (dominant first-order index).
-    # L2: 3→0 — reclassified as hard gate; failed binomial H₀: w_on ≤ w_off.
-    # Regime: 3→0 — failed binomial test; already required by drift Gate 1.
+    # Whale: 5â†’4 to tighten Sobol S1 variance (dominant first-order index).
+    # L2: 3â†’0 â€” reclassified as hard gate; failed binomial Hâ‚€: w_on â‰¤ w_off.
+    # Regime: 3â†’0 â€” failed binomial test; already required by drift Gate 1.
     confluence_whale_discount: float = _env_float("CONFLUENCE_WHALE_DISCOUNT", 4.0)
     confluence_spread_discount: float = _env_float("CONFLUENCE_SPREAD_DISCOUNT", 4.0)
     confluence_l2_discount: float = _env_float("CONFLUENCE_L2_DISCOUNT", 0.0)
     confluence_regime_discount: float = _env_float("CONFLUENCE_REGIME_DISCOUNT", 0.0)
 
-    # ── V4: Probe sizing ──────────────────────────────────────────────────
+    # â”€â”€ V4: Probe sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Allow sub-threshold entries (EQS in [probe_eqs_floor, min_edge_score))
     # at micro-size for market exploration and scale-in upon confirmation.
     probe_sizing_enabled: bool = _env_bool("PROBE_SIZING_ENABLED", True)
@@ -154,21 +145,21 @@ class StrategyParams:
     probe_kelly_fraction: float = _env_float("PROBE_KELLY_FRACTION", 0.05)
     probe_max_usd: float = _env_float("PROBE_MAX_USD", 2.0)
 
-    # ── V1-V4 Risk Guard: combined maker+confluence floor (Flaw 1) ────────
+    # â”€â”€ V1-V4 Risk Guard: combined maker+confluence floor (Flaw 1) â”€â”€â”€â”€â”€â”€â”€â”€
     # When both maker_routing AND all-4-confluence fire simultaneously,
     # the score is inflated (0 fees) while the threshold is compressed.
     # This hard floor prevents the adjusted threshold from falling below
     # this value when maker routing is active.
     confluence_maker_combined_floor: float = _env_float("CONFLUENCE_MAKER_COMBINED_FLOOR", 40.0)
 
-    # ── V3/V2 Drift-regime double-count guard (Flaw 2) ────────────────────
+    # â”€â”€ V3/V2 Drift-regime double-count guard (Flaw 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # DriftSignal gate 1 requires regime_mean_revert; confluence also awards
     # confluence_regime_discount when regime is mean-reverting.  These are
     # NOT independent bits.  When the primary signal is a drift signal,
     # the regime discount is suppressed to avoid double-counting.
     drift_suppress_regime_discount: bool = _env_bool("DRIFT_SUPPRESS_REGIME_DISCOUNT", True)
 
-    # ── V4 Probe risk controls (Flaw 3) ───────────────────────────────────
+    # â”€â”€ V4 Probe risk controls (Flaw 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Probes are sub-threshold micro-entries designed for data gathering, not
     # strong-signal confirmation trades.  Confluence discounts (especially
     # the 5-pt whale discount) should NOT lower the probe threshold: probes
@@ -176,7 +167,7 @@ class StrategyParams:
     # applying confluence discounts to them double-counts unconfirmed signals.
     probe_suppress_confluence: bool = _env_bool("PROBE_SUPPRESS_CONFLUENCE", True)
 
-    # ── Probe harvesting ──────────────────────────────────────────────────
+    # â”€â”€ Probe harvesting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # When a probe reaches breakeven (StopLossMonitor fires on_probe_breakeven),
     # scale_probe_to_full() pyramids the position up to full Kelly.
     # harvest_max_progress: skip scale-in if > this fraction of TP achieved.
@@ -186,10 +177,10 @@ class StrategyParams:
     harvest_min_profit_cents: float = _env_float("HARVEST_MIN_PROFIT_CENTS", 0.50)
     harvest_min_increment_usd: float = _env_float("HARVEST_MIN_INCREMENT_USD", 0.50)
 
-    # ── Adverse Selection Monitor: dynamic alpha ──────────────────────────
-    # The fixed α=0.05 over-suspends in low-vol and under-suspends in
-    # high-vol.  Scale α with rolling EWMA volatility:
-    #   α_dynamic = α_base × (σ_rolling / σ_ref)^γ, clamped to [α_min, α_max]
+    # â”€â”€ Adverse Selection Monitor: dynamic alpha â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # The fixed Î±=0.05 over-suspends in low-vol and under-suspends in
+    # high-vol.  Scale Î± with rolling EWMA volatility:
+    #   Î±_dynamic = Î±_base Ã— (Ïƒ_rolling / Ïƒ_ref)^Î³, clamped to [Î±_min, Î±_max]
     adverse_monitor_alpha_base: float = _env_float("ADVERSE_MONITOR_ALPHA_BASE", 0.05)
     adverse_monitor_vol_ref: float = _env_float("ADVERSE_MONITOR_VOL_REF", 0.01)
     adverse_monitor_alpha_gamma: float = _env_float("ADVERSE_MONITOR_ALPHA_GAMMA", 0.5)
@@ -217,7 +208,20 @@ class StrategyParams:
 
     # Load shedding: maximum markets with full L2 book reconstruction.
     # Remaining discovered markets use lightweight price/trade-only tracking.
-    max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 50)
+    max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 25)
+
+    # Pure maker quoting universe and sizing.
+    pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
+    pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
+    pure_mm_quote_size_usd: float = _env_float("PURE_MM_QUOTE_SIZE_USD", 5.0)
+    pure_mm_inventory_cap_usd: float = _env_float("PURE_MM_INVENTORY_CAP_USD", 15.0)
+    pure_mm_loop_ms: int = _env_int("PURE_MM_LOOP_MS", 250)
+    pure_mm_wide_tier_enabled: bool = _env_bool("PURE_MM_WIDE_TIER_ENABLED", False)
+    pure_mm_wide_spread_pct: float = _env_float("PURE_MM_WIDE_SPREAD_PCT", 0.15)
+    pure_mm_wide_size_usd: float = _env_float("PURE_MM_WIDE_SIZE_USD", 50.0)
+    pure_mm_toxic_ofi_ratio: float = _env_float("PURE_MM_TOXIC_OFI_RATIO", 0.80)
+    pure_mm_depth_window_s: float = _env_float("PURE_MM_DEPTH_WINDOW_S", 2.0)
+    pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.20)
 
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
@@ -237,7 +241,7 @@ class StrategyParams:
     sl_vol_ref: float = _env_float("SL_VOL_REF", 0.70)
     sl_vol_multiplier_max: float = _env_float("SL_VOL_MULTIPLIER_MAX", 1.5)
 
-    # ── Pillar 11.3: Preemptive Liquidity & Time-Decay Stop ────────────
+    # â”€â”€ Pillar 11.3: Preemptive Liquidity & Time-Decay Stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Preemptive liquidity drain: trigger stop when support-side depth
     # is < threshold fraction of resistance-side depth AND position
     # is underwater.  Prevents slippage bleed on a "hollow book".
@@ -253,32 +257,32 @@ class StrategyParams:
 
     # Maximum dollar-risk per trade.  Caps position size so that a
     # gap-to-zero event cannot lose more than this many cents.
-    # max_loss = entry_price × size × 100 ≤ max_loss_per_trade_cents.
+    # max_loss = entry_price Ã— size Ã— 100 â‰¤ max_loss_per_trade_cents.
     max_loss_per_trade_cents: float = _env_float("MAX_LOSS_PER_TRADE_CENTS", 1500.0)
 
-    # ── Pillar 1: Passive-Aggressive Chasing ───────────────────────────────
+    # â”€â”€ Pillar 1: Passive-Aggressive Chasing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     chase_interval_ms: int = _env_int("CHASE_INTERVAL_MS", 250)
     max_chase_depth_cents: float = _env_float("MAX_CHASE_DEPTH_CENTS", 3.0)
     post_only_enabled: bool = _env_bool("POST_ONLY_ENABLED", True)
 
-    # ── Pillar 2: Liquidity-Sensing Sizing ─────────────────────────────────
+    # â”€â”€ Pillar 2: Liquidity-Sensing Sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     max_impact_pct: float = _env_float("MAX_IMPACT_PCT", 15.0)
     impact_depth_cents: float = _env_float("IMPACT_DEPTH_CENTS", 5.0)
 
-    # ── Pillar 3: Adaptive TP Rescaling ────────────────────────────────────
+    # â”€â”€ Pillar 3: Adaptive TP Rescaling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     tp_rescale_interval_s: int = _env_int("TP_RESCALE_INTERVAL_S", 15)
     tp_vol_sensitivity: float = _env_float("TP_VOL_SENSITIVITY", 1.5)
     tp_spread_min_mult: float = _env_float("TP_SPREAD_MIN_MULT", 0.5)
     tp_spread_max_mult: float = _env_float("TP_SPREAD_MAX_MULT", 3.0)
 
-    # ── Pillar 4: Stale-Data Kill-Switch ───────────────────────────────────
-    latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 1500)
+    # â”€â”€ Pillar 4: Stale-Data Kill-Switch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    latency_block_ms: int = _env_int("LATENCY_BLOCK_MS", 5000)
     latency_warn_ms: int = _env_int("LATENCY_WARN_MS", 800)
     latency_recovery_count: int = _env_int("LATENCY_RECOVERY_COUNT", 3)
 
-    # ── Pillar 5: Anti-Adverse-Selection ("Fast-Kill") ─────────────────────
+    # â”€â”€ Pillar 5: Anti-Adverse-Selection ("Fast-Kill") â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #
-    # Intrinsic detection engine — four intra-Polymarket signals detect
+    # Intrinsic detection engine â€” four intra-Polymarket signals detect
     # toxic flow using data the bot already collects.  A kill fires when
     # ANY two of the four signals trigger simultaneously (2-of-4 rule),
     # reducing false positives from idiosyncratic market noise.
@@ -291,7 +295,7 @@ class StrategyParams:
     # Polygon head-lag threshold (used by PolygonHeadLagChecker in heartbeat.py)
     adverse_sel_polygon_head_lag_ms: int = _env_int("ADVERSE_SEL_POLYGON_HEAD_LAG_MS", 3000)
 
-    # Signal 1 — Cross-market flow coherence
+    # Signal 1 â€” Cross-market flow coherence
     # When taker-initiated trades dominate 3+ independent markets within
     # a 5-second window, it indicates a platform-wide information event
     # (news drop, API leak).  Idiosyncratic noise cannot produce
@@ -300,9 +304,9 @@ class StrategyParams:
     adverse_sel_mti_min_markets: int = _env_int("ADVERSE_SEL_MTI_MIN_MARKETS", 3)
     adverse_sel_mti_window_s: float = _env_float("ADVERSE_SEL_MTI_WINDOW_S", 5.0)
 
-    # Signal 2 — Book depth evaporation
+    # Signal 2 â€” Book depth evaporation
     # When informed traders arrive, market makers pull quotes before the
-    # price moves.  A 75% depth drop within 2 seconds within 5¢ of mid
+    # price moves.  A 75% depth drop within 2 seconds within 5Â¢ of mid
     # is the classic signature.  Raised from 60% to 75% to reduce false
     # positives on thin Polymarket books where natural noise can produce
     # transient depth drops.
@@ -310,18 +314,18 @@ class StrategyParams:
     adverse_sel_depth_window_s: float = _env_float("ADVERSE_SEL_DEPTH_WINDOW_S", 2.0)
     adverse_sel_depth_near_mid_cents: float = _env_float("ADVERSE_SEL_DEPTH_NEAR_MID_CENTS", 5.0)
 
-    # Signal 3 — Spread blow-out
-    # When the bid-ask spread on a positioned market widens to 4× its
+    # Signal 3 â€” Spread blow-out
+    # When the bid-ask spread on a positioned market widens to 4Ã— its
     # 5-minute rolling average, market makers are widening defensively
-    # in response to perceived information asymmetry.  Raised from 3×
-    # to 4× to reduce false positives on naturally noisy spreads.
+    # in response to perceived information asymmetry.  Raised from 3Ã—
+    # to 4Ã— to reduce false positives on naturally noisy spreads.
     adverse_sel_spread_blowout_mult: float = _env_float("ADVERSE_SEL_SPREAD_BLOWOUT_MULT", 4.0)
     adverse_sel_spread_avg_window_s: float = _env_float("ADVERSE_SEL_SPREAD_AVG_WINDOW_S", 300.0)
 
-    # Signal 4 — Velocity anomaly on positioned assets
-    # A 5× spike in trade arrival rate over a 10-minute baseline on a
+    # Signal 4 â€” Velocity anomaly on positioned assets
+    # A 5Ã— spike in trade arrival rate over a 10-minute baseline on a
     # market where the bot holds a position indicates a burst of
-    # informed activity.  Under Poisson arrival, a 5× spike has
+    # informed activity.  Under Poisson arrival, a 5Ã— spike has
     # p < 0.001 unless event-driven.
     adverse_sel_velocity_mult: float = _env_float("ADVERSE_SEL_VELOCITY_MULT", 5.0)
     adverse_sel_velocity_window_s: float = _env_float("ADVERSE_SEL_VELOCITY_WINDOW_S", 600.0)
@@ -334,8 +338,8 @@ class StrategyParams:
 
     # Kill outcome retrospective analysis.
     # After each fast-kill, wait outcome_delay_s then re-read mid-prices
-    # and classify the kill as TP (price moved adversely ≥ threshold) or
-    # FP (it didn’t).  Results are logged and persisted to JSONL.
+    # and classify the kill as TP (price moved adversely â‰¥ threshold) or
+    # FP (it didnâ€™t).  Results are logged and persisted to JSONL.
     adverse_sel_outcome_delay_s: float = _env_float("ADVERSE_SEL_OUTCOME_DELAY_S", 60.0)
     adverse_sel_tp_threshold_cents: float = _env_float("ADVERSE_SEL_TP_THRESHOLD_CENTS", 3.0)
 
@@ -343,21 +347,21 @@ class StrategyParams:
     # for N consecutive poll cycles before firing.  At 50ms cadence,
     # 4 cycles = 200ms delay.  Filters single-cycle transient spikes.
     adverse_sel_confirmation_cycles: int = _env_int("ADVERSE_SEL_CONFIRMATION_CYCLES", 4)
-    # ── Pillar 6: Dynamic Fee-Curve Integration ────────────────────────────
+    # â”€â”€ Pillar 6: Dynamic Fee-Curve Integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     fee_cache_ttl_s: int = _env_int("FEE_CACHE_TTL_S", 300)
     fee_default_bps: int = _env_int("FEE_DEFAULT_BPS", 200)
     desired_margin_cents: float = _env_float("DESIRED_MARGIN_CENTS", 2.5)
 
-    # ── Pillar 7: Hybrid-Aggressive Chaser Escalation ──────────────────────
+    # â”€â”€ Pillar 7: Hybrid-Aggressive Chaser Escalation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     chaser_max_rejections: int = _env_int("CHASER_MAX_REJECTIONS", 3)
     chaser_escalation_ticks: int = _env_int("CHASER_ESCALATION_TICKS", 1)
     # Anti-toxicity guard: if the adverse-selection p-value drops below
     # this ceiling during a chase, cancel rather than crossing the spread.
     chaser_toxicity_p_value_ceil: float = _env_float("CHASER_TOXICITY_P_VALUE_CEIL", 0.10)
 
-    # ── Pillar 8: Clock-Skew & Stale Book Safety ──────────────────────────
+    # â”€â”€ Pillar 8: Clock-Skew & Stale Book Safety â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
-    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 5000)
+    heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 15000)
     heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 3)
     ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 10.0)
     # L2 uses a separate, longer timeout because low-volume markets
@@ -365,8 +369,8 @@ class StrategyParams:
     # socket alive; application-level silence is expected.
     l2_silence_timeout_s: float = _env_float("L2_SILENCE_TIMEOUT_S", 120.0)
 
-    # ── Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) ───────────
-    # MTI — Maker/Taker Imbalance penalty
+    # â”€â”€ Pillar 9: Toxic Flow Avoidance (2026 Dynamic Fee Regime) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # MTI â€” Maker/Taker Imbalance penalty
     mti_threshold: float = _env_float("MTI_THRESHOLD", 0.80)
     mti_penalty_points: float = _env_float("MTI_PENALTY_POINTS", 40.0)
 
@@ -379,19 +383,19 @@ class StrategyParams:
     # gross spread to fees are hard-rejected as mathematically -EV.
     eqs_fee_efficiency_floor: float = _env_float("EQS_FEE_EFFICIENCY_FLOOR", 0.30)
 
-    # ── Pillar 10: Order Status Polling ─────────────────────────────────
+    # â”€â”€ Pillar 10: Order Status Polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     order_status_poll_s: float = _env_float("ORDER_STATUS_POLL_S", 2.0)
     order_status_max_retries: int = _env_int("ORDER_STATUS_MAX_RETRIES", 3)
-    # ── Pillar 11: Active Stop-Loss Engine ────────────────────────────────
+    # â”€â”€ Pillar 11: Active Stop-Loss Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     stop_loss_poll_ms: int = _env_int("STOP_LOSS_POLL_MS", 500)
     trailing_stop_offset_cents: float = _env_float("TRAILING_STOP_OFFSET_CENTS", 0.0)
 
-    # ── Pillar 12: Multi-Signal Framework ─────────────────────────────────
+    # â”€â”€ Pillar 12: Multi-Signal Framework â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     imbalance_threshold: float = _env_float("IMBALANCE_THRESHOLD", 1.5)
     spread_compression_pct: float = _env_float("SPREAD_COMPRESSION_PCT", 0.70)
     min_composite_signal_score: float = _env_float("MIN_COMPOSITE_SIGNAL_SCORE", 0.20)
 
-    # ── Kelly cold-start ──────────────────────────────────────────────────
+    # â”€â”€ Kelly cold-start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     min_kelly_trades: int = _env_int("MIN_KELLY_TRADES", 20)
     cold_start_frac: float = _env_float("COLD_START_FRAC", 0.50)
     # Adaptive cold-start: halt new entries when rolling N-trade
@@ -399,38 +403,30 @@ class StrategyParams:
     cold_start_halt_window: int = _env_int("COLD_START_HALT_WINDOW", 10)
     cold_start_negative_ev_halt: bool = _env_bool("COLD_START_NEGATIVE_EV_HALT", True)
 
-    # ── Spread-based signal source ────────────────────────────────────────
+    # â”€â”€ Spread-based signal source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     spread_signal_enabled: bool = _env_bool("SPREAD_SIGNAL_ENABLED", True)
     spread_signal_cooldown_s: float = _env_float("SPREAD_SIGNAL_COOLDOWN_S", 30.0)
 
-    # ── Panic detector NO-discount gate ────────────────────────────────────
-    # NO best_ask must be ≤ no_vwap × no_discount_factor for panic to fire.
-    # Lower = stricter (0.98 means NO must be 2% below VWAP).
-    # Requires a genuine 2% discount before entry to ensure the
-    # contrarian edge exists.  Without this, entries at full VWAP
-    # have no mean-reversion cushion and bleed on fees + spread.
-    no_discount_factor: float = _env_float("NO_DISCOUNT_FACTOR", 0.995)
-
-    # ── EWMA volatility (RiskMetrics) ──────────────────────────────────────────
+    # â”€â”€ EWMA volatility (RiskMetrics) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Exponentially-weighted moving average of 1-min log-return variance.
     # Reacts to regime changes in ~6 bars vs ~30 for equal-weight std.
-    # λ = 0.94 is the RiskMetrics standard for daily data scaled to 1-min.
+    # Î» = 0.94 is the RiskMetrics standard for daily data scaled to 1-min.
     volatility_ewma_lambda: float = _env_float("VOLATILITY_EWMA_LAMBDA", 0.94)
 
-    # ── Regime-adaptive EQS threshold (OE-6) ─────────────────────────────────
-    # Scale min_edge_score by EWMA σ.  Low-vol → raise threshold
-    # (avoid noise), high-vol → lower threshold (mean-reversion α).
+    # â”€â”€ Regime-adaptive EQS threshold (OE-6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Scale min_edge_score by EWMA Ïƒ.  Low-vol â†’ raise threshold
+    # (avoid noise), high-vol â†’ lower threshold (mean-reversion Î±).
     eqs_vol_adaptive: bool = _env_bool("EQS_VOL_ADAPTIVE", False)
     # Recalibrated from 0.02 to 0.70 based on 3-day tick data analysis:
     # actual market EWMA vols have median 0.72 (P10=0.21, P75=1.22).
-    # At 0.02, the ratio was always 10-96x, jamming the ±25% adjuster
+    # At 0.02, the ratio was always 10-96x, jamming the Â±25% adjuster
     # permanently at -25%.  At 0.70, the feature is actually adaptive:
-    # quiet bars (σ<0.41) → threshold +25% (more selective),
-    # normal bars (σ≈0.72) → threshold ≈ baseline,
-    # active bars (σ>1.22) → threshold -25% (exploit mean-reversion).
-    eqs_vol_ref: float = _env_float("EQS_VOL_REF", 0.70)         # median 1-min σ from data
-    eqs_vol_scale_range: float = _env_float("EQS_VOL_SCALE_RANGE", 0.25)  # ±25% max adjustment
-    # ── Pillar 13: Kelly Sizing ───────────────────────────────────────────
+    # quiet bars (Ïƒ<0.41) â†’ threshold +25% (more selective),
+    # normal bars (Ïƒâ‰ˆ0.72) â†’ threshold â‰ˆ baseline,
+    # active bars (Ïƒ>1.22) â†’ threshold -25% (exploit mean-reversion).
+    eqs_vol_ref: float = _env_float("EQS_VOL_REF", 0.70)         # median 1-min Ïƒ from data
+    eqs_vol_scale_range: float = _env_float("EQS_VOL_SCALE_RANGE", 0.25)  # Â±25% max adjustment
+    # â”€â”€ Pillar 13: Kelly Sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     kelly_fraction: float = _env_float("KELLY_FRACTION", 0.25)
     kelly_max_pct: float = _env_float("KELLY_MAX_PCT", 10.0)
     kelly_p_cap: float = _env_float("KELLY_P_CAP", 0.85)                      # max win probability estimate
@@ -441,10 +437,10 @@ class StrategyParams:
     kelly_prior_win_rate: float = _env_float("KELLY_PRIOR_WIN_RATE", 0.55)
 
     # Decay factor for exponentially-weighted win rate.
-    # ŵ_t = α · 1[win_t] + (1-α) · ŵ_{t-1}.  α=0.10 → ~10-trade half-life.
+    # Åµ_t = Î± Â· 1[win_t] + (1-Î±) Â· Åµ_{t-1}.  Î±=0.10 â†’ ~10-trade half-life.
     kelly_wr_decay_alpha: float = _env_float("KELLY_WR_DECAY_ALPHA", 0.10)
 
-    # ── Uncertainty penalty weights for edge discounting ──────────────────
+    # â”€â”€ Uncertainty penalty weights for edge discounting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     uncertainty_spread_weight: float = _env_float("UNCERTAINTY_SPREAD_WEIGHT", 0.6)
     uncertainty_conf_weight: float = _env_float("UNCERTAINTY_CONF_WEIGHT", 0.4)
 
@@ -454,7 +450,7 @@ class StrategyParams:
     ghost_recovery_s: float = _env_float("GHOST_RECOVERY_S", 60.0)
     ghost_check_interval_ms: int = _env_int("GHOST_CHECK_INTERVAL_MS", 500)
 
-    # ── Vacuum / Stink Bid Strategy ────────────────────────────────────────
+    # â”€â”€ Vacuum / Stink Bid Strategy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # When ghost liquidity is detected, place POST_ONLY limit orders deeply
     # out-of-the-money on both sides of the book to catch flash-crash wicks.
     vacuum_stink_bid_enabled: bool = _env_bool("VACUUM_STINK_BID_ENABLED", True)
@@ -476,7 +472,7 @@ class StrategyParams:
     whale_cluster_lookback_blocks: int = _env_int("WHALE_CLUSTER_LOOKBACK_BLOCKS", 10000)
     whale_cluster_refresh_hours: float = _env_float("WHALE_CLUSTER_REFRESH_HOURS", 6.0)
 
-    # ── Pillar 11: Real-Time L2 Order Book ─────────────────────────────────
+    # â”€â”€ Pillar 11: Real-Time L2 Order Book â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     l2_enabled: bool = _env_bool("L2_ENABLED", True)
     l2_max_levels: int = _env_int("L2_MAX_LEVELS", 50)
     l2_snapshot_timeout_s: float = _env_float("L2_SNAPSHOT_TIMEOUT_S", 10.0)
@@ -484,13 +480,13 @@ class StrategyParams:
     l2_seq_gap_max_retries: int = _env_int("L2_SEQ_GAP_MAX_RETRIES", 3)
     l2_spread_score_top_n: int = _env_int("L2_SPREAD_SCORE_TOP_N", 3)
     # Maximum acceptable seq-gap rate for an L2 book.  Books that exceed
-    # this rate (after ≥50 deltas) are flagged unreliable and excluded
+    # this rate (after â‰¥50 deltas) are flagged unreliable and excluded
     # from signal evaluation until they stabilise.
     l2_max_seq_gap_rate: float = _env_float("L2_MAX_SEQ_GAP_RATE", 0.02)
 
-    # ── Pillar 14: Resolution Probability Engine (RPE) ─────────────────────
+    # â”€â”€ Pillar 14: Resolution Probability Engine (RPE) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #
-    # RPE_SHADOW_MODE (default False → live mode):
+    # RPE_SHADOW_MODE (default False â†’ live mode):
     #   When True, RPE signals are evaluated, logged, recorded in the
     #   calibration tracker, and sent to Telegram (prefixed "SHADOW"),
     #   but NO positions are opened.  Use this to collect calibration
@@ -505,7 +501,7 @@ class StrategyParams:
     # GenericBayesianModel uses a Beta(2,2)-derived prior that shrinks
     # every market toward 0.50.  This creates false divergence on any
     # market not priced at 0.50.  Disabled by default; enable ONLY after
-    # RPECalibrationTracker shows direction_accuracy > 55% on ≥30
+    # RPECalibrationTracker shows direction_accuracy > 55% on â‰¥30
     # resolved signals.
     rpe_generic_enabled: bool = _env_bool("RPE_GENERIC_ENABLED", False)
     rpe_crypto_retrigger_cents: float = _env_float("RPE_CRYPTO_RETRIGGER_CENTS", 500.0)
@@ -519,20 +515,12 @@ class StrategyParams:
     # independently.
     stale_market_eviction_s: float = _env_float("STALE_MARKET_EVICTION_S", 1800.0)
 
-    # ── V3: Low-volatility drift signal ───────────────────────────────────
-    # Captures slow-bleed mean-reversion in sideways markets where
-    # PanicDetector is silent.  Requires MR regime + low EWMA σ.
-    drift_signal_enabled: bool = _env_bool("DRIFT_SIGNAL_ENABLED", True)
-    drift_lookback_bars: int = _env_int("DRIFT_LOOKBACK_BARS", 10)
-    drift_z_threshold: float = _env_float("DRIFT_Z_THRESHOLD", 0.8)
-    drift_vol_ceiling: float = _env_float("DRIFT_VOL_CEILING", 0.35)
-    drift_cooldown_s: float = _env_float("DRIFT_COOLDOWN_S", 60.0)
     rpe_prior_k: float = _env_float("RPE_PRIOR_K", 4.0)
     rpe_min_eqs: float = _env_float("RPE_MIN_EQS", 25.0)
     rpe_tail_veto_threshold: float = _env_float("RPE_TAIL_VETO_THRESHOLD", 0.10)
 
-    # ── Dynamic Prior Generation Engine (RPE upgrade) ──────────────────────
-    # L2 order-book imbalance sensitivity — scales ln(book_depth_ratio)
+    # â”€â”€ Dynamic Prior Generation Engine (RPE upgrade) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # L2 order-book imbalance sensitivity â€” scales ln(book_depth_ratio)
     # into Beta pseudo-counts.  Higher = more responsive to book skew.
     rpe_l2_kappa: float = _env_float("RPE_L2_KAPPA", 1.5)
     # Time-decay sigmoid steepness (higher = sharper transition).
@@ -546,7 +534,7 @@ class StrategyParams:
     # Enable tag-based dynamic priors (vs fixed/market-anchored).
     rpe_dynamic_prior_enabled: bool = _env_bool("RPE_DYNAMIC_PRIOR_ENABLED", True)
 
-    # ── Pillar 15: Portfolio Correlation Engine (PCE) ───────────────────────
+    # â”€â”€ Pillar 15: Portfolio Correlation Engine (PCE) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pce_shadow_mode: bool = _env_bool("PCE_SHADOW_MODE", True)
     pce_max_portfolio_var_usd: float = _env_float("PCE_MAX_PORTFOLIO_VAR_USD", 50.0)
     pce_correlation_haircut_threshold: float = _env_float("PCE_CORRELATION_HAIRCUT_THRESHOLD", 0.50)
@@ -565,8 +553,8 @@ class StrategyParams:
     pce_near_extreme_overlap_multiplier: int = _env_int("PCE_NEAR_EXTREME_OVERLAP_MULTIPLIER", 3)
     pce_backtest_enabled: bool = _env_bool("PCE_BACKTEST_ENABLED", False)
 
-    # ── SI-1: Regime Detector ──────────────────────────────────────────────
-    # Per-market HMM-lite regime classifier.  Score ∈ [0,1] where
+    # â”€â”€ SI-1: Regime Detector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Per-market HMM-lite regime classifier.  Score âˆˆ [0,1] where
     # 1 = mean-reversion favourable.  Entries are suppressed when the
     # score drops below regime_threshold.
     regime_enabled: bool = _env_bool("REGIME_ENABLED", True)
@@ -575,7 +563,7 @@ class StrategyParams:
     regime_persistence_window: int = _env_int("REGIME_PERSISTENCE_WINDOW", 15)
     regime_threshold: float = _env_float("REGIME_THRESHOLD", 0.40)
 
-    # ── SI-2: Iceberg Detector ─────────────────────────────────────────────
+    # â”€â”€ SI-2: Iceberg Detector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Detects hidden reserve orders via repeated size replenishment at
     # persistent price levels in the L2 book.
     iceberg_enabled: bool = _env_bool("ICEBERG_ENABLED", True)
@@ -589,7 +577,7 @@ class StrategyParams:
     # Take-profit alpha adjustment when iceberg is detected.
     iceberg_tp_alpha: float = _env_float("ICEBERG_TP_ALPHA", 0.05)
 
-    # ── SI-3: Cross-Market Signal Generator ────────────────────────────────
+    # â”€â”€ SI-3: Cross-Market Signal Generator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Offensive pairs-style alpha from correlated market lag divergences.
     cross_mkt_enabled: bool = _env_bool("CROSS_MKT_ENABLED", True)
     cross_mkt_shadow: bool = _env_bool("CROSS_MKT_SHADOW", True)  # log-only until calibrated
@@ -597,7 +585,7 @@ class StrategyParams:
     cross_mkt_z_entry: float = _env_float("CROSS_MKT_Z_ENTRY", 2.0)
     cross_mkt_spread_ewma_lambda: float = _env_float("CROSS_MKT_SPREAD_EWMA_LAMBDA", 0.94)
 
-    # ── SI-4: Stealth Execution ────────────────────────────────────────────
+    # â”€â”€ SI-4: Stealth Execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Time-sliced order splitting to reduce market footprint.
     stealth_enabled: bool = _env_bool("STEALTH_ENABLED", True)
     stealth_min_size_usd: float = _env_float("STEALTH_MIN_SIZE_USD", 5.0)
@@ -612,18 +600,19 @@ class StrategyParams:
     # Abandonment: skip remaining slices if this fraction already filled.
     stealth_abandon_fill_pct: float = _env_float("STEALTH_ABANDON_FILL_PCT", 0.75)
 
-    # ── SI-8: Oracle Latency Arbitrage ─────────────────────────────────────
+    # â”€â”€ SI-8: Oracle Latency Arbitrage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Generalised off-chain oracle system.  Polls real-world APIs (election
-    # feeds, live sports) and triggers the SI-7 fast-strike taker path when
-    # the CLOB price diverges from the oracle-derived probability.
+    # feeds, live sports, news websockets) and triggers the SI-7 fast-strike
+    # taker path when the CLOB price diverges from the oracle-derived
+    # probability.  Activation is controlled by ORACLE_ARB_ENABLED.
     oracle_arb_enabled: bool = _env_bool("ORACLE_ARB_ENABLED", False)
     # Default polling interval (ms) for REST-based oracle adapters.
     oracle_default_poll_ms: int = _env_int("ORACLE_DEFAULT_POLL_MS", 1000)
-    # Critical-window polling interval (ms) — throttled during decisive moments.
+    # Critical-window polling interval (ms) â€” throttled during decisive moments.
     oracle_critical_poll_ms: int = _env_int("ORACLE_CRITICAL_POLL_MS", 200)
-    # Idle-period polling interval (ms) — relaxed during halftime / pre-event.
+    # Idle-period polling interval (ms) â€” relaxed during halftime / pre-event.
     oracle_idle_poll_ms: int = _env_int("ORACLE_IDLE_POLL_MS", 30000)
-    # Base divergence threshold (tighter than RPE's 0.08 — oracle signals
+    # Base divergence threshold (tighter than RPE's 0.08 â€” oracle signals
     # are high-conviction by nature).
     oracle_confidence_threshold: float = _env_float("ORACLE_CONFIDENCE_THRESHOLD", 0.06)
     # Minimum oracle confidence to fire a signal.  Higher bar than RPE's
@@ -637,7 +626,8 @@ class StrategyParams:
     # low liquidity.
     oracle_max_spread_cents: float = _env_float("ORACLE_MAX_SPREAD_CENTS", 15.0)
     # JSON-encoded list of oracle market bindings.  Each entry:
-    #   {"market_id": "...", "oracle_type": "ap_election"|"sports",
+    #   {"market_id": "...", "oracle_type": "ap_election"|"sports"
+    #    |"odds_api_ws"|"tree_news_ws",
     #    "oracle_params": {...}, "yes_asset_id": "...", "no_asset_id": "...",
     #    "event_id": "..."}
     oracle_market_configs: str = _env("ORACLE_MARKET_CONFIGS", "[]")
@@ -647,13 +637,19 @@ class StrategyParams:
     # Sports API credentials
     oracle_sports_api_key: str = _env("ORACLE_SPORTS_API_KEY")
     oracle_sports_api_url: str = _env("ORACLE_SPORTS_API_URL")
-    # Shadow mode — evaluate and log oracle signals without placing orders.
+    # Odds API WebSocket credentials
+    oracle_odds_api_ws_url: str = _env("ORACLE_ODDS_API_WS_URL", "")
+    oracle_odds_api_ws_key: str = _env("ORACLE_ODDS_API_WS_KEY", "")
+    # Tree News WebSocket credentials
+    oracle_tree_news_ws_url: str = _env("ORACLE_TREE_NEWS_WS_URL", "")
+    oracle_tree_news_ws_key: str = _env("ORACLE_TREE_NEWS_WS_KEY", "")
+    # Shadow mode â€” evaluate and log oracle signals without placing orders.
     # Enabled by default for safe rollout; disable to go live.
     oracle_shadow_mode: bool = _env_bool("ORACLE_SHADOW_MODE", True)
 
-    # ── SI-9: Mutually Exclusive Combinatorial Arbitrage ───────────────────
+    # â”€â”€ SI-9: Mutually Exclusive Combinatorial Arbitrage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Passive maker-only arbitrage across negRisk event clusters where
-    # sum(YES best_bids) < 1.0 - margin  ⇒  risk-free if all legs fill.
+    # sum(YES best_bids) < 1.0 - margin  â‡’  risk-free if all legs fill.
     si9_arb_enabled: bool = _env_bool("SI9_ARB_ENABLED", False)
     si9_min_margin_cents: float = _env_float("SI9_MIN_MARGIN_CENTS", 2.0)
     si9_margin_buffer_cents: float = _env_float("SI9_MARGIN_BUFFER_CENTS", 1.0)
@@ -700,11 +696,11 @@ class Settings:
     telegram_bot_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
     telegram_chat_id: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID"))
 
-    # ── Deployment phase (replaces simple paper_mode boolean) ──────────
+    # â”€â”€ Deployment phase (replaces simple paper_mode boolean) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     deployment_env: DeploymentEnv = field(
         default_factory=lambda: DeploymentEnv(_env("DEPLOYMENT_ENV", "PAPER"))
     )
-    # Derived — kept for backward compatibility with executor / poller
+    # Derived â€” kept for backward compatibility with executor / poller
     paper_mode: bool = field(init=False, default=True)
 
     # Data recording
@@ -767,7 +763,7 @@ class Settings:
     # Logging
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "logs"))
 
-    # ── Security: mask secrets in repr / str / logs ─────────────────────
+    # â”€â”€ Security: mask secrets in repr / str / logs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _SENSITIVE_PATTERN: re.Pattern = field(
         default=re.compile(r"(SECRET|KEY|PASSPHRASE|TOKEN)", re.IGNORECASE),
         repr=False,
@@ -812,3 +808,4 @@ class Settings:
 
 # Singleton
 settings = Settings()
+

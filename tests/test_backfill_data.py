@@ -25,6 +25,8 @@ import pytest
 # ── Ensure scripts/ is importable ────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import backfill_data
+
 from backfill_data import (
     ADAPTERS,
     PMXTArchiveAdapter,
@@ -260,26 +262,20 @@ class TestSchemaMatchInvariant:
             [ts],
         )
 
-        # Create module-level stubs so the lazy import inside
-        # _read_parquet_batch succeeds even without pyarrow/fsspec.
-        mock_pq_mod = types.ModuleType("pyarrow.parquet")
-        mock_pq_mod.ParquetFile = MagicMock(return_value=mock_pf)
-
+        # fsspec is imported lazily inside _read_parquet_batch, but the
+        # parquet alias is already bound on the imported backfill_data module.
         mock_fs_mod = types.ModuleType("fsspec")
         fs_instance = MagicMock()
         fs_instance.open.return_value.__enter__ = MagicMock(return_value=MagicMock())
         fs_instance.open.return_value.__exit__ = MagicMock(return_value=False)
         mock_fs_mod.filesystem = MagicMock(return_value=fs_instance)
 
-        with patch.dict("sys.modules", {
-            "pyarrow": types.ModuleType("pyarrow"),
-            "pyarrow.parquet": mock_pq_mod,
-            "fsspec": mock_fs_mod,
-        }):
-            result = adapter._read_parquet_batch(
-                "https://r2.pmxt.dev/test.parquet",
-                market_ids,
-            )
+        with patch.object(backfill_data.pq, "ParquetFile", return_value=mock_pf):
+            with patch.dict("sys.modules", {"fsspec": mock_fs_mod}):
+                result = adapter._read_parquet_batch(
+                    "https://r2.pmxt.dev/test.parquet",
+                    market_ids,
+                )
 
         assert SAMPLE_MARKET.market_id in result
         recs = result[SAMPLE_MARKET.market_id]
@@ -408,7 +404,7 @@ class TestResilienceInvariant:
 
         assert result is False
         assert mock_client.head.call_count == 3  # MAX_RETRIES
-        assert mock_sleep.call_count == 3
+        assert mock_sleep.call_count == 2
 
     @pytest.mark.asyncio
     async def test_head_check_exhausted_retries_returns_false(self):

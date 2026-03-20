@@ -729,6 +729,64 @@ class MatchingEngine:
 
         return stale
 
+    def simulate_order_fill(
+        self,
+        order_id: str,
+        size: float,
+        *,
+        price: float | None = None,
+        current_time: float,
+        is_maker: bool = True,
+    ) -> Fill | None:
+        """Force a simulated fill on an existing order.
+
+        Used by replay adapters when the historical book shows our resting
+        quote has been crossed even though no explicit trade print exists.
+        """
+        order = self._all_orders.get(order_id)
+        if order is None:
+            return None
+        if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            return None
+        if order.remaining <= 1e-9 or current_time < order.active_time:
+            return None
+
+        fill_qty = min(size, order.remaining)
+        if fill_qty <= 1e-9:
+            return None
+
+        fill_price = order.price if price is None else price
+        fee = 0.0 if is_maker else self._compute_fee(fill_price, fill_qty)
+        fill = Fill(
+            order_id=order.order_id,
+            price=fill_price,
+            size=fill_qty,
+            fee=fee,
+            timestamp=current_time,
+            is_maker=is_maker,
+            side=order.side,
+        )
+        order.fills.append(fill)
+        order.remaining -= fill_qty
+
+        if order.remaining <= 1e-9:
+            order.remaining = 0.0
+            order.status = OrderStatus.FILLED
+            self._pending.pop(order_id, None)
+            self._active_makers.pop(order_id, None)
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
+
+        log.debug(
+            "sim_order_force_filled",
+            order_id=order_id,
+            price=fill_price,
+            fill_qty=fill_qty,
+            remaining=order.remaining,
+            is_maker=is_maker,
+        )
+        return fill
+
     # ═══════════════════════════════════════════════════════════════════════
     #  Fee computation
     # ═══════════════════════════════════════════════════════════════════════
