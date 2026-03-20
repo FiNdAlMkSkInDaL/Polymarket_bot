@@ -1,6 +1,6 @@
 ================================================================================
   POLYMARKET HFT BOT — COMPLETE SYSTEM REFERENCE
-  Last updated: March 17, 2026
+  Last updated: March 18, 2026
 ================================================================================
 
 This document exhaustively describes the entire Polymarket Mean-Reversion
@@ -29,6 +29,7 @@ Table of Contents:
   18. Signal Intelligence (SI-1 through SI-9)
   19. Cross-Module Dependencies Graph
   20. Change History Evolution
+  21. March 18 SI-8 Crypto Addendum
 
 
 ================================================================================
@@ -2379,6 +2380,22 @@ SI-8 — GENERALISED ORACLE LATENCY ARBITRAGE (DISABLED BY DEFAULT):
       Event phases: pre_event (5s), in_progress (1s), critical (200ms),
         idle/halftime (30s), final (5s).
 
+    BinanceWebSocketAdapter — src/data/adapters/binance_adapter.py
+      Streams Binance aggTrade ticks from:
+        wss://stream.binance.com:9443/ws/<symbol>@aggTrade
+      Current implementation details (March 18):
+        - Adapter type/name: "crypto"
+        - Per-adapter ExceptionCircuitBreaker (5 errors / 60s)
+        - Reconnect loop with exponential backoff + jitter
+        - Threshold resolution mapping for OracleSignalEngine gate:
+            market_type == "threshold" → resolved_outcome computed from
+            live price vs goal_line (target_outcome/opposing outcome)
+        - Coalescing/throttle via _last_emit_time at
+            oracle_critical_poll_ms / 1000.0
+        - Snapshot metadata includes symbol, price, quantity,
+            event_time_ms, trade_time_ms, agg_trade_id, goal_line,
+            market_type
+
     OracleSignalEngine — src/signals/oracle_signal.py
       Converts OracleSnapshot → SignalResult.
       Gates (all must pass):
@@ -2424,6 +2441,23 @@ SI-8 — GENERALISED ORACLE LATENCY ARBITRAGE (DISABLED BY DEFAULT):
     oracle_ap_api_url         = ""     (AP Elections endpoint)
     oracle_sports_api_key     = ""     (sports data API key)
     oracle_sports_api_url     = ""     (sports data endpoint)
+
+  March 18 operational notes:
+    - Local .env legacy keys ORACLE_SPORTS_API_KEY and
+      ORACLE_SPORTS_API_URL were removed for SI-8 crypto migration.
+    - VPS run confirmed oracle adapter bootstrap for crypto:
+        oracle_adapter_spawned (oracle_type="crypto")
+        oracle_polling_loop_started (adapter_count=1)
+        binance_adapter_started (emit_interval_s=0.2)
+        binance_ws_connected
+    - During telemetry extraction, /home/botuser/polymarket-bot/logs/bot_console.log
+      was missing on VPS, so oracle_signal / fast_strike grep queries against that
+      file returned "No such file or directory".
+    - VPS shell environment did not expose plain `python`; commands requiring
+      Python must use python3 or /home/botuser/polymarket-bot/.venv/bin/python.
+    - Native grep/pipe commands issued from Windows PowerShell require careful
+      quoting; several failed attempts were caused by local shell parsing before
+      reaching VPS bash.
 
 SI-9 — MUTUALLY EXCLUSIVE COMBINATORIAL ARBITRAGE (DISABLED BY DEFAULT):
   Dutch Book arbitrage across negRisk (mutually exclusive) Polymarket markets.
@@ -2778,6 +2812,82 @@ March 16th — Paper Execution Forensic Remediation (Touch Fill + Duplicate Clos
         src/trading/position_manager.py
     * Integrity verified by local/remote SHA256 match for all three files.
     * Corrupted state purged:
+
+
+================================================================================
+SECTION 21: MARCH 18 SI-8 CRYPTO ADDENDUM
+================================================================================
+
+Scope:
+  This addendum records the SI-8 pivot from sports REST polling to Binance
+  WebSocket crypto oracle ingestion, plus VPS deployment/diagnostic outcomes.
+
+Code-level changes:
+  - Added: src/data/adapters/binance_adapter.py
+  - Updated: src/data/oracle_adapter.py registry create() path to route
+    oracle_type="crypto" to BinanceWebSocketAdapter.
+  - Added local validation script: scripts/test_binance_ws.py
+  - Local dry-run verified live BTCUSDT aggTrade ticks over 5 seconds.
+
+VPS deployment status:
+  - Updated files copied to VPS path /home/botuser/polymarket-bot/.
+  - .env set for PAPER + oracle path:
+      DEPLOYMENT_ENV=PAPER
+      ORACLE_ARB_ENABLED=True
+      ORACLE_SHADOW_MODE=False
+      ORACLE_CRITICAL_POLL_MS=200
+      ORACLE_MARKET_CONFIGS set to crypto threshold JSON
+  - Boot logs confirmed adapter and websocket connection:
+      oracle_adapter_spawned
+      oracle_polling_loop_started
+      binance_adapter_started (emit_interval_s=0.2)
+      binance_ws_connected
+
+Diagnostic caveats observed:
+  - bot_console.log did not exist on VPS during requested grep checks,
+    preventing direct extraction of oracle_signal / fast_strike lines from
+    that file path.
+  - Several command failures were operational (quoting/parsing) rather than
+    system logic failures; quoting was stabilized with uploaded bash scripts.
+  - `python` command not present in VPS shell PATH; use python3 or
+    .venv/bin/python for tooling commands.
+
+Current interpretation:
+  - SI-8 crypto adapter wiring and Binance stream connectivity are verified.
+  - Oracle signal-evaluation telemetry remains partially blocked by runtime log
+    path/availability mismatch (bot_console.log missing in queried location),
+    not by adapter connectivity.
+
+March 18th (later) - Ghost-State Forensics + Surgical Reset:
+  - Trigger condition observed:
+    * system_health.json kept reporting l2_total_deltas = 0 while oracle path
+      showed startup markers, indicating "oracle alive, market-data pipeline
+      stale" behavior.
+  - Surgical reset executed on VPS:
+      pkill -f "python -m src.cli run" ; pkill -f "l2_worker" ;
+      pkill -f "pce_worker" ; rm -rf /dev/shm/pmb_* ;
+      ipcs -m | grep botuser | awk '{print $2}' | xargs -r ipcrm -m
+  - Post-reset launch (DEBUG) executed via tmux:
+      tmux send-keys -t bot_prod "cd /home/botuser/polymarket-bot &&
+      export LOG_LEVEL=DEBUG && .venv/bin/python -m src.cli run --env PAPER
+      > logs/bot_fresh.log 2>&1" C-m
+  - Forensic markers after relaunch:
+    * lifecycle_bootstrap present:
+        {"active": 167, "observing": 33, "total_discovered": 200,
+         "event": "lifecycle_bootstrap", ...}
+    * binance_adapter_started present:
+        {"event": "binance_adapter_started", "symbol": "btcusdt", ...}
+    * l2_worker_started present:
+        {"event": "l2_worker_started", "n_assets": 50, ...}
+    * ORACLE_ARB_ENABLED verified in .env as True (not commented out).
+  - Key unresolved signal:
+    * system_health.json still reported l2_total_deltas = 0 after the 60-second
+      telemetry window.
+  - Operational diagnosis:
+    * Startup sequencing reached L2 worker and Binance adapter initialization,
+      but no L2 delta flow was ingested; this is consistent with a likely
+      network-level block/degradation on the Polymarket WebSocket path rather
+      than an SI-8 adapter wiring failure.
         pkill -f "python -m src.cli run"
         rm -f /dev/shm/pmb_*
         rm -f /home/botuser/polymarket-bot/logs/trades.db
