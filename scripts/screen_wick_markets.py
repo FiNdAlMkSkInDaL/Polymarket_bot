@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from pathlib import Path
 import shutil
 import time
 from dataclasses import dataclass
@@ -89,6 +90,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=20.0,
         help="HTTP timeout in seconds (default: 20).",
+    )
+    parser.add_argument(
+        "--export-json",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Write the top ranked Market ID strings to FILE as a JSON array for "
+            "automated config injection."
+        ),
     )
     return parser.parse_args()
 
@@ -297,6 +308,12 @@ def print_table(markets: list[RankedMarket], *, top_n: int) -> None:
     print(f"Ranked {len(markets):,} qualifying active markets; showing top {len(selected):,}.")
 
 
+def export_market_ids(markets: list[RankedMarket], *, top_n: int, output_path: Path) -> None:
+    selected_ids = [market.market_id for market in markets[:top_n]]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(selected_ids), encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     markets = fetch_active_markets(
@@ -310,6 +327,9 @@ def main() -> int:
         min_liquidity=args.min_liquidity,
     )
     print_table(ranked, top_n=args.top)
+    if args.export_json is not None:
+        export_market_ids(ranked, top_n=args.top, output_path=args.export_json)
+        print(f"Exported {min(args.top, len(ranked))} market IDs to {args.export_json}")
     return 0
 
 
