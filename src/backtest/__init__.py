@@ -28,7 +28,7 @@ from src.backtest.clock import SimClock
 from src.backtest.data_loader import DataLoader, MarketEvent
 from src.backtest.engine import BacktestConfig, BacktestEngine, BacktestResult
 from src.backtest.matching_engine import Fill, MatchingEngine, SimOrder
-from src.backtest.strategy import BotReplayAdapter, StrategyABC
+from src.backtest.strategy import BotReplayAdapter, PureMarketMakerReplayAdapter, StrategyABC
 from src.backtest.telemetry import Telemetry
 from src.backtest.wfo_optimizer import (
     FoldResult,
@@ -48,6 +48,7 @@ __all__ = [
     "FoldResult",
     "MarketEvent",
     "MatchingEngine",
+    "PureMarketMakerReplayAdapter",
     "SimClock",
     "SimOrder",
     "StrategyABC",

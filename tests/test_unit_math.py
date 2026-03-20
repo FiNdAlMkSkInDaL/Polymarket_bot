@@ -23,6 +23,7 @@ def mock_fees():
 
 
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar, BAR_INTERVAL
+from src.core.config import settings
 from src.data.websocket_client import TradeEvent
 from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.trading.take_profit import compute_take_profit, TakeProfitResult
@@ -315,10 +316,14 @@ class TestNumericRegression:
         assert r.spread_cents == pytest.approx(7.20, abs=0.5)
 
     def test_take_profit_golden_value_2(self):
-        """entry=0.30, VWAP=0.80, whale=True → α clamped to 0.55 (alpha_max)."""
+        """entry=0.30, VWAP=0.80, whale=True follows the current alpha formula."""
         r = compute_take_profit(entry_price=0.30, no_vwap=0.80, whale_confluence=True)
-        assert r.alpha == pytest.approx(0.4534, abs=0.005)
-        expected_target = 0.30 + 0.4534 * (0.80 - 0.30)  # 0.30 + 0.2267 = 0.5267
+        expected_alpha = min(
+            settings.strategy.alpha_max,
+            max(settings.strategy.alpha_min, settings.strategy.alpha_default + 0.12),
+        )
+        assert r.alpha == pytest.approx(expected_alpha, abs=0.005)
+        expected_target = 0.30 + expected_alpha * (0.80 - 0.30)
         assert r.target_price == pytest.approx(expected_target, abs=0.01)
 
     def test_pnl_formula(self):

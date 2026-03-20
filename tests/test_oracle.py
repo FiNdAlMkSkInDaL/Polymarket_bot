@@ -13,6 +13,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
 import os
 import time
 
@@ -30,7 +32,10 @@ from src.data.oracle_adapter import (
     OracleSnapshot,
 )
 from src.data.adapters.ap_election_adapter import APElectionAdapter
+from src.data.adapters.odds_api_websocket_adapter import OddsAPIWebSocketAdapter
 from src.data.adapters.sports_adapter import SportsAdapter
+from src.data.adapters.tree_news_websocket_adapter import TreeNewsWebSocketAdapter
+from src.data.adapters import websocket_adapter_base
 from src.signals.oracle_signal import OracleSignalEngine
 
 
@@ -126,9 +131,12 @@ class TestOracleAdapterRegistry:
 
     def test_registered_types(self):
         reg = OracleAdapterRegistry()
-        reg.register("ap_election", APElectionAdapter)
-        reg.register("sports", SportsAdapter)
-        assert sorted(reg.registered_types) == ["ap_election", "sports"]
+        assert sorted(reg.registered_types) == [
+            "ap_election",
+            "odds_api_ws",
+            "sports",
+            "tree_news_ws",
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -206,6 +214,110 @@ class TestOffChainOracleAdapter:
         adapter._running = True
         adapter.stop()
         assert not adapter._running
+
+
+class TestWebSocketOracleAdapterStart:
+
+    @pytest.mark.asyncio
+    async def test_start_streams_unique_snapshots_into_queue(self, monkeypatch):
+        payload_batches = [
+            [json.dumps({
+                "event": {
+                    "id": "evt-1",
+                    "status": "IN_PLAY",
+                    "minute": 20,
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "scores": [
+                        {"name": "Arsenal", "score": 1},
+                        {"name": "Chelsea", "score": 0},
+                    ],
+                },
+            })],
+            [json.dumps({
+                "event": {
+                    "id": "evt-1",
+                    "status": "FINISHED",
+                    "minute": 90,
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "scores": [
+                        {"name": "Arsenal", "score": 2},
+                        {"name": "Chelsea", "score": 0},
+                    ],
+                    "completed": True,
+                },
+            })],
+        ]
+
+        class FakeWebSocket:
+            def __init__(self, messages):
+                self._messages = list(messages)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._messages:
+                    return self._messages.pop(0)
+                raise StopAsyncIteration
+
+            async def send(self, payload):
+                return None
+
+            async def ping(self):
+                loop = asyncio.get_running_loop()
+                waiter = loop.create_future()
+                waiter.set_result(None)
+                return waiter
+
+        class FakeConnection:
+            def __init__(self, websocket):
+                self._websocket = websocket
+
+            async def __aenter__(self):
+                return self._websocket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        opened = []
+
+        def fake_connect(*args, **kwargs):
+            websocket = FakeWebSocket(payload_batches[len(opened)])
+            opened.append(websocket)
+            return FakeConnection(websocket)
+
+        monkeypatch.setattr(websocket_adapter_base.websockets, "connect", fake_connect)
+
+        adapter = OddsAPIWebSocketAdapter(
+            _mc(
+                oracle_type="odds_api_ws",
+                external_id="evt-1",
+                target_outcome="Arsenal",
+                market_type="winner",
+                oracle_params={},
+            ),
+            websocket_url="ws://example.test/feed",
+            reconnect_base_s=0.01,
+            reconnect_max_s=0.02,
+            heartbeat_interval_s=60.0,
+            heartbeat_timeout_s=60.0,
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def stop_after_two():
+            while queue.qsize() < 2:
+                await asyncio.sleep(0.01)
+            adapter.stop()
+
+        await asyncio.wait_for(asyncio.gather(adapter.start(queue), stop_after_two()), timeout=2.0)
+
+        first = queue.get_nowait()
+        second = queue.get_nowait()
+        assert first.event_phase == "in_progress"
+        assert second.event_phase == "final"
+        assert queue.empty()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -467,9 +579,17 @@ class TestAPElectionAdapter:
 class TestSportsAdapter:
 
     def _adapter(self, market_type="winner", **overrides):
-        params = {"match_id": "M1", "team": "Arsenal", "market_type": market_type}
-        params.update(overrides)
-        mc = _mc(oracle_type="sports", oracle_params=params)
+        if "team" in overrides:
+            overrides["target_outcome"] = overrides.pop("team")
+        defaults = {
+            "oracle_type": "sports",
+            "external_id": "M1",
+            "target_outcome": "Arsenal",
+            "market_type": market_type,
+            "goal_line": 2.5,
+        }
+        defaults.update(overrides)
+        mc = _mc(**defaults)
         return SportsAdapter(mc)
 
     def test_name(self):
@@ -690,7 +810,7 @@ class TestSportsAdapter:
 
     def test_interval_phases(self):
         adapter = self._adapter()
-        assert adapter._compute_interval("pre_event") == 5000
+        assert adapter._compute_interval("pre_event") == 200
         assert adapter._compute_interval("in_progress") == 1000
         assert adapter._compute_interval("critical") == 200
         assert adapter._compute_interval("idle") == 30000
@@ -698,10 +818,277 @@ class TestSportsAdapter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  WebSocket oracle adapter tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestOddsAPIWebSocketAdapter:
+
+    def _adapter(self, **overrides):
+        mc = _mc(
+            oracle_type="odds_api_ws",
+            external_id="evt-1",
+            target_outcome="Arsenal",
+            market_type="winner",
+            oracle_params={},
+            **overrides,
+        )
+        return OddsAPIWebSocketAdapter(mc, websocket_url="ws://127.0.0.1/test")
+
+    def test_parse_final_winner_snapshot(self):
+        adapter = self._adapter()
+        snap = adapter._build_snapshot({
+            "match": {
+                "status": "FINISHED",
+                "minute": 90,
+                "score": {"home": 2, "away": 0},
+                "homeTeam": {"name": "Arsenal"},
+                "awayTeam": {"name": "Chelsea"},
+                "events": [],
+            },
+        })
+        assert snap.resolved_outcome == "YES"
+        assert snap.confidence == 0.98
+        assert snap.event_phase == "final"
+
+    @pytest.mark.asyncio
+    async def test_stream_reconnects_after_disconnect(self, monkeypatch):
+        class FakeWebSocket:
+            def __init__(self, messages):
+                self._messages = list(messages)
+                self.sent = []
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._messages:
+                    return self._messages.pop(0)
+                raise StopAsyncIteration
+
+            async def send(self, payload):
+                self.sent.append(payload)
+
+            async def ping(self):
+                loop = asyncio.get_running_loop()
+                waiter = loop.create_future()
+                waiter.set_result(None)
+                return waiter
+
+        class FakeConnection:
+            def __init__(self, websocket):
+                self._websocket = websocket
+
+            async def __aenter__(self):
+                return self._websocket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        payload_batches = [
+            [json.dumps({
+                "event": {
+                    "id": "evt-1",
+                    "status": "IN_PLAY",
+                    "minute": 70,
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "scores": [
+                        {"name": "Arsenal", "score": 1},
+                        {"name": "Chelsea", "score": 0},
+                    ],
+                },
+            })],
+            [json.dumps({
+                "event": {
+                    "id": "evt-1",
+                    "status": "FINISHED",
+                    "minute": 90,
+                    "home_team": "Arsenal",
+                    "away_team": "Chelsea",
+                    "scores": [
+                        {"name": "Arsenal", "score": 2},
+                        {"name": "Chelsea", "score": 0},
+                    ],
+                    "completed": True,
+                },
+            })],
+        ]
+        opened = []
+
+        def fake_connect(*args, **kwargs):
+            websocket = FakeWebSocket(payload_batches[len(opened)])
+            opened.append((args, kwargs, websocket))
+            return FakeConnection(websocket)
+
+        monkeypatch.setattr(websocket_adapter_base.websockets, "connect", fake_connect)
+
+        adapter = OddsAPIWebSocketAdapter(
+            _mc(
+                oracle_type="odds_api_ws",
+                external_id="evt-1",
+                target_outcome="Arsenal",
+                market_type="winner",
+                oracle_params={},
+            ),
+            websocket_url="ws://example.test/feed",
+            reconnect_base_s=0.01,
+            reconnect_max_s=0.02,
+            heartbeat_interval_s=60.0,
+            heartbeat_timeout_s=60.0,
+        )
+
+        async def collect_snapshots():
+            snapshots = []
+            async for snapshot in adapter.stream_snapshots():
+                snapshots.append(snapshot)
+                if len(snapshots) == 2:
+                    adapter.stop()
+                    break
+            return snapshots
+
+        snapshots = await asyncio.wait_for(collect_snapshots(), timeout=2.0)
+
+        assert [snap.resolved_outcome for snap in snapshots] == ["YES", "YES"]
+        assert snapshots[0].event_phase == "in_progress"
+        assert snapshots[1].event_phase == "final"
+        assert len(opened) == 2
+
+
+class TestTreeNewsWebSocketAdapter:
+
+    def _adapter(self, **overrides):
+        mc = _mc(
+            oracle_type="tree_news_ws",
+            external_id="race-1",
+            target_outcome="Smith",
+            oracle_params={},
+            **overrides,
+        )
+        return TreeNewsWebSocketAdapter(mc, websocket_url="ws://127.0.0.1/test")
+
+    @pytest.mark.asyncio
+    async def test_parse_final_resolved_payload(self):
+        adapter = self._adapter()
+        snap = await adapter._payload_to_snapshot(None, {
+            "eventId": "race-1",
+            "status": "resolved",
+            "outcome": {
+                "label": "Smith",
+                "confidence": 0.98,
+            },
+            "verified": True,
+        })
+        assert snap is not None
+        assert snap.resolved_outcome == "YES"
+        assert snap.confidence == 0.98
+        assert snap.event_phase == "final"
+
+    @pytest.mark.asyncio
+    async def test_parse_breaking_negative_payload(self):
+        adapter = self._adapter()
+        snap = await adapter._payload_to_snapshot(None, {
+            "eventId": "race-1",
+            "status": "developing",
+            "urgency": "breaking",
+            "outcome": {
+                "label": "Jones",
+            },
+            "confidenceScore": 91,
+        })
+        assert snap is not None
+        assert snap.resolved_outcome == "NO"
+        assert snap.confidence == 0.91
+        assert snap.event_phase == "critical"
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_keepalive_snapshot_on_successful_pong(self, monkeypatch):
+        class FakeWebSocket:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+                raise StopAsyncIteration
+
+            async def send(self, payload):
+                return None
+
+            async def ping(self):
+                loop = asyncio.get_running_loop()
+                waiter = loop.create_future()
+                waiter.set_result(None)
+                return waiter
+
+        class FakeConnection:
+            def __init__(self, websocket):
+                self._websocket = websocket
+
+            async def __aenter__(self):
+                return self._websocket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        monkeypatch.setattr(
+            websocket_adapter_base.websockets,
+            "connect",
+            lambda *args, **kwargs: FakeConnection(FakeWebSocket()),
+        )
+
+        adapter = TreeNewsWebSocketAdapter(
+            _mc(
+                oracle_type="tree_news_ws",
+                external_id="",
+                target_outcome="YES",
+                oracle_params={},
+            ),
+            websocket_url="ws://example.test/feed",
+            reconnect_base_s=0.01,
+            reconnect_max_s=0.02,
+            heartbeat_interval_s=0.01,
+            heartbeat_timeout_s=0.5,
+        )
+
+        async def collect_first_snapshot():
+            async for snapshot in adapter.stream_snapshots():
+                adapter.stop()
+                return snapshot
+            return None
+
+        snapshot = await asyncio.wait_for(collect_first_snapshot(), timeout=1.0)
+
+        assert snapshot is not None
+        assert snapshot.raw_state == {"type": "keepalive", "transport": "pong"}
+        assert snapshot.resolved_outcome is None
+        assert snapshot.confidence == 0.0
+        assert snapshot.event_phase == "idle"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Config integration test
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestOracleConfig:
+
+    @staticmethod
+    def _reload_config(monkeypatch: pytest.MonkeyPatch, **env: str | None):
+        keys = {
+            "ORACLE_ARB_ENABLED",
+            "ORACLE_ODDS_API_WS_URL",
+            "ORACLE_ODDS_API_WS_KEY",
+            "ORACLE_TREE_NEWS_WS_URL",
+            "ORACLE_TREE_NEWS_WS_KEY",
+        }
+        keys.update(env.keys())
+        for key in keys:
+            monkeypatch.setenv(key, "")
+        for key, value in env.items():
+            if value is not None:
+                monkeypatch.setenv(key, value)
+
+        import src.core.config as config_module
+
+        return importlib.reload(config_module)
 
     def test_si8_config_fields_exist(self):
         from src.core.config import settings
@@ -719,11 +1106,15 @@ class TestOracleConfig:
         assert hasattr(strat, "oracle_ap_api_url")
         assert hasattr(strat, "oracle_sports_api_key")
         assert hasattr(strat, "oracle_sports_api_url")
+        assert hasattr(strat, "oracle_odds_api_ws_url")
+        assert hasattr(strat, "oracle_odds_api_ws_key")
+        assert hasattr(strat, "oracle_tree_news_ws_url")
+        assert hasattr(strat, "oracle_tree_news_ws_key")
         assert hasattr(strat, "oracle_shadow_mode")
 
-    def test_si8_defaults(self):
-        from src.core.config import settings
-        strat = settings.strategy
+    def test_si8_defaults(self, monkeypatch: pytest.MonkeyPatch):
+        config_module = self._reload_config(monkeypatch)
+        strat = config_module.StrategyParams()
         assert strat.oracle_arb_enabled is False
         assert strat.oracle_default_poll_ms == 1000
         assert strat.oracle_critical_poll_ms == 200
@@ -732,4 +1123,23 @@ class TestOracleConfig:
         assert strat.oracle_min_confidence == pytest.approx(0.80)
         assert strat.oracle_cooldown_seconds == 300
         assert strat.oracle_max_spread_cents == pytest.approx(15.0)
+        assert strat.oracle_odds_api_ws_url == ""
+        assert strat.oracle_odds_api_ws_key == ""
+        assert strat.oracle_tree_news_ws_url == ""
+        assert strat.oracle_tree_news_ws_key == ""
         assert strat.oracle_shadow_mode is True
+
+    def test_si8_tree_news_only_env_override(self, monkeypatch: pytest.MonkeyPatch):
+        config_module = self._reload_config(
+            monkeypatch,
+            ORACLE_ARB_ENABLED="true",
+            ORACLE_TREE_NEWS_WS_URL="wss://news.treeofalpha.com/ws",
+            ORACLE_TREE_NEWS_WS_KEY="tree-key",
+        )
+        strat = config_module.StrategyParams()
+
+        assert strat.oracle_arb_enabled is True
+        assert strat.oracle_tree_news_ws_url == "wss://news.treeofalpha.com/ws"
+        assert strat.oracle_tree_news_ws_key == "tree-key"
+        assert strat.oracle_odds_api_ws_url == ""
+        assert strat.oracle_odds_api_ws_key == ""

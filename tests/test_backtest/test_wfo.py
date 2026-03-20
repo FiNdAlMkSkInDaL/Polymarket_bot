@@ -18,11 +18,16 @@ import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from src.backtest.strategy import BotReplayAdapter
+from src.backtest.strategy import (
+    LEGACY_BACKTEST_SIGNAL_DEFAULTS,
+    BotReplayAdapter,
+    split_strategy_and_legacy_params,
+)
 from src.backtest.wfo_optimizer import (
     FoldResult,
     WfoConfig,
     WfoReport,
+    _suggest_params,
     _compute_stitched_metrics,
     _stitch_equity_curves,
     compute_wfo_score,
@@ -256,7 +261,7 @@ class TestWfoScore:
             sharpe_ratio=3.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=2, min_trades=5,
         )
-        assert score == -10.0
+        assert score == float("-inf")
 
     def test_exactly_min_trades_passes(self):
         """Exactly min_trades should pass the gate."""
@@ -272,7 +277,7 @@ class TestWfoScore:
             sharpe_ratio=0.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
             total_fills=0,
         )
-        assert score == -10.0
+        assert score == float("-inf")
 
     # ── Multi-metric composite tests ───────────────────────────────────
 
@@ -327,8 +332,8 @@ class TestWfoScore:
         score = compute_wfo_score(
             sharpe_ratio=2.0, max_drawdown=0.0, max_acceptable_drawdown=0.15,
         )
-        # With default min_trades=5 and total_fills=0, should be -10.0
-        assert score == -10.0
+        # With default min_trades=5 and total_fills=0, should be rejected.
+        assert score == float("-inf")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,20 +348,21 @@ class TestParameterInjection:
         adapter = BotReplayAdapter(
             market_id="MKT", yes_asset_id="YES", no_asset_id="NO"
         )
-        assert adapter._params.zscore_threshold == StrategyParams().zscore_threshold
         assert adapter._params.kelly_fraction == StrategyParams().kelly_fraction
+        assert adapter._legacy_signal_params == LEGACY_BACKTEST_SIGNAL_DEFAULTS
 
     def test_custom_params_used(self):
         """Injected StrategyParams override defaults."""
-        custom = StrategyParams(zscore_threshold=1.7, kelly_fraction=0.10)
+        custom = StrategyParams(kelly_fraction=0.10)
         adapter = BotReplayAdapter(
             market_id="MKT",
             yes_asset_id="YES",
             no_asset_id="NO",
             params=custom,
+            legacy_signal_params={"zscore_threshold": 1.7},
         )
-        assert adapter._params.zscore_threshold == 1.7
         assert adapter._params.kelly_fraction == 0.10
+        assert adapter._legacy_signal_params["zscore_threshold"] == 1.7
 
     def test_alpha_default_injected(self):
         """The target-price alpha should read from params."""
@@ -667,6 +673,7 @@ class TestSearchSpace:
         mock_trial.suggest_float = MagicMock(
             side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
         )
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         params = _suggest_params(mock_trial)
 
@@ -674,19 +681,22 @@ class TestSearchSpace:
             assert key in params, f"Missing parameter: {key}"
 
     def test_suggested_params_build_strategy_params(self):
-        """Suggested params can be passed to StrategyParams constructor."""
+        """Suggested params partition cleanly into live and legacy buckets."""
         from src.backtest.wfo_optimizer import _suggest_params
 
         mock_trial = MagicMock()
         mock_trial.suggest_float = MagicMock(
             side_effect=lambda name, lo, hi, **kwargs: (lo + hi) / 2
         )
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         params = _suggest_params(mock_trial)
-        sp = StrategyParams(**params)
+        strategy_params, legacy_params = split_strategy_and_legacy_params(params)
+        sp = StrategyParams(**strategy_params)
 
-        assert sp.zscore_threshold == (0.05 + 2.5) / 2
         assert sp.kelly_fraction == (0.03 + 0.40) / 2
+        assert sp.pure_mm_wide_tier_enabled is True
+        assert legacy_params["zscore_threshold"] == (0.2 + 2.5) / 2
 
     def test_expanded_search_space_has_new_params(self):
         """Search space includes the new parameters."""
@@ -699,9 +709,18 @@ class TestSearchSpace:
             "min_edge_score",
             "iceberg_eqs_bonus",
             "iceberg_tp_alpha",
+            "pure_mm_wide_tier_enabled",
+            "pure_mm_wide_spread_pct",
         ]
         for p in new_params:
             assert p in SEARCH_SPACE, f"Missing new param: {p}"
+
+    def test_pure_mm_bounds_are_hardened(self):
+        """Pure-MM sweep bounds should match the intended Monday grid."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        assert SEARCH_SPACE["pure_mm_wide_spread_pct"] == ("suggest_float", 0.05, 0.25)
+        assert SEARCH_SPACE["pure_mm_toxic_ofi_ratio"] == ("suggest_float", 0.60, 0.95)
 
     def test_log_scale_params_marked(self):
         """Certain params should use log-scale (4th element = True)."""
@@ -738,6 +757,7 @@ class TestSearchSpace:
 
         mock_trial = MagicMock()
         mock_trial.suggest_float = MagicMock(side_effect=mock_suggest)
+        mock_trial.suggest_categorical = MagicMock(side_effect=lambda name, choices: choices[0])
 
         _suggest_params(mock_trial)
 
@@ -850,6 +870,118 @@ class TestSingleFoldSmoke:
         assert len(folds) >= 1
         assert len(folds[0].train_dates) > 0
         assert len(folds[0].test_dates) > 0
+
+
+class TestPureMmWfoHooks:
+    def test_suggest_params_can_be_filtered(self):
+        class _Trial:
+            def suggest_float(self, name, low, high, log=False):
+                return (low + high) / 2.0
+
+            def suggest_int(self, name, low, high):
+                return low
+
+            def suggest_categorical(self, name, choices):
+                return choices[0]
+
+        params = _suggest_params(
+            _Trial(),
+            search_space_params=(
+                "pure_mm_wide_tier_enabled",
+                "pure_mm_wide_spread_pct",
+                "pure_mm_toxic_ofi_ratio",
+                "pure_mm_depth_evaporation_pct",
+            ),
+        )
+
+        assert set(params) == {
+            "pure_mm_wide_tier_enabled",
+            "pure_mm_wide_spread_pct",
+            "pure_mm_toxic_ofi_ratio",
+            "pure_mm_depth_evaporation_pct",
+        }
+        assert params["pure_mm_wide_tier_enabled"] is True
+
+    def test_run_single_backtest_with_pure_mm_adapter(self, tmp_path: Path):
+        from src.backtest.wfo_optimizer import _run_single_backtest
+
+        tick_dir = tmp_path / "raw_ticks" / "2026-01-15"
+        events = [
+            {
+                "local_ts": 1.0,
+                "source": "l2",
+                "asset_id": "NO",
+                "payload": {
+                    "event_type": "snapshot",
+                    "bids": [{"price": "0.40", "size": "20"}],
+                    "asks": [{"price": "0.42", "size": "20"}],
+                },
+            },
+            {
+                "local_ts": 2.0,
+                "source": "l2",
+                "asset_id": "NO",
+                "payload": {
+                    "event_type": "snapshot",
+                    "bids": [{"price": "0.39", "size": "20"}],
+                    "asks": [{"price": "0.40", "size": "20"}],
+                },
+            },
+        ]
+        _write_events(tick_dir / "NO.jsonl", events)
+
+        result = _run_single_backtest(
+            data_dir=str(tmp_path),
+            dates=["2026-01-15"],
+            param_overrides={
+                "pure_mm_toxic_ofi_ratio": 0.8,
+                "pure_mm_depth_evaporation_pct": 0.75,
+            },
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            initial_cash=1000.0,
+            latency_ms=0.0,
+            fee_max_pct=1.56,
+            fee_enabled=False,
+            strategy_adapter="pure_market_maker",
+        )
+
+        assert result is not None
+        assert result["total_fills"] >= 1
+
+    def test_run_single_backtest_with_pure_mm_adapter_requires_l2(self, tmp_path: Path):
+        from src.backtest.wfo_optimizer import _run_single_backtest
+
+        tick_dir = tmp_path / "raw_ticks" / "2026-01-15"
+        events = [
+            {
+                "local_ts": 1.0,
+                "source": "trade",
+                "asset_id": "NO",
+                "payload": {"price": "0.40", "size": "5", "side": "sell"},
+            }
+        ]
+        _write_events(tick_dir / "NO.jsonl", events)
+
+        result = _run_single_backtest(
+            data_dir=str(tmp_path),
+            dates=["2026-01-15"],
+            param_overrides={
+                "pure_mm_toxic_ofi_ratio": 0.8,
+                "pure_mm_depth_evaporation_pct": 0.75,
+            },
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            initial_cash=1000.0,
+            latency_ms=0.0,
+            fee_max_pct=1.56,
+            fee_enabled=False,
+            strategy_adapter="pure_market_maker",
+        )
+
+        assert result is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

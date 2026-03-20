@@ -135,7 +135,10 @@ class WhaleMonitor:
 
         # ── Adaptive polling via panic Z-score callback ────────────────────
         self._zscore_fn = zscore_fn
-        self._zscore_threshold = zscore_threshold or settings.strategy.zscore_threshold
+        self._zscore_threshold = (
+            zscore_threshold
+            or settings.strategy.whale_zscore_threshold
+        )
 
         # ── Wallet cluster detection (funded-from-same-CEX grouping) ───────
         self._clusters: dict[str, str] = {}  # wallet → cluster_id (funder)
