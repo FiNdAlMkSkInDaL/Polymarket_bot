@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
+import src.core.config as cfg
 from src.data.market_discovery import MarketInfo
 from src.strategies.pure_market_maker import PureMarketMaker
 from src.trading.executor import Order, OrderSide, OrderStatus
@@ -75,6 +76,13 @@ def _build_market() -> MarketInfo:
     )
 
 
+@pytest.fixture
+def restore_strategy_params():
+    original = cfg.settings.strategy
+    yield
+    object.__setattr__(cfg.settings, "strategy", original)
+
+
 @pytest.mark.asyncio
 async def test_pure_mm_places_bid_then_inventory_backed_ask():
     market = _build_market()
@@ -107,11 +115,22 @@ async def test_pure_mm_places_bid_then_inventory_backed_ask():
 
 
 @pytest.mark.asyncio
-async def test_pure_mm_cancels_quote_on_toxic_flow():
+async def test_pure_mm_places_tight_and_wide_quotes_at_expected_prices(restore_strategy_params):
     market = _build_market()
     tracker = _FakeTracker()
     l2_book = _FakeL2Book()
     executor = _FakeExecutor()
+
+    object.__setattr__(
+        cfg.settings,
+        "strategy",
+        cfg.StrategyParams(
+            pure_mm_inventory_cap_usd=1000.0,
+            pure_mm_wide_tier_enabled=True,
+            pure_mm_wide_spread_pct=0.15,
+            pure_mm_wide_size_usd=50.0,
+        ),
+    )
 
     mm = PureMarketMaker(
         executor=executor,
@@ -120,11 +139,50 @@ async def test_pure_mm_cancels_quote_on_toxic_flow():
         get_book_trackers=lambda: {market.no_token_id: tracker},
         get_l2_active_set=lambda: {market.condition_id},
     )
+    mm._inventory[market.no_token_id] = 200.0
 
     await mm._sync_quotes()
-    assert len(executor.orders) == 1
 
-    l2_book._against = executor.orders[0].size
+    assert len(executor.orders) == 4
+    placed = {(order.side, order.price): order.size for order in executor.orders}
+    assert placed[(OrderSide.BUY, 0.45)] == pytest.approx(11.11)
+    assert placed[(OrderSide.SELL, 0.46)] == pytest.approx(10.87)
+    assert placed[(OrderSide.BUY, 0.38)] == pytest.approx(111.11)
+    assert placed[(OrderSide.SELL, 0.53)] == pytest.approx(108.7)
+
+
+@pytest.mark.asyncio
+async def test_pure_mm_cancels_all_tiers_on_toxic_flow(restore_strategy_params):
+    market = _build_market()
+    tracker = _FakeTracker()
+    l2_book = _FakeL2Book()
+    executor = _FakeExecutor()
+
+    object.__setattr__(
+        cfg.settings,
+        "strategy",
+        cfg.StrategyParams(
+            pure_mm_inventory_cap_usd=1000.0,
+            pure_mm_wide_tier_enabled=True,
+            pure_mm_wide_spread_pct=0.15,
+            pure_mm_wide_size_usd=50.0,
+            pure_mm_toxic_ofi_ratio=0.5,
+        ),
+    )
+
+    mm = PureMarketMaker(
+        executor=executor,
+        get_active_markets=lambda: [market],
+        get_l2_books=lambda: {market.no_token_id: l2_book},
+        get_book_trackers=lambda: {market.no_token_id: tracker},
+        get_l2_active_set=lambda: {market.condition_id},
+    )
+    mm._inventory[market.no_token_id] = 200.0
+
+    await mm._sync_quotes()
+    assert len(executor.orders) == 4
+
+    l2_book._against = max(order.size for order in executor.orders)
     await mm._sync_quotes()
 
-    assert executor.cancelled == [executor.orders[0].order_id]
+    assert executor.cancelled == [order.order_id for order in executor.orders]
