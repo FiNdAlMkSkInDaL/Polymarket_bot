@@ -83,6 +83,29 @@ The backtest and walk-forward stack has pivoted with the live strategy.
 If you are evaluating the current live architecture, assume L2 data is a hard
 requirement rather than an optional enhancement.
 
+## Offline Tools
+
+`scripts/visualize_l2_wicks.py` is a standalone offline analysis tool for local
+tick captures. It reconstructs the Level 2 top of book from snapshot and delta
+events, plots best bid and best ask over time, overlays trades, and flags
+potential liquidity vacuums or wick trades where executions occur more than 5%
+away from the rolling 1-minute mid-price baseline.
+
+Use it when you want to visually inspect market microstructure, deep sweeps,
+and flash-move executions without running the live bot.
+
+Example usage:
+
+```bash
+python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id>
+python scripts/visualize_l2_wicks.py data/vps_march2026_parquet/2026-03-18 <market_id> --output wick_chart.png
+python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id> --wick-threshold-pct 5 --window-seconds 60 --show
+```
+
+The script accepts either raw `.jsonl` captures or prepared `.parquet` files.
+If the selected dataset contains only trade prints and no L2 snapshot or delta
+events, the visualizer exits early because book reconstruction is not possible.
+
 ## Testing
 
 ```bash
