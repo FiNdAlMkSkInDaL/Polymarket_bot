@@ -820,6 +820,7 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         self._wide_spread_pct = self._params.pure_mm_wide_spread_pct
         self._wide_size_usd = self._params.pure_mm_wide_size_usd
         self._inventory_cap_usd = self._params.pure_mm_inventory_cap_usd
+        self._inventory_penalty_coef = max(0.0, self._params.pure_mm_inventory_penalty_coef)
         self._toxic_ofi_ratio = self._params.pure_mm_toxic_ofi_ratio
         self._depth_window_s = self._params.pure_mm_depth_window_s
         self._depth_evaporation_pct = self._params.pure_mm_depth_evaporation_pct
@@ -1087,7 +1088,10 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         remaining_headroom_usd = self._inventory_cap_usd - inventory_value - reserved_buy_notional
         if remaining_headroom_usd <= 0:
             return 0.0
-        allocatable_usd = min(size_usd, remaining_headroom_usd)
+        penalty_scale = self._inventory_penalty_scale(inventory_value)
+        if penalty_scale <= 0:
+            return 0.0
+        allocatable_usd = min(size_usd * penalty_scale, remaining_headroom_usd)
         return self._normalise_size(allocatable_usd / best_bid, best_bid)
 
     def _quote_size_for_ask(
@@ -1132,6 +1136,12 @@ class PureMarketMakerReplayAdapter(StrategyABC):
         if remaining_headroom_usd <= 0:
             return 0.0
         return remaining_headroom_usd / book_price
+
+    def _inventory_penalty_scale(self, inventory_value: float) -> float:
+        if self._inventory_cap_usd <= 0:
+            return 0.0
+        fill_ratio = min(max(inventory_value / self._inventory_cap_usd, 0.0), 1.0)
+        return max(0.0, (1.0 - fill_ratio) ** self._inventory_penalty_coef)
 
     def _fillable_sell_size(self, order: "SimOrder") -> float:
         available_inventory = self._inventory - self._reserved_sell_shares(exclude_order_id=order.order_id)

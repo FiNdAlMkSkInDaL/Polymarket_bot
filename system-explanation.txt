@@ -1,6 +1,6 @@
 ===============================================================================
 POLYMARKET BOT - SYSTEM EXPLANATION
-Last updated: March 20, 2026
+Last updated: March 23, 2026
 ===============================================================================
 
 This repository is no longer a bar-driven directional trading bot.
@@ -13,13 +13,21 @@ agent should treat that as the primary architectural truth.
 1. CURRENT REALITY
 ===============================================================================
 
-The active production architecture has three live strategy families:
+The production codebase currently contains three strategy families:
 
 1. Pure Market Maker
 2. SI-9 Combinatorial Arbitrage
 3. Latency Arbitrage
    - SI-7 crypto fast-strike
    - SI-8 news/oracle fast-strike
+
+Current live paper deployment status:
+
+- SI-9 combinatorial arbitrage is LIVE in PAPER mode.
+- the pure market maker code path remains in the repo, but PURE_MM is
+  currently DISABLED on the Top 25 / high-volume target map
+- latency-arb infrastructure remains part of the active architecture, but the
+  major live paper focus today is SI-9 plus the hardened L2 stack
 
 The old directional stack is retired for live trading.
 
@@ -71,6 +79,9 @@ The system load-sheds aggressively:
 - those tracked markets are selected by volume and reconciled on refresh so the
   bot does not silently grow back to a 100+ market event-loop workload
 - full L2 reconstruction runs only on the top tracked markets inside that cap
+- operationally, the target map should be kept strictly below 25 markets when
+  SI-9 is active; the current posture is a sub-25 effective cap to preserve L2
+  WebSocket stability and avoid packet drops during live paper trading
 
 Current operator workflow for that universe cap:
 
@@ -93,6 +104,10 @@ Current operator workflow for that universe cap:
 - its JSON export preserves per-leg conditionId hex strings for each cluster so
   SI-9 downstream consumers stay keyed to CLOB-compatible identifiers rather
   than Gamma numeric market ids
+- during Gamma discovery, ONE_MARKET_PER_EVENT is dynamically disabled whenever
+  SI-9 is enabled so all negRisk legs for an event remain available for cluster
+  formation; keeping one-market-per-event on would collapse each event to a
+  single leg and prevent downstream SI-9 cluster construction
 
 L2 processing is first-class infrastructure, not an optional add-on.
 Worker processes can reconstruct books off the main asyncio loop and publish
@@ -184,7 +199,19 @@ Current latency telemetry workflow:
 4. ACTIVE STRATEGY 1 - PURE MARKET MAKER
 ===============================================================================
 
-This is the primary live engine.
+This is no longer the active top-of-book live paper strategy.
+
+Current live status:
+
+- the pure market maker implementation remains maintained in the repo, but
+  PURE_MM is currently DISABLED for the Top 25 / high-volume market set
+- that disablement is deliberate, not accidental
+- the quantitative reason is recent out-of-sample WFO failure on the high-
+  volume universe: OOS Sharpe = -79.5565, which confirmed those books are
+  highly toxic for passive quoting and showed adverse selection even on spreads
+  up to roughly 4.5%
+- until that toxicity regime is solved, pure MM should not be treated as the
+  active live deployment path for the current target map
 
 What it does:
 
@@ -231,7 +258,8 @@ before informed flow runs through the quote.
 5. ACTIVE STRATEGY 2 - SI-9 COMBINATORIAL ARBITRAGE
 ===============================================================================
 
-SI-9 is a maker-first state machine for mutually exclusive market clusters.
+SI-9 is a maker-first state machine for mutually exclusive market clusters and
+is currently LIVE in PAPER mode.
 
 When a Polymarket event exposes a set of mutually exclusive outcomes and the
 cluster is marked negRisk-compatible, the bot checks whether the combined YES
@@ -249,6 +277,16 @@ Current live design:
 - that bottleneck leg is worked passively first
 - the remaining legs are routed after the maker-first state machine confirms
   the opportunity can be completed defensibly
+- Gamma discovery dynamically disables ONE_MARKET_PER_EVENT while SI-9 is
+  active so every negRisk leg survives bootstrap and cluster formation
+
+Current guardrails added on March 23, 2026:
+
+- minimum sum of YES best bids across the cluster: Σ bids must be at least 0.85
+- maximum apparent gross edge: edge dollars must be at most 0.15
+- guardrail rejection logging is throttled per event so the bot logs the first
+  rejection immediately, then only re-logs after 1 hour or when Σ bids moves by
+  more than 5 percentage points
 
 This is not a generic stat-arb module. It is a routing-aware execution system
 for Dutch-book style mispricings in mutually exclusive Polymarket structures.
@@ -367,8 +405,10 @@ event families over the course of normal operation.
 8. BACKTEST AND WFO PIVOT
 ===============================================================================
 
-Walk-Forward Optimization has been realigned around the new pure market maker
-architecture.
+Walk-Forward Optimization has been realigned around the pure market maker replay
+path, but the most important current conclusion is operational rather than
+optimistic: pure MM is not deployable on the current Top 25 / high-volume live
+universe.
 
 Important facts:
 
@@ -392,6 +432,15 @@ Current enforced behavior:
 This is deliberate. A fake pure-MM backtest on trade-only data is worse than
 no backtest because it produces parameter outputs that look scientific but do
 not reflect the live execution problem.
+
+Current deployment conclusion from recent OOS work:
+
+- the latest pure-MM out-of-sample WFO artifact for the high-volume universe
+  recorded OOS Sharpe = -79.5565
+- that result is treated as proof that the current Top 25 / high-volume books
+  are too toxic for live pure-MM deployment right now
+- for the current live paper posture, PURE_MM should remain disabled on that
+  target set until a materially different quoting/risk design is validated
 
 If you want valid pure market maker backtests, your dataset must contain:
 
@@ -507,14 +556,19 @@ Operational implication:
 If you are an AI agent reading this file later, start with these assumptions:
 
 - the bot is an HFT pure market maker and latency arbitrage engine
+- the current live paper deployment is centered on SI-9, with SI-9 LIVE in
+  PAPER mode and PURE_MM disabled on the Top 25 / high-volume target map
 - L2 data is a hard dependency for understanding live behavior
 - the VPS paper deployment is expected to run under systemd, not nohup
-- the live tracked universe is intentionally capped at 25 markets unless that
-  operating assumption is explicitly changed
+- the tracked universe must stay below 25 markets in practice to preserve L2
+  WebSocket stability and avoid packet loss; do not casually widen the target
+  map beyond that operating constraint
 - the offline market screener for wick-catching exports conditionId hex strings,
   not Gamma numeric ids, when generating machine-readable universe files
 - the offline SI-9 cluster screener also exports CLOB-compatible conditionId
   hex strings per leg, not Gamma numeric ids
+- Gamma discovery disables one-market-per-event deduplication whenever SI-9 is
+  enabled so cluster legs are not destroyed during bootstrap
 - the pure-MM WFO surface visualizer is an offline standalone script and is
   not part of the live trading engine or replay execution path
 - if interactive inspection is requested, the expected artifact is a standalone

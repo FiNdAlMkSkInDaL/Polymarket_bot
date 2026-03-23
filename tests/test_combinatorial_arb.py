@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import src.signals.combinatorial_arb as combinatorial_arb
+
 from src.data.arb_clusters import ArbCluster
 from src.data.market_discovery import MarketInfo
 from src.data.orderbook import OrderbookTracker
@@ -103,3 +105,124 @@ def test_combo_arb_detector_prefers_thinnest_leg_when_spreads_tie():
     )
     assert signal.maker_leg.bid_depth_usd < min(leg.bid_depth_usd for leg in signal.taker_legs)
     assert all(leg.target_shares == signal.target_shares for leg in signal.taker_legs)
+
+
+def test_combo_arb_detector_rejects_absurd_edge_on_dead_books():
+
+    books = {
+        "YES_A": _book(0.28, 0.32, 400.0, 200.0),
+        "YES_B": _book(0.27, 0.31, 500.0, 200.0),
+        "YES_C": _book(0.29, 0.33, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    signal = detector.evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is None
+
+
+def test_combo_arb_detector_allows_boundary_sum_bids_at_eighty_five_percent():
+
+    books = {
+        "YES_A": _book(0.28, 0.32, 400.0, 200.0),
+        "YES_B": _book(0.28, 0.31, 500.0, 200.0),
+        "YES_C": _book(0.29, 0.33, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    signal = detector.evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is not None
+    assert signal.sum_best_bids == 0.85
+    assert signal.edge_cents == 13.0
+
+
+def test_combo_arb_guardrail_logs_only_once_within_throttle_window(monkeypatch):
+
+    books = {
+        "YES_A": _book(0.28, 0.32, 400.0, 200.0),
+        "YES_B": _book(0.27, 0.31, 500.0, 200.0),
+        "YES_C": _book(0.29, 0.33, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    log_calls: list[tuple[str, dict[str, object]]] = []
+    timestamps = iter([1000.0, 1010.0, 1020.0])
+
+    monkeypatch.setattr(combinatorial_arb.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(
+        combinatorial_arb.log,
+        "info",
+        lambda event, **kwargs: log_calls.append((event, kwargs)),
+    )
+
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+    assert [event for event, _ in log_calls] == ["combo_arb_guardrail_rejected"]
+
+
+def test_combo_arb_guardrail_logs_again_when_sum_bids_moves_by_more_than_five_points(monkeypatch):
+
+    books = {
+        "YES_A": _book(0.28, 0.32, 400.0, 200.0),
+        "YES_B": _book(0.27, 0.31, 500.0, 200.0),
+        "YES_C": _book(0.29, 0.33, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    log_calls: list[tuple[str, dict[str, object]]] = []
+    timestamps = iter([1000.0, 1005.0, 1010.0, 1015.0])
+
+    monkeypatch.setattr(combinatorial_arb.time, "time", lambda: next(timestamps))
+    monkeypatch.setattr(
+        combinatorial_arb.log,
+        "info",
+        lambda event, **kwargs: log_calls.append((event, kwargs)),
+    )
+
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+    books["YES_A"].on_book_snapshot(
+        {
+            "bids": [{"price": "0.22", "size": "400.0"}],
+            "asks": [{"price": "0.32", "size": "200.0"}],
+            "timestamp": 2,
+        }
+    )
+
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+    assert [event for event, _ in log_calls] == [
+        "combo_arb_guardrail_rejected",
+        "combo_arb_guardrail_rejected",
+    ]

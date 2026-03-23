@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,19 @@ DEFAULT_TRIALS_PATH = DEFAULT_REPORT_DIR / "wfo_trials.json"
 TARGET_PARAMS = (
     "pure_mm_wide_tier_enabled",
     "pure_mm_wide_spread_pct",
+    "pure_mm_inventory_penalty_coef",
     "pure_mm_toxic_ofi_ratio",
     "pure_mm_depth_evaporation_pct",
 )
+
+
+def _safe_print(text: str) -> None:
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        sys.stdout.buffer.write(text.encode(encoding, errors="replace") + b"\n")
+        sys.stdout.flush()
 
 
 def _risk_adjusted_ratio(total_pnl: float, max_drawdown: float) -> float:
@@ -142,11 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     trial_export_path.write_text(json.dumps(trials_payload, indent=2), encoding="utf-8")
 
     best_ratio = payload["best_return_drawdown"]
-    print(report.summary())
-    print("Best return/drawdown candidate:")
-    print(json.dumps(best_ratio, indent=2))
-    print(f"WFO report written to {report_path}")
-    print(f"WFO trial export written to {trial_export_path}")
+    _safe_print(report.summary())
+    _safe_print("Best return/drawdown candidate:")
+    _safe_print(json.dumps(best_ratio, indent=2))
+    _safe_print(f"WFO report written to {report_path}")
+    _safe_print(f"WFO trial export written to {trial_export_path}")
     return 0
 
 

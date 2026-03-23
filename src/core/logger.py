@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import logging
 import logging.handlers
+import os
 import queue
 import sys
 from pathlib import Path
@@ -34,18 +35,22 @@ def setup_logging(
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # Rotating file handler — 10 MB per file, 5 backups
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_path / log_file,
-        encoding="utf-8",
-        maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=5,
-    )
-    file_handler.setLevel(level)
-
     # Stdout handler
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(level)
+
+    listener_handlers: list[logging.Handler] = [stream_handler]
+
+    if os.getenv("BOT_DISABLE_FILE_LOGGING", "").lower() not in {"1", "true", "yes", "on"}:
+        # Rotating file handler — 10 MB per file, 5 backups
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_path / log_file,
+            encoding="utf-8",
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+        )
+        file_handler.setLevel(level)
+        listener_handlers.insert(0, file_handler)
 
     # Offload all handler I/O to a background thread via QueueHandler.
     # This guarantees log calls never block the asyncio event loop.
@@ -53,7 +58,7 @@ def setup_logging(
     queue_handler = logging.handlers.QueueHandler(log_queue)
 
     _LISTENER = logging.handlers.QueueListener(
-        log_queue, file_handler, stream_handler, respect_handler_level=True,
+        log_queue, *listener_handlers, respect_handler_level=True,
     )
     _LISTENER.start()
     atexit.register(_LISTENER.stop)

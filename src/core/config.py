@@ -215,6 +215,7 @@ class StrategyParams:
     pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
     pure_mm_quote_size_usd: float = _env_float("PURE_MM_QUOTE_SIZE_USD", 5.0)
     pure_mm_inventory_cap_usd: float = _env_float("PURE_MM_INVENTORY_CAP_USD", 15.0)
+    pure_mm_inventory_penalty_coef: float = _env_float("PURE_MM_INVENTORY_PENALTY_COEF", 4.0)
     pure_mm_loop_ms: int = _env_int("PURE_MM_LOOP_MS", 250)
     pure_mm_wide_tier_enabled: bool = _env_bool("PURE_MM_WIDE_TIER_ENABLED", False)
     pure_mm_wide_spread_pct: float = _env_float("PURE_MM_WIDE_SPREAD_PCT", 0.15)

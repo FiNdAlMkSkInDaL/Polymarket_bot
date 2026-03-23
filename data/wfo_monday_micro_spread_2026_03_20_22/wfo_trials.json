@@ -1,0 +1,4370 @@
+[
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 0,
+    "objective": -110.4554243019657,
+    "score": -110.4554243019657,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006412146417251125,
+      "pure_mm_toxic_ofi_ratio": 0.556493425871611,
+      "pure_mm_depth_evaporation_pct": 0.2802858525835559
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 1,
+    "objective": -110.2092475306847,
+    "score": -110.2092475306847,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.002801418535530292,
+      "pure_mm_toxic_ofi_ratio": 0.611563903148327,
+      "pure_mm_depth_evaporation_pct": 0.7997148882121476
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 2,
+    "objective": -110.47519916785734,
+    "score": -110.47519916785734,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006463787726991102,
+      "pure_mm_toxic_ofi_ratio": 0.5076099296652232,
+      "pure_mm_depth_evaporation_pct": 0.5192070512247815
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 3,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.004234694329425743,
+      "pure_mm_toxic_ofi_ratio": 0.7155721183568543,
+      "pure_mm_depth_evaporation_pct": 0.5752234520376758
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 4,
+    "objective": -109.79225493052846,
+    "score": -109.79225493052846,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005220670790896785,
+      "pure_mm_toxic_ofi_ratio": 0.8870864584366158,
+      "pure_mm_depth_evaporation_pct": 0.2366846437320803
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 5,
+    "objective": -110.3497877942314,
+    "score": -110.3497877942314,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005767737565846886,
+      "pure_mm_toxic_ofi_ratio": 0.8312482837802488,
+      "pure_mm_depth_evaporation_pct": 0.24064154561571183
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 6,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008986585902474756,
+      "pure_mm_toxic_ofi_ratio": 0.8645515850070838,
+      "pure_mm_depth_evaporation_pct": 0.7788285460405462
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 7,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006570563617045266,
+      "pure_mm_toxic_ofi_ratio": 0.8876377466938877,
+      "pure_mm_depth_evaporation_pct": 0.6366703981757991
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 8,
+    "objective": -110.36162191197846,
+    "score": -110.36162191197846,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007389745599344421,
+      "pure_mm_toxic_ofi_ratio": 0.5914544430660156,
+      "pure_mm_depth_evaporation_pct": 0.43942619335370053
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 9,
+    "objective": -110.3497877942314,
+    "score": -110.3497877942314,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008773110965717958,
+      "pure_mm_toxic_ofi_ratio": 0.6577961904712664,
+      "pure_mm_depth_evaporation_pct": 0.2242810916860223
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 10,
+    "objective": -110.38158347916925,
+    "score": -110.38158347916925,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0030643832822477967,
+      "pure_mm_toxic_ofi_ratio": 0.6918885852487857,
+      "pure_mm_depth_evaporation_pct": 0.46005817768425117
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 11,
+    "objective": -110.47519916785734,
+    "score": -110.47519916785734,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007154929468266754,
+      "pure_mm_toxic_ofi_ratio": 0.5104039121231657,
+      "pure_mm_depth_evaporation_pct": 0.5497074294010904
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 12,
+    "objective": -110.38158347916925,
+    "score": -110.38158347916925,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009311348784778059,
+      "pure_mm_toxic_ofi_ratio": 0.7190847358948205,
+      "pure_mm_depth_evaporation_pct": 0.3168814665163569
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 13,
+    "objective": -110.3497877942314,
+    "score": -110.3497877942314,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005569584144122812,
+      "pure_mm_toxic_ofi_ratio": 0.6793398268915785,
+      "pure_mm_depth_evaporation_pct": 0.2551442233238465
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 14,
+    "objective": -110.3497877942314,
+    "score": -110.3497877942314,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.004804741128458872,
+      "pure_mm_toxic_ofi_ratio": 0.6993719534945075,
+      "pure_mm_depth_evaporation_pct": 0.21723355041550851
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 15,
+    "objective": -109.822932365401,
+    "score": -109.822932365401,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0034553314398703275,
+      "pure_mm_toxic_ofi_ratio": 0.8885513762127905,
+      "pure_mm_depth_evaporation_pct": 0.3634959029677181
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 16,
+    "objective": -110.2092475306847,
+    "score": -110.2092475306847,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00942935016920821,
+      "pure_mm_toxic_ofi_ratio": 0.5991912825345823,
+      "pure_mm_depth_evaporation_pct": 0.7271725582798669
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 17,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009919076381617034,
+      "pure_mm_toxic_ofi_ratio": 0.790749020902472,
+      "pure_mm_depth_evaporation_pct": 0.7931871113417781
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 18,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00960041204106965,
+      "pure_mm_toxic_ofi_ratio": 0.9381697142788018,
+      "pure_mm_depth_evaporation_pct": 0.7722076931536
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 19,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007846297544670353,
+      "pure_mm_toxic_ofi_ratio": 0.9495746819533943,
+      "pure_mm_depth_evaporation_pct": 0.767889370952936
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 20,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0011860375493004229,
+      "pure_mm_toxic_ofi_ratio": 0.8199627088781367,
+      "pure_mm_depth_evaporation_pct": 0.7728809030414671
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 21,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0011896931678939291,
+      "pure_mm_toxic_ofi_ratio": 0.7998892125628089,
+      "pure_mm_depth_evaporation_pct": 0.7442491551716165
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 22,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0012645868819950714,
+      "pure_mm_toxic_ofi_ratio": 0.8017469332375098,
+      "pure_mm_depth_evaporation_pct": 0.7306228567041582
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 23,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0014127977913205069,
+      "pure_mm_toxic_ofi_ratio": 0.8094843961580397,
+      "pure_mm_depth_evaporation_pct": 0.7168903951051487
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 24,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0010433917938050463,
+      "pure_mm_toxic_ofi_ratio": 0.9430160205518654,
+      "pure_mm_depth_evaporation_pct": 0.6788908746647637
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 25,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0013553562167163032,
+      "pure_mm_toxic_ofi_ratio": 0.926944972837793,
+      "pure_mm_depth_evaporation_pct": 0.6538424185172322
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 26,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008372283119671777,
+      "pure_mm_toxic_ofi_ratio": 0.7810375469660109,
+      "pure_mm_depth_evaporation_pct": 0.657633588846547
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 27,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008400871445197905,
+      "pure_mm_toxic_ofi_ratio": 0.793125933880295,
+      "pure_mm_depth_evaporation_pct": 0.6538833188841374
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 28,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008104072023390913,
+      "pure_mm_toxic_ofi_ratio": 0.9472490511511488,
+      "pure_mm_depth_evaporation_pct": 0.6662549248988161
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 29,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008608109710763085,
+      "pure_mm_toxic_ofi_ratio": 0.9355297498506218,
+      "pure_mm_depth_evaporation_pct": 0.6640120200703795
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 30,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008410283586812785,
+      "pure_mm_toxic_ofi_ratio": 0.9461655993336245,
+      "pure_mm_depth_evaporation_pct": 0.6737824279182261
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 31,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008357832205425174,
+      "pure_mm_toxic_ofi_ratio": 0.9490001471822815,
+      "pure_mm_depth_evaporation_pct": 0.6497473274725956
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 32,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008227953048056083,
+      "pure_mm_toxic_ofi_ratio": 0.8997699049189926,
+      "pure_mm_depth_evaporation_pct": 0.6263453909059177
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 33,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008276882860499185,
+      "pure_mm_toxic_ofi_ratio": 0.8703374378367664,
+      "pure_mm_depth_evaporation_pct": 0.6314669977235784
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 34,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008234959077284498,
+      "pure_mm_toxic_ofi_ratio": 0.8661018523019742,
+      "pure_mm_depth_evaporation_pct": 0.6032303117442466
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 35,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009921826840370108,
+      "pure_mm_toxic_ofi_ratio": 0.8649930195733728,
+      "pure_mm_depth_evaporation_pct": 0.599471249036763
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 36,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0065862306894916385,
+      "pure_mm_toxic_ofi_ratio": 0.8680663499705589,
+      "pure_mm_depth_evaporation_pct": 0.5958219884024512
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 37,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006545532409979479,
+      "pure_mm_toxic_ofi_ratio": 0.8629697189537453,
+      "pure_mm_depth_evaporation_pct": 0.6165883580277676
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 38,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007415140673055303,
+      "pure_mm_toxic_ofi_ratio": 0.8875885087043888,
+      "pure_mm_depth_evaporation_pct": 0.6181461311776648
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 39,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00733961906559654,
+      "pure_mm_toxic_ofi_ratio": 0.886287985364282,
+      "pure_mm_depth_evaporation_pct": 0.604360800070677
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 40,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0072845638582841096,
+      "pure_mm_toxic_ofi_ratio": 0.8668543624079282,
+      "pure_mm_depth_evaporation_pct": 0.7610853854021371
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 41,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007391869590957373,
+      "pure_mm_toxic_ofi_ratio": 0.8583351330738346,
+      "pure_mm_depth_evaporation_pct": 0.7559568830351197
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 42,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007472572965736131,
+      "pure_mm_toxic_ofi_ratio": 0.9050569174779183,
+      "pure_mm_depth_evaporation_pct": 0.7624155210954985
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 43,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006572582952756322,
+      "pure_mm_toxic_ofi_ratio": 0.9035848533040526,
+      "pure_mm_depth_evaporation_pct": 0.7710643114375322
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 44,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007406966397388494,
+      "pure_mm_toxic_ofi_ratio": 0.9017359856787835,
+      "pure_mm_depth_evaporation_pct": 0.766531460578219
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 45,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006187639913885986,
+      "pure_mm_toxic_ofi_ratio": 0.9142218250502742,
+      "pure_mm_depth_evaporation_pct": 0.7655715337086019
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 46,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007677135655602671,
+      "pure_mm_toxic_ofi_ratio": 0.912117557861942,
+      "pure_mm_depth_evaporation_pct": 0.7720984326022051
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 47,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006057352092559563,
+      "pure_mm_toxic_ofi_ratio": 0.7585069927596438,
+      "pure_mm_depth_evaporation_pct": 0.7648666029853949
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 48,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00924268372454639,
+      "pure_mm_toxic_ofi_ratio": 0.9215321817775652,
+      "pure_mm_depth_evaporation_pct": 0.7119921892465852
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 49,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009548523505605247,
+      "pure_mm_toxic_ofi_ratio": 0.7615826370015943,
+      "pure_mm_depth_evaporation_pct": 0.7000936556672601
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 50,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0060677779278102,
+      "pure_mm_toxic_ofi_ratio": 0.9177076201510453,
+      "pure_mm_depth_evaporation_pct": 0.6982328064058085
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 51,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009090106057332402,
+      "pure_mm_toxic_ofi_ratio": 0.9193930510264074,
+      "pure_mm_depth_evaporation_pct": 0.6996966656971062
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 52,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009095972813194911,
+      "pure_mm_toxic_ofi_ratio": 0.7510951757354569,
+      "pure_mm_depth_evaporation_pct": 0.6975523330375712
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 53,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009098677657663281,
+      "pure_mm_toxic_ofi_ratio": 0.7702799986319779,
+      "pure_mm_depth_evaporation_pct": 0.6929015267052993
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 54,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00913379700309349,
+      "pure_mm_toxic_ofi_ratio": 0.7557861649617327,
+      "pure_mm_depth_evaporation_pct": 0.7085843845769464
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 55,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009040673946943639,
+      "pure_mm_toxic_ofi_ratio": 0.8297397918087445,
+      "pure_mm_depth_evaporation_pct": 0.7050400419877619
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 56,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008969486062675653,
+      "pure_mm_toxic_ofi_ratio": 0.8364411231238147,
+      "pure_mm_depth_evaporation_pct": 0.6971519628812195
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 57,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.004920804720462099,
+      "pure_mm_toxic_ofi_ratio": 0.8412382996771482,
+      "pure_mm_depth_evaporation_pct": 0.7969537886966691
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 58,
+    "objective": -110.38837447682927,
+    "score": -110.38837447682927,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.001835883388683927,
+      "pure_mm_toxic_ofi_ratio": 0.8364825243353656,
+      "pure_mm_depth_evaporation_pct": 0.5444821950550047
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 59,
+    "objective": -109.77877286182031,
+    "score": -109.77877286182031,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.002168085386243519,
+      "pure_mm_toxic_ofi_ratio": 0.8460427060596637,
+      "pure_mm_depth_evaporation_pct": 0.5547124796801711
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 60,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0020867782331725065,
+      "pure_mm_toxic_ofi_ratio": 0.93272574203275,
+      "pure_mm_depth_evaporation_pct": 0.5374917019224481
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 61,
+    "objective": -109.77877286182031,
+    "score": -109.77877286182031,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0019252908743832284,
+      "pure_mm_toxic_ofi_ratio": 0.8401683709193,
+      "pure_mm_depth_evaporation_pct": 0.5477377764887863
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 62,
+    "objective": -110.38837447682927,
+    "score": -110.38837447682927,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0019958147852836144,
+      "pure_mm_toxic_ofi_ratio": 0.8305862043183259,
+      "pure_mm_depth_evaporation_pct": 0.5256259591949419
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 63,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0019563114767115358,
+      "pure_mm_toxic_ofi_ratio": 0.8457658176445568,
+      "pure_mm_depth_evaporation_pct": 0.7975343668724727
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 64,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0022459190276786726,
+      "pure_mm_toxic_ofi_ratio": 0.9331323923775126,
+      "pure_mm_depth_evaporation_pct": 0.5436718625179966
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 65,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0018559183898203832,
+      "pure_mm_toxic_ofi_ratio": 0.9258712250110072,
+      "pure_mm_depth_evaporation_pct": 0.5416483279189389
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 66,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.002259469197872273,
+      "pure_mm_toxic_ofi_ratio": 0.9360012218792211,
+      "pure_mm_depth_evaporation_pct": 0.49767083001400114
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 67,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00690147157891635,
+      "pure_mm_toxic_ofi_ratio": 0.9299068050726095,
+      "pure_mm_depth_evaporation_pct": 0.4701903075174898
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 68,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.003909090479684883,
+      "pure_mm_toxic_ofi_ratio": 0.9346322282890926,
+      "pure_mm_depth_evaporation_pct": 0.4930579312223614
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 69,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.003830491763506737,
+      "pure_mm_toxic_ofi_ratio": 0.931419209859763,
+      "pure_mm_depth_evaporation_pct": 0.4943966278671699
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 70,
+    "objective": -109.822932365401,
+    "score": -109.822932365401,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0032791942483283228,
+      "pure_mm_toxic_ofi_ratio": 0.9372470409032867,
+      "pure_mm_depth_evaporation_pct": 0.42589073354286255
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 71,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0038613537215895794,
+      "pure_mm_toxic_ofi_ratio": 0.93524659758393,
+      "pure_mm_depth_evaporation_pct": 0.7395364585510226
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 72,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007811426636471996,
+      "pure_mm_toxic_ofi_ratio": 0.9453454730428613,
+      "pure_mm_depth_evaporation_pct": 0.4799078971258972
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 73,
+    "objective": -109.74501751613741,
+    "score": -109.74501751613741,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007906332874928196,
+      "pure_mm_toxic_ofi_ratio": 0.9452744987966254,
+      "pure_mm_depth_evaporation_pct": 0.4618107705926955
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 74,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0036374906081460615,
+      "pure_mm_toxic_ofi_ratio": 0.9452565959262426,
+      "pure_mm_depth_evaporation_pct": 0.7356315077507126
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 75,
+    "objective": -109.822932365401,
+    "score": -109.822932365401,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008693978972073845,
+      "pure_mm_toxic_ofi_ratio": 0.948540269053967,
+      "pure_mm_depth_evaporation_pct": 0.41074720038708107
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 76,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007975417519552866,
+      "pure_mm_toxic_ofi_ratio": 0.9496578452825841,
+      "pure_mm_depth_evaporation_pct": 0.7353722970408682
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 77,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007864941995366827,
+      "pure_mm_toxic_ofi_ratio": 0.9459071994783574,
+      "pure_mm_depth_evaporation_pct": 0.7357399790220771
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 78,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007947963529412298,
+      "pure_mm_toxic_ofi_ratio": 0.9493165304557257,
+      "pure_mm_depth_evaporation_pct": 0.6657793136838693
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 79,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00800437962585173,
+      "pure_mm_toxic_ofi_ratio": 0.9492440393645594,
+      "pure_mm_depth_evaporation_pct": 0.6687974921732341
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 80,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00864096087999674,
+      "pure_mm_toxic_ofi_ratio": 0.8830998098016151,
+      "pure_mm_depth_evaporation_pct": 0.676247801659892
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 81,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008703917172613866,
+      "pure_mm_toxic_ofi_ratio": 0.8833843995127142,
+      "pure_mm_depth_evaporation_pct": 0.6773065376791484
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 82,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0010237207109289783,
+      "pure_mm_toxic_ofi_ratio": 0.8889949220297306,
+      "pure_mm_depth_evaporation_pct": 0.6769418003371277
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 83,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009537218658690843,
+      "pure_mm_toxic_ofi_ratio": 0.8826748198429205,
+      "pure_mm_depth_evaporation_pct": 0.6799703517191151
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 84,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00968820846418908,
+      "pure_mm_toxic_ofi_ratio": 0.8920659047542249,
+      "pure_mm_depth_evaporation_pct": 0.673658434171319
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 85,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009607215902288458,
+      "pure_mm_toxic_ofi_ratio": 0.8818545446003033,
+      "pure_mm_depth_evaporation_pct": 0.6741988960499117
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 86,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009674296664336937,
+      "pure_mm_toxic_ofi_ratio": 0.6351735581075668,
+      "pure_mm_depth_evaporation_pct": 0.5749570615144893
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 87,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009597932455313096,
+      "pure_mm_toxic_ofi_ratio": 0.8904895300750302,
+      "pure_mm_depth_evaporation_pct": 0.6381211934193433
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 88,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00965036731017067,
+      "pure_mm_toxic_ofi_ratio": 0.8953861067876467,
+      "pure_mm_depth_evaporation_pct": 0.6471706827691852
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 89,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009583574604927463,
+      "pure_mm_toxic_ofi_ratio": 0.8973683714323517,
+      "pure_mm_depth_evaporation_pct": 0.6449708204627839
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 90,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009622898795969172,
+      "pure_mm_toxic_ofi_ratio": 0.649521618742242,
+      "pure_mm_depth_evaporation_pct": 0.6389256504448912
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 91,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005747158849486648,
+      "pure_mm_toxic_ofi_ratio": 0.9103257522371203,
+      "pure_mm_depth_evaporation_pct": 0.6393436901476046
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 92,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00147517388653089,
+      "pure_mm_toxic_ofi_ratio": 0.9140627566990943,
+      "pure_mm_depth_evaporation_pct": 0.6433499888240591
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 93,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0015249277508833856,
+      "pure_mm_toxic_ofi_ratio": 0.9032566894186149,
+      "pure_mm_depth_evaporation_pct": 0.641111597814493
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 94,
+    "objective": -110.20925920915296,
+    "score": -110.20925920915296,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007088038677097113,
+      "pure_mm_toxic_ofi_ratio": 0.5526136976688214,
+      "pure_mm_depth_evaporation_pct": 0.6401053655959348
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 95,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006929771551733743,
+      "pure_mm_toxic_ofi_ratio": 0.9087578028471824,
+      "pure_mm_depth_evaporation_pct": 0.644200770472433
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 96,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008483259213352636,
+      "pure_mm_toxic_ofi_ratio": 0.9102628486217728,
+      "pure_mm_depth_evaporation_pct": 0.7833573344143072
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 97,
+    "objective": -110.20925920915296,
+    "score": -110.20925920915296,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0015146898206683142,
+      "pure_mm_toxic_ofi_ratio": 0.5341306497869925,
+      "pure_mm_depth_evaporation_pct": 0.7832786688852019
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 98,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00703298269505837,
+      "pure_mm_toxic_ofi_ratio": 0.9107879030871461,
+      "pure_mm_depth_evaporation_pct": 0.6167186884651354
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 99,
+    "objective": -110.20925920915296,
+    "score": -110.20925920915296,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008415702083517142,
+      "pure_mm_toxic_ofi_ratio": 0.5341892345622731,
+      "pure_mm_depth_evaporation_pct": 0.7218585516385115
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 100,
+    "objective": -110.20925920915296,
+    "score": -110.20925920915296,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008480327900916088,
+      "pure_mm_toxic_ofi_ratio": 0.5460932598161572,
+      "pure_mm_depth_evaporation_pct": 0.7853868495699071
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 101,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008477137797086694,
+      "pure_mm_toxic_ofi_ratio": 0.9251346406232985,
+      "pure_mm_depth_evaporation_pct": 0.6198451602817499
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 102,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008852057195043752,
+      "pure_mm_toxic_ofi_ratio": 0.9236808853530737,
+      "pure_mm_depth_evaporation_pct": 0.7845335872294547
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 103,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008476349260794354,
+      "pure_mm_toxic_ofi_ratio": 0.9224943078867136,
+      "pure_mm_depth_evaporation_pct": 0.6185937985601699
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 104,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00823252787577065,
+      "pure_mm_toxic_ofi_ratio": 0.8756743511083652,
+      "pure_mm_depth_evaporation_pct": 0.5703410437334204
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 105,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.002590714494542435,
+      "pure_mm_toxic_ofi_ratio": 0.8748735420754787,
+      "pure_mm_depth_evaporation_pct": 0.579655301809759
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 106,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008199629781822242,
+      "pure_mm_toxic_ofi_ratio": 0.9405090752959042,
+      "pure_mm_depth_evaporation_pct": 0.5858610698023263
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 107,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008159358440078849,
+      "pure_mm_toxic_ofi_ratio": 0.8560676694151869,
+      "pure_mm_depth_evaporation_pct": 0.5861979417291324
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 108,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007646653027209704,
+      "pure_mm_toxic_ofi_ratio": 0.8745401241008129,
+      "pure_mm_depth_evaporation_pct": 0.7528793358118636
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 109,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00817885577652891,
+      "pure_mm_toxic_ofi_ratio": 0.8749985299345557,
+      "pure_mm_depth_evaporation_pct": 0.5830875938055412
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 110,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007586585959588947,
+      "pure_mm_toxic_ofi_ratio": 0.8570425558171207,
+      "pure_mm_depth_evaporation_pct": 0.5914137038220135
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 111,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00819700321366458,
+      "pure_mm_toxic_ofi_ratio": 0.9397307175164104,
+      "pure_mm_depth_evaporation_pct": 0.5892909124125346
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 112,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009309474649155455,
+      "pure_mm_toxic_ofi_ratio": 0.8576849205704785,
+      "pure_mm_depth_evaporation_pct": 0.7544972512602102
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 113,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007558528204953512,
+      "pure_mm_toxic_ofi_ratio": 0.8569123206507543,
+      "pure_mm_depth_evaporation_pct": 0.748646082679535
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 114,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007687045752332827,
+      "pure_mm_toxic_ofi_ratio": 0.9374921122353307,
+      "pure_mm_depth_evaporation_pct": 0.7506415088327901
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 115,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009322374739507899,
+      "pure_mm_toxic_ofi_ratio": 0.9368735139477772,
+      "pure_mm_depth_evaporation_pct": 0.6579650685343775
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 116,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008900082228366446,
+      "pure_mm_toxic_ofi_ratio": 0.9260153806733539,
+      "pure_mm_depth_evaporation_pct": 0.7479303148748909
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 117,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00930804302737774,
+      "pure_mm_toxic_ofi_ratio": 0.9191942034960019,
+      "pure_mm_depth_evaporation_pct": 0.6585049769622318
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 118,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00530268923057756,
+      "pure_mm_toxic_ofi_ratio": 0.9283192052389636,
+      "pure_mm_depth_evaporation_pct": 0.6583692313411984
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 119,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009333701618985975,
+      "pure_mm_toxic_ofi_ratio": 0.9185986913269648,
+      "pure_mm_depth_evaporation_pct": 0.6581090561358973
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 120,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008854140228491505,
+      "pure_mm_toxic_ofi_ratio": 0.9218568959835335,
+      "pure_mm_depth_evaporation_pct": 0.6290612680030447
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 121,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0043456746615603,
+      "pure_mm_toxic_ofi_ratio": 0.9217235185587161,
+      "pure_mm_depth_evaporation_pct": 0.6286633489697131
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 122,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005336674711826108,
+      "pure_mm_toxic_ofi_ratio": 0.9269375759083714,
+      "pure_mm_depth_evaporation_pct": 0.6909852513734407
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 123,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008879227740573621,
+      "pure_mm_toxic_ofi_ratio": 0.7285433020143193,
+      "pure_mm_depth_evaporation_pct": 0.6871415959064366
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 124,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008861706130446442,
+      "pure_mm_toxic_ofi_ratio": 0.9210496939948899,
+      "pure_mm_depth_evaporation_pct": 0.6284071282558343
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 125,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008665903850098498,
+      "pure_mm_toxic_ofi_ratio": 0.8999168871884335,
+      "pure_mm_depth_evaporation_pct": 0.6257741730655835
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 126,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.004503251772309953,
+      "pure_mm_toxic_ofi_ratio": 0.904942993424502,
+      "pure_mm_depth_evaporation_pct": 0.6901591448678153
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 127,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009882220883243519,
+      "pure_mm_toxic_ofi_ratio": 0.9017205867386338,
+      "pure_mm_depth_evaporation_pct": 0.6252145565554955
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 128,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008738218830009784,
+      "pure_mm_toxic_ofi_ratio": 0.8979378190121927,
+      "pure_mm_depth_evaporation_pct": 0.6010849510912949
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 129,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.004613773714537758,
+      "pure_mm_toxic_ofi_ratio": 0.8173816388369451,
+      "pure_mm_depth_evaporation_pct": 0.6088770911938354
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 130,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00990141279627666,
+      "pure_mm_toxic_ofi_ratio": 0.9013896838040455,
+      "pure_mm_depth_evaporation_pct": 0.6056552219502903
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 131,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008051363356797377,
+      "pure_mm_toxic_ofi_ratio": 0.8990666561691718,
+      "pure_mm_depth_evaporation_pct": 0.607744773598574
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 132,
+    "objective": -110.2092475306847,
+    "score": -110.2092475306847,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007241172627223545,
+      "pure_mm_toxic_ofi_ratio": 0.5856371061536121,
+      "pure_mm_depth_evaporation_pct": 0.6057858739575012
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 133,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008316272316351797,
+      "pure_mm_toxic_ofi_ratio": 0.8206707804326917,
+      "pure_mm_depth_evaporation_pct": 0.603106929671323
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 134,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.001022271125787055,
+      "pure_mm_toxic_ofi_ratio": 0.8079157346570504,
+      "pure_mm_depth_evaporation_pct": 0.6050739171755029
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 135,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00806068152682972,
+      "pure_mm_toxic_ofi_ratio": 0.8120927408728026,
+      "pure_mm_depth_evaporation_pct": 0.7234111552185107
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 136,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006324015180919692,
+      "pure_mm_toxic_ofi_ratio": 0.8237809551682538,
+      "pure_mm_depth_evaporation_pct": 0.718079242163645
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 137,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0067030669589116165,
+      "pure_mm_toxic_ofi_ratio": 0.8191289394371668,
+      "pure_mm_depth_evaporation_pct": 0.7176817430892587
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 138,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008084221419848676,
+      "pure_mm_toxic_ofi_ratio": 0.809132907532465,
+      "pure_mm_depth_evaporation_pct": 0.7143790347126661
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 139,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0010310351326704714,
+      "pure_mm_toxic_ofi_ratio": 0.8693717036465044,
+      "pure_mm_depth_evaporation_pct": 0.7131399234945993
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 140,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009079487262023487,
+      "pure_mm_toxic_ofi_ratio": 0.8661495023949202,
+      "pure_mm_depth_evaporation_pct": 0.7205675870972872
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 141,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009985596370608654,
+      "pure_mm_toxic_ofi_ratio": 0.8480471339212621,
+      "pure_mm_depth_evaporation_pct": 0.7108304533136357
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 142,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007818109585167179,
+      "pure_mm_toxic_ofi_ratio": 0.868144712679835,
+      "pure_mm_depth_evaporation_pct": 0.5604082504411454
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 143,
+    "objective": -109.822932365401,
+    "score": -109.822932365401,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006382499047347343,
+      "pure_mm_toxic_ofi_ratio": 0.8665621785041084,
+      "pure_mm_depth_evaporation_pct": 0.31544985851629004
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 144,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0012650864921489615,
+      "pure_mm_toxic_ofi_ratio": 0.8676144713831497,
+      "pure_mm_depth_evaporation_pct": 0.5685354759061888
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 145,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00911782672178436,
+      "pure_mm_toxic_ofi_ratio": 0.8475262283069571,
+      "pure_mm_depth_evaporation_pct": 0.6676594600954873
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 146,
+    "objective": -109.822932365401,
+    "score": -109.822932365401,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009121488733219142,
+      "pure_mm_toxic_ofi_ratio": 0.8687578908025347,
+      "pure_mm_depth_evaporation_pct": 0.34891499899639533
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 147,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007793494178977712,
+      "pure_mm_toxic_ofi_ratio": 0.9488392255714586,
+      "pure_mm_depth_evaporation_pct": 0.6663983362558882
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 148,
+    "objective": -109.77877286182031,
+    "score": -109.77877286182031,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007788041960293611,
+      "pure_mm_toxic_ofi_ratio": 0.8473330246060229,
+      "pure_mm_depth_evaporation_pct": 0.5611809513010356
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 149,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007878196826663953,
+      "pure_mm_toxic_ofi_ratio": 0.949366109696483,
+      "pure_mm_depth_evaporation_pct": 0.6656074075778775
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 150,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005651254343954009,
+      "pure_mm_toxic_ofi_ratio": 0.942584141854013,
+      "pure_mm_depth_evaporation_pct": 0.6504685001759805
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 151,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008590525133591284,
+      "pure_mm_toxic_ofi_ratio": 0.9399261940904768,
+      "pure_mm_depth_evaporation_pct": 0.6536603926607726
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 152,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008609002576993081,
+      "pure_mm_toxic_ofi_ratio": 0.9420853904829901,
+      "pure_mm_depth_evaporation_pct": 0.6491822784021055
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 153,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0059364305256144525,
+      "pure_mm_toxic_ofi_ratio": 0.9405081240481848,
+      "pure_mm_depth_evaporation_pct": 0.6592172831397529
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 154,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008565011468072089,
+      "pure_mm_toxic_ofi_ratio": 0.9485829067526425,
+      "pure_mm_depth_evaporation_pct": 0.7729515493001059
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 155,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008643936798475079,
+      "pure_mm_toxic_ofi_ratio": 0.9428291597612211,
+      "pure_mm_depth_evaporation_pct": 0.6540124875183234
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 156,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008556605858597247,
+      "pure_mm_toxic_ofi_ratio": 0.9400719900869328,
+      "pure_mm_depth_evaporation_pct": 0.6537305097371338
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 157,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008575260638197819,
+      "pure_mm_toxic_ofi_ratio": 0.9367322776866402,
+      "pure_mm_depth_evaporation_pct": 0.6833298595905221
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 158,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008558383852479822,
+      "pure_mm_toxic_ofi_ratio": 0.9337877922062101,
+      "pure_mm_depth_evaporation_pct": 0.7680727500196022
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 159,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006881985296746679,
+      "pure_mm_toxic_ofi_ratio": 0.8846481283447486,
+      "pure_mm_depth_evaporation_pct": 0.7671842701445113
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 160,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006638062997275051,
+      "pure_mm_toxic_ofi_ratio": 0.8858154245355443,
+      "pure_mm_depth_evaporation_pct": 0.6328652803182501
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 161,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006610598511251474,
+      "pure_mm_toxic_ofi_ratio": 0.8887504590142864,
+      "pure_mm_depth_evaporation_pct": 0.7692446803635675
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 162,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00498735545418825,
+      "pure_mm_toxic_ofi_ratio": 0.8827485632050227,
+      "pure_mm_depth_evaporation_pct": 0.6313070089469501
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 163,
+    "objective": -109.70136039233311,
+    "score": -109.70136039233311,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008359038057163957,
+      "pure_mm_toxic_ofi_ratio": 0.9327554966563351,
+      "pure_mm_depth_evaporation_pct": 0.5236880892487157
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 164,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008336891797993098,
+      "pure_mm_toxic_ofi_ratio": 0.8879919232634362,
+      "pure_mm_depth_evaporation_pct": 0.6348379772691853
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 165,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006593235092170454,
+      "pure_mm_toxic_ofi_ratio": 0.8830164254727113,
+      "pure_mm_depth_evaporation_pct": 0.6835199356977198
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 166,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0016883974582420076,
+      "pure_mm_toxic_ofi_ratio": 0.8882982503582256,
+      "pure_mm_depth_evaporation_pct": 0.6217333101140895
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 167,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006665717088806111,
+      "pure_mm_toxic_ofi_ratio": 0.9146149530495543,
+      "pure_mm_depth_evaporation_pct": 0.6320867047592003
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 168,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008355974050072806,
+      "pure_mm_toxic_ofi_ratio": 0.9129760887389989,
+      "pure_mm_depth_evaporation_pct": 0.6186120077172396
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 169,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00736709335056042,
+      "pure_mm_toxic_ofi_ratio": 0.9123359795558089,
+      "pure_mm_depth_evaporation_pct": 0.6197500757498507
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 170,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007438274129378457,
+      "pure_mm_toxic_ofi_ratio": 0.9139113461438046,
+      "pure_mm_depth_evaporation_pct": 0.591405957546801
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 171,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008338818006587196,
+      "pure_mm_toxic_ofi_ratio": 0.9127720689520455,
+      "pure_mm_depth_evaporation_pct": 0.5917523674898703
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 172,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007391256573136216,
+      "pure_mm_toxic_ofi_ratio": 0.9109911160759782,
+      "pure_mm_depth_evaporation_pct": 0.6204414615327011
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 173,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0062566142150496055,
+      "pure_mm_toxic_ofi_ratio": 0.859053135465278,
+      "pure_mm_depth_evaporation_pct": 0.613884565055902
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 174,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00743213082340665,
+      "pure_mm_toxic_ofi_ratio": 0.9148099530437172,
+      "pure_mm_depth_evaporation_pct": 0.5969034976287969
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 175,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007562643148695411,
+      "pure_mm_toxic_ofi_ratio": 0.8383297215032682,
+      "pure_mm_depth_evaporation_pct": 0.6106428266159192
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 176,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005941588921003852,
+      "pure_mm_toxic_ofi_ratio": 0.8385342835777037,
+      "pure_mm_depth_evaporation_pct": 0.5950041856258759
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 177,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008278870958699737,
+      "pure_mm_toxic_ofi_ratio": 0.9287569808357172,
+      "pure_mm_depth_evaporation_pct": 0.7969446716431818
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 178,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006242655024013543,
+      "pure_mm_toxic_ofi_ratio": 0.8587914818824531,
+      "pure_mm_depth_evaporation_pct": 0.595777241893342
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 179,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007223990499821778,
+      "pure_mm_toxic_ofi_ratio": 0.8754780912511987,
+      "pure_mm_depth_evaporation_pct": 0.59548385539814
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 180,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006020665809024378,
+      "pure_mm_toxic_ofi_ratio": 0.9288629836732041,
+      "pure_mm_depth_evaporation_pct": 0.6116296974977083
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 181,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00609942854285078,
+      "pure_mm_toxic_ofi_ratio": 0.6899249078301073,
+      "pure_mm_depth_evaporation_pct": 0.5983939062019883
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 182,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.005937027448132845,
+      "pure_mm_toxic_ofi_ratio": 0.9271470280069025,
+      "pure_mm_depth_evaporation_pct": 0.5931618314917216
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 183,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007205598644895235,
+      "pure_mm_toxic_ofi_ratio": 0.8599467776928442,
+      "pure_mm_depth_evaporation_pct": 0.643431005784888
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 184,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007972288043980051,
+      "pure_mm_toxic_ofi_ratio": 0.9284315671293629,
+      "pure_mm_depth_evaporation_pct": 0.6998231100102881
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 185,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.00803066545750563,
+      "pure_mm_toxic_ofi_ratio": 0.9284816464305403,
+      "pure_mm_depth_evaporation_pct": 0.7002463652910653
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 186,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.008062998460173455,
+      "pure_mm_toxic_ofi_ratio": 0.85446608835806,
+      "pure_mm_depth_evaporation_pct": 0.6424204104756137
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 187,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007992660772110895,
+      "pure_mm_toxic_ofi_ratio": 0.8933889653460871,
+      "pure_mm_depth_evaporation_pct": 0.6457527972046481
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 188,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006807797820677479,
+      "pure_mm_toxic_ofi_ratio": 0.8562362149774522,
+      "pure_mm_depth_evaporation_pct": 0.6420584696777841
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 189,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0068750427734445615,
+      "pure_mm_toxic_ofi_ratio": 0.8766320908262781,
+      "pure_mm_depth_evaporation_pct": 0.6438033317565357
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 190,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007134593813412172,
+      "pure_mm_toxic_ofi_ratio": 0.8638508758036183,
+      "pure_mm_depth_evaporation_pct": 0.6426519013995307
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 191,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007997045776872536,
+      "pure_mm_toxic_ofi_ratio": 0.8746478727257353,
+      "pure_mm_depth_evaporation_pct": 0.779007126075758
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 192,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006786668444855595,
+      "pure_mm_toxic_ofi_ratio": 0.8763565042392327,
+      "pure_mm_depth_evaporation_pct": 0.7777211580160674
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 193,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006926916124737166,
+      "pure_mm_toxic_ofi_ratio": 0.8720739719745587,
+      "pure_mm_depth_evaporation_pct": 0.6691277626147799
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 194,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.006837774272280147,
+      "pure_mm_toxic_ofi_ratio": 0.8667256207022742,
+      "pure_mm_depth_evaporation_pct": 0.7998545901479366
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 195,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007130500631511433,
+      "pure_mm_toxic_ofi_ratio": 0.8698811429864838,
+      "pure_mm_depth_evaporation_pct": 0.7787974633116046
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 196,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007577961169733329,
+      "pure_mm_toxic_ofi_ratio": 0.8758532748351845,
+      "pure_mm_depth_evaporation_pct": 0.7839445021882149
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 197,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007673403502362344,
+      "pure_mm_toxic_ofi_ratio": 0.8693669133075215,
+      "pure_mm_depth_evaporation_pct": 0.7856665002648578
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 198,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007577123266887633,
+      "pure_mm_toxic_ofi_ratio": 0.8788782873627659,
+      "pure_mm_depth_evaporation_pct": 0.5787254789281369
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 199,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007689345813189956,
+      "pure_mm_toxic_ofi_ratio": 0.8723919712920216,
+      "pure_mm_depth_evaporation_pct": 0.7588364370385466
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 200,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0077425504758459355,
+      "pure_mm_toxic_ofi_ratio": 0.8940383486682459,
+      "pure_mm_depth_evaporation_pct": 0.7553986755592943
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 201,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0076575409775986,
+      "pure_mm_toxic_ofi_ratio": 0.8494552880007445,
+      "pure_mm_depth_evaporation_pct": 0.758091892140077
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 202,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007651945539782125,
+      "pure_mm_toxic_ofi_ratio": 0.845598876140412,
+      "pure_mm_depth_evaporation_pct": 0.7576090184627435
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 203,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007713413020774355,
+      "pure_mm_toxic_ofi_ratio": 0.8952786833899894,
+      "pure_mm_depth_evaporation_pct": 0.7585852682356665
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 204,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009861135762237768,
+      "pure_mm_toxic_ofi_ratio": 0.8480179363447554,
+      "pure_mm_depth_evaporation_pct": 0.7422926209288861
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 205,
+    "objective": -109.60196817207334,
+    "score": -109.60196817207334,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.007704474509034563,
+      "pure_mm_toxic_ofi_ratio": 0.9498125564361235,
+      "pure_mm_depth_evaporation_pct": 0.758879152296651
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 206,
+    "objective": -110.25254479430536,
+    "score": -110.25254479430536,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.009797809521800375,
+      "pure_mm_toxic_ofi_ratio": 0.7814927988426255,
+      "pure_mm_depth_evaporation_pct": 0.7293101064281853
+    }
+  },
+  {
+    "study_name": "polymarket_wfo_fold_0",
+    "fold_index": 0,
+    "trial_number": 207,
+    "objective": -109.6472432441951,
+    "score": -109.6472432441951,
+    "state": "TrialState.COMPLETE",
+    "train_dates": [
+      "2026-03-20",
+      "2026-03-21"
+    ],
+    "test_dates": [
+      "2026-03-22"
+    ],
+    "params": {
+      "pure_mm_wide_tier_enabled": true,
+      "pure_mm_wide_spread_pct": 0.0012323930617383037,
+      "pure_mm_toxic_ofi_ratio": 0.847090486760546,
+      "pure_mm_depth_evaporation_pct": 0.7585487373931803
+    }
+  }
+]
