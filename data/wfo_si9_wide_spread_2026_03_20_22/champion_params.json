@@ -1,0 +1,24 @@
+{
+  "params": {
+    "pure_mm_wide_tier_enabled": true,
+    "pure_mm_wide_spread_pct": 0.04557646031918993,
+    "pure_mm_inventory_penalty_coef": 4.850718862229165,
+    "pure_mm_toxic_ofi_ratio": 0.636261777577359,
+    "pure_mm_depth_evaporation_pct": 0.2701305225804218
+  },
+  "meta": {
+    "champion_fold": 0,
+    "oos_sharpe": -79.5565,
+    "oos_win_rate": 0.0,
+    "oos_profit_factor": 0.0,
+    "oos_trade_count": 2,
+    "oos_degradation_pct": 505.44,
+    "n_folds": 1,
+    "n_trials_per_fold": 100,
+    "data_range": "2026-03-20 to 2026-03-22",
+    "generated_at": "2026-03-23T15:27:28.985042+00:00",
+    "avg_sharpe_decay_pct": -505.44,
+    "overfit_probability": 1.0,
+    "unstable_params": []
+  }
+}

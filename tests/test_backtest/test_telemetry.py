@@ -252,7 +252,7 @@ class TestSharpeRatio:
         assert m.sharpe_ratio > 0
 
     def test_sharpe_annualisation_factor(self):
-        """Verify the annualisation uses sqrt(525960)."""
+        """Stable positive returns still annualise to a large positive Sharpe."""
         # We can verify by constructing known returns
         tel = Telemetry(initial_cash=1000.0)
         # Create equity: 1000, 1010, 1020.1, 1030.301, ...
@@ -270,6 +270,23 @@ class TestSharpeRatio:
         # Expected: mean return ≈ 0.001, std ≈ very small
         # Sharpe should be very high (consistent returns)
         assert m.sharpe_ratio > 50  # very stable returns → high Sharpe
+
+    def test_sharpe_respects_equity_sample_spacing(self):
+        tel_fast = Telemetry(initial_cash=1000.0)
+        tel_slow = Telemetry(initial_cash=1000.0)
+
+        fast_points = [(0.0, 1000.0), (60.0, 1010.0), (120.0, 1005.0), (180.0, 1015.0)]
+        slow_points = [(0.0, 1000.0), (600.0, 1010.0), (1200.0, 1005.0), (1800.0, 1015.0)]
+
+        for ts, eq in fast_points:
+            tel_fast.record_equity(ts, eq)
+        for ts, eq in slow_points:
+            tel_slow.record_equity(ts, eq)
+
+        fast_metrics = tel_fast.finalize(final_equity=fast_points[-1][1])
+        slow_metrics = tel_slow.finalize(final_equity=slow_points[-1][1])
+
+        assert fast_metrics.sharpe_ratio > slow_metrics.sharpe_ratio
 
     def test_insufficient_data(self):
         """<3 equity samples → Sharpe = 0."""

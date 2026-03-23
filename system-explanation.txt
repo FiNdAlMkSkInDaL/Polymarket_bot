@@ -1,6 +1,6 @@
 ===============================================================================
 POLYMARKET BOT - SYSTEM EXPLANATION
-Last updated: March 20, 2026
+Last updated: March 23, 2026
 ===============================================================================
 
 This document describes two things separately:
@@ -52,6 +52,37 @@ Operational reading of that local evidence:
 
 
 1. CURRENT REPOSITORY REALITY
+The production codebase currently contains three strategy families:
+
+1. Pure Market Maker
+2. SI-9 Combinatorial Arbitrage
+3. Latency Arbitrage
+   - SI-7 crypto fast-strike
+   - SI-8 news/oracle fast-strike
+
+Current live paper deployment status:
+
+- SI-9 combinatorial arbitrage is LIVE in PAPER mode.
+- the pure market maker code path remains in the repo, but PURE_MM is
+  currently DISABLED on the Top 25 / high-volume target map
+- latency-arb infrastructure remains part of the active architecture, but the
+  major live paper focus today is SI-9 plus the hardened L2 stack
+
+The old directional stack is retired for live trading.
+
+Retired from live architecture:
+- PanicDetector-driven entries
+- Mean-reversion drift entries
+- bar-entry logic as the primary execution path
+- deployment decisions based on legacy z-score or drift-ceiling style knobs
+
+Some of that code still exists for research, compatibility, and legacy replay,
+but it is not the live engine. If a document, script, or config discussion
+frames this repo as a panic-fading or bar-signal bot, that description is
+wrong.
+
+
+2. EXECUTIVE SUMMARY
 ===============================================================================
 
 The checked-in repository is a hybrid, transitional trading system.
@@ -124,6 +155,58 @@ different deployed build than the current checkout.
 Pure market making is implemented and wired.
 
 Evidence in code:
+3.1 Data plane
+
+The live bot consumes and maintains:
+
+- Polymarket trade and book streams
+- dedicated L2 snapshot and delta data
+- optional external price and oracle feeds for latency arbitrage
+
+The system load-sheds aggressively:
+
+- the live paper deployment hard-caps the tracked market universe at 25 markets
+- those tracked markets are selected by volume and reconciled on refresh so the
+  bot does not silently grow back to a 100+ market event-loop workload
+- full L2 reconstruction runs only on the top tracked markets inside that cap
+- operationally, the target map should be kept strictly below 25 markets when
+  SI-9 is active; the current posture is a sub-25 effective cap to preserve L2
+  WebSocket stability and avoid packet drops during live paper trading
+
+Current operator workflow for that universe cap:
+
+- scripts/screen_wick_markets.py is the offline pre-trade universe screener for
+  the stink-bid / wick-catching research path
+- it ranks active Gamma markets by a simple wick-potential proxy:
+  24h volume divided by resting liquidity
+- the terminal table is for human review and may show the numeric Gamma market
+  id for readability
+- if --export-json is used, the script must export Polymarket CLOB-compatible
+  conditionId hex strings, not Gamma numeric ids
+- that JSON export is the correct handoff format for config injection because
+  the live bot, subscriptions, and L2 paths key markets by conditionId-style
+  identifiers rather than Gamma's numeric primary key
+- scripts/screen_si9_clusters.py is the offline discovery screener for the
+  SI-9 mutually exclusive negRisk cluster path
+- it queries Gamma /events, filters to active open negRisk-compatible event
+  groups, and ranks clusters by aggregate 24h volume divided by aggregate
+  resting liquidity
+- its JSON export preserves per-leg conditionId hex strings for each cluster so
+  SI-9 downstream consumers stay keyed to CLOB-compatible identifiers rather
+  than Gamma numeric market ids
+- during Gamma discovery, ONE_MARKET_PER_EVENT is dynamically disabled whenever
+  SI-9 is enabled so all negRisk legs for an event remain available for cluster
+  formation; keeping one-market-per-event on would collapse each event to a
+  single leg and prevent downstream SI-9 cluster construction
+
+L2 processing is first-class infrastructure, not an optional add-on.
+Worker processes can reconstruct books off the main asyncio loop and publish
+state back through shared memory so strategy code reads current BBO and depth
+without blocking the bot.
+
+3.2 Strategy plane
+
+The strategy layer is centered on three active paths:
 
 - src/strategies/pure_market_maker.py contains a real inventory-aware quoting
   engine
@@ -170,6 +253,33 @@ Evidence in code:
   - tree_news_ws
 
 Implications:
+- scripts/profile_latency_logs.py is the standalone offline profiler for raw
+  text exports captured from journald
+- it is intended to parse processing-latency and heartbeat-delta style events
+  from exported journal output rather than from legacy bot.log files
+- its default histogram view includes a red 5000 ms block-threshold marker so
+  operators can see the current live paper safety margin against the latency
+  guard cutoff
+
+
+4. ACTIVE STRATEGY 1 - PURE MARKET MAKER
+===============================================================================
+
+This is no longer the active top-of-book live paper strategy.
+
+Current live status:
+
+- the pure market maker implementation remains maintained in the repo, but
+  PURE_MM is currently DISABLED for the Top 25 / high-volume market set
+- that disablement is deliberate, not accidental
+- the quantitative reason is recent out-of-sample WFO failure on the high-
+  volume universe: OOS Sharpe = -79.5565, which confirmed those books are
+  highly toxic for passive quoting and showed adverse selection even on spreads
+  up to roughly 4.5%
+- until that toxicity regime is solved, pure MM should not be treated as the
+  active live deployment path for the current target map
+
+What it does:
 
 - Tree News support exists in the repo
 - Tree News being active cannot be assumed from this workspace alone
@@ -217,6 +327,62 @@ Current checked-in code behavior at startup:
   all wired markets
 
 Current checked-in config defaults:
+SI-9 is a maker-first state machine for mutually exclusive market clusters and
+is currently LIVE in PAPER mode.
+
+When a Polymarket event exposes a set of mutually exclusive outcomes and the
+cluster is marked negRisk-compatible, the bot checks whether the combined YES
+pricing is inconsistent with a guaranteed payout structure.
+
+Core idea:
+
+- if mutually exclusive outcomes are mispriced, the bot can buy a balanced set
+  of legs whose combined settlement value is locked in
+
+Current live design:
+
+- clusters are built from mutually exclusive event groups
+- the hardest leg to fill is chosen as the maker leg
+- that bottleneck leg is worked passively first
+- the remaining legs are routed after the maker-first state machine confirms
+  the opportunity can be completed defensibly
+- Gamma discovery dynamically disables ONE_MARKET_PER_EVENT while SI-9 is
+  active so every negRisk leg survives bootstrap and cluster formation
+
+Current guardrails added on March 23, 2026:
+
+- minimum sum of YES best bids across the cluster: Σ bids must be at least 0.85
+- maximum apparent gross edge: edge dollars must be at most 0.15
+- guardrail rejection logging is throttled per event so the bot logs the first
+  rejection immediately, then only re-logs after 1 hour or when Σ bids moves by
+  more than 5 percentage points
+
+This is not a generic stat-arb module. It is a routing-aware execution system
+for Dutch-book style mispricings in mutually exclusive Polymarket structures.
+
+
+6. ACTIVE STRATEGY 3 - LATENCY ARBITRAGE
+===============================================================================
+
+Latency arbitrage is the taker side of the architecture. When an external
+source of truth moves faster than the Polymarket book, the bot attempts to hit
+stale liquidity immediately.
+
+There are two live latency-arb flavors.
+
+6.1 SI-7 - Crypto Fast-Strike
+
+SI-7 targets crypto-linked prediction markets.
+
+What drives it:
+
+- free external crypto spot feeds for BTC and ETH
+- the Resolution Probability Engine in src/signals/resolution_probability.py
+- Black-Scholes-style threshold pricing for crypto strike markets
+- a fast retrigger loop that re-evaluates crypto markets whenever spot moves
+  enough to create a fresh divergence
+
+How it executes:
 
 - max_active_l2_markets = 25
 - pure_mm_max_markets = 25
@@ -284,6 +450,12 @@ So the accurate statement is:
 ===============================================================================
 
 The repo includes systemd deployment artifacts:
+Walk-Forward Optimization has been realigned around the pure market maker replay
+path, but the most important current conclusion is operational rather than
+optimistic: pure MM is not deployable on the current Top 25 / high-volume live
+universe.
+
+Important facts:
 
 - scripts/polymarket-bot.service
 - scripts/install_paper_service.sh
@@ -299,6 +471,71 @@ Accurate operational statements from local evidence:
 - that snapshot shows the bot was alive but had meaningful reconnect churn
 
 What cannot be stated as a verified local fact:
+- WFO now supports a pure market maker replay adapter
+- that replay path depends on L2 snapshots and L2 deltas
+- pure market maker WFO is invalid on trade-only datasets
+
+Why trade-only data is insufficient:
+
+- passive maker fills cannot be simulated defensibly from trade receipts alone
+- OFI cannot be reconstructed from trade-only data
+- depth evaporation cannot be measured from trade-only data
+- quote cancellation logic cannot be replayed faithfully without book changes
+
+Current enforced behavior:
+
+- when WFO is run with strategy_adapter set to pure_market_maker and the
+  replay sees zero L2 book updates, the optimizer logs a missing-L2 warning
+  and returns no usable result
+
+This is deliberate. A fake pure-MM backtest on trade-only data is worse than
+no backtest because it produces parameter outputs that look scientific but do
+not reflect the live execution problem.
+
+Current deployment conclusion from recent OOS work:
+
+- the latest pure-MM out-of-sample WFO artifact for the high-volume universe
+  recorded OOS Sharpe = -79.5565
+- that result is treated as proof that the current Top 25 / high-volume books
+  are too toxic for live pure-MM deployment right now
+- for the current live paper posture, PURE_MM should remain disabled on that
+  target set until a materially different quoting/risk design is validated
+
+If you want valid pure market maker backtests, your dataset must contain:
+
+- L2 snapshots
+- L2 deltas
+- correctly ordered book events over time
+
+Current operational verification path:
+
+- the script scripts/audit_forward_data.py is the forward-data health check
+- it is designed to inspect recent live raw-tick files and verify that fresh
+  data contains both snapshots and deltas
+- the strict gate is --require-wfo-ready
+- passing that audit is the intended proof that the live paper recorder is
+  capturing replayable pure-MM data
+
+Current optimizer grid state:
+
+- the WFO search space is now pre-wired for the wide liquidity tier
+- pure_mm_wide_tier_enabled is forced on in the pure-MM WFO path so the
+  optimizer actually exercises the Tier-2 quote logic
+- pure_mm_wide_spread_pct is bounded to 0.05 through 0.25 for the Monday
+  sweep
+- pure_mm_toxic_ofi_ratio is narrowed to 0.60 through 0.95
+- the focused pure-MM WFO entrypoint at repo root now includes the wide-tier
+  activation flag and wide spread parameter in its target parameter set
+
+Important limitation:
+
+- pure_mm_wide_size_usd exists in live and replay configuration, but it is not
+  yet part of the current optimizer sweep because no explicit search bounds
+  have been locked for it in this repo state
+- position sizing for that parameter is currently a post-WFO operator step,
+  not an in-search optimization dimension
+
+Current offline analysis tooling for that sweep:
 
 - that the VPS is currently running under systemd
 - that journald is the authoritative live source for the currently running host
@@ -375,6 +612,50 @@ Do not assume, without checking runtime evidence:
 
 
 9. REPOSITORY MAP
+- the bot is an HFT pure market maker and latency arbitrage engine
+- the current live paper deployment is centered on SI-9, with SI-9 LIVE in
+  PAPER mode and PURE_MM disabled on the Top 25 / high-volume target map
+- L2 data is a hard dependency for understanding live behavior
+- the VPS paper deployment is expected to run under systemd, not nohup
+- the tracked universe must stay below 25 markets in practice to preserve L2
+  WebSocket stability and avoid packet loss; do not casually widen the target
+  map beyond that operating constraint
+- the offline market screener for wick-catching exports conditionId hex strings,
+  not Gamma numeric ids, when generating machine-readable universe files
+- the offline SI-9 cluster screener also exports CLOB-compatible conditionId
+  hex strings per leg, not Gamma numeric ids
+- Gamma discovery disables one-market-per-event deduplication whenever SI-9 is
+  enabled so cluster legs are not destroyed during bootstrap
+- the pure-MM WFO surface visualizer is an offline standalone script and is
+  not part of the live trading engine or replay execution path
+- if interactive inspection is requested, the expected artifact is a standalone
+  Plotly HTML export rather than a dependency on the live bot UI
+- the SI-7 Black-Scholes pricing calibrator is also offline-only research
+  tooling and does not change the live Resolution Probability Engine path
+- the live PAPER deployment uses relaxed latency thresholds (5s block, 15s
+  heartbeat stale) to tolerate real Polymarket network jitter
+- journald, not bot.log, is the authoritative live logging surface
+- the intended offline latency review path for live journald exports is
+  scripts/profile_latency_logs.py
+- pure market maker is the main passive strategy
+- SI-9 is the maker-first mutually exclusive combo arb module
+- SI-7 and SI-8 are fast-strike stale-book sniping paths
+- paid non-crypto and paid sports oracle feeds are not part of the intended
+  zero-overhead production architecture
+- legacy directional signal code is not the live trading core
+
+Do not center your analysis on retired live concepts such as:
+
+- panic-spike entries
+- drift-signal entries
+- bar-driven entry pipelines
+- z-score-based deployment narratives
+
+Those may still appear in research and replay code, but they do not define the
+current system.
+
+
+10. REPOSITORY MAP FOR THE CURRENT ARCHITECTURE
 ===============================================================================
 
 Primary files for understanding the current checked-in architecture:

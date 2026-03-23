@@ -28,6 +28,12 @@ from src.signals.signal_framework import BaseSignal, SignalGenerator, SignalResu
 log = get_logger(__name__)
 
 
+SI9_MIN_SUM_BIDS = 0.85
+SI9_MAX_EDGE_DOLLARS = 0.15
+SI9_GUARDRAIL_LOG_INTERVAL_SECONDS = 60 * 60
+SI9_GUARDRAIL_LOG_SUM_BIDS_DELTA = 0.05
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Data payloads
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,6 +185,7 @@ class ComboArbDetector(SignalGenerator):
     ) -> None:
         self._books = book_trackers
         self._sizer = ComboSizer()
+        self._guardrail_rejection_log_state: dict[str, tuple[float, float]] = {}
 
     @property
     def name(self) -> str:
@@ -319,6 +326,22 @@ class ComboArbDetector(SignalGenerator):
         edge_dollars = 1.0 - sum_bids
         edge_cents = edge_dollars * 100.0 - strat.si9_min_margin_cents
 
+        # Reject ghost-town books with implausibly large gaps. SI-9 should
+        # only work tight, liquid mispricings rather than dead markets.
+        if sum_bids < SI9_MIN_SUM_BIDS or edge_dollars > SI9_MAX_EDGE_DOLLARS:
+            if self._should_log_guardrail_rejection(cluster.event_id, sum_bids):
+                log.info(
+                    "combo_arb_guardrail_rejected",
+                    event_id=cluster.event_id,
+                    sum_bids=round(sum_bids, 4),
+                    edge_dollars=round(edge_dollars, 4),
+                    min_sum_bids=SI9_MIN_SUM_BIDS,
+                    max_edge_dollars=SI9_MAX_EDGE_DOLLARS,
+                    throttle_interval_s=SI9_GUARDRAIL_LOG_INTERVAL_SECONDS,
+                    sum_bids_delta_threshold=SI9_GUARDRAIL_LOG_SUM_BIDS_DELTA,
+                )
+            return None
+
         ranked_legs = self._rank_legs_for_routing(legs)
         maker_leg = ranked_legs[0]
         taker_legs = ranked_legs[1:]
@@ -381,3 +404,21 @@ class ComboArbDetector(SignalGenerator):
             total_collateral=round(total_collateral, 2),
         )
         return signal
+
+    def _should_log_guardrail_rejection(self, event_id: str, sum_bids: float) -> bool:
+        now = time.time()
+        last_state = self._guardrail_rejection_log_state.get(event_id)
+        if last_state is None:
+            self._guardrail_rejection_log_state[event_id] = (now, sum_bids)
+            return True
+
+        last_logged_at, last_sum_bids = last_state
+        if now - last_logged_at >= SI9_GUARDRAIL_LOG_INTERVAL_SECONDS:
+            self._guardrail_rejection_log_state[event_id] = (now, sum_bids)
+            return True
+
+        if abs(sum_bids - last_sum_bids) > SI9_GUARDRAIL_LOG_SUM_BIDS_DELTA:
+            self._guardrail_rejection_log_state[event_id] = (now, sum_bids)
+            return True
+
+        return False

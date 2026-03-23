@@ -32,14 +32,18 @@ scripts/
 ## Active Strategies
 
 1. Pure Market Maker
-   Passive NO-token quoting on the highest-volume L2 markets. Uses order flow
-   imbalance and depth evaporation to cancel toxic resting quotes before they
-   are adversely selected.
+   The passive NO-token quoting engine remains in the codebase, but PURE_MM is
+   currently disabled on the Top 25 / high-volume live paper target map.
+   Recent out-of-sample WFO on that universe produced OOS Sharpe -79.5565,
+   confirming the books are currently too toxic for live passive deployment.
 
 2. SI-9 Combinatorial Arbitrage
    Maker-first state machine for mutually exclusive event clusters. Works the
    bottleneck leg passively before completing the rest of the combo when a
-   Dutch-book style mispricing exists.
+   Dutch-book style mispricing exists. This strategy is currently live in paper
+   mode. Current guardrails require minimum Σ bids of 0.85, maximum edge of
+   0.15 dollars, and throttle repeated rejection logs to 1 hour unless Σ bids
+   moves by more than 5 percentage points.
 
 3. Latency Arbitrage
    SI-7 crypto fast-strike uses free BTC and ETH spot feeds plus
@@ -79,6 +83,17 @@ The backtest and walk-forward stack has pivoted with the live strategy.
 - Trade-only data is not sufficient to simulate passive maker fills, OFI, or
    depth evaporation defensibly.
 - Pure-MM WFO intentionally fails fast when the dataset has no L2 book events.
+- Recent pure-MM OOS WFO on the current high-volume universe recorded OOS
+   Sharpe -79.5565, so PURE_MM is not the active live paper strategy on the
+   current target map.
+
+## Current Live Posture
+
+- SI-9 combinatorial arbitrage is live in paper mode.
+- Gamma discovery disables ONE_MARKET_PER_EVENT whenever SI-9 is enabled so all
+   negRisk legs survive discovery.
+- The live target map should stay below 25 markets in practice to maintain L2
+   WebSocket stability and avoid packet drops.
 
 If you are evaluating the current live architecture, assume L2 data is a hard
 requirement rather than an optional enhancement.
