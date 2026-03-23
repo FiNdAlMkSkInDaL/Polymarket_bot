@@ -15,6 +15,7 @@ DEFAULT_REPORT_DIR = Path("data/wfo_mm_last7")
 DEFAULT_REPORT_PATH = DEFAULT_REPORT_DIR / "wfo_report.json"
 DEFAULT_PARAMS_PATH = DEFAULT_REPORT_DIR / "champion_params.json"
 DEFAULT_STORAGE_PATH = DEFAULT_REPORT_DIR / "wfo_optuna.db"
+DEFAULT_TRIALS_PATH = DEFAULT_REPORT_DIR / "wfo_trials.json"
 TARGET_PARAMS = (
     "pure_mm_wide_tier_enabled",
     "pure_mm_wide_spread_pct",
@@ -65,9 +66,37 @@ def _report_payload(report: WfoReport) -> dict[str, Any]:
     return payload
 
 
+def _trial_payload(storage_path: str, study_prefix: str, report: WfoReport) -> list[dict[str, Any]]:
+    import optuna
+
+    rows: list[dict[str, Any]] = []
+    storage_url = f"sqlite:///{Path(storage_path).as_posix()}"
+    for fold in report.folds:
+        study_name = f"{study_prefix}_fold_{fold.fold_index}"
+        study = optuna.load_study(study_name=study_name, storage=storage_url)
+        for trial in study.trials:
+            if trial.value is None:
+                continue
+            rows.append(
+                {
+                    "study_name": study_name,
+                    "fold_index": fold.fold_index,
+                    "trial_number": trial.number,
+                    "objective": trial.value,
+                    "score": trial.value,
+                    "state": str(trial.state),
+                    "train_dates": fold.train_dates,
+                    "test_dates": fold.test_dates,
+                    "params": trial.params,
+                }
+            )
+    return rows
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run pure market-maker WFO on the 7-day PMXT dataset.")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--dates", nargs="+", default=None)
     parser.add_argument("--train-days", type=int, default=5)
     parser.add_argument("--test-days", type=int, default=1)
     parser.add_argument("--step-days", type=int, default=1)
@@ -78,6 +107,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--storage-path", default=str(DEFAULT_STORAGE_PATH))
     parser.add_argument("--report-path", default=str(DEFAULT_REPORT_PATH))
     parser.add_argument("--params-path", default=str(DEFAULT_PARAMS_PATH))
+    parser.add_argument("--trial-export-path", default=str(DEFAULT_TRIALS_PATH))
     return parser.parse_args(argv)
 
 
@@ -85,11 +115,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     report_path = Path(args.report_path)
     params_path = Path(args.params_path)
+    trial_export_path = Path(args.trial_export_path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     params_path.parent.mkdir(parents=True, exist_ok=True)
+    trial_export_path.parent.mkdir(parents=True, exist_ok=True)
 
     cfg = WfoConfig(
         data_dir=args.data_dir,
+        allowed_dates=tuple(args.dates) if args.dates else None,
         train_days=args.train_days,
         test_days=args.test_days,
         step_days=args.step_days,
@@ -105,12 +138,15 @@ def main(argv: list[str] | None = None) -> int:
     report = run_wfo(cfg)
     payload = _report_payload(report)
     report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    trials_payload = _trial_payload(args.storage_path, cfg.study_prefix, report)
+    trial_export_path.write_text(json.dumps(trials_payload, indent=2), encoding="utf-8")
 
     best_ratio = payload["best_return_drawdown"]
     print(report.summary())
     print("Best return/drawdown candidate:")
     print(json.dumps(best_ratio, indent=2))
     print(f"WFO report written to {report_path}")
+    print(f"WFO trial export written to {trial_export_path}")
     return 0
 
 

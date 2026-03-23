@@ -94,6 +94,65 @@ class TestPureMarketMakerReplayAdapter:
         prices = sorted(order.price for order in bid_orders)
         assert prices == [0.34, 0.4]
 
+    def test_inventory_cap_limits_total_bid_exposure(self, tmp_path: Path):
+        events = [_snapshot(1.0, "NO", "0.40", "20", "0.42", "20")]
+        _write_events(tmp_path / "ticks.jsonl", events)
+
+        adapter = PureMarketMakerReplayAdapter(
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            params=StrategyParams(
+                pure_mm_wide_tier_enabled=True,
+                pure_mm_wide_spread_pct=0.15,
+                pure_mm_inventory_cap_usd=15.0,
+            ),
+        )
+        engine = BacktestEngine(
+            strategy=adapter,
+            data_loader=DataLoader.from_files(tmp_path / "ticks.jsonl"),
+            config=BacktestConfig(initial_cash=1000.0, latency_ms=0.0),
+        )
+
+        result = engine.run()
+
+        bid_orders = [order for order in result.all_orders if order.side.value == "BUY"]
+        total_bid_notional = sum(order.price * order.remaining for order in bid_orders)
+        assert bid_orders
+        assert total_bid_notional <= 15.0 + 1e-9
+
+    def test_inventory_cap_blocks_repeated_buying_after_cap(self, tmp_path: Path):
+        events = [
+            _snapshot(1.0, "NO", "0.40", "20", "0.42", "20"),
+            _snapshot(2.0, "NO", "0.40", "20", "0.40", "20"),
+            _snapshot(3.0, "NO", "0.40", "20", "0.40", "20"),
+        ]
+        _write_events(tmp_path / "ticks.jsonl", events)
+
+        adapter = PureMarketMakerReplayAdapter(
+            market_id="MKT",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+            params=StrategyParams(
+                pure_mm_wide_tier_enabled=False,
+                pure_mm_quote_size_usd=20.0,
+                pure_mm_inventory_cap_usd=15.0,
+            ),
+        )
+        engine = BacktestEngine(
+            strategy=adapter,
+            data_loader=DataLoader.from_files(tmp_path / "ticks.jsonl"),
+            config=BacktestConfig(initial_cash=1000.0, latency_ms=0.0, fee_enabled=False),
+        )
+
+        result = engine.run()
+
+        buy_orders = [order for order in result.all_orders if order.side.value == "BUY"]
+        assert result.metrics.total_fills == 1
+        assert adapter._inventory * 0.40 <= 15.0 + 1e-9
+        assert len(buy_orders) == 1
+        assert buy_orders[0].remaining == 0.0
+
     def test_fills_resting_bid_when_ask_crosses(self, tmp_path: Path):
         events = [
             _snapshot(1.0, "NO", "0.40", "20", "0.42", "20"),

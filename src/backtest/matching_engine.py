@@ -105,6 +105,7 @@ class SimOrder:
     fills: list[Fill] = field(default_factory=list)
     status: OrderStatus = OrderStatus.PENDING
     rejection_reason: str = ""
+    asset_id: str = ""
 
     @property
     def filled_size(self) -> float:
@@ -316,6 +317,7 @@ class MatchingEngine:
         order_type: Literal["limit", "market"] = "limit",
         post_only: bool = False,
         current_time: float = 0.0,
+        asset_id: str = "",
     ) -> SimOrder:
         """Submit an order to the simulated exchange.
 
@@ -335,6 +337,7 @@ class MatchingEngine:
             post_only=post_only,
             submit_time=current_time,
             active_time=current_time + self._latency_s,
+            asset_id=asset_id,
         )
 
         self._pending[oid] = order

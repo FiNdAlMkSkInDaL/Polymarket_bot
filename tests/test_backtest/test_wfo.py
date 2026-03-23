@@ -27,6 +27,7 @@ from src.backtest.wfo_optimizer import (
     FoldResult,
     WfoConfig,
     WfoReport,
+    _export_champion_params,
     _suggest_params,
     _compute_stitched_metrics,
     _stitch_equity_curves,
@@ -610,6 +611,52 @@ class TestWfoReport:
         report = WfoReport(overfit_probability=0.75)
         text = report.summary()
         assert "75.0%" in text
+
+    def test_export_champion_params_uses_champion_fold_metrics(self, tmp_path: Path):
+        output_path = tmp_path / "champion_params.json"
+        cfg = WfoConfig(output_params_path=str(output_path), n_trials=17)
+        report = WfoReport(
+            folds=[
+                FoldResult(
+                    fold_index=0,
+                    best_params={"pure_mm_wide_spread_pct": 0.2},
+                    oos_sharpe=0.5,
+                    oos_win_rate=0.45,
+                    oos_profit_factor=0.9,
+                    oos_total_fills=11,
+                    train_dates=["2026-03-20"],
+                    test_dates=["2026-03-21"],
+                ),
+                FoldResult(
+                    fold_index=1,
+                    best_params={"pure_mm_wide_spread_pct": 0.25},
+                    oos_sharpe=1.8,
+                    oos_win_rate=0.62,
+                    oos_profit_factor=1.4,
+                    oos_total_fills=29,
+                    train_dates=["2026-03-21"],
+                    test_dates=["2026-03-22"],
+                ),
+            ],
+            aggregate_oos_sharpe=-3.7,
+            aggregate_oos_win_rate=0.12,
+            aggregate_oos_profit_factor=0.4,
+            aggregate_oos_trade_count=999,
+            champion_params={"pure_mm_wide_spread_pct": 0.25},
+            champion_fold_index=1,
+            champion_degradation_pct=12.34,
+        )
+
+        _export_champion_params(cfg, report)
+
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        assert payload["meta"]["champion_fold"] == 1
+        assert payload["meta"]["oos_sharpe"] == 1.8
+        assert payload["meta"]["oos_win_rate"] == 0.62
+        assert payload["meta"]["oos_profit_factor"] == 1.4
+        assert payload["meta"]["oos_trade_count"] == 29
+        assert payload["meta"]["n_trials_per_fold"] == 17
+        assert payload["params"] == {"pure_mm_wide_spread_pct": 0.25}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

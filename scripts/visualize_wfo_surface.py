@@ -26,6 +26,7 @@ import json
 import math
 import statistics
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -67,6 +68,13 @@ VALUE_FIELD_CANDIDATES = (
     "best_trial_score",
     "best_value",
 )
+
+
+@dataclass(frozen=True)
+class AxisSpec:
+    centers: np.ndarray
+    labels: list[str]
+    edges: np.ndarray | None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -121,6 +129,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of plateau candidates to print (default: 5).",
+    )
+    parser.add_argument(
+        "--x-bins",
+        type=int,
+        default=None,
+        help=(
+            "Optional number of uniform bins for pure_mm_wide_spread_pct. "
+            "If omitted, the script keeps exact coordinates for small discrete grids "
+            "and auto-bins dense float sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--y-bins",
+        type=int,
+        default=None,
+        help=(
+            "Optional number of uniform bins for pure_mm_toxic_ofi_ratio. "
+            "If omitted, the script keeps exact coordinates for small discrete grids "
+            "and auto-bins dense float sweeps."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -229,13 +257,77 @@ def _aggregate(values: list[float], method: str) -> float:
     raise ValueError(f"Unsupported aggregation method: {method}")
 
 
+def _auto_bin_count(unique_count: int) -> int:
+    if unique_count <= 12:
+        return unique_count
+    return min(12, max(4, int(math.ceil(math.sqrt(unique_count)))))
+
+
+def _format_bin_label(lower: float, upper: float) -> str:
+    return f"{lower:.4f}-{upper:.4f}"
+
+
+def _build_axis_spec(values: list[float], requested_bins: int | None) -> AxisSpec:
+    unique_values = sorted(set(values))
+    if not unique_values:
+        raise ValueError("Cannot build a grid axis from an empty value set.")
+
+    if len(unique_values) == 1:
+        only_value = float(unique_values[0])
+        return AxisSpec(
+            centers=np.array([only_value], dtype=float),
+            labels=[f"{only_value:.4f}"],
+            edges=None,
+        )
+
+    n_bins = requested_bins if requested_bins is not None else _auto_bin_count(len(unique_values))
+    n_bins = max(1, min(int(n_bins), len(unique_values)))
+    if n_bins >= len(unique_values):
+        centers = np.array(unique_values, dtype=float)
+        return AxisSpec(
+            centers=centers,
+            labels=[f"{value:.4f}" for value in centers],
+            edges=None,
+        )
+
+    data_min = float(unique_values[0])
+    data_max = float(unique_values[-1])
+    edges = np.linspace(data_min, data_max, n_bins + 1, dtype=float)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    labels = [_format_bin_label(float(edges[i]), float(edges[i + 1])) for i in range(n_bins)]
+    return AxisSpec(centers=centers, labels=labels, edges=edges)
+
+
+def _locate_axis_index(axis: AxisSpec, value: float) -> int:
+    if axis.edges is None:
+        return int(np.searchsorted(axis.centers, value))
+    index = int(np.searchsorted(axis.edges, value, side="right") - 1)
+    return min(max(index, 0), len(axis.centers) - 1)
+
+
 def build_grid(
     points: Iterable[tuple[float, float, float]],
     agg: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[tuple[float, float], list[float]]]:
+    x_bins: int | None = None,
+    y_bins: int | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    list[str],
+    np.ndarray,
+    np.ndarray,
+    dict[tuple[float, float], list[float]],
+]:
+    point_list = list(points)
+    x_axis = _build_axis_spec([x_value for x_value, _, _ in point_list], x_bins)
+    y_axis = _build_axis_spec([y_value for _, y_value, _ in point_list], y_bins)
+
     buckets: dict[tuple[float, float], list[float]] = defaultdict(list)
-    for x_value, y_value, z_value in points:
-        buckets[(x_value, y_value)].append(z_value)
+    for x_value, y_value, z_value in point_list:
+        x_index = _locate_axis_index(x_axis, x_value)
+        y_index = _locate_axis_index(y_axis, y_value)
+        buckets[(float(x_axis.centers[x_index]), float(y_axis.centers[y_index]))].append(z_value)
 
     if not buckets:
         raise ValueError(
@@ -243,8 +335,8 @@ def build_grid(
             "pure_mm_toxic_ofi_ratio, and a numeric value column."
         )
 
-    x_values = np.array(sorted({pair[0] for pair in buckets}), dtype=float)
-    y_values = np.array(sorted({pair[1] for pair in buckets}), dtype=float)
+    x_values = x_axis.centers
+    y_values = y_axis.centers
 
     grid = np.full((len(y_values), len(x_values)), np.nan, dtype=float)
     counts = np.zeros_like(grid)
@@ -255,7 +347,7 @@ def build_grid(
                 continue
             grid[y_index, x_index] = _aggregate(values, agg)
             counts[y_index, x_index] = len(values)
-    return x_values, y_values, grid, counts, buckets
+    return x_values, y_values, x_axis.labels, y_axis.labels, grid, counts, buckets
 
 
 def compute_plateau_scores(grid: np.ndarray, radius: int) -> np.ndarray:
@@ -314,13 +406,11 @@ def _build_norm(grid: np.ndarray) -> colors.Normalize:
     return colors.Normalize(vmin=data_min, vmax=data_max)
 
 
-def _format_tick_labels(values: np.ndarray) -> list[str]:
-    return [f"{value:.3f}" for value in values]
-
-
 def plot_heatmap(
     x_values: np.ndarray,
     y_values: np.ndarray,
+    x_labels: list[str],
+    y_labels: list[str],
     grid: np.ndarray,
     plateau_scores: np.ndarray,
     value_field: str,
@@ -335,9 +425,9 @@ def plot_heatmap(
     axes[0].set_xlabel(X_FIELD)
     axes[0].set_ylabel(Y_FIELD)
     axes[0].set_xticks(np.arange(len(x_values)))
-    axes[0].set_xticklabels(_format_tick_labels(x_values), rotation=45, ha="right")
+    axes[0].set_xticklabels(x_labels, rotation=45, ha="right")
     axes[0].set_yticks(np.arange(len(y_values)))
-    axes[0].set_yticklabels(_format_tick_labels(y_values))
+    axes[0].set_yticklabels(y_labels)
     figure.colorbar(heatmap, ax=axes[0], fraction=0.046, pad=0.04, label=value_field)
 
     plateau_map = axes[1].imshow(
@@ -351,9 +441,9 @@ def plot_heatmap(
     axes[1].set_xlabel(X_FIELD)
     axes[1].set_ylabel(Y_FIELD)
     axes[1].set_xticks(np.arange(len(x_values)))
-    axes[1].set_xticklabels(_format_tick_labels(x_values), rotation=45, ha="right")
+    axes[1].set_xticklabels(x_labels, rotation=45, ha="right")
     axes[1].set_yticks(np.arange(len(y_values)))
-    axes[1].set_yticklabels(_format_tick_labels(y_values))
+    axes[1].set_yticklabels(y_labels)
     figure.colorbar(plateau_map, ax=axes[1], fraction=0.046, pad=0.04, label="plateau score")
 
     figure.suptitle("WFO parameter surface: broad profitable plateaus beat narrow peaks", fontsize=13)
@@ -471,6 +561,8 @@ def _string_grid(values: np.ndarray) -> list[list[str | None]]:
 def build_plotly_heatmap_figure(
     x_values: np.ndarray,
     y_values: np.ndarray,
+    x_labels: list[str],
+    y_labels: list[str],
     grid: np.ndarray,
     plateau_scores: np.ndarray,
     counts: np.ndarray,
@@ -484,8 +576,18 @@ def build_plotly_heatmap_figure(
         horizontal_spacing=0.12,
     )
     value_text = _string_grid(grid)
-    plateau_text = _string_grid(plateau_scores)
     sample_text = _string_grid(counts)
+    x_label_grid = np.array([x_labels for _ in y_values], dtype=object)
+    y_label_grid = np.array([[label] * len(x_values) for label in y_labels], dtype=object)
+    value_customdata = np.empty((len(y_values), len(x_values), 3), dtype=object)
+    value_customdata[:, :, 0] = x_label_grid
+    value_customdata[:, :, 1] = y_label_grid
+    value_customdata[:, :, 2] = sample_text
+    plateau_customdata = np.empty((len(y_values), len(x_values), 4), dtype=object)
+    plateau_customdata[:, :, 0] = x_label_grid
+    plateau_customdata[:, :, 1] = y_label_grid
+    plateau_customdata[:, :, 2] = value_text
+    plateau_customdata[:, :, 3] = sample_text
 
     figure.add_trace(
         go.Heatmap(
@@ -494,12 +596,12 @@ def build_plotly_heatmap_figure(
             z=grid,
             colorbar={"title": value_field, "x": 0.44},
             hovertemplate=(
-                f"{X_FIELD}: %{{x:.4f}}<br>"
-                f"{Y_FIELD}: %{{y:.4f}}<br>"
+                f"{X_FIELD}: %{{customdata[0]}}<br>"
+                f"{Y_FIELD}: %{{customdata[1]}}<br>"
                 f"{value_field}: %{{z:.4f}}<br>"
-                "samples: %{customdata}<extra></extra>"
+                "samples: %{customdata[2]}<extra></extra>"
             ),
-            customdata=sample_text,
+            customdata=value_customdata,
             **_plotly_heatmap_color_axis(grid),
         ),
         row=1,
@@ -513,13 +615,13 @@ def build_plotly_heatmap_figure(
             colorscale="Viridis",
             colorbar={"title": "plateau score", "x": 1.02},
             hovertemplate=(
-                f"{X_FIELD}: %{{x:.4f}}<br>"
-                f"{Y_FIELD}: %{{y:.4f}}<br>"
+                f"{X_FIELD}: %{{customdata[0]}}<br>"
+                f"{Y_FIELD}: %{{customdata[1]}}<br>"
                 "plateau_score: %{z:.4f}<br>"
-                f"{value_field}: %{{customdata[0]}}<br>"
-                "samples: %{customdata[1]}<extra></extra>"
+                f"{value_field}: %{{customdata[2]}}<br>"
+                "samples: %{customdata[3]}<extra></extra>"
             ),
-            customdata=np.dstack((value_text, sample_text)),
+            customdata=plateau_customdata,
         ),
         row=1,
         col=2,
@@ -586,6 +688,8 @@ def build_plotly_surface_figure(
 def export_plotly_html(
     x_values: np.ndarray,
     y_values: np.ndarray,
+    x_labels: list[str],
+    y_labels: list[str],
     grid: np.ndarray,
     plateau_scores: np.ndarray,
     counts: np.ndarray,
@@ -600,6 +704,8 @@ def export_plotly_html(
         heatmap_figure = build_plotly_heatmap_figure(
             x_values=x_values,
             y_values=y_values,
+            x_labels=x_labels,
+            y_labels=y_labels,
             grid=grid,
             plateau_scores=plateau_scores,
             counts=counts,
@@ -655,14 +761,19 @@ def print_summary(
     input_path: Path,
     rows: list[dict[str, Any]],
     points: list[tuple[float, float, float]],
+    x_values: np.ndarray,
+    y_values: np.ndarray,
     value_field: str,
     agg: str,
     plateau_candidates: list[dict[str, float]],
 ) -> None:
     unique_pairs = {(x_value, y_value) for x_value, y_value, _ in points}
+    occupied_cells = len(plateau_candidates)
     print(f"Loaded {len(rows)} raw rows from {input_path}")
     print(f"Usable rows: {len(points)}")
     print(f"Unique parameter pairs: {len(unique_pairs)}")
+    print(f"Grid bins: {len(x_values)} x {len(y_values)}")
+    print(f"Occupied grid cells: {occupied_cells}")
     print(f"Value field: {value_field}")
     print(f"Aggregation: {agg}")
     print()
@@ -690,7 +801,12 @@ def main(argv: list[str] | None = None) -> int:
     rows = load_rows(input_path)
     value_field = _resolve_value_field(rows, args.value_column)
     points = _collect_points(rows, value_field)
-    x_values, y_values, grid, counts, _ = build_grid(points, args.agg)
+    x_values, y_values, x_labels, y_labels, grid, counts, _ = build_grid(
+        points,
+        args.agg,
+        x_bins=args.x_bins,
+        y_bins=args.y_bins,
+    )
     plateau_scores = compute_plateau_scores(grid, radius=max(0, args.plateau_radius))
     plateau_candidates = summarize_plateaus(
         x_values=x_values,
@@ -703,17 +819,37 @@ def main(argv: list[str] | None = None) -> int:
     output_paths = resolve_output_paths(input_path, args.output, args.plot)
 
     if args.plot == "heatmap":
-        plot_heatmap(x_values, y_values, grid, plateau_scores, value_field, output_paths[0])
+        plot_heatmap(
+            x_values,
+            y_values,
+            x_labels,
+            y_labels,
+            grid,
+            plateau_scores,
+            value_field,
+            output_paths[0],
+        )
     elif args.plot == "surface":
         plot_surface(x_values, y_values, grid, value_field, output_paths[0])
     else:
-        plot_heatmap(x_values, y_values, grid, plateau_scores, value_field, output_paths[0])
+        plot_heatmap(
+            x_values,
+            y_values,
+            x_labels,
+            y_labels,
+            grid,
+            plateau_scores,
+            value_field,
+            output_paths[0],
+        )
         plot_surface(x_values, y_values, grid, value_field, output_paths[1])
 
     if args.export_html:
         export_plotly_html(
             x_values=x_values,
             y_values=y_values,
+            x_labels=x_labels,
+            y_labels=y_labels,
             grid=grid,
             plateau_scores=plateau_scores,
             counts=counts,
@@ -726,6 +862,8 @@ def main(argv: list[str] | None = None) -> int:
         input_path=input_path,
         rows=rows,
         points=points,
+        x_values=x_values,
+        y_values=y_values,
         value_field=value_field,
         agg=args.agg,
         plateau_candidates=plateau_candidates,
