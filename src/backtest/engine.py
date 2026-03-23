@@ -22,6 +22,7 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from src.backtest.clock import SimClock
 from src.backtest.data_loader import DataLoader, MarketEvent
@@ -153,6 +154,7 @@ class BacktestEngine:
         # rather than the unified matching-engine book (which reflects only the
         # most recently processed asset in trade-only mode).
         self._bbo_per_asset: dict[str, tuple[float, float]] = {}  # asset_id → (bid, ask)
+        self._book_per_asset: dict[str, dict[str, dict[float, float]]] = {}
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Order submission API (called by strategies)
@@ -166,6 +168,7 @@ class BacktestEngine:
         *,
         order_type: str = "limit",
         post_only: bool = False,
+        asset_id: str = "",
     ) -> SimOrder:
         """Submit an order to the simulated exchange.
 
@@ -182,6 +185,7 @@ class BacktestEngine:
             order_type=order_type,
             post_only=post_only,
             current_time=self.clock.now(),
+            asset_id=asset_id,
         )
 
         # Store mid for slippage calc when fills arrive
@@ -323,6 +327,8 @@ class BacktestEngine:
     def _process_book_event(self, event: MarketEvent) -> None:
         """Handle an L2 delta or snapshot."""
         self._has_real_book = True
+        self._update_asset_book(event.asset_id, event.data)
+
         # Update the matching engine's historical book mirror
         self.matching_engine.on_book_update(event.data, current_time=event.timestamp)
 
@@ -330,21 +336,7 @@ class BacktestEngine:
         self.matching_engine.check_maker_viability()
 
         # Build a snapshot dict for the strategy
-        snapshot = {
-            "best_bid": self.matching_engine.best_bid,
-            "best_ask": self.matching_engine.best_ask,
-            "mid_price": self.matching_engine.mid_price,
-            "bid_levels": self.matching_engine.bid_levels(5),
-            "ask_levels": self.matching_engine.ask_levels(5),
-            "event_data": event.data,
-            "timestamp": event.timestamp,
-        }
-
-        # Record per-asset BBO from real book data
-        self._bbo_per_asset[event.asset_id] = (
-            self.matching_engine.best_bid,
-            self.matching_engine.best_ask,
-        )
+        snapshot = self._build_asset_snapshot(event.asset_id, event.data, event.timestamp)
 
         self.strategy.on_book_update(event.asset_id, snapshot)
 
@@ -441,16 +433,16 @@ class BacktestEngine:
             if fill.side == OrderSide.BUY:
                 cost = fill.price * fill.size + fill.fee
                 self._cash -= cost
-                self._positions[fill.order_id.rsplit("-", 1)[0]] = (
-                    self._positions.get(fill.order_id.rsplit("-", 1)[0], 0.0)
+                pos_key = order.asset_id if order and order.asset_id else fill.order_id.rsplit("-", 1)[0]
+                self._positions[pos_key] = (
+                    self._positions.get(pos_key, 0.0)
                     + fill.size
                 )
             else:
                 proceeds = fill.price * fill.size - fill.fee
                 self._cash += proceeds
                 # Reduce position — use the order context to find asset
-                # For simplicity, track by a synthetic key
-                pos_key = fill.order_id.rsplit("-", 1)[0]
+                pos_key = order.asset_id if order and order.asset_id else fill.order_id.rsplit("-", 1)[0]
                 held = self._positions.get(pos_key, 0.0)
                 self._positions[pos_key] = max(0.0, held - fill.size)
                 if self._positions[pos_key] <= 1e-9:
@@ -467,13 +459,91 @@ class BacktestEngine:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _compute_equity(self) -> float:
-        """Mark-to-market equity = cash + sum(position_value)."""
+        """Mark-to-market equity = cash + conservative liquidation value."""
         equity = self._cash
-        mid = self.matching_engine.mid_price
-        if mid > 0:
-            for _key, shares in self._positions.items():
-                equity += shares * mid
+        for asset_id, shares in self._positions.items():
+            if shares <= 0:
+                continue
+            bbo = self._bbo_per_asset.get(asset_id)
+            if bbo is not None:
+                best_bid, best_ask = bbo
+                mark_price = best_bid if shares >= 0 else best_ask
+            else:
+                mark_price = self.matching_engine.best_bid if shares >= 0 else self.matching_engine.best_ask
+            if mark_price > 0:
+                equity += shares * mark_price
         return equity
+
+    def _build_asset_snapshot(
+        self,
+        asset_id: str,
+        event_data: dict[str, Any],
+        timestamp: float,
+    ) -> dict[str, Any]:
+        book = self._book_per_asset.get(asset_id, {"bids": {}, "asks": {}})
+        bid_levels = sorted(book["bids"].items(), key=lambda item: item[0], reverse=True)[:5]
+        ask_levels = sorted(book["asks"].items(), key=lambda item: item[0])[:5]
+        best_bid, best_ask = self._bbo_per_asset.get(asset_id, (0.0, 0.0))
+        mid_price = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": mid_price,
+            "bid_levels": bid_levels,
+            "ask_levels": ask_levels,
+            "event_data": event_data,
+            "timestamp": timestamp,
+        }
+
+    def _update_asset_book(self, asset_id: str, event_data: dict[str, Any]) -> None:
+        book = self._book_per_asset.setdefault(asset_id, {"bids": {}, "asks": {}})
+        event_type = str(event_data.get("event_type", "")).lower()
+
+        if event_type in ("book", "snapshot", "book_snapshot", "l2_snapshot"):
+            book["bids"] = self._parse_book_levels(event_data.get("bids") or [])
+            book["asks"] = self._parse_book_levels(event_data.get("asks") or [])
+        else:
+            changes = event_data.get("price_changes") or event_data.get("changes") or event_data.get("data") or []
+            if isinstance(changes, dict):
+                changes = [changes]
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                try:
+                    price = float(change.get("price", 0.0))
+                    size = float(change.get("size", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0:
+                    continue
+                side = str(change.get("side", "")).upper()
+                if side in ("BUY", "BID"):
+                    if size <= 0:
+                        book["bids"].pop(price, None)
+                    else:
+                        book["bids"][price] = size
+                elif side in ("SELL", "ASK"):
+                    if size <= 0:
+                        book["asks"].pop(price, None)
+                    else:
+                        book["asks"][price] = size
+
+        best_bid = max(book["bids"], default=0.0)
+        best_ask = min(book["asks"], default=0.0)
+        self._bbo_per_asset[asset_id] = (best_bid, best_ask)
+
+    @staticmethod
+    def _parse_book_levels(levels: list[dict[str, Any]]) -> dict[float, float]:
+        parsed: dict[float, float] = {}
+        for level in levels:
+            try:
+                price = float(level["price"])
+                size = float(level["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                parsed[price] = size
+        return parsed
 
     def _get_aggregator(self, asset_id: str) -> OHLCVAggregator:
         """Lazily create per-asset OHLCV aggregators."""

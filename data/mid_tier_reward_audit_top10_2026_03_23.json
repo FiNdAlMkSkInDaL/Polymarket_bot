@@ -1,0 +1,372 @@
+[
+  {
+    "market_id": "665325",
+    "condition_id": "0x182390641d3b1b47cc64274b9da290efd04221c586651ba190880713da6347d9",
+    "question": "US-Iran nuclear deal before 2027?",
+    "volume_24h": 14572.787726999997,
+    "liquidity": 30342.7495,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 4.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 0.0,
+    "total_reward_zone_depth_usd": 0.0,
+    "capital_for_majority_usd": 0.0,
+    "reward_to_competition": null,
+    "token_audit": [
+      {
+        "token_id": "102936224134271070189104847090829839924697394514566827387181305960175107677216",
+        "outcome": "Yes",
+        "mid_price": 0.51,
+        "best_bid": 0.5,
+        "best_ask": 0.52,
+        "reward_bid_depth_usd": 0.0,
+        "reward_ask_depth_usd": 0.0,
+        "paired_depth_usd": 0.0
+      },
+      {
+        "token_id": "45763018441764333771124945243746174684578244015331389396782339063349542289693",
+        "outcome": "No",
+        "mid_price": 0.49,
+        "best_bid": 0.48,
+        "best_ask": 0.5,
+        "reward_bid_depth_usd": 0.0,
+        "reward_ask_depth_usd": 0.0,
+        "paired_depth_usd": 0.0
+      }
+    ]
+  },
+  {
+    "market_id": "1145481",
+    "condition_id": "0x02dd4a8820831ee3ce210a5a075651d09ab38064ad0e2d4241aaece5724a3544",
+    "question": "Tulsi Gabbard out by March 31?",
+    "volume_24h": 14136.630872000002,
+    "liquidity": 17655.83101,
+    "daily_reward_usd": 100.0,
+    "reward_max_spread_cents": 4.5,
+    "reward_min_size": 50.0,
+    "competitive_flag": true,
+    "competition_usd": 806.76,
+    "total_reward_zone_depth_usd": 5163.61,
+    "capital_for_majority_usd": 847.1,
+    "reward_to_competition": 0.12395260052555902,
+    "token_audit": [
+      {
+        "token_id": "101083186608313981443973041180919242949313297291506239384068182730249434635927",
+        "outcome": "Yes",
+        "mid_price": 0.0665,
+        "best_bid": 0.066,
+        "best_ask": 0.067,
+        "reward_bid_depth_usd": 49.58,
+        "reward_ask_depth_usd": 310.67,
+        "paired_depth_usd": 49.58
+      },
+      {
+        "token_id": "76456261268481962148208724609694636655917524674795688415709850424601760709387",
+        "outcome": "No",
+        "mid_price": 0.9335,
+        "best_bid": 0.933,
+        "best_ask": 0.934,
+        "reward_bid_depth_usd": 4046.18,
+        "reward_ask_depth_usd": 757.18,
+        "paired_depth_usd": 757.18
+      }
+    ]
+  },
+  {
+    "market_id": "609655",
+    "condition_id": "0xfdc73f10edf0266756686f35b5712cffa828b0940fc015e0426c76c934c2105d",
+    "question": "US recession by end of 2026?",
+    "volume_24h": 20797.335218000004,
+    "liquidity": 75058.8255,
+    "daily_reward_usd": 150.0,
+    "reward_max_spread_cents": 3.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 2711.48,
+    "total_reward_zone_depth_usd": 10019.97,
+    "capital_for_majority_usd": 2847.05,
+    "reward_to_competition": 0.05532034165843008,
+    "token_audit": [
+      {
+        "token_id": "100379208559626151022751801118534484742123694725746262280150222742563282755057",
+        "outcome": "Yes",
+        "mid_price": 0.345,
+        "best_bid": 0.34,
+        "best_ask": 0.35,
+        "reward_bid_depth_usd": 2470.0,
+        "reward_ask_depth_usd": 955.19,
+        "paired_depth_usd": 955.19
+      },
+      {
+        "token_id": "113732820231608904682346496304917888352004831436510840986547065248348999143469",
+        "outcome": "No",
+        "mid_price": 0.655,
+        "best_bid": 0.65,
+        "best_ask": 0.66,
+        "reward_bid_depth_usd": 1756.29,
+        "reward_ask_depth_usd": 4838.49,
+        "paired_depth_usd": 1756.29
+      }
+    ]
+  },
+  {
+    "market_id": "1385754",
+    "condition_id": "0x0c38dd9305e3205557885183f0730270779e7e426b0ec3e7743f23963b6d6e4a",
+    "question": "Will France, UK, or Germany strike Iran by June 30?",
+    "volume_24h": 10441.100446,
+    "liquidity": 70704.3248,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 4.5,
+    "reward_min_size": 100.0,
+    "competitive_flag": true,
+    "competition_usd": 334.96,
+    "total_reward_zone_depth_usd": 1178.79,
+    "capital_for_majority_usd": 351.71,
+    "reward_to_competition": 0.029854310962502986,
+    "token_audit": [
+      {
+        "token_id": "7328072973899355705297677072418607468586389403280574518335559515248500056682",
+        "outcome": "Yes",
+        "mid_price": 0.115,
+        "best_bid": 0.11,
+        "best_ask": 0.12,
+        "reward_bid_depth_usd": 91.22,
+        "reward_ask_depth_usd": 43.54,
+        "paired_depth_usd": 43.54
+      },
+      {
+        "token_id": "112418822297470572658312548631220776645321771603729476024056332596414394278374",
+        "outcome": "No",
+        "mid_price": 0.885,
+        "best_bid": 0.88,
+        "best_ask": 0.89,
+        "reward_bid_depth_usd": 291.42,
+        "reward_ask_depth_usd": 752.61,
+        "paired_depth_usd": 291.42
+      }
+    ]
+  },
+  {
+    "market_id": "1107878",
+    "condition_id": "0x80ebf0a88a44bf737d4047b3accd7108285c69b84257e5c684bdc4c715c81139",
+    "question": "Will the U.S. invade Cuba in 2026?",
+    "volume_24h": 15202.177128,
+    "liquidity": 129206.3587,
+    "daily_reward_usd": 30.0,
+    "reward_max_spread_cents": 3.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 3426.92,
+    "total_reward_zone_depth_usd": 31375.84,
+    "capital_for_majority_usd": 3598.27,
+    "reward_to_competition": 0.008754216614335905,
+    "token_audit": [
+      {
+        "token_id": "1291454874125024564913411658636854434792972068510027777552181749936579562639",
+        "outcome": "Yes",
+        "mid_price": 0.245,
+        "best_bid": 0.24,
+        "best_ask": 0.25,
+        "reward_bid_depth_usd": 792.41,
+        "reward_ask_depth_usd": 6995.83,
+        "paired_depth_usd": 792.41
+      },
+      {
+        "token_id": "46036307473347147486878725188057240439237346445231099615680388314304154599904",
+        "outcome": "No",
+        "mid_price": 0.755,
+        "best_bid": 0.75,
+        "best_ask": 0.76,
+        "reward_bid_depth_usd": 20953.09,
+        "reward_ask_depth_usd": 2634.51,
+        "paired_depth_usd": 2634.51
+      }
+    ]
+  },
+  {
+    "market_id": "1285886",
+    "condition_id": "0x02f0c60b4f9551c97fe67bc6f02df357de52ca969f0e9159e06a5aca69cd2bf6",
+    "question": " Iran agrees to end enrichment of uranium by March 31?",
+    "volume_24h": 37691.50398600001,
+    "liquidity": 26111.64775,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 3.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 1280.83,
+    "total_reward_zone_depth_usd": 4695.98,
+    "capital_for_majority_usd": 1344.87,
+    "reward_to_competition": 0.007807437364833741,
+    "token_audit": [
+      {
+        "token_id": "31960841751919981056525414658345236180374534606053184123499100806143881191074",
+        "outcome": "Yes",
+        "mid_price": 0.0665,
+        "best_bid": 0.065,
+        "best_ask": 0.068,
+        "reward_bid_depth_usd": 77.4,
+        "reward_ask_depth_usd": 245.94,
+        "paired_depth_usd": 77.4
+      },
+      {
+        "token_id": "10078316256053557157063536818926650832044107721234178118318636350721246704893",
+        "outcome": "No",
+        "mid_price": 0.9335,
+        "best_bid": 0.932,
+        "best_ask": 0.935,
+        "reward_bid_depth_usd": 3169.21,
+        "reward_ask_depth_usd": 1203.43,
+        "paired_depth_usd": 1203.43
+      }
+    ]
+  },
+  {
+    "market_id": "703257",
+    "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+    "question": "Will the US confirm that aliens exist before 2027?",
+    "volume_24h": 51653.72212,
+    "liquidity": 1757357.1902,
+    "daily_reward_usd": 400.0,
+    "reward_max_spread_cents": 3.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 348554.85,
+    "total_reward_zone_depth_usd": 788381.0,
+    "capital_for_majority_usd": 365982.59,
+    "reward_to_competition": 0.0011475955649448,
+    "token_audit": [
+      {
+        "token_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "outcome": "Yes",
+        "mid_price": 0.165,
+        "best_bid": 0.16,
+        "best_ask": 0.17,
+        "reward_bid_depth_usd": 55071.1,
+        "reward_ask_depth_usd": 75676.21,
+        "paired_depth_usd": 55071.1
+      },
+      {
+        "token_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392",
+        "outcome": "No",
+        "mid_price": 0.835,
+        "best_bid": 0.83,
+        "best_ask": 0.84,
+        "reward_bid_depth_usd": 364149.94,
+        "reward_ask_depth_usd": 293483.75,
+        "paired_depth_usd": 293483.75
+      }
+    ]
+  },
+  {
+    "market_id": "666861",
+    "condition_id": "0x48b0b0bca515f68fccf95af4793dbd0edbfec1f8ec6e8df2c0f69ba74f8c4722",
+    "question": "Trump out as President before 2027?",
+    "volume_24h": 12475.136217,
+    "liquidity": 179962.9635,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 4.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 9436.04,
+    "total_reward_zone_depth_usd": 25338.93,
+    "capital_for_majority_usd": 9907.84,
+    "reward_to_competition": 0.0010597665970046757,
+    "token_audit": [
+      {
+        "token_id": "59252515735652674747158950210016502214756531287333895140318848923768750410355",
+        "outcome": "Yes",
+        "mid_price": 0.165,
+        "best_bid": 0.16,
+        "best_ask": 0.17,
+        "reward_bid_depth_usd": 1443.63,
+        "reward_ask_depth_usd": 2754.77,
+        "paired_depth_usd": 1443.63
+      },
+      {
+        "token_id": "2849827372590072151380088930233312280478318575453624773762283369907909283027",
+        "outcome": "No",
+        "mid_price": 0.835,
+        "best_bid": 0.83,
+        "best_ask": 0.84,
+        "reward_bid_depth_usd": 13148.12,
+        "reward_ask_depth_usd": 7992.41,
+        "paired_depth_usd": 7992.41
+      }
+    ]
+  },
+  {
+    "market_id": "1126504",
+    "condition_id": "0x890fc3ba40458db0b67560691aa1597344c2a0560d18e80f586a4b35f510b4ce",
+    "question": "Will the US acquire part of Greenland in 2026?",
+    "volume_24h": 23826.377781999996,
+    "liquidity": 178722.596,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 4.5,
+    "reward_min_size": 200.0,
+    "competitive_flag": true,
+    "competition_usd": 23744.96,
+    "total_reward_zone_depth_usd": 76245.39,
+    "capital_for_majority_usd": 24932.21,
+    "reward_to_competition": 0.0004211420023449187,
+    "token_audit": [
+      {
+        "token_id": "60745476350338574489643206785963608049827415658137795738920858026399504782388",
+        "outcome": "Yes",
+        "mid_price": 0.155,
+        "best_bid": 0.15,
+        "best_ask": 0.16,
+        "reward_bid_depth_usd": 7579.49,
+        "reward_ask_depth_usd": 3834.51,
+        "paired_depth_usd": 3834.51
+      },
+      {
+        "token_id": "104895545296438735617666172336621441242754294947987367085791779928220778311973",
+        "outcome": "No",
+        "mid_price": 0.845,
+        "best_bid": 0.84,
+        "best_ask": 0.85,
+        "reward_bid_depth_usd": 19910.45,
+        "reward_ask_depth_usd": 44920.94,
+        "paired_depth_usd": 19910.45
+      }
+    ]
+  },
+  {
+    "market_id": "997488",
+    "condition_id": "0xd595eb9b81885ff018738300c79047e3ec89e87294424f57a29a7fa9162bf116",
+    "question": "Will Trump acquire Greenland before 2027?",
+    "volume_24h": 20216.42039800002,
+    "liquidity": 350452.9595,
+    "daily_reward_usd": 10.0,
+    "reward_max_spread_cents": 3.5,
+    "reward_min_size": 20.0,
+    "competitive_flag": true,
+    "competition_usd": 36750.92,
+    "total_reward_zone_depth_usd": 74628.12,
+    "capital_for_majority_usd": 38588.47,
+    "reward_to_competition": 0.00027210203173145056,
+    "token_audit": [
+      {
+        "token_id": "5161623255678193352839985156330393796378434470119114669671615782853260939535",
+        "outcome": "Yes",
+        "mid_price": 0.09,
+        "best_bid": 0.089,
+        "best_ask": 0.091,
+        "reward_bid_depth_usd": 3075.68,
+        "reward_ask_depth_usd": 3524.66,
+        "paired_depth_usd": 3075.68
+      },
+      {
+        "token_id": "57216272564529548464686463691236811991956032201293786790337952253964682584376",
+        "outcome": "No",
+        "mid_price": 0.91,
+        "best_bid": 0.909,
+        "best_ask": 0.911,
+        "reward_bid_depth_usd": 33675.24,
+        "reward_ask_depth_usd": 34352.54,
+        "paired_depth_usd": 33675.24
+      }
+    ]
+  }
+]

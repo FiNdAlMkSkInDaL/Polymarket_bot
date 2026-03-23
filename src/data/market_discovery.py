@@ -319,7 +319,13 @@ async def _fetch_gamma_events(
     tags_raw = settings.strategy.discovery_tags.strip()
     tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
 
-    one_per_event = settings.strategy.one_market_per_event
+    # SI-9 cluster discovery needs all negRisk legs for an event present in
+    # the bootstrap universe. Per-event deduplication collapses each event to
+    # a single market and guarantees zero clusters downstream.
+    one_per_event = (
+        settings.strategy.one_market_per_event
+        and not settings.strategy.si9_arb_enabled
+    )
     gamma_url = "https://gamma-api.polymarket.com/events"
     markets: list[MarketInfo] = []
     rejections: list[dict] = []
