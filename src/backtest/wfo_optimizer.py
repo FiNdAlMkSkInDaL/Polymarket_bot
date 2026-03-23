@@ -363,9 +363,10 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     "drift_vol_ceiling": ("suggest_float", 0.02, 0.15, True),     # log-scale
     # Pure market maker microstructure
     "pure_mm_wide_tier_enabled": ("suggest_categorical", (True,)),
-    "pure_mm_wide_spread_pct": ("suggest_float", 0.05, 0.25),
-    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.60, 0.95),
-    "pure_mm_depth_evaporation_pct": ("suggest_float", 0.2, 0.95),
+    "pure_mm_wide_spread_pct": ("suggest_float", 0.01, 0.05),
+    "pure_mm_inventory_penalty_coef": ("suggest_float", 2.0, 10.0),
+    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.30, 0.70),
+    "pure_mm_depth_evaporation_pct": ("suggest_float", 0.20, 0.80),
     # PCE (Pillar 15)
     "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
     "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),

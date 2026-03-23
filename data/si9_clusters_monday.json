@@ -1,0 +1,1209 @@
+[
+  {
+    "event_id": "183788",
+    "event_slug": "col1-dep-alf-2026-02-11",
+    "title": "Deportivo Pereira vs. Alianza FC",
+    "leg_count": 3,
+    "total_volume_24h": 1133.0,
+    "total_liquidity": 7.6305499999999995,
+    "cluster_score": 148.48208844709754,
+    "condition_ids": [
+      "0x7d00e4f39e9d21c55ac8c3c422a7976fb1a0f43d1f068e9678002193aa086587",
+      "0x86a7f7698d6d96dba25e474ccf8b63cb3cd37de0a19bdddf3777fd40ffea1207",
+      "0x5585d6c8c65ea32969d589d95d9ae4b48841b77cda883990c7c9958f20a089d2"
+    ],
+    "markets": [
+      {
+        "market_id": "1250969",
+        "condition_id": "0x7d00e4f39e9d21c55ac8c3c422a7976fb1a0f43d1f068e9678002193aa086587",
+        "question": "Will Alianza FC win on 2026-02-11?",
+        "group_item_title": "Alianza FC",
+        "volume_24h": 0.0,
+        "liquidity": 1.8053
+      },
+      {
+        "market_id": "1250967",
+        "condition_id": "0x86a7f7698d6d96dba25e474ccf8b63cb3cd37de0a19bdddf3777fd40ffea1207",
+        "question": "Will Deportivo Pereira win on 2026-02-11?",
+        "group_item_title": "Deportivo Pereira",
+        "volume_24h": 1133.0,
+        "liquidity": 3.1499
+      },
+      {
+        "market_id": "1250968",
+        "condition_id": "0x5585d6c8c65ea32969d589d95d9ae4b48841b77cda883990c7c9958f20a089d2",
+        "question": "Will Deportivo Pereira vs. Alianza FC end in a draw?",
+        "group_item_title": "Draw (Deportivo Pereira vs. Alianza FC)",
+        "volume_24h": 0.0,
+        "liquidity": 2.67535
+      }
+    ]
+  },
+  {
+    "event_id": "107420",
+    "event_slug": "slovenian-parliamentary-election-winner-791",
+    "title": "Slovenian Parliamentary Election Winner",
+    "leg_count": 2,
+    "total_volume_24h": 2505984.7596080005,
+    "total_liquidity": 82970.01946,
+    "cluster_score": 30.203497310448874,
+    "condition_ids": [
+      "0xc28589f4effa41509c87c36535208481f7ab8878a4926a1014d6e525816df729",
+      "0x64d6a172e63a085198fcd8032da984cc42398e21d8984eaf4813ce6e3f0469a6"
+    ],
+    "markets": [
+      {
+        "market_id": "954519",
+        "condition_id": "0xc28589f4effa41509c87c36535208481f7ab8878a4926a1014d6e525816df729",
+        "question": "Will the Freedom Movement (GS) win the most seats in the 2026 Slovenian parliamentary election?",
+        "group_item_title": "Freedom Movement (GS)",
+        "volume_24h": 1165524.9639650027,
+        "liquidity": 64630.20394
+      },
+      {
+        "market_id": "954518",
+        "condition_id": "0x64d6a172e63a085198fcd8032da984cc42398e21d8984eaf4813ce6e3f0469a6",
+        "question": "Will the Slovenian Democratic Party (SDS) win the most seats in the 2026 Slovenian parliamentary election?",
+        "group_item_title": "Slovenian Democratic Party (SDS)",
+        "volume_24h": 1340459.795642998,
+        "liquidity": 18339.81552
+      }
+    ]
+  },
+  {
+    "event_id": "166459",
+    "event_slug": "next-prime-minister-of-slovenia",
+    "title": "Next Prime Minister of Slovenia",
+    "leg_count": 4,
+    "total_volume_24h": 316408.4580900001,
+    "total_liquidity": 34224.00883,
+    "cluster_score": 9.245219040869447,
+    "condition_ids": [
+      "0xdcdecdd86db43aa1d0c4ed4fc80142e86597c5383a22eccf006464c29099371c",
+      "0xe94749bbf616139120735f9720de5b1a94b61cb7da0feb633f97f113d61a167b",
+      "0x409836e4b9af0e8f7d1c2cc5f071d9ecb85efe706091323c4294c6859cc09ba0",
+      "0x066ab5c23968b87e3dedae9843889eb60de22dfa07498d938bafee0b684439cb"
+    ],
+    "markets": [
+      {
+        "market_id": "1193230",
+        "condition_id": "0xdcdecdd86db43aa1d0c4ed4fc80142e86597c5383a22eccf006464c29099371c",
+        "question": "Will An\u017ee Logar be the next Prime Minister of Slovenia?",
+        "group_item_title": "An\u017ee Logar",
+        "volume_24h": 65174.219924000034,
+        "liquidity": 9533.8593
+      },
+      {
+        "market_id": "1193229",
+        "condition_id": "0xe94749bbf616139120735f9720de5b1a94b61cb7da0feb633f97f113d61a167b",
+        "question": "Will Janez Jan\u0161a be the next Prime Minister of Slovenia?",
+        "group_item_title": "Janez Jan\u0161a",
+        "volume_24h": 113473.27928799998,
+        "liquidity": 9397.1213
+      },
+      {
+        "market_id": "1193228",
+        "condition_id": "0x409836e4b9af0e8f7d1c2cc5f071d9ecb85efe706091323c4294c6859cc09ba0",
+        "question": "Will Robert Golob be the next Prime Minister of Slovenia?",
+        "group_item_title": "Robert Golob",
+        "volume_24h": 124989.60270300007,
+        "liquidity": 8850.8201
+      },
+      {
+        "market_id": "1193231",
+        "condition_id": "0x066ab5c23968b87e3dedae9843889eb60de22dfa07498d938bafee0b684439cb",
+        "question": "Will Vladimir Prebili\u010d be the next Prime Minister of Slovenia?",
+        "group_item_title": "Vladimir Prebili\u010d",
+        "volume_24h": 12771.356174999999,
+        "liquidity": 6442.20813
+      }
+    ]
+  },
+  {
+    "event_id": "80918",
+    "event_slug": "who-will-win-the-lyon-mayoral-election",
+    "title": "Who will win the Lyon mayoral election?",
+    "leg_count": 4,
+    "total_volume_24h": 266627.07641900016,
+    "total_liquidity": 81455.99442,
+    "cluster_score": 3.2732652558905455,
+    "condition_ids": [
+      "0x17bcdc8803522b1014b6c8e7c5ddc3db18e9704c126d14d391e1e486970cce91",
+      "0x9c1cac166616ca0b8d6117223aa9b2fb6e60d9190cd5261245c329e471ef459b",
+      "0x1bb43dc44799556ee98623b3ec98bdf0d094ba4bf2dfc73e7df32a4a9f75d737",
+      "0x379914c8e1309261364e9a8f7888e99004ca398a9db6737fe821505cdb153bf5"
+    ],
+    "markets": [
+      {
+        "market_id": "681392",
+        "condition_id": "0x17bcdc8803522b1014b6c8e7c5ddc3db18e9704c126d14d391e1e486970cce91",
+        "question": "Will Alexandre Dupalais win the 2026 Lyon mayoral election?",
+        "group_item_title": "Alexandre Dupalais",
+        "volume_24h": 2640.0,
+        "liquidity": 31830.6853
+      },
+      {
+        "market_id": "681390",
+        "condition_id": "0x9c1cac166616ca0b8d6117223aa9b2fb6e60d9190cd5261245c329e471ef459b",
+        "question": "Will Gr\u00e9gory Doucet win the 2026 Lyon mayoral election?",
+        "group_item_title": "Gr\u00e9gory Doucet",
+        "volume_24h": 142801.66678200013,
+        "liquidity": 10784.56423
+      },
+      {
+        "market_id": "681389",
+        "condition_id": "0x1bb43dc44799556ee98623b3ec98bdf0d094ba4bf2dfc73e7df32a4a9f75d737",
+        "question": "Will Jean-Michel Aulas win the 2026 Lyon mayoral election?",
+        "group_item_title": "Jean-Michel Aulas",
+        "volume_24h": 120185.40963700003,
+        "liquidity": 12554.17043
+      },
+      {
+        "market_id": "681394",
+        "condition_id": "0x379914c8e1309261364e9a8f7888e99004ca398a9db6737fe821505cdb153bf5",
+        "question": "Will Nathalie Perrin-Gilbert win the 2026 Lyon mayoral election?",
+        "group_item_title": "Nathalie Perrin-Gilbert",
+        "volume_24h": 1000.0,
+        "liquidity": 26286.57446
+      }
+    ]
+  },
+  {
+    "event_id": "33509",
+    "event_slug": "la-liga-winner-114",
+    "title": "La Liga Winner",
+    "leg_count": 4,
+    "total_volume_24h": 1513092.8669909998,
+    "total_liquidity": 1240802.67515,
+    "cluster_score": 1.219446812369326,
+    "condition_ids": [
+      "0xad9cf9a89f41009718b3858c47ea30c88491dbf9f043b8fcd704c4ba65be8edf",
+      "0x069fef06f8b32dee6a22fab6189249dc83582f22cb737a85225b114770d7da05",
+      "0xa1f08ec3bcc1434cb0b695bd5ee9f81268ef45fb73f752b3a1c1fb1d35750866",
+      "0x683b0254bde8d1ef08206953015629f25b9869d9770807baab939f6aaba4ae5c"
+    ],
+    "markets": [
+      {
+        "market_id": "566229",
+        "condition_id": "0xad9cf9a89f41009718b3858c47ea30c88491dbf9f043b8fcd704c4ba65be8edf",
+        "question": "Will Atletico Madrid win the 2025\u201326 La Liga?",
+        "group_item_title": "Atletico Madrid",
+        "volume_24h": 344908.36999999994,
+        "liquidity": 428896.44624
+      },
+      {
+        "market_id": "566228",
+        "condition_id": "0x069fef06f8b32dee6a22fab6189249dc83582f22cb737a85225b114770d7da05",
+        "question": "Will Barcelona win the 2025\u201326 La Liga?",
+        "group_item_title": "Barcelona",
+        "volume_24h": 17582.922005,
+        "liquidity": 94158.1265
+      },
+      {
+        "market_id": "566227",
+        "condition_id": "0xa1f08ec3bcc1434cb0b695bd5ee9f81268ef45fb73f752b3a1c1fb1d35750866",
+        "question": "Will Real Madrid win the 2025\u201326 La Liga?",
+        "group_item_title": "Real Madrid",
+        "volume_24h": 14334.110798000002,
+        "liquidity": 155687.0877
+      },
+      {
+        "market_id": "566230",
+        "condition_id": "0x683b0254bde8d1ef08206953015629f25b9869d9770807baab939f6aaba4ae5c",
+        "question": "Will Villarreal win the 2025\u201326 La Liga?",
+        "group_item_title": "Villarreal",
+        "volume_24h": 1136267.464188,
+        "liquidity": 562061.01471
+      }
+    ]
+  },
+  {
+    "event_id": "75478",
+    "event_slug": "fed-decision-in-april",
+    "title": "Fed decision in April?",
+    "leg_count": 4,
+    "total_volume_24h": 2833204.9502419997,
+    "total_liquidity": 2615069.00726,
+    "cluster_score": 1.083414985369949,
+    "condition_ids": [
+      "0x0d14f5dc9fb3250ec888b1ac8d9fe9a0ce06f9d3ea60fdf138e8690622fea84c",
+      "0xd4d00e5bf8b960cc37c74c1ec19e41e00b0706add203ddcfbb65ad006c5c223a",
+      "0xd72622d154dfe65b9c019d6afcfe75a55717e5c502db611f555b101aafbf6ec5",
+      "0x36e8ca24d2a13435f519f15580d42b45cdbe3bc425fb39a7c2733260357af0fa"
+    ],
+    "markets": [
+      {
+        "market_id": "669661",
+        "condition_id": "0x0d14f5dc9fb3250ec888b1ac8d9fe9a0ce06f9d3ea60fdf138e8690622fea84c",
+        "question": "Will the Fed decrease interest rates by 25 bps after the April 2026 meeting?",
+        "group_item_title": "25 bps decrease",
+        "volume_24h": 464085.9285959999,
+        "liquidity": 689731.18811
+      },
+      {
+        "market_id": "669663",
+        "condition_id": "0xd4d00e5bf8b960cc37c74c1ec19e41e00b0706add203ddcfbb65ad006c5c223a",
+        "question": "Will the Fed increase interest rates by 25+ bps after the April 2026 meeting?",
+        "group_item_title": "25+ bps increase",
+        "volume_24h": 796836.7551380002,
+        "liquidity": 310621.93516
+      },
+      {
+        "market_id": "669660",
+        "condition_id": "0xd72622d154dfe65b9c019d6afcfe75a55717e5c502db611f555b101aafbf6ec5",
+        "question": "Will the Fed decrease interest rates by 50+ bps after the April 2026 meeting?",
+        "group_item_title": "50+ bps decrease",
+        "volume_24h": 1067611.3829799998,
+        "liquidity": 1090216.90361
+      },
+      {
+        "market_id": "669662",
+        "condition_id": "0x36e8ca24d2a13435f519f15580d42b45cdbe3bc425fb39a7c2733260357af0fa",
+        "question": "Will there be no change in Fed interest rates after the April 2026 meeting?",
+        "group_item_title": "No change",
+        "volume_24h": 504670.88352800003,
+        "liquidity": 524498.98038
+      }
+    ]
+  },
+  {
+    "event_id": "80911",
+    "event_slug": "who-will-win-the-nice-mayoral-election",
+    "title": "Who will win the Nice mayoral election?",
+    "leg_count": 4,
+    "total_volume_24h": 75664.01073600001,
+    "total_liquidity": 71336.66693,
+    "cluster_score": 1.0606608633712347,
+    "condition_ids": [
+      "0xc5b07cdec6c7ff66113ce4160ecb2ca148df06b72c170cfa0ec8d4a52309c7fa",
+      "0xd90a30a612b04f2aab7f8d8c67d3696d6aceafa8446ae4e0548e0e4492d7b14f",
+      "0xa50a1b10bec49d2ab35197289678fdbed917a5111d5b629ae47753fc14d3eb93",
+      "0x92aa5a508a571ba5be623c7595b5c24968ace5bbbc637314384ee076f83f6dae"
+    ],
+    "markets": [
+      {
+        "market_id": "681363",
+        "condition_id": "0xc5b07cdec6c7ff66113ce4160ecb2ca148df06b72c170cfa0ec8d4a52309c7fa",
+        "question": "Will Christian Estrosi win the 2026 Nice mayoral election?",
+        "group_item_title": "Christian Estrosi",
+        "volume_24h": 42375.25680600001,
+        "liquidity": 14673.6345
+      },
+      {
+        "market_id": "681362",
+        "condition_id": "0xd90a30a612b04f2aab7f8d8c67d3696d6aceafa8446ae4e0548e0e4492d7b14f",
+        "question": "Will Eric Ciotti win the 2026 Nice mayoral election?",
+        "group_item_title": "Eric Ciotti",
+        "volume_24h": 33288.75393,
+        "liquidity": 5453.85355
+      },
+      {
+        "market_id": "681365",
+        "condition_id": "0xa50a1b10bec49d2ab35197289678fdbed917a5111d5b629ae47753fc14d3eb93",
+        "question": "Will Juliette Chesnel-Leroux win the 2026 Nice mayoral election?",
+        "group_item_title": "Juliette Chesnel-Leroux",
+        "volume_24h": 0.0,
+        "liquidity": 25271.82657
+      },
+      {
+        "market_id": "681366",
+        "condition_id": "0x92aa5a508a571ba5be623c7595b5c24968ace5bbbc637314384ee076f83f6dae",
+        "question": "Will Mireille Damiano win the 2026 Nice mayoral election?",
+        "group_item_title": "Mireille Damiano",
+        "volume_24h": 0.0,
+        "liquidity": 25937.35231
+      }
+    ]
+  },
+  {
+    "event_id": "166322",
+    "event_slug": "marseille-mayor-election-winner",
+    "title": "Marseille Mayoral Election Winner",
+    "leg_count": 3,
+    "total_volume_24h": 32152.257882,
+    "total_liquidity": 30569.61608,
+    "cluster_score": 1.051771726470436,
+    "condition_ids": [
+      "0xedd700f83787dedec5edc10bb118956c4f6a58a1135810b917eab94b6b778ea0",
+      "0xc5153775b1693ef577a567cade666e1cae41327a48b3ba3d7748078d8181ca1e",
+      "0x5ebbe361b3a762a2e080110d5cf9b9aee0260a81c6333ccb0c7c5362520ab381"
+    ],
+    "markets": [
+      {
+        "market_id": "1192579",
+        "condition_id": "0xedd700f83787dedec5edc10bb118956c4f6a58a1135810b917eab94b6b778ea0",
+        "question": "Will Beno\u00eet Payan win the Marseille mayor election?",
+        "group_item_title": "Beno\u00eet Payan",
+        "volume_24h": 21479.800497,
+        "liquidity": 5649.84368
+      },
+      {
+        "market_id": "1192581",
+        "condition_id": "0xc5153775b1693ef577a567cade666e1cae41327a48b3ba3d7748078d8181ca1e",
+        "question": "Will Franck Allisio win the Marseille mayor election?",
+        "group_item_title": "Franck Allisio",
+        "volume_24h": 9514.792385,
+        "liquidity": 9537.62699
+      },
+      {
+        "market_id": "1192580",
+        "condition_id": "0x5ebbe361b3a762a2e080110d5cf9b9aee0260a81c6333ccb0c7c5362520ab381",
+        "question": "Will Martine Vassal win the Marseille mayor election?",
+        "group_item_title": "Martine Vassal",
+        "volume_24h": 1157.665,
+        "liquidity": 15382.14541
+      }
+    ]
+  },
+  {
+    "event_id": "119701",
+    "event_slug": "bank-of-mexico-decision-in-march",
+    "title": "Bank of Mexico Decision in March?",
+    "leg_count": 3,
+    "total_volume_24h": 14327.584267,
+    "total_liquidity": 15175.336630000002,
+    "cluster_score": 0.9441361741311171,
+    "condition_ids": [
+      "0x5d4434f968133ae04385e7a4035b49fbfcc96febf811eb2a93da18e123460979",
+      "0x9db4599a8ca89d4da9ef6680c520ae01d2a7e7d353e4e3f95c0718111ff00ada",
+      "0x4a29417dd569806a261b11731a6a97e25e1290fc569a913d5177a3a5ebac6454"
+    ],
+    "markets": [
+      {
+        "market_id": "1005381",
+        "condition_id": "0x5d4434f968133ae04385e7a4035b49fbfcc96febf811eb2a93da18e123460979",
+        "question": "Will the Bank of Mexico announce a decrease at the March meeting?",
+        "group_item_title": "Decrease",
+        "volume_24h": 4329.755521,
+        "liquidity": 2626.7359
+      },
+      {
+        "market_id": "1005383",
+        "condition_id": "0x9db4599a8ca89d4da9ef6680c520ae01d2a7e7d353e4e3f95c0718111ff00ada",
+        "question": "Will the Bank of Mexico announce an increase at the March meeting?",
+        "group_item_title": "Increase",
+        "volume_24h": 4172.237079,
+        "liquidity": 9873.98263
+      },
+      {
+        "market_id": "1005382",
+        "condition_id": "0x4a29417dd569806a261b11731a6a97e25e1290fc569a913d5177a3a5ebac6454",
+        "question": "Will the Bank of Mexico announce no change at the March meeting?",
+        "group_item_title": "No change",
+        "volume_24h": 5825.591667,
+        "liquidity": 2674.6181
+      }
+    ]
+  },
+  {
+    "event_id": "189646",
+    "event_slug": "mex-que-jua-2026-02-22",
+    "title": "Quer\u00e9taro FC vs. FC Ju\u00e1rez",
+    "leg_count": 3,
+    "total_volume_24h": 66.17,
+    "total_liquidity": 80.3545,
+    "cluster_score": 0.8234759720986379,
+    "condition_ids": [
+      "0xaea084c04caba295fcaa47e8e6c436e8600be03ac61927d1fb24b51a5486460f",
+      "0x75b2bb97569fefe5d39bb6898dfc26edb423a10309b8a81cfbd3ce686a20169f",
+      "0xf77c27919433746aa6ff6759e36e8455458359f41a1f0dc75e6993736120091e"
+    ],
+    "markets": [
+      {
+        "market_id": "1272208",
+        "condition_id": "0xaea084c04caba295fcaa47e8e6c436e8600be03ac61927d1fb24b51a5486460f",
+        "question": "Will Quer\u00e9taro FC vs. FC Ju\u00e1rez end in a draw?",
+        "group_item_title": "Draw (Quer\u00e9taro FC vs. FC Ju\u00e1rez)",
+        "volume_24h": 62.56,
+        "liquidity": 24.8862
+      },
+      {
+        "market_id": "1272209",
+        "condition_id": "0x75b2bb97569fefe5d39bb6898dfc26edb423a10309b8a81cfbd3ce686a20169f",
+        "question": "Will FC Ju\u00e1rez win on 2026-02-22?",
+        "group_item_title": "FC Ju\u00e1rez",
+        "volume_24h": 0.0,
+        "liquidity": 17.4288
+      },
+      {
+        "market_id": "1272207",
+        "condition_id": "0xf77c27919433746aa6ff6759e36e8455458359f41a1f0dc75e6993736120091e",
+        "question": "Will Quer\u00e9taro FC win on 2026-02-22?",
+        "group_item_title": "Quer\u00e9taro FC",
+        "volume_24h": 3.6100000000000003,
+        "liquidity": 38.0395
+      }
+    ]
+  },
+  {
+    "event_id": "63271",
+    "event_slug": "nba-2025-26-southeast-division-winner",
+    "title": "NBA Southeast Division Winner",
+    "leg_count": 4,
+    "total_volume_24h": 2870.440978,
+    "total_liquidity": 4841.24043,
+    "cluster_score": 0.592914361412949,
+    "condition_ids": [
+      "0xeadca300f9565a5836e4e09b22c547a2e4dfa9ef53edf0fdfa9ca5795316c14d",
+      "0xb6f3732fc2464da2ed17f4270dc87ac59a2b4b1ed711d491f9584ca9a783c95c",
+      "0x3b74dc0c578dd2d5ac066b98d4a8849995240003c921b44558fe9f06400f1c55",
+      "0x15ba9c42b7b541d4acfcf44ac0c9d1e7740f4e3d320868b2eb2543596a2d2154"
+    ],
+    "markets": [
+      {
+        "market_id": "643459",
+        "condition_id": "0xeadca300f9565a5836e4e09b22c547a2e4dfa9ef53edf0fdfa9ca5795316c14d",
+        "question": "Will the Atlanta Hawks win the 2025\u20132026 NBA Southeast Division?",
+        "group_item_title": "Atlanta Hawks",
+        "volume_24h": 805.8412440000001,
+        "liquidity": 1620.06646
+      },
+      {
+        "market_id": "643463",
+        "condition_id": "0xb6f3732fc2464da2ed17f4270dc87ac59a2b4b1ed711d491f9584ca9a783c95c",
+        "question": "Will the Charlotte Hornets win the 2025\u20132026 NBA Southeast Division?",
+        "group_item_title": "Charlotte Hornets",
+        "volume_24h": 313.365597,
+        "liquidity": 1135.25407
+      },
+      {
+        "market_id": "643460",
+        "condition_id": "0x3b74dc0c578dd2d5ac066b98d4a8849995240003c921b44558fe9f06400f1c55",
+        "question": "Will the Miami Heat win the 2025\u20132026 NBA Southeast Division?",
+        "group_item_title": "Miami Heat",
+        "volume_24h": 1039.585364,
+        "liquidity": 1387.2216
+      },
+      {
+        "market_id": "643461",
+        "condition_id": "0x15ba9c42b7b541d4acfcf44ac0c9d1e7740f4e3d320868b2eb2543596a2d2154",
+        "question": "Will the Orlando Magic win the 2025\u20132026 NBA Southeast Division?",
+        "group_item_title": "Orlando Magic",
+        "volume_24h": 711.6487729999999,
+        "liquidity": 698.6983
+      }
+    ]
+  },
+  {
+    "event_id": "101772",
+    "event_slug": "fed-decision-in-june-825",
+    "title": "Fed Decision in June?",
+    "leg_count": 5,
+    "total_volume_24h": 293791.152183,
+    "total_liquidity": 641785.88132,
+    "cluster_score": 0.4577712921617127,
+    "condition_ids": [
+      "0xdde06286a7b9464d344f410ab0b3d2ebc6469904e72c27fd982f65fdbf78768d",
+      "0xa7cb4135c6d9c36da0e343874dd5b455de739c6d1b9f9f5583dd9320aacf5db2",
+      "0x4e4a7df876b0c04f0b8b29b9073eddfbaf5c787192da825ae7ca1031bc8cfd15",
+      "0xb01e70a56199a6d5467f47a2b94e75e7c7218c128c8d0b8beb6dafed2f0d15c2",
+      "0xde04b189b3f19eaccda02529a3ea67abfc46bff5c0c8fc42d8a2d0ed7b8f0d41"
+    ],
+    "markets": [
+      {
+        "market_id": "906973",
+        "condition_id": "0xdde06286a7b9464d344f410ab0b3d2ebc6469904e72c27fd982f65fdbf78768d",
+        "question": "Will the Fed decrease interest rates by 25 bps after the June 2026 meeting?",
+        "group_item_title": "25 bps decrease",
+        "volume_24h": 20912.924201000005,
+        "liquidity": 109321.9529
+      },
+      {
+        "market_id": "906975",
+        "condition_id": "0xa7cb4135c6d9c36da0e343874dd5b455de739c6d1b9f9f5583dd9320aacf5db2",
+        "question": "Will the Fed increase interest rates by 25 bps after the June 2026 meeting?",
+        "group_item_title": "25 bps increase",
+        "volume_24h": 45871.494759,
+        "liquidity": 110092.85336
+      },
+      {
+        "market_id": "906972",
+        "condition_id": "0x4e4a7df876b0c04f0b8b29b9073eddfbaf5c787192da825ae7ca1031bc8cfd15",
+        "question": "Will the Fed decrease interest rates by 50+ bps after the June 2026 meeting?",
+        "group_item_title": "50+ bps decrease",
+        "volume_24h": 29884.222030999998,
+        "liquidity": 204155.58414
+      },
+      {
+        "market_id": "906976",
+        "condition_id": "0xb01e70a56199a6d5467f47a2b94e75e7c7218c128c8d0b8beb6dafed2f0d15c2",
+        "question": "Will the Fed increase interest rates by 50+ bps after the June 2026 meeting?",
+        "group_item_title": "50+ bps increase",
+        "volume_24h": 116561.64280599997,
+        "liquidity": 115706.04102
+      },
+      {
+        "market_id": "906974",
+        "condition_id": "0xde04b189b3f19eaccda02529a3ea67abfc46bff5c0c8fc42d8a2d0ed7b8f0d41",
+        "question": "Will there be no change in Fed interest rates after the June 2026 meeting?",
+        "group_item_title": "No change",
+        "volume_24h": 80560.868386,
+        "liquidity": 102509.4499
+      }
+    ]
+  },
+  {
+    "event_id": "95203",
+    "event_slug": "quebec-general-election-winner",
+    "title": "Quebec General Election Winner",
+    "leg_count": 6,
+    "total_volume_24h": 33239.541666,
+    "total_liquidity": 75083.89100999999,
+    "cluster_score": 0.44269870965495134,
+    "condition_ids": [
+      "0xc7bc5d759ecbd05cfbf3b41ec98f1cd7ab306234bf76fd6c1768d3be1d6b9e76",
+      "0xb79b3e4a9eca37f56dbd00bb495be37079050b1bea9759e0281fe8fe475dc5aa",
+      "0x9b609d94cd0e303bf36f68a422a93f7dad9f58a2f8e4212eef51eed93480f323",
+      "0x30d4a64f70d80faee66508a797b347ef65e63913e4200bca954718fc824ea10e",
+      "0x72a433f7e229db037d504dbbed5c93bfcaccf9c641521be7290db4b357eb3352",
+      "0x4c7d3102ab3408414937b8ed71a34914c117650bfa484069534761babec02560"
+    ],
+    "markets": [
+      {
+        "market_id": "789406",
+        "condition_id": "0xc7bc5d759ecbd05cfbf3b41ec98f1cd7ab306234bf76fd6c1768d3be1d6b9e76",
+        "question": "Will Coalition Avenir Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "CAQ",
+        "volume_24h": 5.0,
+        "liquidity": 13055.2746
+      },
+      {
+        "market_id": "789410",
+        "condition_id": "0xb79b3e4a9eca37f56dbd00bb495be37079050b1bea9759e0281fe8fe475dc5aa",
+        "question": "Will Parti conservateur du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "PCQ",
+        "volume_24h": 33074.691666,
+        "liquidity": 12019.58615
+      },
+      {
+        "market_id": "789408",
+        "condition_id": "0x9b609d94cd0e303bf36f68a422a93f7dad9f58a2f8e4212eef51eed93480f323",
+        "question": "Will Parti lib\u00e9ral du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "PLQ",
+        "volume_24h": 8.0,
+        "liquidity": 9520.3126
+      },
+      {
+        "market_id": "789407",
+        "condition_id": "0x30d4a64f70d80faee66508a797b347ef65e63913e4200bca954718fc824ea10e",
+        "question": "Will Parti Qu\u00e9b\u00e9cois win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "PQ",
+        "volume_24h": 151.85,
+        "liquidity": 12361.3628
+      },
+      {
+        "market_id": "789411",
+        "condition_id": "0x72a433f7e229db037d504dbbed5c93bfcaccf9c641521be7290db4b357eb3352",
+        "question": "Will Parti vert du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "PVQ",
+        "volume_24h": 0.0,
+        "liquidity": 13243.64833
+      },
+      {
+        "market_id": "789409",
+        "condition_id": "0x4c7d3102ab3408414937b8ed71a34914c117650bfa484069534761babec02560",
+        "question": "Will Qu\u00e9bec solidaire win the most seats in the 2026 Quebec general election?",
+        "group_item_title": "QS",
+        "volume_24h": 0.0,
+        "liquidity": 14883.70653
+      }
+    ]
+  },
+  {
+    "event_id": "33507",
+    "event_slug": "english-premier-league-winner",
+    "title": "English Premier League Winner",
+    "leg_count": 5,
+    "total_volume_24h": 1450299.147909337,
+    "total_liquidity": 3802889.04453,
+    "cluster_score": 0.3813677262015883,
+    "condition_ids": [
+      "0xcba24842ceac7a40d2a8b9adde1f4407999b6505193b9fd68156ae76fbffa706",
+      "0x2ca58175aa8080357d9706c535bb0be218ce7bb156dc48753e0d8b8ee6b56635",
+      "0x65a2dd0af5f4155915a701e8fdbcdb2f547fb5925d0bcef0b373a8c39a16613e",
+      "0xfb1835b887c33862f5749c619e612d1244ab6e66115f0ef43d373485dc3a1573",
+      "0x7cab9da787443beec1eb5e399afd46fffdc27b5f00e0293a1d6a9996c948ac52"
+    ],
+    "markets": [
+      {
+        "market_id": "566187",
+        "condition_id": "0xcba24842ceac7a40d2a8b9adde1f4407999b6505193b9fd68156ae76fbffa706",
+        "question": "Will Arsenal win the 2025\u201326 English Premier League?",
+        "group_item_title": "Arsenal",
+        "volume_24h": 58570.27571900003,
+        "liquidity": 486522.5233
+      },
+      {
+        "market_id": "566193",
+        "condition_id": "0x2ca58175aa8080357d9706c535bb0be218ce7bb156dc48753e0d8b8ee6b56635",
+        "question": "Will Aston Villa win the 2025\u201326 English Premier League?",
+        "group_item_title": "Aston Villa",
+        "volume_24h": 538979.902,
+        "liquidity": 637121.10472
+      },
+      {
+        "market_id": "566186",
+        "condition_id": "0x65a2dd0af5f4155915a701e8fdbcdb2f547fb5925d0bcef0b373a8c39a16613e",
+        "question": "Will Liverpool win the 2025\u201326 English Premier League?",
+        "group_item_title": "Liverpool",
+        "volume_24h": 7.31,
+        "liquidity": 1385936.64853
+      },
+      {
+        "market_id": "566188",
+        "condition_id": "0xfb1835b887c33862f5749c619e612d1244ab6e66115f0ef43d373485dc3a1573",
+        "question": "Will Manchester City win the 2025\u201326 English Premier League?",
+        "group_item_title": "Man City",
+        "volume_24h": 824660.134190337,
+        "liquidity": 840690.9335
+      },
+      {
+        "market_id": "566191",
+        "condition_id": "0x7cab9da787443beec1eb5e399afd46fffdc27b5f00e0293a1d6a9996c948ac52",
+        "question": "Will Manchester United win the 2025\u201326 English Premier League?",
+        "group_item_title": "Man United",
+        "volume_24h": 28081.525999999998,
+        "liquidity": 452617.83448
+      }
+    ]
+  },
+  {
+    "event_id": "63269",
+    "event_slug": "nba-2025-26-pacific-division-winner",
+    "title": "NBA Pacific Division Winner",
+    "leg_count": 3,
+    "total_volume_24h": 7079.677294,
+    "total_liquidity": 20044.45523,
+    "cluster_score": 0.3531987880321156,
+    "condition_ids": [
+      "0xbd3915e973e50831f5a29bc3713459f20895be5dfb1dc133fa783da8af4b0257",
+      "0xb80648ac5065ea63ccd08aea88b6c2faf5f324fa0cb9c26abb8a29c5a53e0d41",
+      "0x8d2f1d7b05bdc074c2cdba4e4b51be5673953f9b22b3c0fc8e3bf5cbed13c90f"
+    ],
+    "markets": [
+      {
+        "market_id": "643450",
+        "condition_id": "0xbd3915e973e50831f5a29bc3713459f20895be5dfb1dc133fa783da8af4b0257",
+        "question": "Will the Los Angeles Clippers win the 2025\u20132026 NBA Pacific Division?",
+        "group_item_title": "Los Angeles Clippers",
+        "volume_24h": 17.0,
+        "liquidity": 11873.7452
+      },
+      {
+        "market_id": "643451",
+        "condition_id": "0xb80648ac5065ea63ccd08aea88b6c2faf5f324fa0cb9c26abb8a29c5a53e0d41",
+        "question": "Will the Los Angeles Lakers win the 2025\u20132026 NBA Pacific Division?",
+        "group_item_title": "Los Angeles Lakers",
+        "volume_24h": 860.997294,
+        "liquidity": 484.76521
+      },
+      {
+        "market_id": "643452",
+        "condition_id": "0x8d2f1d7b05bdc074c2cdba4e4b51be5673953f9b22b3c0fc8e3bf5cbed13c90f",
+        "question": "Will the Phoenix Suns win the 2025\u20132026 NBA Pacific Division?",
+        "group_item_title": "Phoenix Suns",
+        "volume_24h": 6201.68,
+        "liquidity": 7685.94482
+      }
+    ]
+  },
+  {
+    "event_id": "181453",
+    "event_slug": "south-african-reserve-bank-decision-in-march",
+    "title": "South African Reserve Bank Decision in March?",
+    "leg_count": 3,
+    "total_volume_24h": 2047.665228,
+    "total_liquidity": 5868.94915,
+    "cluster_score": 0.3488981035046112,
+    "condition_ids": [
+      "0xc4e0d0454edfe307d867ab2c6cf53a1bb190118cbbb9e36498e6eae225058439",
+      "0x977e161e9d1c64b3fa9d493963279eccad4a5c5c7bac5053e2773e7e52e9987c",
+      "0xe529643b7701dcb55f030e45590c1da1c94c251ffd741ce5183bc4761efab285"
+    ],
+    "markets": [
+      {
+        "market_id": "1242883",
+        "condition_id": "0xc4e0d0454edfe307d867ab2c6cf53a1bb190118cbbb9e36498e6eae225058439",
+        "question": "Will the South African Reserve Bank decrease the repo rate after the March meeting?",
+        "group_item_title": "Decrease",
+        "volume_24h": 93.481865,
+        "liquidity": 2624.79624
+      },
+      {
+        "market_id": "1242885",
+        "condition_id": "0x977e161e9d1c64b3fa9d493963279eccad4a5c5c7bac5053e2773e7e52e9987c",
+        "question": "Will the South African Reserve Bank increase the repo rate after the March meeting?",
+        "group_item_title": "Increase",
+        "volume_24h": 65.493363,
+        "liquidity": 1716.46661
+      },
+      {
+        "market_id": "1242884",
+        "condition_id": "0xe529643b7701dcb55f030e45590c1da1c94c251ffd741ce5183bc4761efab285",
+        "question": "Will the South African Reserve Bank make no change to the repo rate after the March meeting?",
+        "group_item_title": "No Change",
+        "volume_24h": 1888.69,
+        "liquidity": 1527.6863
+      }
+    ]
+  },
+  {
+    "event_id": "63272",
+    "event_slug": "nba-2025-26-atlantic-division-winner",
+    "title": "NBA Atlantic Division Winner",
+    "leg_count": 4,
+    "total_volume_24h": 1806.375989,
+    "total_liquidity": 6617.83676,
+    "cluster_score": 0.2729556582474542,
+    "condition_ids": [
+      "0xce33ad5f0fbcc1a4861cc92b81814cd174020d16df3dc80d5c287d5f047e68fc",
+      "0xc3bf50cff1df0ce6c71df5d37d8e4edd871b04be6765be1022efd56870d20852",
+      "0x512759e436a0b29c350b3cf76b75cbc4d1e9960d8b8916daecac9e9a089c2165",
+      "0xa5762abe39c8b83cd512cff2c95f6243e239d091596b35d4df838684c33fbac0"
+    ],
+    "markets": [
+      {
+        "market_id": "643464",
+        "condition_id": "0xce33ad5f0fbcc1a4861cc92b81814cd174020d16df3dc80d5c287d5f047e68fc",
+        "question": "Will the Boston Celtics win the 2025\u20132026 NBA Atlantic Division?",
+        "group_item_title": "Boston Celtics",
+        "volume_24h": 459.85842699999995,
+        "liquidity": 900.61274
+      },
+      {
+        "market_id": "643466",
+        "condition_id": "0xc3bf50cff1df0ce6c71df5d37d8e4edd871b04be6765be1022efd56870d20852",
+        "question": "Will the New York Knicks win the 2025\u20132026 NBA Atlantic Division?",
+        "group_item_title": "New York Knicks",
+        "volume_24h": 447.707643,
+        "liquidity": 1884.1722
+      },
+      {
+        "market_id": "643467",
+        "condition_id": "0x512759e436a0b29c350b3cf76b75cbc4d1e9960d8b8916daecac9e9a089c2165",
+        "question": "Will the Philadelphia 76ers win the 2025\u20132026 NBA Atlantic Division?",
+        "group_item_title": "Philadelphia 76ers",
+        "volume_24h": 784.7209999999999,
+        "liquidity": 2312.88025
+      },
+      {
+        "market_id": "643468",
+        "condition_id": "0xa5762abe39c8b83cd512cff2c95f6243e239d091596b35d4df838684c33fbac0",
+        "question": "Will the Toronto Raptors win the 2025\u20132026 NBA Atlantic Division?",
+        "group_item_title": "Toronto Raptors",
+        "volume_24h": 114.088919,
+        "liquidity": 1520.17157
+      }
+    ]
+  },
+  {
+    "event_id": "32224",
+    "event_slug": "which-party-will-win-the-senate-in-2026",
+    "title": "Which party will win the Senate in 2026?",
+    "leg_count": 2,
+    "total_volume_24h": 93355.30360000001,
+    "total_liquidity": 350785.5189,
+    "cluster_score": 0.266132147908344,
+    "condition_ids": [
+      "0x307a1ed89d60b61002dd5bbf00e1408c5ed2ab3fcdb056191ca7ef9bc34d38f3",
+      "0x86bfb53af7250a40928975c551d12c185b762fa4ce0b40c6a64a50c946d72587"
+    ],
+    "markets": [
+      {
+        "market_id": "562793",
+        "condition_id": "0x307a1ed89d60b61002dd5bbf00e1408c5ed2ab3fcdb056191ca7ef9bc34d38f3",
+        "question": "Will the Democratic Party control the Senate after the 2026 Midterm elections?",
+        "group_item_title": "Democratic Party",
+        "volume_24h": 51102.388523,
+        "liquidity": 193007.0969
+      },
+      {
+        "market_id": "562794",
+        "condition_id": "0x86bfb53af7250a40928975c551d12c185b762fa4ce0b40c6a64a50c946d72587",
+        "question": "Will the Republican Party control the Senate after the 2026 Midterm elections?",
+        "group_item_title": "Republican Party",
+        "volume_24h": 42252.91507700001,
+        "liquidity": 157778.422
+      }
+    ]
+  },
+  {
+    "event_id": "24383",
+    "event_slug": "harvey-weinstein-prison-time",
+    "title": "Harvey Weinstein prison time?",
+    "leg_count": 6,
+    "total_volume_24h": 4586.720991,
+    "total_liquidity": 17519.4971,
+    "cluster_score": 0.26180665830870226,
+    "condition_ids": [
+      "0x3d495a3e05eaffe438bb1c2ab97ed57a79b0a6ab18a2ca6fa5b448e20ce70082",
+      "0xdee5db5410b362783a1405b66b9aa08a7d050ae1f99e8da85b9d1ae7962dad3b",
+      "0x2499928ffbe6022444543dcd940075259cecb5e41e346284b578cb64e1404d32",
+      "0x3209617364a0d598435806b59d0d056b606022dc9028c466ad7912df94fc170c",
+      "0xe2b48e3b44de9658ee9c8b37354301763e33c0b502fd966839d644b4c0a9dea8",
+      "0xf398b0e5016eeaee9b0885ed84012b6dc91269ac10d3b59d60722859c2e30b2f"
+    ],
+    "markets": [
+      {
+        "market_id": "544095",
+        "condition_id": "0x3d495a3e05eaffe438bb1c2ab97ed57a79b0a6ab18a2ca6fa5b448e20ce70082",
+        "question": "Will Harvey Weinstein be sentenced to between 10 and 20 years in prison?",
+        "group_item_title": "10-20 years",
+        "volume_24h": 623.241115,
+        "liquidity": 394.92619
+      },
+      {
+        "market_id": "544096",
+        "condition_id": "0xdee5db5410b362783a1405b66b9aa08a7d050ae1f99e8da85b9d1ae7962dad3b",
+        "question": "Will Harvey Weinstein be sentenced to between 20 and 30 years in prison?",
+        "group_item_title": "20-30 years",
+        "volume_24h": 789.5058760000001,
+        "liquidity": 759.74932
+      },
+      {
+        "market_id": "544097",
+        "condition_id": "0x2499928ffbe6022444543dcd940075259cecb5e41e346284b578cb64e1404d32",
+        "question": "Will Harvey Weinstein be sentenced to more than 30 years in prison?",
+        "group_item_title": "30+ years",
+        "volume_24h": 364.670059,
+        "liquidity": 5250.46934
+      },
+      {
+        "market_id": "544094",
+        "condition_id": "0x3209617364a0d598435806b59d0d056b606022dc9028c466ad7912df94fc170c",
+        "question": "Will Harvey Weinstein be sentenced to between 5 and 10 years in prison?",
+        "group_item_title": "5-10 years",
+        "volume_24h": 735.220347,
+        "liquidity": 2088.6639
+      },
+      {
+        "market_id": "544093",
+        "condition_id": "0xe2b48e3b44de9658ee9c8b37354301763e33c0b502fd966839d644b4c0a9dea8",
+        "question": "Will Harvey Weinstein be sentenced to less than 5 years in prison?",
+        "group_item_title": "<5 years",
+        "volume_24h": 827.3605450000002,
+        "liquidity": 6829.21895
+      },
+      {
+        "market_id": "544092",
+        "condition_id": "0xf398b0e5016eeaee9b0885ed84012b6dc91269ac10d3b59d60722859c2e30b2f",
+        "question": "Will Harvey Weinstein be sentenced to no prison time?",
+        "group_item_title": "No Prison Time",
+        "volume_24h": 1246.723049,
+        "liquidity": 2196.4694
+      }
+    ]
+  },
+  {
+    "event_id": "183525",
+    "event_slug": "bank-of-japan-decision-in-april",
+    "title": "Bank of Japan Decision in April?",
+    "leg_count": 4,
+    "total_volume_24h": 9728.071016,
+    "total_liquidity": 37596.57266,
+    "cluster_score": 0.2587488786271722,
+    "condition_ids": [
+      "0x848223ff8871d1f37fcb6ba83a5edc1c917ea4bdc8c708a4513e56f575091277",
+      "0x00da1f8d0b1f8fac5a6d1cb44dc84f6bc1af7d552e452c9debd50cd290d6df71",
+      "0x8fb526c3afd133bae39214acb5502374a36e3563cbedb8a964899825c8be2b64",
+      "0x62b71e5e61067bc382f67779e8135ee4512acbab9ddb4a44917dc7d9f93e607a"
+    ],
+    "markets": [
+      {
+        "market_id": "1249981",
+        "condition_id": "0x848223ff8871d1f37fcb6ba83a5edc1c917ea4bdc8c708a4513e56f575091277",
+        "question": "Bank of Japan increases interest rates by 25 bps after the April 2026 meeting?",
+        "group_item_title": "25 bps increase",
+        "volume_24h": 1412.7634440000002,
+        "liquidity": 5229.3478
+      },
+      {
+        "market_id": "1249982",
+        "condition_id": "0x00da1f8d0b1f8fac5a6d1cb44dc84f6bc1af7d552e452c9debd50cd290d6df71",
+        "question": "Bank of Japan increases interest rates by 50+ bps after the April 2026 meeting?",
+        "group_item_title": "50+ bps increase",
+        "volume_24h": 2647.29079,
+        "liquidity": 11902.13893
+      },
+      {
+        "market_id": "1249979",
+        "condition_id": "0x8fb526c3afd133bae39214acb5502374a36e3563cbedb8a964899825c8be2b64",
+        "question": "Bank of Japan decreases interest rates after the April 2026 meeting?",
+        "group_item_title": "Decrease rates",
+        "volume_24h": 4540.196806,
+        "liquidity": 14345.20593
+      },
+      {
+        "market_id": "1249980",
+        "condition_id": "0x62b71e5e61067bc382f67779e8135ee4512acbab9ddb4a44917dc7d9f93e607a",
+        "question": "No change in Bank of Japan\u2019s interest rates after the April 2026 meeting?",
+        "group_item_title": "No change",
+        "volume_24h": 1127.819976,
+        "liquidity": 6119.88
+      }
+    ]
+  },
+  {
+    "event_id": "91885",
+    "event_slug": "turnout-in-2025-honduran-general-election",
+    "title": "Turnout in 2025 Honduran General Election",
+    "leg_count": 3,
+    "total_volume_24h": 3906.970307,
+    "total_liquidity": 15890.61231,
+    "cluster_score": 0.2458665676804244,
+    "condition_ids": [
+      "0x5f8b16de1a2779f18666c120f4ade9669ba17db89149ebc0d76843ca18aacaa0",
+      "0xb8b5284544c6ff85948a925b1a9a3a9e3b1683cdec2c4344438a03b6544bf3b6",
+      "0x3507d3a6f4a6c49972549255accd4e49e0c3d039cac1b2927a876ca243684f6f"
+    ],
+    "markets": [
+      {
+        "market_id": "716369",
+        "condition_id": "0x5f8b16de1a2779f18666c120f4ade9669ba17db89149ebc0d76843ca18aacaa0",
+        "question": "Will turnout in the 2025 Honduran general election be between 55% and 60%?",
+        "group_item_title": "55-60%",
+        "volume_24h": 230.40127,
+        "liquidity": 4253.90634
+      },
+      {
+        "market_id": "716370",
+        "condition_id": "0xb8b5284544c6ff85948a925b1a9a3a9e3b1683cdec2c4344438a03b6544bf3b6",
+        "question": "Will turnout in the 2025 Honduran general election be between 60% and 65%?",
+        "group_item_title": "60-65%",
+        "volume_24h": 3192.439673,
+        "liquidity": 6424.44405
+      },
+      {
+        "market_id": "716368",
+        "condition_id": "0x3507d3a6f4a6c49972549255accd4e49e0c3d039cac1b2927a876ca243684f6f",
+        "question": "Will turnout in the 2025 Honduran general election be less than 55%?",
+        "group_item_title": "<55%",
+        "volume_24h": 484.129364,
+        "liquidity": 5212.26192
+      }
+    ]
+  },
+  {
+    "event_id": "84018",
+    "event_slug": "next-ceo-of-apple",
+    "title": "Next CEO of Apple?",
+    "leg_count": 4,
+    "total_volume_24h": 1979.0098819999996,
+    "total_liquidity": 10887.49008,
+    "cluster_score": 0.18176915592652368,
+    "condition_ids": [
+      "0x21c9a70d8cb47541cc7d6f09f18437371dd3b375c945f73dd294484ad09d48e9",
+      "0x533e3cf5be22f305e14e0c67fb82e8335db2cfba811cf253bef7923d6042416d",
+      "0x19be7c46e28b61455ec766679ee1122fba39eb0d5c85d0878e4b203ab8b18406",
+      "0x935f71018092c4f90aa08c310bb26a4a12096b1ddf5af6afa008a9b14531d1ff"
+    ],
+    "markets": [
+      {
+        "market_id": "688376",
+        "condition_id": "0x21c9a70d8cb47541cc7d6f09f18437371dd3b375c945f73dd294484ad09d48e9",
+        "question": "Will Craig Federighi be the next CEO of Apple?",
+        "group_item_title": "Craig Federighi",
+        "volume_24h": 0.0,
+        "liquidity": 2209.21447
+      },
+      {
+        "market_id": "688380",
+        "condition_id": "0x533e3cf5be22f305e14e0c67fb82e8335db2cfba811cf253bef7923d6042416d",
+        "question": "Will Greg Joswiak be the next CEO of Apple?",
+        "group_item_title": "Greg Joswiak",
+        "volume_24h": 0.0,
+        "liquidity": 2354.74711
+      },
+      {
+        "market_id": "688375",
+        "condition_id": "0x19be7c46e28b61455ec766679ee1122fba39eb0d5c85d0878e4b203ab8b18406",
+        "question": "Will John Ternus be the next CEO of Apple?",
+        "group_item_title": "John Ternus",
+        "volume_24h": 1979.0098819999996,
+        "liquidity": 3776.9498
+      },
+      {
+        "market_id": "688377",
+        "condition_id": "0x935f71018092c4f90aa08c310bb26a4a12096b1ddf5af6afa008a9b14531d1ff",
+        "question": "Will Sabih Khan be the next CEO of Apple?",
+        "group_item_title": "Sabih Khan",
+        "volume_24h": 0.0,
+        "liquidity": 2546.5787
+      }
+    ]
+  },
+  {
+    "event_id": "106928",
+    "event_slug": "fed-decisions-jan-apr",
+    "title": "Fed decisions (Jan-Apr)",
+    "leg_count": 3,
+    "total_volume_24h": 5156.514575,
+    "total_liquidity": 29844.45254,
+    "cluster_score": 0.17277966711196374,
+    "condition_ids": [
+      "0x951fda6a6baf97f16d903534095b84dfb20ea35cdd9a35e6854f18f47d6ec69a",
+      "0x337f46c571cdf4b891a7faed065a053fcf012481189a7dd7ebad20777e05a4a1",
+      "0x0248586d93eca782dc023e24a8948575ac27db8ba249b28cf0a101e3c4263aa9"
+    ],
+    "markets": [
+      {
+        "market_id": "950069",
+        "condition_id": "0x951fda6a6baf97f16d903534095b84dfb20ea35cdd9a35e6854f18f47d6ec69a",
+        "question": "Will the Fed decide differently in the next three decisions (Jan\u2013Mar\u2013Apr)?",
+        "group_item_title": "Other",
+        "volume_24h": 997.602241,
+        "liquidity": 6289.96374
+      },
+      {
+        "market_id": "950066",
+        "condition_id": "0x337f46c571cdf4b891a7faed065a053fcf012481189a7dd7ebad20777e05a4a1",
+        "question": "Will the Fed Pause\u2013Pause\u2013Cut in the next three decisions (Jan\u2013Mar\u2013Apr)?",
+        "group_item_title": "Pause\u2013Pause\u2013Cut",
+        "volume_24h": 771.481843,
+        "liquidity": 18721.87185
+      },
+      {
+        "market_id": "950065",
+        "condition_id": "0x0248586d93eca782dc023e24a8948575ac27db8ba249b28cf0a101e3c4263aa9",
+        "question": "Will the Fed Pause\u2013Pause\u2013Pause in the next three decisions (Jan\u2013Mar\u2013Apr)?",
+        "group_item_title": "Pause\u2013Pause\u2013Pause",
+        "volume_24h": 3387.430491,
+        "liquidity": 4832.61695
+      }
+    ]
+  },
+  {
+    "event_id": "63275",
+    "event_slug": "nba-best-record-765",
+    "title": "NBA Best Record",
+    "leg_count": 6,
+    "total_volume_24h": 2909.1965319999995,
+    "total_liquidity": 16840.38014,
+    "cluster_score": 0.17275123885653565,
+    "condition_ids": [
+      "0xa7800430ef0cd8a4bb5807ca57d8f111dcc511fb19f3a901a4feeaabbf2dec5f",
+      "0x3659029a2ffcd2df378dad1d1a3f2c3a1d3662174aaca0c063beb46596084443",
+      "0xf377fd5c692dab8aa55c22561de5ad3e13ae5b80b87ae9adc9c3bbf7d1c8567f",
+      "0x9b343134c7c64e0f72b56bd9bc236d13f5fac5a73273a5a4f6a6e222f84cd872",
+      "0x02e9bd7d63034d022150692e78d860da3347498c58a196709941e602025b4029",
+      "0x7ac2681d02ec069119e2f29f2b95de58b14f0946b31657c4bdc088672cf546b8"
+    ],
+    "markets": [
+      {
+        "market_id": "643472",
+        "condition_id": "0xa7800430ef0cd8a4bb5807ca57d8f111dcc511fb19f3a901a4feeaabbf2dec5f",
+        "question": "Will the Boston Celtics finish with the best record in the NBA?",
+        "group_item_title": "Boston Celtics",
+        "volume_24h": 38.879999999999995,
+        "liquidity": 2799.98534
+      },
+      {
+        "market_id": "643479",
+        "condition_id": "0x3659029a2ffcd2df378dad1d1a3f2c3a1d3662174aaca0c063beb46596084443",
+        "question": "Will the Detroit Pistons finish with the best record in the NBA?",
+        "group_item_title": "Detroit Pistons",
+        "volume_24h": 2057.9399999999996,
+        "liquidity": 2213.08671
+      },
+      {
+        "market_id": "643484",
+        "condition_id": "0xf377fd5c692dab8aa55c22561de5ad3e13ae5b80b87ae9adc9c3bbf7d1c8567f",
+        "question": "Will the Los Angeles Lakers finish with the best record in the NBA?",
+        "group_item_title": "Los Angeles Lakers",
+        "volume_24h": 38.879999999999995,
+        "liquidity": 2856.83201
+      },
+      {
+        "market_id": "643490",
+        "condition_id": "0x9b343134c7c64e0f72b56bd9bc236d13f5fac5a73273a5a4f6a6e222f84cd872",
+        "question": "Will the New York Knicks finish with the best record in the NBA?",
+        "group_item_title": "New York Knicks",
+        "volume_24h": 38.879999999999995,
+        "liquidity": 2794.57565
+      },
+      {
+        "market_id": "643491",
+        "condition_id": "0x02e9bd7d63034d022150692e78d860da3347498c58a196709941e602025b4029",
+        "question": "Will the Oklahoma City Thunder finish with the best record in the NBA?",
+        "group_item_title": "Oklahoma City Thunder",
+        "volume_24h": 479.154317,
+        "liquidity": 4810.76401
+      },
+      {
+        "market_id": "643497",
+        "condition_id": "0x7ac2681d02ec069119e2f29f2b95de58b14f0946b31657c4bdc088672cf546b8",
+        "question": "Will the San Antonio Spurs finish with the best record in the NBA?",
+        "group_item_title": "San Antonio Spurs",
+        "volume_24h": 255.462215,
+        "liquidity": 1365.13642
+      }
+    ]
+  },
+  {
+    "event_id": "135338",
+    "event_slug": "how-many-large-volcano-eruption-vei-4-in-2026-657",
+    "title": "How many large volcano eruptions (VEI \u22654) in 2026?",
+    "leg_count": 6,
+    "total_volume_24h": 2231.290735,
+    "total_liquidity": 13338.82299,
+    "cluster_score": 0.1672779327435996,
+    "condition_ids": [
+      "0xb60cf8249d71b05baf2b2d96621b8e69b0617ab7c8a0d175b62b6e8f91726920",
+      "0x026243ce3148973693b1bbfe17c97082ea6c4b41ee94c0787d5dd725cfccd662",
+      "0x73e96451415a300b39b7bb83b0501696d4f7f2a9e52e69988e0e65cee20f12fa",
+      "0xa238259a45fab99f7950e92f359cafbdcf60e8cb567c3434ef99aac5d643ae6f",
+      "0x3591f6759eacceea5710e958aa2b4549a3d4edd08bcc1ca621a2c5de34af51c0",
+      "0x3502f4d9275ea8f0b02f7d54db44fb942da8809d3a9671ba3918c3938dd632d7"
+    ],
+    "markets": [
+      {
+        "market_id": "1075290",
+        "condition_id": "0xb60cf8249d71b05baf2b2d96621b8e69b0617ab7c8a0d175b62b6e8f91726920",
+        "question": "Will there be exactly 0 confirmed VEI 4 or higher volcanic eruptions worldwide in 2026?",
+        "group_item_title": "0",
+        "volume_24h": 1993.35,
+        "liquidity": 3578.899
+      },
+      {
+        "market_id": "1075291",
+        "condition_id": "0x026243ce3148973693b1bbfe17c97082ea6c4b41ee94c0787d5dd725cfccd662",
+        "question": "Will there be exactly 1 confirmed VEI 4 or higher volcanic eruption worldwide in 2026?",
+        "group_item_title": "1",
+        "volume_24h": 214.422218,
+        "liquidity": 2160.9955
+      },
+      {
+        "market_id": "1075292",
+        "condition_id": "0x73e96451415a300b39b7bb83b0501696d4f7f2a9e52e69988e0e65cee20f12fa",
+        "question": "Will there be exactly 2 confirmed VEI 4 or higher volcanic eruptions worldwide in 2026?",
+        "group_item_title": "2",
+        "volume_24h": 5.0,
+        "liquidity": 2058.91929
+      },
+      {
+        "market_id": "1075293",
+        "condition_id": "0xa238259a45fab99f7950e92f359cafbdcf60e8cb567c3434ef99aac5d643ae6f",
+        "question": "Will there be exactly 3 confirmed VEI 4 or higher volcanic eruptions worldwide in 2026?",
+        "group_item_title": "3",
+        "volume_24h": 18.518517,
+        "liquidity": 1786.9346
+      },
+      {
+        "market_id": "1075294",
+        "condition_id": "0x3591f6759eacceea5710e958aa2b4549a3d4edd08bcc1ca621a2c5de34af51c0",
+        "question": "Will there be exactly 4 confirmed VEI 4 or higher volcanic eruptions worldwide in 2026?",
+        "group_item_title": "4",
+        "volume_24h": 0.0,
+        "liquidity": 1520.01801
+      },
+      {
+        "market_id": "1075295",
+        "condition_id": "0x3502f4d9275ea8f0b02f7d54db44fb942da8809d3a9671ba3918c3938dd632d7",
+        "question": "Will there be 5 or more confirmed VEI 4 or higher volcanic eruptions worldwide in 2026?",
+        "group_item_title": "5+",
+        "volume_24h": 0.0,
+        "liquidity": 2233.05659
+      }
+    ]
+  }
+]

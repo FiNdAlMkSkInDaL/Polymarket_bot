@@ -82,6 +82,7 @@ class PureMarketMaker:
         self._wide_spread_pct = strat.pure_mm_wide_spread_pct
         self._wide_size_usd = strat.pure_mm_wide_size_usd
         self._inventory_cap_usd = strat.pure_mm_inventory_cap_usd
+        self._inventory_penalty_coef = max(0.0, strat.pure_mm_inventory_penalty_coef)
         self._toxic_ofi_ratio = strat.pure_mm_toxic_ofi_ratio
         self._depth_window_s = strat.pure_mm_depth_window_s
         self._depth_evaporation_pct = strat.pure_mm_depth_evaporation_pct
@@ -354,7 +355,11 @@ class PureMarketMaker:
         inventory_value = self.inventory_for_asset(asset_id) * best_bid
         if inventory_value >= self._inventory_cap_usd:
             return 0.0
-        return self._normalise_size(size_usd / best_bid, best_bid)
+        penalty_scale = self._inventory_penalty_scale(inventory_value)
+        if penalty_scale <= 0:
+            return 0.0
+        target_usd = size_usd * penalty_scale
+        return self._normalise_size(target_usd / best_bid, best_bid)
 
     def _quote_size_for_ask(self, best_ask: float, asset_id: str, size_usd: float) -> float:
         inventory = self.inventory_for_asset(asset_id)
@@ -362,6 +367,12 @@ class PureMarketMaker:
             return 0.0
         target = min(inventory, size_usd / best_ask)
         return self._normalise_size(target, best_ask)
+
+    def _inventory_penalty_scale(self, inventory_value: float) -> float:
+        if self._inventory_cap_usd <= 0:
+            return 0.0
+        fill_ratio = min(max(inventory_value / self._inventory_cap_usd, 0.0), 1.0)
+        return max(0.0, (1.0 - fill_ratio) ** self._inventory_penalty_coef)
 
     @staticmethod
     def _normalise_size(raw_size: float, price: float) -> float:
