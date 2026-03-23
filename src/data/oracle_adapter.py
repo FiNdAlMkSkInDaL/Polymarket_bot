@@ -312,7 +312,13 @@ class OracleAdapterRegistry:
 
         Raises ``KeyError`` if the oracle_type is not registered.
         """
-        cls = self._adapters[oracle_type]
+        resolved_type = market_config.oracle_type or oracle_type
+        if resolved_type == "crypto":
+            from src.data.adapters.binance_adapter import BinanceWebSocketAdapter
+
+            return BinanceWebSocketAdapter(market_config, on_trip=on_trip)
+
+        cls = self._adapters[resolved_type]
         return cls(market_config, on_trip=on_trip)
 
     @property
