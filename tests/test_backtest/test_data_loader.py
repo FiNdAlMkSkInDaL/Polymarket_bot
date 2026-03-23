@@ -294,6 +294,31 @@ class TestEventTypeMapping:
         events = list(DataLoader.from_files(fpath))
         assert events[0].event_type == "trade"
 
+    def test_price_change_trade_source_becomes_l2_delta(self, tmp_path: Path):
+        records = [
+            {
+                "local_ts": 1.0,
+                "source": "trade",
+                "asset_id": "0xmarket",
+                "payload": {
+                    "event_type": "price_change",
+                    "price_changes": [
+                        {"asset_id": "YES", "price": "0.45", "size": "100", "side": "BUY"},
+                        {"asset_id": "NO", "price": "0.55", "size": "100", "side": "SELL"},
+                    ],
+                },
+            },
+        ]
+        fpath = tmp_path / "price_change.jsonl"
+        _write_jsonl(records, fpath)
+
+        events = list(DataLoader.from_files(fpath, asset_ids={"YES"}))
+
+        assert len(events) == 1
+        assert events[0].event_type == "l2_delta"
+        assert events[0].asset_id == "YES"
+        assert events[0].data["price_changes"][0]["asset_id"] == "YES"
+
 
 class TestFactoryMethods:
     """Factory constructors: from_directory, from_files."""

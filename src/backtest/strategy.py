@@ -869,10 +869,12 @@ class PureMarketMakerReplayAdapter(StrategyABC):
             self._order_to_key.pop(fill.order_id, None)
 
     def on_end(self) -> None:
+        inventory_mark_price = max(self._book.best_bid, 0.0)
         log.info(
             "pure_mm_replay_adapter_summary",
             asset_id=self._no_asset_id,
             inventory=round(self._inventory, 4),
+            inventory_mark_value=round(self._inventory_value(inventory_mark_price), 4),
             open_quotes=sum(1 for state in self._quote_states.values() if state.order_id),
             book_updates=self._book_update_count,
         )
@@ -915,39 +917,79 @@ class PureMarketMakerReplayAdapter(StrategyABC):
                 continue
 
             if state.side == OrderSide.BUY and self._book.best_ask > 0 and self._book.best_ask <= order.price:
-                self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
+                fillable = self._fillable_buy_size(order)
+                if fillable <= 0:
+                    self._cancel_state(state, reason="inventory_cap_reached")
+                    continue
+                self.engine.simulate_fill(
+                    order.order_id,
+                    min(order.remaining, fillable),
+                    order.price,
+                    is_maker=True,
+                )
             elif state.side == OrderSide.SELL and self._book.best_bid > 0 and self._book.best_bid >= order.price:
-                self.engine.simulate_fill(order.order_id, order.remaining, order.price, is_maker=True)
+                fillable = self._fillable_sell_size(order)
+                if fillable <= 0:
+                    self._cancel_state(state, reason="inventory_depleted")
+                    continue
+                self.engine.simulate_fill(
+                    order.order_id,
+                    min(order.remaining, fillable),
+                    order.price,
+                    is_maker=True,
+                )
 
     def _build_intended_quotes(self, best_bid: float, best_ask: float) -> list[_ReplayIntendedQuote]:
         intended_quotes: list[_ReplayIntendedQuote] = []
+        reserved_buy_notional = self._reserved_buy_notional()
+        reserved_sell_shares = self._reserved_sell_shares()
 
-        tight_bid_size = self._quote_size_for_bid(best_bid, self._quote_size_usd)
-        tight_ask_size = self._quote_size_for_ask(best_ask, self._quote_size_usd)
+        tight_bid_size = self._quote_size_for_bid(
+            best_bid,
+            self._quote_size_usd,
+            reserved_buy_notional=reserved_buy_notional,
+        )
+        tight_ask_size = self._quote_size_for_ask(
+            best_ask,
+            self._quote_size_usd,
+            reserved_sell_shares=reserved_sell_shares,
+        )
         if tight_bid_size > 0:
             intended_quotes.append(
                 _ReplayIntendedQuote(OrderSide.BUY, _REPLAY_TIGHT_TIER, best_bid, tight_bid_size)
             )
+            reserved_buy_notional += tight_bid_size * best_bid
         if tight_ask_size > 0:
             intended_quotes.append(
                 _ReplayIntendedQuote(OrderSide.SELL, _REPLAY_TIGHT_TIER, best_ask, tight_ask_size)
             )
+            reserved_sell_shares += tight_ask_size
 
         if not self._wide_tier_enabled:
             return intended_quotes
 
-        wide_bid_size = self._quote_size_for_bid(best_bid, self._wide_size_usd)
-        wide_ask_size = self._quote_size_for_ask(best_ask, self._wide_size_usd)
         wide_bid_price = best_bid * (1.0 - self._wide_spread_pct)
         wide_ask_price = best_ask * (1.0 + self._wide_spread_pct)
+        wide_bid_size = self._quote_size_for_bid(
+            best_bid,
+            self._wide_size_usd,
+            reserved_buy_notional=reserved_buy_notional,
+        )
+        wide_ask_size = self._quote_size_for_ask(
+            best_ask,
+            self._wide_size_usd,
+            reserved_sell_shares=reserved_sell_shares,
+        )
         if wide_bid_size > 0 and wide_bid_price > 0:
             intended_quotes.append(
                 _ReplayIntendedQuote(OrderSide.BUY, _REPLAY_WIDE_TIER, wide_bid_price, wide_bid_size)
             )
+            reserved_buy_notional += wide_bid_size * best_bid
         if wide_ask_size > 0 and wide_ask_price > 0:
             intended_quotes.append(
                 _ReplayIntendedQuote(OrderSide.SELL, _REPLAY_WIDE_TIER, wide_ask_price, wide_ask_size)
             )
+            reserved_sell_shares += wide_ask_size
         return intended_quotes
 
     def _sync_quote(self, intended_quote: _ReplayIntendedQuote) -> None:
@@ -976,6 +1018,7 @@ class PureMarketMakerReplayAdapter(StrategyABC):
             size=rounded_size,
             order_type="limit",
             post_only=True,
+            asset_id=self._no_asset_id,
         )
         state.order_id = order.order_id
         self._order_to_key[order.order_id] = key
@@ -1031,22 +1074,81 @@ class PureMarketMakerReplayAdapter(StrategyABC):
             reason=reason,
         )
 
-    def _quote_size_for_bid(self, best_bid: float, size_usd: float) -> float:
+    def _quote_size_for_bid(
+        self,
+        best_bid: float,
+        size_usd: float,
+        *,
+        reserved_buy_notional: float = 0.0,
+    ) -> float:
         if best_bid <= 0:
             return 0.0
         inventory_value = self._inventory * best_bid
-        if inventory_value >= self._inventory_cap_usd:
+        remaining_headroom_usd = self._inventory_cap_usd - inventory_value - reserved_buy_notional
+        if remaining_headroom_usd <= 0:
             return 0.0
-        return self._normalise_size(size_usd / best_bid, best_bid)
+        allocatable_usd = min(size_usd, remaining_headroom_usd)
+        return self._normalise_size(allocatable_usd / best_bid, best_bid)
 
-    def _quote_size_for_ask(self, best_ask: float, size_usd: float) -> float:
+    def _quote_size_for_ask(
+        self,
+        best_ask: float,
+        size_usd: float,
+        *,
+        reserved_sell_shares: float = 0.0,
+    ) -> float:
         if best_ask <= 0 or self._inventory <= 0:
             return 0.0
-        return self._normalise_size(min(self._inventory, size_usd / best_ask), best_ask)
+        available_inventory = max(0.0, self._inventory - reserved_sell_shares)
+        if available_inventory <= 0:
+            return 0.0
+        return self._normalise_size(min(available_inventory, size_usd / best_ask), best_ask)
+
+    def _reserved_buy_notional(self, *, exclude_order_id: str | None = None) -> float:
+        if self.engine is None:
+            return 0.0
+        total = 0.0
+        for order in self.engine.matching_engine.get_open_orders():
+            if order.order_id == exclude_order_id or order.side != OrderSide.BUY:
+                continue
+            total += order.remaining * order.price
+        return total
+
+    def _reserved_sell_shares(self, *, exclude_order_id: str | None = None) -> float:
+        if self.engine is None:
+            return 0.0
+        total = 0.0
+        for order in self.engine.matching_engine.get_open_orders():
+            if order.order_id == exclude_order_id or order.side != OrderSide.SELL:
+                continue
+            total += order.remaining
+        return total
+
+    def _fillable_buy_size(self, order: "SimOrder") -> float:
+        book_price = max(self._book.best_bid, order.price, 1e-9)
+        inventory_value = self._inventory_value(book_price)
+        reserved_buy_notional = self._reserved_buy_notional(exclude_order_id=order.order_id)
+        remaining_headroom_usd = self._inventory_cap_usd - inventory_value - reserved_buy_notional
+        if remaining_headroom_usd <= 0:
+            return 0.0
+        return remaining_headroom_usd / book_price
+
+    def _fillable_sell_size(self, order: "SimOrder") -> float:
+        available_inventory = self._inventory - self._reserved_sell_shares(exclude_order_id=order.order_id)
+        if available_inventory <= 0:
+            return 0.0
+        return min(order.remaining, available_inventory)
+
+    def _inventory_value(self, mark_price: float) -> float:
+        if mark_price <= 0:
+            return 0.0
+        return self._inventory * mark_price
 
     @staticmethod
     def _normalise_size(raw_size: float, price: float) -> float:
         if raw_size <= 0 or price <= 0:
             return 0.0
         min_size = max(EXCHANGE_MIN_SHARES, EXCHANGE_MIN_USD / price)
-        return round(max(raw_size, min_size), 2)
+        if raw_size + 1e-9 < min_size:
+            return 0.0
+        return round(raw_size, 2)

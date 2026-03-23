@@ -37,6 +37,9 @@ log = get_logger(__name__)
 # ── Event type literals ────────────────────────────────────────────────────
 EventType = Literal["l2_delta", "l2_snapshot", "trade", "external_price"]
 
+_SNAPSHOT_EVENT_TYPES = {"book", "snapshot", "book_snapshot", "l2_snapshot"}
+_DELTA_EVENT_TYPES = {"price_change", "delta", "l2_delta"}
+
 # Map the recorder's source tags → canonical event types
 _SOURCE_MAP: dict[str, EventType] = {
     "l2": "l2_delta",
@@ -291,57 +294,80 @@ class DataLoader:
         total = len(raw_records)
         prev_ts = 0.0
         for seq, (record, rec_line_no) in enumerate(raw_records):
-            event = self._parse_record(record, fpath, rec_line_no)
-            if event is None:
+            events = self._parse_record_events(record, fpath, rec_line_no)
+            if not events:
                 self._skipped_events += 1
                 continue
 
-            # Replace collapsed timestamp with synthetic one spread across the day
-            if synth_day_start is not None:
-                event = MarketEvent(
-                    timestamp=synth_day_start + seq * (86400.0 / max(total, 1)),
-                    event_type=event.event_type,
-                    asset_id=event.asset_id,
-                    data=event.data,
-                    server_time=event.server_time,
-                )
+            for event in events:
+                # Replace collapsed timestamp with synthetic one spread across the day
+                if synth_day_start is not None:
+                    event = MarketEvent(
+                        timestamp=synth_day_start + seq * (86400.0 / max(total, 1)),
+                        event_type=event.event_type,
+                        asset_id=event.asset_id,
+                        data=event.data,
+                        server_time=event.server_time,
+                    )
 
-            if event.timestamp < prev_ts:
-                log.warning(
-                    "dataloader_non_monotonic",
-                    file=str(fpath),
-                    line=rec_line_no,
-                    ts=event.timestamp,
-                    prev_ts=prev_ts,
-                )
-            prev_ts = event.timestamp
-            yield event
+                if event.timestamp < prev_ts:
+                    log.warning(
+                        "dataloader_non_monotonic",
+                        file=str(fpath),
+                        line=rec_line_no,
+                        ts=event.timestamp,
+                        prev_ts=prev_ts,
+                    )
+                prev_ts = event.timestamp
+                yield event
 
-    def _parse_record(
+    def _parse_record_events(
         self, record: dict, fpath: Path, line_no: int
-    ) -> MarketEvent | None:
-        """Parse a raw JSONL record into a ``MarketEvent``."""
+    ) -> list[MarketEvent]:
+        """Parse a raw JSONL record into one or more ``MarketEvent`` objects."""
         local_ts = record.get("local_ts")
         if local_ts is None:
-            return None
+            return []
 
         try:
             local_ts = float(local_ts)
         except (TypeError, ValueError):
-            return None
+            return []
 
         source = record.get("source", "")
         event_type = _SOURCE_MAP.get(source)
-        if event_type is None:
-            return None
-
-        asset_id = record.get("asset_id", "")
-        if not asset_id:
-            return None
 
         payload = record.get("payload")
         if not isinstance(payload, dict):
-            return None
+            return []
+
+        # Reconcile event type using payload hints.
+        # The recorder uses two top-level ``source`` tags ("l2" and
+        # "trade") but the payload's ``event_type`` is the ground truth.
+        payload_type = str(payload.get("event_type", "")).lower()
+        if payload_type in _SNAPSHOT_EVENT_TYPES:
+            event_type = "l2_snapshot"
+        elif payload_type in _DELTA_EVENT_TYPES:
+            event_type = "l2_delta"
+        elif payload_type == "last_trade_price":
+            event_type = "trade"
+
+        if event_type is None:
+            return []
+
+        server_time = self._extract_server_time(payload)
+
+        if event_type == "l2_delta":
+            expanded_events = self._expand_price_change_events(
+                local_ts=local_ts,
+                fallback_asset_id=str(record.get("asset_id", "") or ""),
+                payload=payload,
+                server_time=server_time,
+            )
+            if expanded_events:
+                return expanded_events
+
+        asset_id = str(record.get("asset_id", "") or "")
 
         # Prefer the per-token asset_id stored in the payload (decimal token
         # id) over the top-level market-id (hex condition_id).  The live
@@ -351,24 +377,25 @@ class DataLoader:
         if payload_token_id:
             asset_id = str(payload_token_id)
 
+        if not asset_id:
+            return []
+
         # Apply asset filter (evaluated after payload id resolution)
         if self._asset_filter and asset_id not in self._asset_filter:
-            return None
+            return []
 
-        # Reconcile event type using payload hints.
-        # The recorder uses two top-level ``source`` tags ("l2" and
-        # "trade") but the payload's ``event_type`` is the ground truth.
-        if payload:
-            payload_type = payload.get("event_type", "")
+        return [
+            MarketEvent(
+                timestamp=local_ts,
+                event_type=event_type,
+                asset_id=asset_id,
+                data=payload,
+                server_time=server_time,
+            )
+        ]
 
-            if payload_type in ("book", "snapshot", "book_snapshot"):
-                # Full L2 snapshot regardless of source tag
-                event_type = "l2_snapshot"
-            elif payload_type == "last_trade_price":
-                # Public trade — contains price/size/side
-                event_type = "trade"
-
-        # Extract server timestamp if present
+    @staticmethod
+    def _extract_server_time(payload: dict) -> float:
         server_time = 0.0
         raw_srv = (
             payload.get("timestamp")
@@ -385,14 +412,46 @@ class DataLoader:
                 server_time = srv
             except (TypeError, ValueError):
                 pass
+        return server_time
 
-        return MarketEvent(
-            timestamp=local_ts,
-            event_type=event_type,
-            asset_id=asset_id,
-            data=payload,
-            server_time=server_time,
-        )
+    def _expand_price_change_events(
+        self,
+        *,
+        local_ts: float,
+        fallback_asset_id: str,
+        payload: dict,
+        server_time: float,
+    ) -> list[MarketEvent]:
+        changes = payload.get("price_changes") or payload.get("changes") or payload.get("data") or []
+        if isinstance(changes, dict):
+            changes = [changes]
+        if not isinstance(changes, list) or not changes:
+            return []
+
+        events: list[MarketEvent] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            asset_id = str(change.get("asset_id") or payload.get("asset_id") or fallback_asset_id or "")
+            if not asset_id:
+                continue
+            if self._asset_filter and asset_id not in self._asset_filter:
+                continue
+
+            event_payload = dict(payload)
+            event_payload["asset_id"] = asset_id
+            event_payload["price_changes"] = [change]
+            events.append(
+                MarketEvent(
+                    timestamp=local_ts,
+                    event_type="l2_delta",
+                    asset_id=asset_id,
+                    data=event_payload,
+                    server_time=server_time,
+                )
+            )
+
+        return events
 
     # ── Parquet support ─────────────────────────────────────────────────
 

@@ -118,6 +118,7 @@ class WfoConfig:
     """
 
     data_dir: str = "data"
+    allowed_dates: tuple[str, ...] | None = None
     market_id: str = "BACKTEST"
     yes_asset_id: str = "YES_TOKEN"
     no_asset_id: str = "NO_TOKEN"
@@ -538,25 +539,44 @@ def generate_folds(
 #  Data Loader helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _collect_files_for_dates(data_dir: str, dates: list[str]) -> list[Path]:
+def _collect_files_for_dates(
+    data_dir: str,
+    dates: list[str],
+    *,
+    market_id: str | None = None,
+    asset_ids: set[str] | None = None,
+) -> list[Path]:
     """Gather all tick files (JSONL and Parquet) for the given date strings."""
     from src.backtest.data_recorder import MarketDataRecorder
 
     files: list[Path] = []
     base = Path(data_dir)
+    target_ids = {str(value) for value in (asset_ids or set()) if value}
+    if market_id:
+        target_ids.add(str(market_id))
+
+    def _include_file(path: Path) -> bool:
+        if not target_ids:
+            return True
+        return path.stem in target_ids
+
     for d in dates:
         # Raw JSONL from raw_ticks/<date>/
-        files.extend(MarketDataRecorder.data_files_for_date(data_dir, d))
+        files.extend(
+            path for path in MarketDataRecorder.data_files_for_date(data_dir, d)
+            if _include_file(path)
+        )
         # Processed Parquet from <data_dir>/<date>/
         parquet_dir = base / d
         if parquet_dir.exists():
-            files.extend(sorted(parquet_dir.glob("*.parquet")))
+            files.extend(path for path in sorted(parquet_dir.glob("*.parquet")) if _include_file(path))
     return files
 
 
 def _build_data_loader(
     data_dir: str,
     dates: list[str],
+    market_id: str | None = None,
     asset_ids: set[str] | None = None,
 ) -> Any:
     """Construct a DataLoader for the given date window.
@@ -565,7 +585,12 @@ def _build_data_loader(
     """
     from src.backtest.data_loader import DataLoader
 
-    files = _collect_files_for_dates(data_dir, dates)
+    files = _collect_files_for_dates(
+        data_dir,
+        dates,
+        market_id=market_id,
+        asset_ids=asset_ids,
+    )
     if not files:
         return None
     return DataLoader(files, asset_ids=asset_ids)
@@ -574,6 +599,7 @@ def _build_data_loader(
 def _compute_gap_ratio(
     data_dir: str,
     dates: list[str],
+    market_id: str,
     asset_ids: set[str],
     max_interval_s: float,
 ) -> float:
@@ -585,7 +611,12 @@ def _compute_gap_ratio(
     """
     from src.backtest.data_loader import DataLoader
 
-    files = _collect_files_for_dates(data_dir, dates)
+    files = _collect_files_for_dates(
+        data_dir,
+        dates,
+        market_id=market_id,
+        asset_ids=asset_ids,
+    )
     if not files:
         return 0.0
 
@@ -722,14 +753,23 @@ def _run_single_backtest(
     from src.core.config import StrategyParams
 
     loader = _build_data_loader(
-        data_dir, dates, asset_ids={yes_asset_id, no_asset_id}
+        data_dir,
+        dates,
+        market_id=market_id,
+        asset_ids={yes_asset_id, no_asset_id},
     )
     if loader is None:
         return None
 
     # ── Pre-scan for gap/stale data quality ─────────────────────────
     if gap_threshold > 0:
-        gap_ratio = _compute_gap_ratio(data_dir, dates, {yes_asset_id, no_asset_id}, gap_max_interval_s)
+        gap_ratio = _compute_gap_ratio(
+            data_dir,
+            dates,
+            market_id,
+            {yes_asset_id, no_asset_id},
+            gap_max_interval_s,
+        )
         if gap_ratio > gap_threshold:
             log.warning(
                 "wfo_data_quality_abort",
@@ -1083,6 +1123,17 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
     from src.backtest.data_recorder import MarketDataRecorder
 
     available = MarketDataRecorder.available_dates(cfg.data_dir)
+    if cfg.allowed_dates is not None:
+        requested_dates = list(dict.fromkeys(cfg.allowed_dates))
+        requested_set = set(requested_dates)
+        all_available = available
+        available = [date_str for date_str in all_available if date_str in requested_set]
+        missing_dates = [date_str for date_str in requested_dates if date_str not in requested_set.intersection(all_available)]
+        if missing_dates:
+            raise FileNotFoundError(
+                "Requested WFO dates were not found in "
+                f"{cfg.data_dir}/raw_ticks/: {', '.join(missing_dates)}"
+            )
     if not available:
         raise FileNotFoundError(
             f"No recorded tick data found in {cfg.data_dir}/raw_ticks/"
@@ -1126,6 +1177,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
     # ── Serialise config for child processes ───────────────────────────
     cfg_dict = {
         "data_dir": cfg.data_dir,
+        "allowed_dates": cfg.allowed_dates,
         "market_id": cfg.market_id,
         "yes_asset_id": cfg.yes_asset_id,
         "no_asset_id": cfg.no_asset_id,
@@ -1458,6 +1510,11 @@ def _export_champion_params(cfg: WfoConfig, report: WfoReport) -> None:
         data_dates.extend(fr.train_dates)
         data_dates.extend(fr.test_dates)
 
+    champion_fold = next(
+        (fr for fr in report.folds if fr.fold_index == report.champion_fold_index),
+        None,
+    )
+
     date_range = ""
     if data_dates:
         date_range = f"{min(data_dates)} to {max(data_dates)}"
@@ -1466,10 +1523,13 @@ def _export_champion_params(cfg: WfoConfig, report: WfoReport) -> None:
         "params": report.champion_params,
         "meta": {
             "champion_fold": report.champion_fold_index,
-            "oos_sharpe": round(report.aggregate_oos_sharpe, 4),
-            "oos_win_rate": round(report.aggregate_oos_win_rate, 4),
-            "oos_profit_factor": round(report.aggregate_oos_profit_factor, 4),
-            "oos_trade_count": int(report.aggregate_oos_trade_count),
+            "oos_sharpe": round(champion_fold.oos_sharpe if champion_fold else 0.0, 4),
+            "oos_win_rate": round(champion_fold.oos_win_rate if champion_fold else 0.0, 4),
+            "oos_profit_factor": round(
+                champion_fold.oos_profit_factor if champion_fold else 0.0,
+                4,
+            ),
+            "oos_trade_count": int(champion_fold.oos_total_fills if champion_fold else 0),
             "oos_degradation_pct": round(report.champion_degradation_pct, 2),
             "n_folds": len(report.folds),
             "n_trials_per_fold": cfg.n_trials,

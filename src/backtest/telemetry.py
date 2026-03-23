@@ -27,8 +27,9 @@ from src.core.logger import get_logger
 
 log = get_logger(__name__)
 
-# Minutes in a year (365.25 × 24 × 60) — for annualising Sharpe
+# Seconds in a year (365.25 × 24 × 60 × 60) — for annualising Sharpe
 _MINUTES_PER_YEAR = 525_960.0
+_SECONDS_PER_YEAR = _MINUTES_PER_YEAR * 60.0
 _BAR_INTERVAL_S = 60.0  # 1-minute bars for return computation
 
 
@@ -308,15 +309,18 @@ class Telemetry:
 
         # ── Sharpe & Sortino from equity curve ─────────────────────────
         if len(self._equity_curve) >= 3:
+            timestamps = np.array([ts for ts, _ in self._equity_curve])
             equities = np.array([eq for _, eq in self._equity_curve])
             returns = np.diff(equities) / np.maximum(equities[:-1], 1e-9)
+            sample_deltas = np.diff(timestamps)
+            positive_deltas = sample_deltas[sample_deltas > 0]
+            sample_interval_s = float(np.median(positive_deltas)) if len(positive_deltas) > 0 else _BAR_INTERVAL_S
 
             if len(returns) > 1:
                 mu = float(np.mean(returns))
                 sigma = float(np.std(returns, ddof=1))
 
-                # Annualize: assume each equity point ~= 1-minute bars
-                ann_factor = math.sqrt(_MINUTES_PER_YEAR)
+                ann_factor = math.sqrt(_SECONDS_PER_YEAR / max(sample_interval_s, 1e-9))
                 m.sharpe_ratio = (mu / sigma * ann_factor) if sigma > 0 else 0.0
 
                 # Sortino: downside deviation

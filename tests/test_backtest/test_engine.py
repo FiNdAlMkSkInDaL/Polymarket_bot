@@ -417,3 +417,30 @@ class TestEquityComputation:
         result = engine.run()
 
         assert abs(result.final_equity - 1000.0) < 1e-6
+
+    def test_equity_uses_asset_specific_raw_book(self, tmp_path: Path):
+        events = [
+            _make_l2_snapshot(
+                1.0,
+                "A",
+                [("0.007", "1000")],
+                [("0.999", "1000"), ("0.008", "1000")],
+            ),
+            _make_trade(2.0, "A", "0.008", "1", "buy"),
+            _make_l2_snapshot(
+                3.0,
+                "A",
+                [("0.007", "1000")],
+                [("0.999", "1000"), ("0.008", "1000")],
+            ),
+        ]
+        _write_events(tmp_path / "a.jsonl", events)
+
+        strategy = BuyOnFirstTradeStrategy()
+        loader = DataLoader.from_files(tmp_path / "a.jsonl")
+        config = BacktestConfig(initial_cash=1000.0, latency_ms=0.0, fee_enabled=False)
+        engine = BacktestEngine(strategy=strategy, data_loader=loader, config=config)
+        result = engine.run()
+
+        assert abs(result.final_cash - 999.92) < 1e-6
+        assert abs(result.final_equity - 999.99) < 1e-6
