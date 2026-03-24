@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS trades (
     zscore          REAL,
     volume_ratio    REAL,
     whale           INTEGER,
+    entry_fee_bps   INTEGER DEFAULT 0,
+    exit_fee_bps    INTEGER DEFAULT 0,
+    entry_toxicity_index REAL DEFAULT 0.0,
+    exit_toxicity_index REAL DEFAULT 0.0,
     created_at      REAL,
     is_probe        INTEGER DEFAULT 0,
     signal_type     TEXT DEFAULT '',
@@ -162,6 +166,22 @@ class TradeStore:
                 await self._db.execute(
                     "ALTER TABLE trades ADD COLUMN meta_weight REAL DEFAULT 1.0"
                 )
+            if "entry_toxicity_index" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN entry_toxicity_index REAL DEFAULT 0.0"
+                )
+            if "exit_toxicity_index" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN exit_toxicity_index REAL DEFAULT 0.0"
+                )
+            if "entry_fee_bps" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN entry_fee_bps INTEGER DEFAULT 0"
+                )
+            if "exit_fee_bps" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN exit_fee_bps INTEGER DEFAULT 0"
+                )
             await self._db.commit()
         except Exception:
             log.warning("schema_migration_skipped", exc_info=True)
@@ -226,15 +246,25 @@ class TradeStore:
 
         hold = (pos.exit_time - pos.entry_time) if pos.exit_time else 0.0
         signal = pos.signal
+        signal_zscore = pos.signal_zscore
+        if signal_zscore is None and signal is not None:
+            signal_zscore = getattr(signal, "zscore", None)
+        signal_volume_ratio = pos.signal_volume_ratio
+        if signal_volume_ratio is None and signal is not None:
+            signal_volume_ratio = getattr(signal, "volume_ratio", None)
+        signal_whale = int(pos.signal_whale_confluence)
+        if signal_whale == 0 and signal is not None:
+            signal_whale = int(getattr(signal, "whale_confluence", False))
 
         await self._db.execute(
             """
             INSERT OR REPLACE INTO trades
             (id, market_id, state, entry_price, entry_size, entry_time,
              target_price, exit_price, exit_time, exit_reason, pnl_cents,
-             hold_seconds, alpha, zscore, volume_ratio, whale, created_at,
+             hold_seconds, alpha, zscore, volume_ratio, whale,
+             entry_fee_bps, exit_fee_bps, entry_toxicity_index, exit_toxicity_index, created_at,
              is_probe, signal_type, meta_weight)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos.id,
@@ -250,9 +280,13 @@ class TradeStore:
                 pos.pnl_cents,
                 round(hold, 1),
                 pos.tp_result.alpha if pos.tp_result else None,
-                signal.zscore if signal else None,
-                signal.volume_ratio if signal else None,
-                int(signal.whale_confluence) if signal else 0,
+                signal_zscore,
+                signal_volume_ratio,
+                signal_whale,
+                int(getattr(pos, "entry_fee_bps", 0) or 0),
+                int(getattr(pos, "exit_fee_bps", 0) or 0),
+                float(getattr(pos, "entry_toxicity_index", 0.0) or 0.0),
+                float(getattr(pos, "exit_toxicity_index", 0.0) or 0.0),
                 pos.created_at,
                 int(getattr(pos, 'is_probe', False)),
                 getattr(pos, 'signal_type', ''),
@@ -313,6 +347,95 @@ class TradeStore:
             "expectancy_cents": round(total_pnl / total, 2) if total else 0,
             "decayed_win_rate": round(self._compute_decayed_wr(pnls), 4),
         }
+
+    async def get_ofi_toxicity_pnl_summary(self, buckets: int = 10) -> list[dict[str, float | int | str]]:
+        """Aggregate OFI momentum trade quality by entry-toxicity bucket.
+
+        Returns one row per fixed-width toxicity bucket across ``[0, 1]``.
+        Each row includes trade count, win rate, average net PnL, and
+        total taker-fee drag in cents. Agent 3 imports this helper for
+        offline TCA analysis.
+        """
+        await self._ensure_db()
+
+        bucket_count = max(1, int(buckets or 10))
+        cursor = await self._db.execute(
+            "SELECT entry_toxicity_index, pnl_cents, entry_price, exit_price, "
+            "entry_size, entry_fee_bps, exit_fee_bps "
+            "FROM trades WHERE state = ? AND signal_type = ? "
+            "ORDER BY entry_toxicity_index ASC, exit_time ASC",
+            (PositionState.CLOSED.value, "ofi_momentum"),
+        )
+        rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        summaries: list[dict[str, float | int | str]] = []
+        for bucket_idx in range(bucket_count):
+            bucket_lo = bucket_idx / bucket_count
+            bucket_hi = (bucket_idx + 1) / bucket_count
+            bucket_trades: list[tuple] = []
+
+            for row in rows:
+                toxicity_index = max(0.0, min(1.0, float(row[0] or 0.0)))
+                mapped_idx = min(bucket_count - 1, int(toxicity_index * bucket_count))
+                if mapped_idx == bucket_idx:
+                    bucket_trades.append(row)
+
+            if not bucket_trades:
+                continue
+
+            total_trades = len(bucket_trades)
+            wins = sum(1 for row in bucket_trades if float(row[1] or 0.0) > 0.0)
+            total_pnl_cents = sum(float(row[1] or 0.0) for row in bucket_trades)
+            total_taker_fee_drag_cents = 0.0
+            for row in bucket_trades:
+                entry_price = float(row[2] or 0.0)
+                exit_price = float(row[3] or 0.0)
+                size = float(row[4] or 0.0)
+                entry_fee_bps = int(row[5] or 0)
+                exit_fee_bps = int(row[6] or 0)
+                total_taker_fee_drag_cents += (
+                    entry_price * (entry_fee_bps / 10_000.0) * 100.0 * size
+                )
+                total_taker_fee_drag_cents += (
+                    exit_price * (exit_fee_bps / 10_000.0) * 100.0 * size
+                )
+
+            summaries.append(
+                {
+                    "bucket_index": bucket_idx,
+                    "toxicity_min": round(bucket_lo, 4),
+                    "toxicity_max": round(bucket_hi, 4),
+                    "bucket_label": f"[{bucket_lo:.1f}, {bucket_hi:.1f}{']' if bucket_idx == bucket_count - 1 else ')'}",
+                    "trade_count": total_trades,
+                    "win_rate": round(wins / total_trades, 4),
+                    "avg_net_pnl_cents": round(total_pnl_cents / total_trades, 4),
+                    "total_net_pnl_cents": round(total_pnl_cents, 4),
+                    "total_taker_fee_drag_cents": round(total_taker_fee_drag_cents, 4),
+                }
+            )
+
+        return summaries
+
+
+async def get_ofi_toxicity_pnl_summary(
+    buckets: int = 10,
+    *,
+    db_path: str | Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Convenience wrapper for OFI toxicity aggregation from SQLite.
+
+    This thin helper exists so offline analysis scripts can import a single
+    public function from ``src.monitoring.trade_store`` without manually
+    managing a ``TradeStore`` lifecycle.
+    """
+    store = TradeStore(db_path=db_path)
+    try:
+        return await store.get_ofi_toxicity_pnl_summary(buckets=buckets)
+    finally:
+        await store.close()
 
     @staticmethod
     def _compute_decayed_wr(
