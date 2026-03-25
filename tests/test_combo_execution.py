@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.signals.bayesian_arb import BayesianArbSignal, BayesianLeg
 from src.signals.combinatorial_arb import ComboArbSignal, ComboLeg
 from src.trading.executor import Order, OrderSide, OrderStatus
 from src.trading.position_manager import ComboState, PositionManager, PositionState
@@ -223,3 +224,86 @@ async def test_hanging_taker_after_sweep_triggers_emergency_dump():
     assert maker_pos.exit_order.price == 0.30
     assert taker_a_pos.exit_order.price == 0.51
     assert len(executor.orders) == 5
+
+
+def _bayesian_signal() -> BayesianArbSignal:
+    maker = BayesianLeg(
+        market_id="MKT_JOINT",
+        asset_id="YES_JOINT",
+        trade_side="YES",
+        yes_token_id="YES_JOINT",
+        no_token_id="NO_JOINT",
+        best_bid=0.20,
+        best_ask=0.21,
+        target_price=0.20,
+        target_shares=25.0,
+        question="Joint",
+        role="joint",
+    )
+    taker_a = BayesianLeg(
+        market_id="MKT_A",
+        asset_id="NO_A",
+        trade_side="NO",
+        yes_token_id="YES_A",
+        no_token_id="NO_A",
+        best_bid=0.31,
+        best_ask=0.35,
+        target_price=0.35,
+        target_shares=25.0,
+        question="Base A",
+        role="base_a",
+    )
+    taker_b = BayesianLeg(
+        market_id="MKT_B",
+        asset_id="NO_B",
+        trade_side="NO",
+        yes_token_id="YES_B",
+        no_token_id="NO_B",
+        best_bid=0.36,
+        best_ask=0.37,
+        target_price=0.37,
+        target_shares=25.0,
+        question="Base B",
+        role="base_b",
+    )
+    return BayesianArbSignal(
+        market_id="REL-LOWER",
+        cluster_event_id="REL-LOWER",
+        maker_leg=maker,
+        taker_legs=[taker_a, taker_b],
+        target_shares=25.0,
+        total_collateral=23.0,
+        edge_cents=9.0,
+        violation_type="lower",
+    )
+
+
+@pytest.mark.asyncio
+async def test_combo_position_uses_trade_asset_ids_for_bayesian_no_legs():
+    executor = _Executor()
+    pm = PositionManager(
+        executor,
+        max_open_positions=10,
+        book_trackers={
+            "NO_A": _Book(best_bid=0.31, best_ask=0.35),
+            "NO_B": _Book(best_bid=0.36, best_ask=0.37),
+        },
+    )
+    pm.set_wallet_balance(1000.0)
+
+    combo = await pm.open_combo_position(_bayesian_signal(), {})
+
+    assert combo is not None
+    assert executor.orders[0].asset_id == "YES_JOINT"
+
+    maker_order = executor.orders[0]
+    maker_order.status = OrderStatus.FILLED
+    maker_order.filled_size = 25.0
+    maker_order.filled_avg_price = 0.20
+
+    handled = await pm.on_combo_order_update(maker_order, {combo.event_id: combo})
+
+    assert handled is True
+    assert [order.asset_id for order in executor.orders] == ["YES_JOINT", "NO_A", "NO_B"]
+    assert combo.legs["MKT_A"].trade_side == "NO"
+    assert combo.legs["MKT_B"].trade_side == "NO"

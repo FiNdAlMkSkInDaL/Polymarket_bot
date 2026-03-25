@@ -56,6 +56,10 @@ class PassiveStrategy(StrategyABC):
         self.ended = True
 
 
+class SelfAggregatingStrategy(PassiveStrategy):
+    self_aggregates_trades = True
+
+
 class BuyOnFirstTradeStrategy(StrategyABC):
     """Places a market buy of 10 shares on the first trade event."""
 
@@ -218,6 +222,24 @@ class TestEventRouting:
         result = engine.run()
 
         assert strategy.book_updates == 2
+
+    def test_self_aggregating_strategy_skips_engine_bar_generation(self, tmp_path: Path):
+        events = [
+            _make_trade(1.0, "A", "0.50", "10"),
+            _make_trade(61.5, "A", "0.55", "10"),
+        ]
+        _write_events(tmp_path / "a.jsonl", events)
+
+        strategy = SelfAggregatingStrategy()
+        loader = DataLoader.from_files(tmp_path / "a.jsonl")
+        engine = BacktestEngine(
+            strategy=strategy, data_loader=loader,
+            config=BacktestConfig(latency_ms=0.0),
+        )
+        result = engine.run()
+
+        assert strategy.trades == 2
+        assert strategy.bars == []
         assert result.events_processed == 2
 
     def test_trades_counted(self, tmp_path: Path):

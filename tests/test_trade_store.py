@@ -48,6 +48,27 @@ def _make_position(
     )
 
 
+def _make_ofi_position(
+    pos_id: str,
+    entry: float,
+    exit_p: float,
+    *,
+    toxicity_index: float,
+    size: float = 10.0,
+    entry_fee_bps: int = 0,
+    exit_fee_bps: int = 0,
+) -> Position:
+    pos = _make_position(pos_id, entry, exit_p, size=size)
+    pos.signal_type = "ofi_momentum"
+    pos.entry_toxicity_index = toxicity_index
+    pos.entry_fee_bps = entry_fee_bps
+    pos.exit_fee_bps = exit_fee_bps
+    pos.drawn_tp = exit_p
+    pos.drawn_stop = round(entry * 0.985, 4)
+    pos.drawn_time = 240.0
+    return pos
+
+
 class TestTradeStore:
     @pytest.fixture
     def store(self, tmp_path):
@@ -73,6 +94,36 @@ class TestTradeStore:
         await store.close()
 
     @pytest.mark.asyncio
+    async def test_record_persists_fill_time_toxicity(self, store):
+        await store.init()
+
+        pos = _make_position("P_TOX", 0.45, 0.55)
+        pos.entry_toxicity_index = 0.87
+        pos.exit_toxicity_index = 0.24
+        pos.drawn_tp = 0.56
+        pos.drawn_stop = 0.441
+        pos.drawn_time = 245.0
+        pos.signal = None
+
+        await store.record(pos)
+
+        cursor = await store._db.execute(
+            "SELECT entry_toxicity_index, exit_toxicity_index, drawn_tp, drawn_stop, drawn_time "
+            "FROM trades WHERE id = ?",
+            ("P_TOX",),
+        )
+        row = await cursor.fetchone()
+
+        assert row is not None
+        assert row[0] == pytest.approx(0.87)
+        assert row[1] == pytest.approx(0.24)
+        assert row[2] == pytest.approx(0.56)
+        assert row[3] == pytest.approx(0.441)
+        assert row[4] == pytest.approx(245.0)
+
+        await store.close()
+
+    @pytest.mark.asyncio
     async def test_go_live_criteria_not_met_few_trades(self, store):
         await store.init()
         await store.record(_make_position("P1", 0.45, 0.55))
@@ -85,6 +136,76 @@ class TestTradeStore:
         await store.init()
         stats = await store.get_stats()
         assert stats["total_trades"] == 0
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_ofi_toxicity_pnl_summary_buckets_pnl_and_fee_drag(self, store):
+        await store.init()
+
+        low_bucket = _make_ofi_position(
+            "OFI-LOW",
+            0.50,
+            0.55,
+            toxicity_index=0.12,
+            entry_fee_bps=100,
+            exit_fee_bps=0,
+        )
+        mid_bucket_win = _make_ofi_position(
+            "OFI-MID-WIN",
+            0.45,
+            0.50,
+            toxicity_index=0.44,
+            entry_fee_bps=100,
+            exit_fee_bps=50,
+        )
+        mid_bucket_loss = _make_ofi_position(
+            "OFI-MID-LOSS",
+            0.48,
+            0.44,
+            toxicity_index=0.47,
+            entry_fee_bps=0,
+            exit_fee_bps=100,
+        )
+        ignored = _make_position("PANIC-IGNORE", 0.40, 0.42)
+        ignored.signal_type = "panic"
+        ignored.entry_toxicity_index = 0.92
+        ignored.entry_fee_bps = 100
+        ignored.exit_fee_bps = 100
+
+        await store.record(low_bucket)
+        await store.record(mid_bucket_win)
+        await store.record(mid_bucket_loss)
+        await store.record(ignored)
+
+        summary = await store.get_ofi_toxicity_pnl_summary(buckets=5)
+
+        assert len(summary) == 2
+
+        low = summary[0]
+        assert low["bucket_index"] == 0
+        assert low["trade_count"] == 1
+        assert low["win_rate"] == pytest.approx(1.0)
+        assert low["avg_net_pnl_cents"] == pytest.approx(50.0)
+        assert low["total_taker_fee_drag_cents"] == pytest.approx(5.0)
+
+        mid = summary[1]
+        assert mid["bucket_index"] == 2
+        assert mid["trade_count"] == 2
+        assert mid["win_rate"] == pytest.approx(0.5)
+        assert mid["avg_net_pnl_cents"] == pytest.approx(5.0)
+        assert mid["total_net_pnl_cents"] == pytest.approx(10.0)
+        assert mid["total_taker_fee_drag_cents"] == pytest.approx(11.4)
+
+        await store.close()
+
+    @pytest.mark.asyncio
+    async def test_get_ofi_toxicity_pnl_summary_empty_when_no_ofi_trades(self, store):
+        await store.init()
+        await store.record(_make_position("PANIC-1", 0.45, 0.55))
+
+        summary = await store.get_ofi_toxicity_pnl_summary()
+
+        assert summary == []
         await store.close()
 
 
@@ -163,6 +284,9 @@ class TestStatePersistence:
         assert p["state"] == "EXIT_PENDING"
         assert p["entry_price"] == 0.45
         assert p["target_price"] == 0.55
+        assert p["drawn_tp"] == 0.0
+        assert p["drawn_stop"] == 0.0
+        assert p["drawn_time"] == 0.0
 
         await store.close()
 

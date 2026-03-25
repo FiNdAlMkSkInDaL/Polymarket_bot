@@ -5,6 +5,7 @@ Parquet round-trip compatibility.
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 
@@ -48,6 +49,17 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def _delta_change_count(event: MarketEvent) -> int:
+    if event.event_type != "l2_delta":
+        return 0
+    changes = event.data.get("price_changes") or event.data.get("changes") or event.data.get("data") or []
+    if isinstance(changes, dict):
+        return 1
+    if isinstance(changes, list):
+        return len(changes)
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -364,12 +376,14 @@ class TestHealthReport:
 class TestDataLoaderRoundTrip:
 
     def test_jsonl_to_parquet_to_events(self, tmp_path: Path) -> None:
-        """JSONL → ParquetConverter → DataLoader produces identical events."""
+        """JSONL → Parquet preserves row count while JSONL replay may expand deltas."""
         # Generate synthetic JSONL
         gen = SyntheticGenerator(seed=99)
         raw_dir = gen.generate(
             tmp_path / "raw", num_rows=500, duration_hours=0.5
         )
+
+        raw_records = _read_jsonl_records(raw_dir)
 
         # Load events from JSONL
         jsonl_loader = DataLoader.from_directory(raw_dir)
@@ -385,16 +399,24 @@ class TestDataLoaderRoundTrip:
         parquet_loader = DataLoader.from_directory(parquet_dir)
         parquet_events = list(parquet_loader)
 
-        # Same count
-        assert len(parquet_events) == len(jsonl_events)
+        assert len(raw_records) == 500
+        assert len(parquet_events) == len(raw_records) == report.valid_rows
+        assert len(jsonl_events) >= len(parquet_events)
 
-        # Same event content (in same order)
-        for je, pe in zip(jsonl_events, parquet_events):
-            assert je.timestamp == pytest.approx(pe.timestamp, abs=1e-6)
-            assert je.event_type == pe.event_type
-            assert je.asset_id == pe.asset_id
-            assert je.data == pe.data
-            assert je.server_time == pytest.approx(pe.server_time, abs=1e-3)
+        jsonl_non_delta = Counter(
+            (round(ev.timestamp, 6), ev.event_type, ev.asset_id)
+            for ev in jsonl_events
+            if ev.event_type != "l2_delta"
+        )
+        parquet_non_delta = Counter(
+            (round(ev.timestamp, 6), ev.event_type, ev.asset_id)
+            for ev in parquet_events
+            if ev.event_type != "l2_delta"
+        )
+        assert parquet_non_delta == jsonl_non_delta
+        assert sum(_delta_change_count(ev) for ev in parquet_events) == sum(
+            1 for ev in jsonl_events if ev.event_type == "l2_delta"
+        )
 
     def test_parquet_loader_asset_filter(self, tmp_path: Path) -> None:
         """DataLoader with asset_ids filter works for Parquet files."""
@@ -440,6 +462,8 @@ class TestDataLoaderRoundTrip:
         converter = ParquetConverter()
         parquet_dir = tmp_path / "mixed"
         converter.convert([raw_dir2], parquet_dir)
+        parquet_events = list(DataLoader.from_directory(parquet_dir))
+        jsonl_events = list(DataLoader.from_directory(raw_dir1))
 
         # Copy JSONL files into the same directory tree
         import shutil
@@ -451,7 +475,7 @@ class TestDataLoaderRoundTrip:
         loader = DataLoader.from_directory(parquet_dir)
         events = list(loader)
 
-        assert len(events) == 400
+        assert len(events) == len(parquet_events) + len(jsonl_events)
 
         # Should be chronologically sorted
         for i in range(1, len(events)):

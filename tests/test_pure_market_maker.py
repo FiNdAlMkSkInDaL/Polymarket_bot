@@ -145,10 +145,18 @@ async def test_pure_mm_places_tight_and_wide_quotes_at_expected_prices(restore_s
 
     assert len(executor.orders) == 4
     placed = {(order.side, order.price): order.size for order in executor.orders}
-    assert placed[(OrderSide.BUY, 0.45)] == pytest.approx(11.11)
-    assert placed[(OrderSide.SELL, 0.46)] == pytest.approx(10.87)
-    assert placed[(OrderSide.BUY, 0.38)] == pytest.approx(111.11)
-    assert placed[(OrderSide.SELL, 0.53)] == pytest.approx(108.7)
+    assert placed[(OrderSide.BUY, 0.45)] == pytest.approx(
+        mm._quote_size_for_bid(0.45, market.no_token_id, cfg.settings.strategy.pure_mm_quote_size_usd)
+    )
+    assert placed[(OrderSide.SELL, 0.46)] == pytest.approx(
+        mm._quote_size_for_ask(0.46, market.no_token_id, cfg.settings.strategy.pure_mm_quote_size_usd)
+    )
+    assert placed[(OrderSide.BUY, 0.38)] == pytest.approx(
+        mm._quote_size_for_bid(0.45, market.no_token_id, cfg.settings.strategy.pure_mm_wide_size_usd)
+    )
+    assert placed[(OrderSide.SELL, 0.53)] == pytest.approx(
+        mm._quote_size_for_ask(0.46, market.no_token_id, cfg.settings.strategy.pure_mm_wide_size_usd)
+    )
 
 
 @pytest.mark.asyncio

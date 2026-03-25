@@ -32,6 +32,12 @@ class TestMetaStrategyController:
         assert d.weight == 0.5
         assert not d.vetoed
 
+    def test_deep_mr_momentum_vetoed(self):
+        d = self.ctrl.evaluate("ofi_momentum", 0.9)
+        assert d.vetoed
+        assert d.veto_reason == "regime_mean_revert_veto"
+        assert d.weight == 0.0
+
     # ── Trending regime (score < 0.3) ────────────────────────────────
 
     def test_trending_panic_vetoed(self):
@@ -50,6 +56,11 @@ class TestMetaStrategyController:
         assert d.weight == 1.0
         assert not d.vetoed
 
+    def test_trending_momentum_boosted(self):
+        d = self.ctrl.evaluate("ofi_momentum", 0.1)
+        assert not d.vetoed
+        assert d.weight == 1.5
+
     # ── Neutral regime (0.3 ≤ score ≤ 0.8) ──────────────────────────
 
     def test_neutral_panic_passthrough(self):
@@ -59,6 +70,11 @@ class TestMetaStrategyController:
 
     def test_neutral_rpe_passthrough(self):
         d = self.ctrl.evaluate("rpe", 0.5)
+        assert d.weight == 1.0
+        assert not d.vetoed
+
+    def test_neutral_momentum_passthrough(self):
+        d = self.ctrl.evaluate("ofi_momentum", 0.5)
         assert d.weight == 1.0
         assert not d.vetoed
 

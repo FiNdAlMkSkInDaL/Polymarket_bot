@@ -2,7 +2,7 @@
 Tests for BookHeartbeat — tiered WebSocket health monitor.
 
 Layer 1: Transport health (L2WebSocket._last_message_time)
-Layer 2: Positioned-asset health (per-book _last_update for open positions)
+Layer 2: Polygon/system health checks
 Layer 3: Legacy fallback (freshest-tracker scan when no transport wired)
 """
 
@@ -281,11 +281,10 @@ class TestConsecutiveStaleCount:
         assert hb._transport_stale_streak == 0
 
 
-# ── Layer 2: Positioned-asset health ──────────────────────────────────────
+# ── Quiet books with healthy transport ────────────────────────────────────
 
-class TestPositionLayer:
-    """Position-aware staleness: only suspend if a book we're actively
-    trading against goes stale (3× the base threshold)."""
+class TestQuietBooks:
+    """When transport is healthy, quiet books must not suspend live execution."""
 
     @pytest.fixture
     def components(self):
@@ -297,8 +296,7 @@ class TestPositionLayer:
 
     @pytest.mark.asyncio
     async def test_no_positions_stale_trackers_no_suspend(self, components):
-        """Stale trackers with NO open positions → no suspension
-        (nothing at risk, no need to block execution)."""
+        """Stale trackers with no positions stay tradable when WS is alive."""
         guard, event, executor = components
         now = time.time()
 
@@ -318,7 +316,7 @@ class TestPositionLayer:
 
     @pytest.mark.asyncio
     async def test_position_on_fresh_book_no_suspend(self, components):
-        """Open position on a book that's fresh → no problem."""
+        """Fresh positioned books should remain healthy."""
         guard, event, executor = components
         now = time.time()
 
@@ -337,15 +335,14 @@ class TestPositionLayer:
         assert hb.is_suspended is False
 
     @pytest.mark.asyncio
-    async def test_position_on_stale_book_suspends(self, components):
-        """Open position on a book that hasn't updated for 6× threshold → suspend.
-        Default threshold is 15000ms, so position threshold is 90000ms."""
+    async def test_position_on_stale_book_no_suspend_when_transport_alive(self, components):
+        """Quiet positioned books must not trip the heartbeat if WS is alive."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)  # WS is healthy
         trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 91.0),
+            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 6 * 3600.0),
         }
 
         hb = BookHeartbeat(
@@ -354,19 +351,20 @@ class TestPositionLayer:
             get_position_assets=lambda: {"POS_BOOK"},
         )
 
-        await hb._check()
-        assert hb.is_suspended is True
+        for _ in range(5):
+            await hb._check()
+        assert hb.is_suspended is False
+        assert guard.is_blocked() is False
+        assert event.is_set()
 
     @pytest.mark.asyncio
-    async def test_position_within_6x_threshold_no_suspend(self, components):
-        """Position book stale by 80s (< 6× 15s = 90s) → NOT suspended."""
+    async def test_missing_position_tracker_no_suspend(self, components):
+        """Missing positioned tracker should not create a false suspension."""
         guard, event, executor = components
         now = time.time()
 
         transport = _make_transport(now - 0.1)
-        trackers = {
-            "POS_BOOK": _make_tracker("POS_BOOK", last_update=now - 80.0),
-        }
+        trackers = {"OTHER": _make_tracker("OTHER", last_update=now - 80.0)}
 
         hb = BookHeartbeat(
             trackers, guard, event, executor,

@@ -120,7 +120,7 @@ class TestOracleAdapterRegistry:
     def test_register_and_create(self):
         reg = OracleAdapterRegistry()
         reg.register("stub", _StubAdapter)
-        adapter = reg.create("stub", _mc())
+        adapter = reg.create("stub", _mc(oracle_type="stub"))
         assert isinstance(adapter, _StubAdapter)
         assert adapter.name == "stub"
 

@@ -289,6 +289,73 @@ class TestFilledSizeTracking:
         assert pos.exit_order.size == 5.0
         assert pos.state == PositionState.CLOSED  # paper mode auto-closes
 
+    def test_on_exit_filled_preserves_existing_reason(self):
+        """Async fill callbacks should not overwrite a pre-assigned exit reason."""
+        executor = OrderExecutor(paper_mode=True)
+        pm = PositionManager(executor)
+
+        pos = Position(
+            id="POS_REASON",
+            market_id="MKT_1",
+            no_asset_id="NO_TOKEN",
+            state=PositionState.EXIT_PENDING,
+            entry_price=0.45,
+            entry_size=10.0,
+            filled_size=10.0,
+            fee_enabled=False,
+            exit_reason="time_stop",
+        )
+        pos.exit_order = Order(
+            order_id="EXIT-REASON",
+            market_id="MKT_1",
+            asset_id="NO_TOKEN",
+            side=OrderSide.SELL,
+            price=0.50,
+            size=10.0,
+            status=OrderStatus.FILLED,
+            filled_size=10.0,
+            filled_avg_price=0.50,
+        )
+
+        pm.on_exit_filled(pos, reason="target")
+
+        assert pos.exit_reason == "time_stop"
+
+    def test_on_exit_filled_counts_smart_passive_maker_fill(self):
+        """A filled post-only time-stop exit should increment the maker-filled counter."""
+        executor = OrderExecutor(paper_mode=True)
+        pm = PositionManager(executor)
+
+        pos = Position(
+            id="POS_SMART_PASSIVE",
+            market_id="MKT_1",
+            no_asset_id="NO_TOKEN",
+            state=PositionState.EXIT_PENDING,
+            entry_price=0.45,
+            entry_size=10.0,
+            filled_size=10.0,
+            fee_enabled=False,
+            signal_type="ofi_momentum",
+            exit_reason="time_stop",
+            smart_passive_exit_deadline=time.time() + 5.0,
+        )
+        pos.exit_order = Order(
+            order_id="EXIT-SP",
+            market_id="MKT_1",
+            asset_id="NO_TOKEN",
+            side=OrderSide.SELL,
+            price=0.50,
+            size=10.0,
+            status=OrderStatus.FILLED,
+            filled_size=10.0,
+            filled_avg_price=0.50,
+            post_only=True,
+        )
+
+        pm.on_exit_filled(pos, reason="time_stop")
+
+        assert pm.smart_passive_counters["maker_filled"] == 1
+
     @pytest.mark.asyncio
     async def test_force_stop_loss_uses_effective_size(self):
         """force_stop_loss should size the market-sell to effective_size."""
