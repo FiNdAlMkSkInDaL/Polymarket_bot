@@ -460,6 +460,91 @@ class TradeStore:
 
         return summaries
 
+    async def get_stochastic_execution_slippage(self) -> list[dict[str, float | int | str]]:
+        """Summarise OFI exit slippage against private stochastic brackets.
+
+        Groups closed OFI momentum trades into three buckets:
+        ``target``, ``stop``, and ``time_stop``. For each bucket, reports
+        how far the realised ``exit_price`` landed from both the private
+        ``drawn_tp`` and ``drawn_stop`` levels, in cents.
+        """
+        await self._ensure_db()
+
+        cursor = await self._db.execute(
+            """
+            SELECT
+                CASE
+                    WHEN exit_reason = 'target' THEN 'target'
+                    WHEN exit_reason IN ('stop_loss', 'preemptive_liquidity_drain') THEN 'stop'
+                    WHEN exit_reason = 'time_stop' THEN 'time_stop'
+                    ELSE 'other'
+                END AS exit_bucket,
+                COUNT(*) AS trade_count,
+                AVG(exit_price) AS avg_exit_price,
+                AVG(drawn_tp) AS avg_drawn_tp,
+                AVG(drawn_stop) AS avg_drawn_stop,
+                AVG((exit_price - drawn_tp) * 100.0) AS avg_exit_minus_drawn_tp_cents,
+                AVG((exit_price - drawn_stop) * 100.0) AS avg_exit_minus_drawn_stop_cents,
+                AVG(
+                    CASE
+                        WHEN exit_reason = 'target' THEN (exit_price - drawn_tp) * 100.0
+                        WHEN exit_reason IN ('stop_loss', 'preemptive_liquidity_drain') THEN (exit_price - drawn_stop) * 100.0
+                        ELSE NULL
+                    END
+                ) AS avg_reference_slippage_cents,
+                AVG(
+                    CASE
+                        WHEN exit_reason = 'target' THEN ABS((exit_price - drawn_tp) * 100.0)
+                        WHEN exit_reason IN ('stop_loss', 'preemptive_liquidity_drain') THEN ABS((exit_price - drawn_stop) * 100.0)
+                        ELSE NULL
+                    END
+                ) AS avg_abs_reference_slippage_cents,
+                MIN(exit_price) AS min_exit_price,
+                MAX(exit_price) AS max_exit_price
+            FROM trades
+            WHERE state = ?
+              AND signal_type = ?
+              AND COALESCE(exit_price, 0.0) > 0.0
+              AND (
+                    COALESCE(drawn_tp, 0.0) > 0.0
+                    OR COALESCE(drawn_stop, 0.0) > 0.0
+                  )
+            GROUP BY exit_bucket
+            HAVING exit_bucket IN ('target', 'stop', 'time_stop')
+            ORDER BY CASE exit_bucket
+                WHEN 'target' THEN 1
+                WHEN 'stop' THEN 2
+                WHEN 'time_stop' THEN 3
+                ELSE 4
+            END
+            """,
+            (PositionState.CLOSED.value, "ofi_momentum"),
+        )
+        rows = await cursor.fetchall()
+
+        if not rows:
+            return []
+
+        summaries: list[dict[str, float | int | str]] = []
+        for row in rows:
+            summaries.append(
+                {
+                    "exit_bucket": row[0],
+                    "trade_count": int(row[1] or 0),
+                    "avg_exit_price": round(float(row[2] or 0.0), 6),
+                    "avg_drawn_tp": round(float(row[3] or 0.0), 6),
+                    "avg_drawn_stop": round(float(row[4] or 0.0), 6),
+                    "avg_exit_minus_drawn_tp_cents": round(float(row[5] or 0.0), 4),
+                    "avg_exit_minus_drawn_stop_cents": round(float(row[6] or 0.0), 4),
+                    "avg_reference_slippage_cents": round(float(row[7] or 0.0), 4),
+                    "avg_abs_reference_slippage_cents": round(float(row[8] or 0.0), 4),
+                    "min_exit_price": round(float(row[9] or 0.0), 6),
+                    "max_exit_price": round(float(row[10] or 0.0), 6),
+                }
+            )
+
+        return summaries
+
     @staticmethod
     def _compute_decayed_wr(
         pnls: list[float], alpha: float = 0.10
@@ -919,5 +1004,17 @@ async def get_ofi_toxicity_pnl_summary(
     store = TradeStore(db_path=db_path)
     try:
         return await store.get_ofi_toxicity_pnl_summary(buckets=buckets)
+    finally:
+        await store.close()
+
+
+async def get_stochastic_execution_slippage(
+    *,
+    db_path: str | Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Convenience wrapper for stochastic OFI execution slippage TCA."""
+    store = TradeStore(db_path=db_path)
+    try:
+        return await store.get_stochastic_execution_slippage()
     finally:
         await store.close()

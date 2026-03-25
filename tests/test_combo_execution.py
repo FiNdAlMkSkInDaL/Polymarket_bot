@@ -307,3 +307,46 @@ async def test_combo_position_uses_trade_asset_ids_for_bayesian_no_legs():
     assert [order.asset_id for order in executor.orders] == ["YES_JOINT", "NO_A", "NO_B"]
     assert combo.legs["MKT_A"].trade_side == "NO"
     assert combo.legs["MKT_B"].trade_side == "NO"
+
+
+@pytest.mark.asyncio
+async def test_combo_entry_blocked_when_other_strategy_holds_same_direction():
+    executor = _Executor()
+    pm = PositionManager(executor, max_open_positions=10)
+    pm.set_wallet_balance(1000.0)
+    pm.ensemble_risk.register_position(
+        position_id="LIVE-YES",
+        market_id="MKT_MAKER",
+        strategy_source="ofi_momentum",
+        direction="YES",
+    )
+
+    combo = await pm.open_combo_position(_signal(), {})
+
+    assert combo is None
+    assert executor.orders == []
+
+
+@pytest.mark.asyncio
+async def test_bayesian_combo_allows_opposite_direction_hedge():
+    executor = _Executor()
+    pm = PositionManager(
+        executor,
+        max_open_positions=10,
+        book_trackers={
+            "NO_A": _Book(best_bid=0.31, best_ask=0.35),
+            "NO_B": _Book(best_bid=0.36, best_ask=0.37),
+        },
+    )
+    pm.set_wallet_balance(1000.0)
+    pm.ensemble_risk.register_position(
+        position_id="LIVE-YES-A",
+        market_id="MKT_A",
+        strategy_source="ofi_momentum",
+        direction="YES",
+    )
+
+    combo = await pm.open_combo_position(_bayesian_signal(), {})
+
+    assert combo is not None
+    assert executor.orders[0].market_id == "MKT_JOINT"

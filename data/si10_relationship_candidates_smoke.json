@@ -1,0 +1,202 @@
+[
+  {
+    "relationship_id": "si10-will-putin-meet-with-zel-will-donald-trump-win-th-will-trump-and-putin-mee",
+    "label": "Will Putin meet with Zelenskyy by June 30, 2026? AND Will Donald Trump win the 2028 US Presidential Election?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "base_b_condition_id": "0xce9a5fa30fe74e323b4a8f15afbb0b7a41a537aa880779ddf7dee22223b2f34a",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_question": "Will Donald Trump win the 2028 US Presidential Election?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_event_title": "Will Donald Trump win the 2028 US Presidential Election?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-donald-trump-jr-win-will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Donald Trump Jr. win the 2028 US Presidential Election? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x23481b811978194fa175143ed7cd8d0000878ca59c408fd552e33535f7aa771e",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Donald Trump Jr. win the 2028 US Presidential Election?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Donald Trump Jr. win the 2028 US Presidential Election?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-eric-trump-win-the--will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Eric Trump win the 2028 US Presidential Election? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x2d3c4fc5cde6dfb43448402b912e41bd4453e3f030448ed026bff8f1a0bc072e",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Eric Trump win the 2028 US Presidential Election?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Eric Trump win the 2028 US Presidential Election?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-donald-trump-win-th-will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Donald Trump win the 2028 Republican presidential nomination? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x895e01dbf3e6a33cd9a44ca0f8cdb5df1bd2b0b6ebed5300d28f8da7145145e4",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Donald Trump win the 2028 Republican presidential nomination?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Donald Trump win the 2028 Republican presidential nomination?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-donald-trump-jr-win-will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Donald Trump Jr. win the 2028 Republican presidential nomination? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x4a9d58d4da874e26708f5bdb014eb07a06aeebb927068d169d43831595386557",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Donald Trump Jr. win the 2028 Republican presidential nomination?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Donald Trump Jr. win the 2028 Republican presidential nomination?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-ivanka-trump-win-th-will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Ivanka Trump win the 2028 Republican presidential nomination? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x4f02b9cf70e514964fcb9aa2f7873d2b0d1aa0986da096cce7e6687e78da00f3",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Ivanka Trump win the 2028 Republican presidential nomination?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Ivanka Trump win the 2028 Republican presidential nomination?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-putin-meet-with-zel-will-eric-trump-win-the--will-trump-and-putin-mee",
+    "label": "Will Putin meet with Zelenskyy by June 30, 2026? AND Will Eric Trump win the 2028 Republican presidential nomination?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "base_b_condition_id": "0xca68152902c3581ab42feb04921b8b1cd3c4e80d06f255ae077259fca0bba15c",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_question": "Will Eric Trump win the 2028 Republican presidential nomination?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_event_title": "Will Eric Trump win the 2028 Republican presidential nomination?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-putin-meet-with-zel-will-trump-visit-china-b-will-trump-and-putin-mee",
+    "label": "Will Putin meet with Zelenskyy by June 30, 2026? AND Will Trump visit China by March 31?",
+    "heuristic_score": 2.158,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "base_b_condition_id": "0xffff6c984d7adab19e799c46d1a478d5ab6483479b41f9639d04617f07a8bab0",
+    "joint_condition_id": "0xca2059450e49cc391ea49c5f205dce7f1a2af63b87d7a3156cd446592ebb7143",
+    "base_a_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_question": "Will Trump visit China by March 31?",
+    "joint_question": "Will Trump and Putin meet next in Belarus?",
+    "base_a_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_event_title": "Will Trump visit China by March 31?",
+    "joint_event_title": "Will Trump and Putin meet next in Belarus?"
+  },
+  {
+    "relationship_id": "si10-will-putin-meet-with-zel-will-donald-trump-win-th-will-trump-and-putin-mee",
+    "label": "Will Putin meet with Zelenskyy by June 30, 2026? AND Will Donald Trump win the 2028 US Presidential Election?",
+    "heuristic_score": 2.157,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "base_b_condition_id": "0xce9a5fa30fe74e323b4a8f15afbb0b7a41a537aa880779ddf7dee22223b2f34a",
+    "joint_condition_id": "0x370ee4a82b6b36581ebf892d41ee60ad926d54db92721e0e9c3a77b7778d15c7",
+    "base_a_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_question": "Will Donald Trump win the 2028 US Presidential Election?",
+    "joint_question": "Will Trump and Putin meet next in Turkey?",
+    "base_a_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "base_b_event_title": "Will Donald Trump win the 2028 US Presidential Election?",
+    "joint_event_title": "Will Trump and Putin meet next in Turkey?"
+  },
+  {
+    "relationship_id": "si10-will-donald-trump-jr-win-will-putin-meet-with-zel-will-trump-and-putin-mee",
+    "label": "Will Donald Trump Jr. win the 2028 US Presidential Election? AND Will Putin meet with Zelenskyy by June 30, 2026?",
+    "heuristic_score": 2.157,
+    "heuristic_reasons": [
+      "joint_text_split_match",
+      "near_resolution_dates",
+      "shared_joint_tokens"
+    ],
+    "shared_tags": [],
+    "base_a_condition_id": "0x23481b811978194fa175143ed7cd8d0000878ca59c408fd552e33535f7aa771e",
+    "base_b_condition_id": "0xc5ab3fb332af0bebf7ed6df1b1d5e1cc32a91e960c57d7602a5224830cf0084b",
+    "joint_condition_id": "0x370ee4a82b6b36581ebf892d41ee60ad926d54db92721e0e9c3a77b7778d15c7",
+    "base_a_question": "Will Donald Trump Jr. win the 2028 US Presidential Election?",
+    "base_b_question": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_question": "Will Trump and Putin meet next in Turkey?",
+    "base_a_event_title": "Will Donald Trump Jr. win the 2028 US Presidential Election?",
+    "base_b_event_title": "Will Putin meet with Zelenskyy by June 30, 2026?",
+    "joint_event_title": "Will Trump and Putin meet next in Turkey?"
+  }
+]

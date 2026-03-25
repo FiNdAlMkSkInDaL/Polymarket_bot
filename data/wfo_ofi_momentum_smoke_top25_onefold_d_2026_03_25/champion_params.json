@@ -1,0 +1,26 @@
+{
+  "params": {
+    "ofi_threshold": 0.8806844554767284,
+    "window_ms": 4346,
+    "ofi_tvi_kappa": 1.1992609557448315,
+    "ofi_toxicity_scale_threshold": 0.42347663490503085,
+    "ofi_toxicity_size_boost_max": 2.731373741811511,
+    "take_profit_pct": 0.03974200820680617,
+    "stop_loss_pct": 0.03808199390807599
+  },
+  "meta": {
+    "champion_fold": 0,
+    "oos_sharpe": 75.1574,
+    "oos_win_rate": 0.0,
+    "oos_profit_factor": 0.0,
+    "oos_trade_count": 166310,
+    "oos_degradation_pct": 0.0,
+    "n_folds": 2,
+    "n_trials_per_fold": 1,
+    "data_range": "2026-01-22 to 2026-03-08",
+    "generated_at": "2026-03-25T18:37:41.126701+00:00",
+    "avg_sharpe_decay_pct": 1885.12,
+    "overfit_probability": 0.0,
+    "unstable_params": []
+  }
+}

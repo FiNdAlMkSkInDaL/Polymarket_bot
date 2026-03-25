@@ -24,6 +24,11 @@ async def test_paper_summary_includes_top_toxicity_rankings(monkeypatch):
             "total_pnl": 15.0,
             "best_trade": 5.0,
             "worst_trade": -2.0,
+            "sync_gate_counters": {
+                "contagion_sync_blocks": 2,
+                "si9_sync_blocks": 1,
+                "si10_sync_blocks": 3,
+            },
         },
         2.0,
         toxicity_rankings=[
@@ -49,8 +54,35 @@ async def test_paper_summary_includes_top_toxicity_rankings(monkeypatch):
     assert len(sent) == 1
     assert "<b>Paper Trade Summary</b>" in sent[0]
     assert "<b>Top Toxicity</b>" in sent[0]
+    assert "Sync gate: contagion=2" in sent[0]
     assert "MKT-A" in sent[0]
     assert "SELL tox=0.91" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_stats_update_formats_sync_gate_counters(monkeypatch):
+    alerter = TelegramAlerter(bot_token="token", chat_id="chat")
+    sent: list[str] = []
+
+    async def _capture(message: str, parse_mode: str = "HTML") -> None:
+        del parse_mode
+        sent.append(message)
+
+    monkeypatch.setattr(alerter, "send", _capture)
+
+    await alerter.notify_stats(
+        {
+            "total_trades": 12,
+            "sync_gate_counters": {
+                "contagion_sync_blocks": 4,
+                "si9_sync_blocks": 5,
+                "si10_sync_blocks": 6,
+            },
+        }
+    )
+
+    assert len(sent) == 1
+    assert "sync_gate: contagion=4 | si9=5 | si10=6" in sent[0]
 
 
 @pytest.mark.asyncio

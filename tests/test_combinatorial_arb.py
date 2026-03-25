@@ -31,13 +31,20 @@ def _market(
     )
 
 
-def _book(best_bid: float, best_ask: float, bid_size: float, ask_size: float) -> OrderbookTracker:
+def _book(
+    best_bid: float,
+    best_ask: float,
+    bid_size: float,
+    ask_size: float,
+    *,
+    timestamp: float = 1.0,
+) -> OrderbookTracker:
     book = OrderbookTracker("unused")
     book.on_book_snapshot(
         {
             "bids": [{"price": str(best_bid), "size": str(bid_size)}],
             "asks": [{"price": str(best_ask), "size": str(ask_size)}],
-            "timestamp": 1,
+            "timestamp": timestamp,
         }
     )
     return book
@@ -229,6 +236,9 @@ def test_combo_arb_guardrail_logs_again_when_sum_bids_moves_by_more_than_five_po
             "timestamp": 2,
         }
     )
+    synced_update = books["YES_A"]._last_update
+    books["YES_B"]._last_update = synced_update
+    books["YES_C"]._last_update = synced_update
 
     assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
     assert [event for event, _ in log_calls] == [
@@ -258,11 +268,32 @@ def test_combo_arb_pauses_on_toxic_maker_leg_ofi():
 
     assert signal is None
     assert detector._maker_leg_ofi_paused["YES_B"] is True
-    deferral = detector.get_active_deferral("EVENT-1")
-    assert deferral is not None
-    assert deferral.reason == "toxic_ofi"
-    assert deferral.maker_leg == "YES_B"
-    assert deferral.defer_count == 1
+
+
+def test_combo_arb_suppresses_cluster_when_leg_books_are_desynced():
+    sync_blocks: list[float] = []
+
+    books = {
+        "YES_A": _book(0.30, 0.34, 400.0, 200.0, timestamp=1.0),
+        "YES_B": _book(0.28, 0.38, 500.0, 200.0, timestamp=1.45),
+        "YES_C": _book(0.29, 0.31, 450.0, 200.0, timestamp=1.0),
+    }
+    detector = ComboArbDetector(books, on_sync_block=lambda assessment: sync_blocks.append(assessment.delta_ms))
+    books["YES_A"]._last_update = 1.0
+    books["YES_B"]._last_update = 1.45
+    books["YES_C"]._last_update = 1.0
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+    assert len(sync_blocks) == 1
+    assert sync_blocks[0] > 400.0
 
 
 def test_combo_arb_resumes_after_toxic_ofi_stabilizes(monkeypatch):

@@ -30,13 +30,20 @@ def _market(
     )
 
 
-def _book(best_bid: float, best_ask: float, bid_size: float = 200.0, ask_size: float = 200.0) -> OrderbookTracker:
+def _book(
+    best_bid: float,
+    best_ask: float,
+    bid_size: float = 200.0,
+    ask_size: float = 200.0,
+    *,
+    timestamp: float = 1.0,
+) -> OrderbookTracker:
     book = OrderbookTracker("unused")
     book.on_book_snapshot(
         {
             "bids": [{"price": str(best_bid), "size": str(bid_size)}],
             "asks": [{"price": str(best_ask), "size": str(ask_size)}],
-            "timestamp": 1,
+            "timestamp": timestamp,
         }
     )
     return book
@@ -172,3 +179,40 @@ def test_bayesian_arb_rejects_low_annualized_yield():
     detector = BayesianArbDetector(books)
 
     assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+
+
+def test_bayesian_arb_suppresses_desynced_cluster_books():
+    sync_blocks: list[float] = []
+    base_a = _market("MKT_A", "Will A happen?", "YES_A", "NO_A")
+    base_b = _market("MKT_B", "Will B happen?", "YES_B", "NO_B")
+    joint = _market("MKT_AB", "Will A and B happen?", "YES_AB", "NO_AB")
+    cluster = BayesianArbCluster(
+        relationship_id="REL-DESYNC",
+        base_a=base_a,
+        base_b=base_b,
+        joint=joint,
+        label="A/B desync",
+    )
+    books = {
+        "YES_A": _book(0.40, 0.41, timestamp=1.0),
+        "NO_A": _book(0.59, 0.60, timestamp=1.0),
+        "YES_B": _book(0.60, 0.61, timestamp=1.0),
+        "NO_B": _book(0.39, 0.40, timestamp=1.0),
+        "YES_AB": _book(0.46, 0.47, timestamp=1.45),
+        "NO_AB": _book(0.53, 0.58, timestamp=1.45),
+    }
+    books["YES_A"]._last_update = 1.0
+    books["NO_A"]._last_update = 1.0
+    books["YES_B"]._last_update = 1.0
+    books["NO_B"]._last_update = 1.0
+    books["YES_AB"]._last_update = 1.45
+    books["NO_AB"]._last_update = 1.45
+
+    signal = BayesianArbDetector(
+        books,
+        on_sync_block=lambda assessment: sync_blocks.append(assessment.delta_ms),
+    ).evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is None
+    assert len(sync_blocks) == 1
+    assert sync_blocks[0] > 400.0

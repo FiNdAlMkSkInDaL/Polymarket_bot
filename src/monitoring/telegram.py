@@ -140,6 +140,14 @@ class TelegramAlerter:
                     f"fallback={int(v.get('fallback_triggered', 0))}"
                 )
                 continue
+            if k == "sync_gate_counters" and isinstance(v, dict):
+                lines.append(
+                    "  sync_gate: "
+                    f"contagion={int(v.get('contagion_sync_blocks', 0))} | "
+                    f"si9={int(v.get('si9_sync_blocks', 0))} | "
+                    f"si10={int(v.get('si10_sync_blocks', 0))}"
+                )
+                continue
             lines.append(f"  {k}: {v}")
         await self.send("\n".join(lines))
 
@@ -405,6 +413,10 @@ class TelegramAlerter:
             stats.get("smart_passive_counters"),
             include_zero=True,
         )
+        sync_gate_block = self._format_sync_gate_counters(
+            stats.get("sync_gate_counters"),
+            include_zero=True,
+        )
 
         emoji = "📈" if total_pnl >= 0 else "📉"
         tph = total / max(0.01, uptime_h)
@@ -430,6 +442,7 @@ class TelegramAlerter:
             f"Best: {best:+.2f}¢  |  Worst: {worst:+.2f}¢\n"
             f"Uptime: {uptime_h:.1f}h"
             f"{counters_block}"
+            f"{sync_gate_block}"
             f"{toxicity_lines}"
         )
 
@@ -453,6 +466,28 @@ class TelegramAlerter:
             f"Smart-passive: {started} started  |  "
             f"{maker_filled} maker-filled  |  "
             f"{fallback} fallback"
+        )
+
+    @staticmethod
+    def _format_sync_gate_counters(
+        counters: dict[str, int] | None,
+        *,
+        include_zero: bool,
+    ) -> str:
+        if not counters:
+            return ""
+
+        contagion = int(counters.get("contagion_sync_blocks", 0) or 0)
+        si9 = int(counters.get("si9_sync_blocks", 0) or 0)
+        si10 = int(counters.get("si10_sync_blocks", 0) or 0)
+        if not include_zero and contagion == 0 and si9 == 0 and si10 == 0:
+            return ""
+
+        return (
+            "\n"
+            f"Sync gate: contagion={contagion}  |  "
+            f"si9={si9}  |  "
+            f"si10={si10}"
         )
 
     async def notify_kill(self) -> None:

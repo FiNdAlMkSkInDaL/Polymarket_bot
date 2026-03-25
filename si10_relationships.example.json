@@ -1,0 +1,16 @@
+[
+  {
+    "relationship_id": "btc-100k-april-and-fed-cut-june",
+    "label": "BTC 100k in April AND Fed cut by June",
+    "base_a_condition_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base_b_condition_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "joint_condition_id": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  {
+    "relationship_id": "candidate-win-and-party-house",
+    "label": "Candidate wins AND party controls House",
+    "base_a_condition_id": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "base_b_condition_id": "0x2222222222222222222222222222222222222222222222222222222222222222",
+    "joint_condition_id": "0x3333333333333333333333333333333333333333333333333333333333333333"
+  }
+]

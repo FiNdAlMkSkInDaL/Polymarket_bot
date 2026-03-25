@@ -1,0 +1,23 @@
+{
+  "params": {
+    "contagion_arb_min_correlation": 0.7194886392550415,
+    "contagion_arb_trigger_percentile": 0.9459018800393078,
+    "contagion_arb_toxicity_impulse_scale": 0.014250823159455632,
+    "max_cross_book_desync_ms": 349
+  },
+  "meta": {
+    "champion_fold": 0,
+    "oos_sharpe": 0.0,
+    "oos_win_rate": 0.0,
+    "oos_profit_factor": 0.0,
+    "oos_trade_count": 0,
+    "oos_degradation_pct": 0.0,
+    "n_folds": 2,
+    "n_trials_per_fold": 12,
+    "data_range": "2026-02-26 to 2026-03-04",
+    "generated_at": "2026-03-25T11:51:48.301510+00:00",
+    "avg_sharpe_decay_pct": 0.0,
+    "overfit_probability": 0.0,
+    "unstable_params": []
+  }
+}

@@ -1049,8 +1049,21 @@ class ContagionReplayAdapter(StrategyABC):
         self._contagion = ContagionArbDetector(
             self._pce,
             self._rpe,
+            universe_size=self._params.max_active_l2_markets,
+            min_correlation=self._params.contagion_arb_min_correlation,
+            trigger_percentile=self._params.contagion_arb_trigger_percentile,
+            min_history=self._params.contagion_arb_min_history,
+            min_leader_shift=self._params.contagion_arb_min_leader_shift,
+            min_residual_shift=self._params.contagion_arb_min_residual_shift,
+            toxicity_impulse_scale=self._params.contagion_arb_toxicity_impulse_scale,
+            cooldown_seconds=self._params.contagion_arb_cooldown_seconds,
+            max_pairs_per_leader=self._params.contagion_arb_max_pairs_per_leader,
             shadow_mode=False,
+            max_cross_book_desync_ms=self._params.max_cross_book_desync_ms,
         )
+
+    def detector_diagnostics(self) -> dict[str, Any]:
+        return self._contagion.diagnostics_snapshot()
 
     def on_init(self) -> None:
         for index, config in enumerate(self._market_configs):
@@ -1204,11 +1217,13 @@ class ContagionReplayAdapter(StrategyABC):
             self._pce.unregister_market(market_id)
 
         total_pnl = sum(pos.get("pnl_net", 0.0) for pos in self._positions)
+        detector_diagnostics = self._contagion.diagnostics_snapshot()
         log.info(
             "contagion_replay_adapter_summary",
             positions=len(self._positions),
             open_remaining=len(self._open_positions),
             total_pnl_net=round(total_pnl, 4),
+            detector_diagnostics=detector_diagnostics,
         )
 
     def _latest_external_price(self) -> float | None:
@@ -1226,8 +1241,10 @@ class ContagionReplayAdapter(StrategyABC):
         if yes_book is None or no_book is None or not yes_book.has_data or not no_book.has_data:
             return
 
-        yes_bid = yes_book.best_bid
-        yes_ask = yes_book.best_ask
+        yes_snapshot = yes_book.snapshot()
+        no_snapshot = no_book.snapshot()
+        yes_bid = float(getattr(yes_snapshot, "best_bid", 0.0) or 0.0)
+        yes_ask = float(getattr(yes_snapshot, "best_ask", 0.0) or 0.0)
         if yes_bid <= 0 or yes_ask <= 0 or yes_ask <= yes_bid:
             return
 
@@ -1239,6 +1256,7 @@ class ContagionReplayAdapter(StrategyABC):
             no_buy_toxicity=no_book.toxicity_index("BUY"),
             timestamp=timestamp,
             universe=list(self._markets.values()),
+            book_snapshots=(yes_snapshot, no_snapshot),
         )
         for signal in signals:
             self._open_contagion_position(signal, timestamp)

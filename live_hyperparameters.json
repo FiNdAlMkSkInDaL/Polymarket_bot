@@ -1,0 +1,37 @@
+{
+  "params": {
+    "si10_min_net_edge_usd": 0.024532671115648077,
+    "si10_maker_ofi_tolerance": 0.8916111527006609,
+    "si9_latency_option_window_ms": 7684
+  },
+  "meta": {
+    "generated_at": "2026-03-25T22:53:25.724184+00:00",
+    "source_count": 1,
+    "sources": [
+      {
+        "path": "C:\\Users\\finph\\OneDrive\\Desktop\\PMB\\Polymarket_bot\\data\\wfo_bayesian_arb_march2026\\champion_params.json",
+        "param_count": 3,
+        "params": [
+          "si10_maker_ofi_tolerance",
+          "si10_min_net_edge_usd",
+          "si9_latency_option_window_ms"
+        ],
+        "meta": {
+          "champion_fold": 0,
+          "oos_sharpe": 0.0,
+          "oos_win_rate": 0.0,
+          "oos_profit_factor": 0.0,
+          "oos_trade_count": 0,
+          "oos_degradation_pct": 0.0,
+          "n_folds": 9,
+          "n_trials_per_fold": 250,
+          "data_range": "2025-12-05 to 2026-03-08",
+          "generated_at": "2026-03-25T22:42:35.487974+00:00",
+          "avg_sharpe_decay_pct": 0.0,
+          "overfit_probability": 0.0,
+          "unstable_params": []
+        }
+      }
+    ]
+  }
+}

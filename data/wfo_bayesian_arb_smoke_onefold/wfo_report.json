@@ -1,0 +1,101 @@
+{
+  "folds": [
+    {
+      "fold_index": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.08212000285969139,
+        "si10_maker_ofi_tolerance": 0.9058124585935661
+      },
+      "is_sharpe": 0.0,
+      "is_max_drawdown": 0.0,
+      "is_total_pnl": 0.0,
+      "is_sortino": 0.0,
+      "is_win_rate": 0.0,
+      "is_profit_factor": 0.0,
+      "is_total_fills": 0,
+      "oos_sharpe": 0.0,
+      "oos_max_drawdown": 0.0,
+      "oos_total_pnl": 0.0,
+      "oos_sortino": 0.0,
+      "oos_win_rate": 0.0,
+      "oos_profit_factor": 0.0,
+      "oos_total_fills": 0,
+      "is_equity_curve": [],
+      "oos_equity_curve": [],
+      "n_trials_completed": 50,
+      "best_trial_score": -Infinity,
+      "train_dates": [
+        "2025-12-05",
+        "2025-12-06",
+        "2025-12-07",
+        "2025-12-08",
+        "2025-12-09",
+        "2025-12-10",
+        "2025-12-11",
+        "2025-12-12",
+        "2025-12-13",
+        "2025-12-14",
+        "2025-12-15",
+        "2025-12-16",
+        "2025-12-17",
+        "2025-12-18",
+        "2025-12-19",
+        "2025-12-20",
+        "2025-12-21",
+        "2025-12-22",
+        "2025-12-23",
+        "2025-12-24",
+        "2025-12-25",
+        "2025-12-26",
+        "2025-12-27",
+        "2025-12-28",
+        "2025-12-29",
+        "2025-12-30",
+        "2025-12-31",
+        "2026-01-01",
+        "2026-01-02",
+        "2026-01-03",
+        "2026-01-04",
+        "2026-01-05",
+        "2026-01-06",
+        "2026-01-07",
+        "2026-01-08"
+      ],
+      "test_dates": [
+        "2026-01-10",
+        "2026-01-11",
+        "2026-01-12",
+        "2026-01-13",
+        "2026-01-14",
+        "2026-01-15",
+        "2026-01-16"
+      ],
+      "sharpe_decay_pct": 0.0
+    }
+  ],
+  "stitched_equity_curve": [],
+  "aggregate_oos_sharpe": 0.0,
+  "aggregate_oos_max_drawdown": 0.0,
+  "aggregate_oos_total_pnl": 0.0,
+  "aggregate_oos_win_rate": 0.0,
+  "aggregate_oos_profit_factor": 0.0,
+  "aggregate_oos_trade_count": 0,
+  "parameter_stability": {
+    "si10_min_net_edge_usd": [
+      0.08212000285969139
+    ],
+    "si10_maker_ofi_tolerance": [
+      0.9058124585935661
+    ]
+  },
+  "total_elapsed_s": 35.56300000000192,
+  "avg_sharpe_decay_pct": 0.0,
+  "overfit_probability": 0.0,
+  "unstable_params": [],
+  "champion_params": {
+    "si10_min_net_edge_usd": 0.08212000285969139,
+    "si10_maker_ofi_tolerance": 0.9058124585935661
+  },
+  "champion_fold_index": 0,
+  "champion_degradation_pct": 0.0
+}

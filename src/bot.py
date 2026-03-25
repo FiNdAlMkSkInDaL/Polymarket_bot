@@ -39,6 +39,7 @@ from src.data.websocket_client import MarketWebSocket, MarketWebSocketPool, Trad
 from src.data.l2_book import BookState, L2OrderBook
 from src.data.l2_websocket import L2WebSocket
 from src.monitoring.telegram import TelegramAlerter
+from src.monitoring.telemetry import SyncGateTelemetry
 from src.monitoring.trade_store import TradeStore
 from src.signals.adverse_selection_guard import AdverseSelectionGuard
 from src.signals.edge_filter import compute_edge_score
@@ -61,6 +62,7 @@ from src.signals.signal_framework import (
 )
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
+from src.trading.ensemble_risk import EnsembleRiskManager
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
 from src.trading.fee_cache import FeeCache
 from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState
@@ -174,15 +176,18 @@ class TradingBot:
         # SI-2: Per-asset iceberg detectors (initialised before PositionManager
         # so the dict reference is shared — new detectors added later are visible).
         self._iceberg_detectors: dict[str, IcebergDetector] = {}  # asset_id → detector
+        self.ensemble_risk = EnsembleRiskManager()
 
         self.positions = PositionManager(
             self.executor, trade_store=self.trade_store, guard=self.guard,
             pce=self.pce,
             book_trackers=self._book_trackers,
             iceberg_detectors=self._iceberg_detectors,
+            ensemble_risk=self.ensemble_risk,
         )
         self.whale_monitor = WhaleMonitor(zscore_fn=self._latest_zscore)
         self.telegram = TelegramAlerter()
+        self.sync_telemetry = SyncGateTelemetry()
         self.executor.configure_runtime_hooks(
             telegram_alerter=self.telegram,
             on_shutdown=self._schedule_stop,
@@ -264,7 +269,11 @@ class TradingBot:
             ],
         )
         self._contagion_arb: ContagionArbDetector | None = (
-            ContagionArbDetector(self.pce, self._rpe)
+            ContagionArbDetector(
+                self.pce,
+                self._rpe,
+                on_sync_block=lambda _assessment: self.sync_telemetry.record_contagion_block(),
+            )
             if settings.strategy.contagion_arb_enabled
             else None
         )
@@ -467,7 +476,11 @@ class TradingBot:
             for tid in self._cluster_mgr.all_cluster_yes_token_ids():
                 if tid not in self._book_trackers:
                     self._book_trackers[tid] = OrderbookTracker(tid)
-            self._combo_detector = ComboArbDetector(self._book_trackers, aggregators=self._yes_aggs)
+            self._combo_detector = ComboArbDetector(
+                self._book_trackers,
+                aggregators=self._yes_aggs,
+                on_sync_block=lambda _assessment: self.sync_telemetry.record_si9_block(),
+            )
             self._tasks.append(
                 asyncio.create_task(self._combo_arbitrage_loop(), name="combo_arb")
             )
@@ -482,6 +495,7 @@ class TradingBot:
                 self._book_trackers,
                 fee_enabled_resolver=self._is_fee_enabled,
                 fee_rate_bps_lookup=self._fee_cache.get_fee_rate_sync,
+                on_sync_block=lambda _assessment: self.sync_telemetry.record_si10_block(),
             )
             self._tasks.append(
                 asyncio.create_task(self._bayesian_arb_loop(), name="bayesian_arb")
@@ -722,6 +736,57 @@ class TradingBot:
             ids.add(pos.no_asset_id)
         return ids
 
+    def _ensemble_allows_entry(
+        self,
+        *,
+        strategy_source: str,
+        market_id: str,
+        direction: str,
+        log_event: str,
+        extra: dict[str, Any] | None = None,
+    ) -> bool:
+        allowed, reason = self.ensemble_risk.can_enter(
+            market_id=market_id,
+            strategy_source=strategy_source,
+            direction=direction,
+        )
+        if allowed:
+            return True
+        payload = {
+            "market_id": market_id,
+            "direction": (reason or {}).get("direction", direction),
+            "strategy_source": strategy_source,
+            "blocking_strategy": (reason or {}).get("blocking_strategy", ""),
+        }
+        if extra:
+            payload.update(extra)
+        log.info(log_event, **payload)
+        return False
+
+    def _ensemble_allows_combo_entry(
+        self,
+        *,
+        strategy_source: str,
+        entry_id: str,
+        exposures: list[tuple[str, str]],
+        log_event: str,
+    ) -> bool:
+        allowed, reason = self.ensemble_risk.can_enter_batch(
+            strategy_source=strategy_source,
+            exposures=exposures,
+        )
+        if allowed:
+            return True
+        log.info(
+            log_event,
+            entry_id=entry_id,
+            market_id=(reason or {}).get("market_id", ""),
+            direction=(reason or {}).get("direction", ""),
+            strategy_source=strategy_source,
+            blocking_strategy=(reason or {}).get("blocking_strategy", ""),
+        )
+        return False
+
     def _is_fee_enabled(self, market: MarketInfo) -> bool:
         """Check if a market's tags match any fee-enabled category."""
         market_tags = (getattr(market, 'tags', '') or '').lower()
@@ -919,6 +984,7 @@ class TradingBot:
                     f"Trades: {int(stats.get('total_trades', 0) or 0)}\n"
                     f"Expectancy: {float(stats.get('expectancy_cents', 0.0) or 0.0):+.2f}¢/trade"
                     f"{self._smart_passive_operator_block()}"
+                    f"{self._sync_gate_operator_block()}"
                 ),
                 timeout=5,
             )
@@ -1413,6 +1479,7 @@ class TradingBot:
             return
 
         yes_snapshot = yes_book.snapshot()
+        no_snapshot = no_book.snapshot()
         yes_price = 0.0
         if yes_snapshot.best_bid > 0 and yes_snapshot.best_ask > 0:
             yes_price = round((yes_snapshot.best_bid + yes_snapshot.best_ask) / 2.0, 4)
@@ -1433,6 +1500,7 @@ class TradingBot:
             yes_buy_toxicity=yes_buy_toxicity,
             no_buy_toxicity=no_buy_toxicity,
             universe=self._tracked_l2_markets(),
+            book_snapshots=(yes_snapshot, no_snapshot),
         )
         for signal in signals:
             lagging_market = self._find_market(signal.lagging_market_id)
@@ -1708,6 +1776,16 @@ class TradingBot:
         signal_metadata: dict | None = None,
     ) -> None:
         """Handle a confirmed entry signal routed into PositionManager."""
+        strategy_source = (signal_metadata or {}).get("signal_source") or getattr(sig, "signal_source", "") or "panic"
+        if not self._ensemble_allows_entry(
+            strategy_source=strategy_source,
+            market_id=market.condition_id,
+            direction="NO",
+            log_event="ensemble_risk_blocked_bot_signal",
+            extra={"signal_type": strategy_source},
+        ):
+            return
+
         # Fire-and-forget — Telegram notification must NOT block the
         # alpha-critical execution path (saves 50-500ms per trade).
         if isinstance(sig, PanicSignal):
@@ -2669,6 +2747,15 @@ class TradingBot:
             "toxicity_percentile": signal.toxicity_percentile,
             "correlation": signal.correlation,
         })
+        trade_direction = "NO" if signal.direction == "buy_no" else "YES"
+        if not self._ensemble_allows_entry(
+            strategy_source=signal.signal_source,
+            market_id=market.condition_id,
+            direction=trade_direction,
+            log_event="ensemble_risk_blocked_contagion_signal",
+            extra={"leading_market_id": signal.leading_market_id},
+        ):
+            return
 
         pos = await self.positions.open_rpe_position(
             market_id=market.condition_id,
@@ -3687,6 +3774,9 @@ class TradingBot:
     def _augment_trade_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(stats)
         enriched["smart_passive_counters"] = self.positions.smart_passive_counters
+        sync_gate_counters = self.sync_telemetry.snapshot()
+        enriched["sync_gate_counters"] = sync_gate_counters
+        enriched.update(sync_gate_counters)
         return enriched
 
     def _smart_passive_operator_block(self) -> str:
@@ -3696,6 +3786,15 @@ class TradingBot:
             f"Smart-passive: {int(counters.get('smart_passive_started', 0) or 0)} started  |  "
             f"{int(counters.get('maker_filled', 0) or 0)} maker-filled  |  "
             f"{int(counters.get('fallback_triggered', 0) or 0)} fallback"
+        )
+
+    def _sync_gate_operator_block(self) -> str:
+        counters = self.sync_telemetry.snapshot()
+        return (
+            "\n"
+            f"Sync gate: contagion={counters['contagion_sync_blocks']}  |  "
+            f"si9={counters['si9_sync_blocks']}  |  "
+            f"si10={counters['si10_sync_blocks']}"
         )
 
     async def _paper_summary_loop(self) -> None:
@@ -3797,6 +3896,9 @@ class TradingBot:
                     "active_markets": len(self.lifecycle.active),
                     "observing_markets": len(self.lifecycle.observing),
                 }
+                sync_gate_counters = self.sync_telemetry.snapshot()
+                health["sync_gate_counters"] = sync_gate_counters
+                health.update(sync_gate_counters)
 
                 # Aggregate L2 book health metrics across all tracked books.
                 # In multicore mode, the actual L2 books live in worker
@@ -4167,6 +4269,17 @@ class TradingBot:
                             )
                         continue
 
+                    if not self._ensemble_allows_combo_entry(
+                        strategy_source="si9_combo_arb",
+                        entry_id=cluster.event_id,
+                        exposures=[
+                            (getattr(leg, "market_id", ""), getattr(leg, "trade_side", "YES") or "YES")
+                            for leg in signal.legs
+                        ],
+                        log_event="ensemble_risk_blocked_combo_signal",
+                    ):
+                        continue
+
                     combo = await self.positions.open_combo_position(
                         signal, self._combo_positions,
                     )
@@ -4308,6 +4421,17 @@ class TradingBot:
                                 threshold=round(deferred.threshold, 6),
                                 defer_count=deferred.defer_count,
                             )
+                        continue
+
+                    if not self._ensemble_allows_combo_entry(
+                        strategy_source="si10_bayesian_arb",
+                        entry_id=cluster.relationship_id,
+                        exposures=[
+                            (getattr(leg, "market_id", ""), getattr(leg, "trade_side", "YES") or "YES")
+                            for leg in signal.legs
+                        ],
+                        log_event="ensemble_risk_blocked_bayesian_signal",
+                    ):
                         continue
 
                     combo = await self.positions.open_combo_position(

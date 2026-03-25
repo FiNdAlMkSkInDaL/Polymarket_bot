@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.arb_clusters import ArbCluster
 from src.data.orderbook import OrderbookTracker
+from src.signals.microstructure_utils import CrossBookSyncGate
 from src.signals.ofi_momentum import OFIMomentumDetector
 from src.signals.signal_framework import BaseSignal, SignalGenerator, SignalResult
 
@@ -202,10 +203,13 @@ class ComboArbDetector(SignalGenerator):
         self,
         book_trackers: dict[str, OrderbookTracker],
         aggregators: dict[str, Any] | None = None,
+        on_sync_block: Callable[[Any], None] | None = None,
     ) -> None:
         self._books = book_trackers
         self._aggregators = aggregators or {}
         self._sizer = ComboSizer()
+        self._sync_gate = CrossBookSyncGate()
+        self._on_sync_block = on_sync_block
         self._ofi_detectors: dict[str, OFIMomentumDetector] = {}
         self._guardrail_rejection_log_state: dict[str, tuple[float, float]] = {}
         self._maker_leg_ofi_paused: dict[str, bool] = {}
@@ -298,6 +302,7 @@ class ComboArbDetector(SignalGenerator):
         min_depth_usd = strat.si9_min_leg_depth_usd
 
         legs: list[ComboLeg] = []
+        snapshots: list[Any] = []
         sum_bids = 0.0
         min_bid_depth_shares = float("inf")
 
@@ -309,6 +314,7 @@ class ComboArbDetector(SignalGenerator):
             snap = book.snapshot()
             if not snap.fresh:
                 return None  # stale data — unsafe for arb
+            snapshots.append(snap)
 
             bid = snap.best_bid
             ask = snap.best_ask
@@ -342,6 +348,12 @@ class ComboArbDetector(SignalGenerator):
                 market_liquidity_usd=round(mkt.liquidity_usd, 2),
                 daily_volume_usd=round(mkt.daily_volume_usd, 2),
             ))
+
+        sync_assessment = self._sync_gate.assess(snapshots)
+        if not sync_assessment.is_synchronized:
+            if self._on_sync_block is not None:
+                self._on_sync_block(sync_assessment)
+            return None
 
         edge_dollars = 1.0 - sum_bids
 

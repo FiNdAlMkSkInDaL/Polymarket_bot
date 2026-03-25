@@ -1,0 +1,186 @@
+{
+  "generated_at": "2026-03-25T22:53:40.421370+00:00",
+  "checkpoint": true,
+  "study_prefix": "polymarket_wfo",
+  "storage_path": "data\\wfo_bayesian_arb_march2026\\wfo_optuna.db",
+  "target_params": [
+    "si10_min_net_edge_usd",
+    "si10_maker_ofi_tolerance",
+    "si9_latency_option_window_ms",
+    "max_cross_book_desync_ms"
+  ],
+  "target_trials_per_fold": 250,
+  "summary": {
+    "fold_count": 9,
+    "complete_folds": 9,
+    "terminal_trials": 4121,
+    "running_trials": 0,
+    "waiting_trials": 36,
+    "selection_basis": "best_complete_fold_by_objective"
+  },
+  "folds": [
+    {
+      "fold_index": 0,
+      "study_name": "polymarket_wfo_fold_0",
+      "trial_state_counts": {
+        "COMPLETE": 380
+      },
+      "terminal_trials": 380,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 1,
+      "study_name": "polymarket_wfo_fold_1",
+      "trial_state_counts": {
+        "COMPLETE": 499,
+        "WAITING": 5
+      },
+      "terminal_trials": 499,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 2,
+      "study_name": "polymarket_wfo_fold_2",
+      "trial_state_counts": {
+        "COMPLETE": 498,
+        "WAITING": 5
+      },
+      "terminal_trials": 498,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 3,
+      "study_name": "polymarket_wfo_fold_3",
+      "trial_state_counts": {
+        "COMPLETE": 499,
+        "WAITING": 5
+      },
+      "terminal_trials": 499,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 4,
+      "study_name": "polymarket_wfo_fold_4",
+      "trial_state_counts": {
+        "COMPLETE": 499,
+        "WAITING": 5
+      },
+      "terminal_trials": 499,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 5,
+      "study_name": "polymarket_wfo_fold_5",
+      "trial_state_counts": {
+        "COMPLETE": 499,
+        "WAITING": 5
+      },
+      "terminal_trials": 499,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 6,
+      "study_name": "polymarket_wfo_fold_6",
+      "trial_state_counts": {
+        "COMPLETE": 499,
+        "WAITING": 5
+      },
+      "terminal_trials": 499,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 7,
+      "study_name": "polymarket_wfo_fold_7",
+      "trial_state_counts": {
+        "COMPLETE": 498,
+        "WAITING": 5
+      },
+      "terminal_trials": 498,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -Infinity,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684
+      }
+    },
+    {
+      "fold_index": 8,
+      "study_name": "polymarket_wfo_fold_8",
+      "trial_state_counts": {
+        "COMPLETE": 247,
+        "FAIL": 3,
+        "WAITING": 1
+      },
+      "terminal_trials": 250,
+      "remaining_to_target": 0,
+      "is_complete": true,
+      "best_value": -9999.0,
+      "best_trial_number": 0,
+      "best_params": {
+        "si10_min_net_edge_usd": 0.024532671115648077,
+        "si10_maker_ofi_tolerance": 0.8916111527006609,
+        "si9_latency_option_window_ms": 7684,
+        "max_cross_book_desync_ms": 1168
+      }
+    }
+  ]
+}

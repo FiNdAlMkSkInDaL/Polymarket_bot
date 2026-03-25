@@ -96,3 +96,27 @@ async def test_contagion_live_gate_suppresses_stale_lagger_trade() -> None:
 
     bot.positions.open_rpe_position.assert_not_awaited()
     assert bot._recent_contagion_matrix[0]["suppression_reason"] == "lagger_trade_stale"
+
+
+@pytest.mark.asyncio
+async def test_contagion_live_gate_suppresses_same_direction_ensemble_overlap() -> None:
+    bot = TradingBot(paper_mode=True)
+    bot.telegram.notify_contagion_matrix = AsyncMock()
+    bot.lifecycle.is_tradeable = MagicMock(return_value=True)
+    bot.lifecycle.is_cooled_down = MagicMock(return_value=True)
+    bot.positions.is_stop_loss_cooled_down = MagicMock(return_value=True)
+    bot.positions.open_rpe_position = AsyncMock()
+
+    market = FakeMarketInfo(condition_id="MKT-E", yes_token_id="YES-E", no_token_id="NO-E")
+    bot._book_trackers[market.yes_token_id] = FakeBook(0.50, 0.51)
+    bot._yes_aggs[market.yes_token_id] = MagicMock(current_price=0.51, last_trade_time=time.time())
+    bot.ensemble_risk.register_position(
+        position_id="LIVE-OFI",
+        market_id=market.condition_id,
+        strategy_source="ofi_momentum",
+        direction="YES",
+    )
+
+    await bot._on_contagion_signal(_signal(market, direction="buy_yes"), market)
+
+    bot.positions.open_rpe_position.assert_not_awaited()

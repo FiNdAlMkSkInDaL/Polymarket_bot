@@ -1,0 +1,20 @@
+{
+  "params": {
+    "si10_min_net_edge_usd": 0.024532671115648077,
+    "si10_maker_ofi_tolerance": 0.8916111527006609,
+    "si9_latency_option_window_ms": 7684,
+    "max_cross_book_desync_ms": 1168
+  },
+  "meta": {
+    "checkpoint": true,
+    "generated_at": "2026-03-25T22:53:40.421370+00:00",
+    "selection_basis": "best_complete_fold_by_objective",
+    "fold_index": 8,
+    "study_name": "polymarket_wfo_fold_8",
+    "best_objective": -9999.0,
+    "best_trial_number": 0,
+    "fold_complete": true,
+    "complete_folds": 9,
+    "target_trials_per_fold": 250
+  }
+}

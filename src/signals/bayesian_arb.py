@@ -33,6 +33,7 @@ from src.core.logger import get_logger
 from src.data.market_discovery import MarketInfo
 from src.data.orderbook import OrderbookTracker
 from src.signals.combinatorial_arb import ComboArbDeferral, ComboSizer
+from src.signals.microstructure_utils import CrossBookSyncGate
 from src.signals.ofi_momentum import OFIMomentumDetector
 from src.signals.signal_framework import BaseSignal, SignalGenerator
 from src.trading.fees import get_fee_rate
@@ -274,9 +275,12 @@ class BayesianArbDetector(SignalGenerator):
         fee_enabled_resolver: Callable[[MarketInfo], bool] | None = None,
         fee_rate_bps_lookup: Callable[[str], int] | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        on_sync_block: Callable[[Any], None] | None = None,
     ) -> None:
         self._books = book_trackers
         self._sizer = ComboSizer()
+        self._sync_gate = CrossBookSyncGate()
+        self._on_sync_block = on_sync_block
         self._ofi_detectors: dict[str, OFIMomentumDetector] = {}
         self._maker_leg_ofi_paused: dict[str, bool] = {}
         self._active_deferrals: dict[str, ComboArbDeferral] = {}
@@ -306,9 +310,20 @@ class BayesianArbDetector(SignalGenerator):
         buffer = strat.si10_margin_buffer_cents / 100.0
         min_depth_usd = strat.si10_min_leg_depth_usd
 
-        base_a_bid = self._yes_best_bid(cluster.base_a)
-        base_b_bid = self._yes_best_bid(cluster.base_b)
-        joint_bid = self._yes_best_bid(cluster.joint)
+        base_a_snapshot = self._yes_snapshot(cluster.base_a)
+        base_b_snapshot = self._yes_snapshot(cluster.base_b)
+        joint_snapshot = self._yes_snapshot(cluster.joint)
+        if base_a_snapshot is None or base_b_snapshot is None or joint_snapshot is None:
+            return None
+        root_sync_assessment = self._sync_gate.assess((base_a_snapshot, base_b_snapshot, joint_snapshot))
+        if not root_sync_assessment.is_synchronized:
+            if self._on_sync_block is not None:
+                self._on_sync_block(root_sync_assessment)
+            return None
+
+        base_a_bid = float(getattr(base_a_snapshot, "best_bid", 0.0) or 0.0)
+        base_b_bid = float(getattr(base_b_snapshot, "best_bid", 0.0) or 0.0)
+        joint_bid = float(getattr(joint_snapshot, "best_bid", 0.0) or 0.0)
         if min(base_a_bid, base_b_bid, joint_bid) <= 0:
             return None
 
@@ -346,6 +361,9 @@ class BayesianArbDetector(SignalGenerator):
                 base_a_bid=base_a_bid,
                 base_b_bid=base_b_bid,
                 joint_bid=joint_bid,
+                base_a_snapshot=base_a_snapshot,
+                base_b_snapshot=base_b_snapshot,
+                joint_snapshot=joint_snapshot,
             )
             if signal is None:
                 continue
@@ -366,6 +384,9 @@ class BayesianArbDetector(SignalGenerator):
         base_a_bid: float,
         base_b_bid: float,
         joint_bid: float,
+        base_a_snapshot: Any,
+        base_b_snapshot: Any,
+        joint_snapshot: Any,
     ) -> BayesianArbSignal | None:
         if candidate.raw_gap_cents <= 0:
             return None
@@ -378,22 +399,32 @@ class BayesianArbDetector(SignalGenerator):
         )
 
         legs: list[BayesianLeg] = []
+        sync_snapshots: list[Any] = [base_a_snapshot, base_b_snapshot, joint_snapshot]
         min_bid_depth_shares = float("inf")
         quote_sum = 0.0
 
         for role, trade_side, market in candidate.leg_specs:
-            leg = self._build_leg(
+            built_leg = self._build_leg(
                 market=market,
                 role=role,
                 trade_side=trade_side,
                 min_depth_usd=min_depth_usd,
             )
-            if leg is None:
+            if built_leg is None:
                 return None
 
+            leg, leg_snapshot = built_leg
+
             legs.append(leg)
+            sync_snapshots.append(leg_snapshot)
             quote_sum += leg.best_bid
             min_bid_depth_shares = min(min_bid_depth_shares, leg.bid_depth_shares)
+
+        sync_assessment = self._sync_gate.assess(sync_snapshots)
+        if not sync_assessment.is_synchronized:
+            if self._on_sync_block is not None:
+                self._on_sync_block(sync_assessment)
+            return None
 
         if quote_sum >= 1.0 - min_margin:
             return None
@@ -564,7 +595,7 @@ class BayesianArbDetector(SignalGenerator):
         role: str,
         trade_side: str,
         min_depth_usd: float,
-    ) -> BayesianLeg | None:
+    ) -> tuple[BayesianLeg, Any] | None:
         asset_id = market.yes_token_id if trade_side == "YES" else market.no_token_id
         book = self._books.get(asset_id)
         if book is None:
@@ -584,33 +615,42 @@ class BayesianArbDetector(SignalGenerator):
             return None
 
         depth_shares = bid_depth_usd / bid if bid > 0 else 0.0
-        return BayesianLeg(
-            market_id=market.condition_id,
-            asset_id=asset_id,
-            trade_side=trade_side,
-            yes_token_id=market.yes_token_id,
-            no_token_id=market.no_token_id,
-            best_bid=bid,
-            best_ask=ask,
-            target_price=0.0,
-            target_shares=0.0,
-            question=market.question[:60],
-            role=role,
-            hedge_weight=1.0,
-            spread_width=round(max(0.0, ask - bid), 4),
-            bid_depth_usd=round(bid_depth_usd, 2),
-            bid_depth_shares=round(depth_shares, 4),
-            market_liquidity_usd=round(market.liquidity_usd, 2),
-            daily_volume_usd=round(market.daily_volume_usd, 2),
-            fee_enabled=self._fee_enabled_resolver(market),
+        return (
+            BayesianLeg(
+                market_id=market.condition_id,
+                asset_id=asset_id,
+                trade_side=trade_side,
+                yes_token_id=market.yes_token_id,
+                no_token_id=market.no_token_id,
+                best_bid=bid,
+                best_ask=ask,
+                target_price=0.0,
+                target_shares=0.0,
+                question=market.question[:60],
+                role=role,
+                hedge_weight=1.0,
+                spread_width=round(max(0.0, ask - bid), 4),
+                bid_depth_usd=round(bid_depth_usd, 2),
+                bid_depth_shares=round(depth_shares, 4),
+                market_liquidity_usd=round(market.liquidity_usd, 2),
+                daily_volume_usd=round(market.daily_volume_usd, 2),
+                fee_enabled=self._fee_enabled_resolver(market),
+            ),
+            snap,
         )
 
-    def _yes_best_bid(self, market: MarketInfo) -> float:
+    def _yes_snapshot(self, market: MarketInfo) -> Any | None:
         book = self._books.get(market.yes_token_id)
         if book is None:
-            return 0.0
+            return None
         snap = book.snapshot()
         if not self._is_snapshot_fresh(snap):
+            return None
+        return snap
+
+    def _yes_best_bid(self, market: MarketInfo) -> float:
+        snap = self._yes_snapshot(market)
+        if snap is None:
             return 0.0
         return float(getattr(snap, "best_bid", 0.0) or 0.0)
 

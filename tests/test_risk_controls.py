@@ -99,6 +99,42 @@ class TestConcentrationLimits:
 # ── Daily loss / drawdown tracking ────────────────────────────────────────
 
 class TestPnLTracking:
+    @pytest.mark.asyncio
+    async def test_entry_and_exit_sync_ensemble_risk(self):
+        exec = OrderExecutor(paper_mode=True)
+        pm = PositionManager(exec)
+
+        pos = Position(
+            id="POS-ER-1",
+            market_id="MKT_A",
+            no_asset_id="NO_MKT_A",
+            trade_side="NO",
+            state=PositionState.ENTRY_PENDING,
+            entry_price=0.50,
+            entry_size=10.0,
+            filled_size=10.0,
+            strategy_source="ofi_momentum",
+            signal_type="ofi_momentum",
+        )
+        pos.entry_order = MagicMock(filled_avg_price=0.50, filled_size=10.0)
+        pm._positions[pos.id] = pos
+
+        await pm.on_entry_filled(pos)
+
+        assert pm.ensemble_risk.exposure_snapshot("MKT_A") == {
+            "YES": {},
+            "NO": {"ofi_momentum": 1},
+        }
+
+        pos.exit_order = MagicMock(
+            filled_avg_price=0.55,
+            post_only=False,
+            status=OrderStatus.FILLED,
+        )
+        pm.on_exit_filled(pos, reason="target")
+
+        assert pm.ensemble_risk.exposure_snapshot("MKT_A") == {"YES": {}, "NO": {}}
+
     def test_on_exit_filled_tracks_pnl(self):
         exec = OrderExecutor(paper_mode=True)
         pm = PositionManager(exec)
