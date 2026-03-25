@@ -750,6 +750,11 @@ class TestSearchSpace:
         from src.backtest.wfo_optimizer import SEARCH_SPACE
 
         new_params = [
+            "ofi_threshold",
+            "window_ms",
+            "ofi_tvi_kappa",
+            "take_profit_pct",
+            "stop_loss_pct",
             "volume_ratio_threshold",
             "alpha_default",
             "tp_vol_sensitivity",
@@ -758,6 +763,9 @@ class TestSearchSpace:
             "iceberg_tp_alpha",
             "pure_mm_wide_tier_enabled",
             "pure_mm_wide_spread_pct",
+            "si10_min_net_edge_usd",
+            "si10_maker_ofi_tolerance",
+            "si9_latency_option_window_ms",
         ]
         for p in new_params:
             assert p in SEARCH_SPACE, f"Missing new param: {p}"
@@ -766,8 +774,24 @@ class TestSearchSpace:
         """Pure-MM sweep bounds should match the intended Monday grid."""
         from src.backtest.wfo_optimizer import SEARCH_SPACE
 
-        assert SEARCH_SPACE["pure_mm_wide_spread_pct"] == ("suggest_float", 0.05, 0.25)
-        assert SEARCH_SPACE["pure_mm_toxic_ofi_ratio"] == ("suggest_float", 0.60, 0.95)
+        assert SEARCH_SPACE["pure_mm_wide_spread_pct"] == ("suggest_float", 0.10, 0.25)
+        assert SEARCH_SPACE["pure_mm_toxic_ofi_ratio"] == ("suggest_float", 0.95, 1.0)
+
+    def test_ofi_momentum_bounds_match_requested_grid(self):
+        """OFI momentum sweep bounds should match the active strategy brief."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        assert SEARCH_SPACE["ofi_threshold"] == ("suggest_float", 0.60, 0.95)
+        assert SEARCH_SPACE["window_ms"] == ("suggest_int", 500, 5000)
+        assert SEARCH_SPACE["ofi_tvi_kappa"] == ("suggest_float", 0.0, 2.0)
+        assert SEARCH_SPACE["take_profit_pct"] == ("suggest_float", 0.01, 0.05)
+        assert SEARCH_SPACE["stop_loss_pct"] == ("suggest_float", 0.01, 0.05)
+
+    def test_arb_latency_window_bound_matches_requested_grid(self):
+        """Arb latency pricing window should remain in milliseconds for WFO."""
+        from src.backtest.wfo_optimizer import SEARCH_SPACE
+
+        assert SEARCH_SPACE["si9_latency_option_window_ms"] == ("suggest_int", 1000, 10000)
 
     def test_log_scale_params_marked(self):
         """Certain params should use log-scale (4th element = True)."""

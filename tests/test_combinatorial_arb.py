@@ -43,6 +43,15 @@ def _book(best_bid: float, best_ask: float, bid_size: float, ask_size: float) ->
     return book
 
 
+class FakeAgg:
+    def __init__(self, *, sigma: float, current_price: float):
+        self.rolling_volatility_ewma = sigma
+        self.current_price = current_price
+
+    def trade_flow_imbalance(self, window_ms: int, *, current_time_ms: int | None = None) -> float:
+        return 0.0
+
+
 def test_combo_arb_signal_splits_maker_and_takers():
 
     books = {
@@ -226,3 +235,116 @@ def test_combo_arb_guardrail_logs_again_when_sum_bids_moves_by_more_than_five_po
         "combo_arb_guardrail_rejected",
         "combo_arb_guardrail_rejected",
     ]
+
+
+def test_combo_arb_pauses_on_toxic_maker_leg_ofi():
+
+    books = {
+        "YES_A": _book(0.30, 0.34, 400.0, 200.0),
+        "YES_B": _book(0.28, 0.38, 200.0, 3800.0),
+        "YES_C": _book(0.29, 0.31, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    signal = detector.evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is None
+    assert detector._maker_leg_ofi_paused["YES_B"] is True
+    deferral = detector.get_active_deferral("EVENT-1")
+    assert deferral is not None
+    assert deferral.reason == "toxic_ofi"
+    assert deferral.maker_leg == "YES_B"
+    assert deferral.defer_count == 1
+
+
+def test_combo_arb_resumes_after_toxic_ofi_stabilizes(monkeypatch):
+
+    books = {
+        "YES_A": _book(0.30, 0.34, 400.0, 200.0),
+        "YES_B": _book(0.28, 0.38, 200.0, 3800.0),
+        "YES_C": _book(0.29, 0.31, 450.0, 200.0),
+    }
+    detector = ComboArbDetector(books)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    log_calls: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        combinatorial_arb.log,
+        "info",
+        lambda event, **kwargs: log_calls.append((event, kwargs)),
+    )
+
+    books["YES_A"]._last_update = 1.0
+    books["YES_B"]._last_update = 1.0
+    books["YES_C"]._last_update = 1.0
+
+    assert detector.evaluate_cluster(cluster, wallet_balance=1000.0) is None
+
+    books["YES_B"].on_book_snapshot(
+        {
+            "bids": [{"price": "0.28", "size": "3800.0"}],
+            "asks": [{"price": "0.38", "size": "200.0"}],
+            "timestamp": 2,
+        }
+    )
+    books["YES_A"]._last_update = 5.5
+    books["YES_B"]._last_update = 5.5
+    books["YES_C"]._last_update = 5.5
+
+    signal = detector.evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is not None
+    assert signal.maker_leg is not None
+    assert signal.maker_leg.yes_token_id == "YES_B"
+    assert detector._maker_leg_ofi_paused["YES_B"] is False
+    resumed = detector.pop_recent_resume("EVENT-1")
+    assert resumed is not None
+    assert resumed.maker_leg == "YES_B"
+    assert detector.pop_recent_resume("EVENT-1") is None
+    assert [event for event, _ in log_calls] == [
+        "combo_arb_ofi_paused",
+        "combo_arb_ofi_resumed",
+        "combo_arb_signal",
+    ]
+
+
+def test_combo_arb_widens_required_edge_for_latency_option_premium():
+
+    books = {
+        "YES_A": _book(0.31, 0.33, 400.0, 200.0),
+        "YES_B": _book(0.31, 0.40, 500.0, 200.0),
+        "YES_C": _book(0.32, 0.34, 450.0, 200.0),
+    }
+    aggregators = {
+        "YES_A": FakeAgg(sigma=0.40, current_price=0.33),
+        "YES_B": FakeAgg(sigma=0.02, current_price=0.40),
+        "YES_C": FakeAgg(sigma=0.40, current_price=0.34),
+    }
+    detector = ComboArbDetector(books, aggregators=aggregators)
+    cluster = ArbCluster(
+        event_id="EVENT-1",
+        legs=[
+            _market("MKT_A", "YES_A", "NO_A", "Outcome A", liquidity_usd=800.0),
+            _market("MKT_B", "YES_B", "NO_B", "Outcome B", liquidity_usd=600.0),
+            _market("MKT_C", "YES_C", "NO_C", "Outcome C", liquidity_usd=900.0),
+        ],
+    )
+
+    signal = detector.evaluate_cluster(cluster, wallet_balance=1000.0)
+
+    assert signal is None

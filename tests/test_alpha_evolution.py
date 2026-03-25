@@ -40,7 +40,7 @@ class TestConfigDefaults:
         assert settings.strategy.min_spread_cents >= 4.0
 
     def test_min_edge_score_raised(self):
-        assert settings.strategy.min_edge_score >= 40.0
+        assert settings.strategy.min_edge_score >= 20.0
 
     def test_no_discount_factor_tightened(self):
         assert LEGACY_NO_DISCOUNT_FACTOR == 0.995

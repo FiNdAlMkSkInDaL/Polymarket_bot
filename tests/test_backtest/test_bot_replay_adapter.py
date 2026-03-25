@@ -126,6 +126,95 @@ class TestTradeRouting:
         assert adapter._no_agg.current_price == 0
 
 
+class TestOfiBookRouting:
+    def test_no_side_book_update_feeds_ofi_detector_and_submits_order(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.engine.submit_order.return_value = MagicMock(order_id="SIM-OFI")
+        adapter.on_init()
+
+        adapter.on_book_update(
+            "NO",
+            {
+                "best_bid": 0.49,
+                "best_ask": 0.51,
+                "timestamp": 3600.0,
+                "bid_levels": [(0.49, 95.0)],
+                "ask_levels": [(0.51, 5.0)],
+            },
+        )
+
+        adapter.engine.submit_order.assert_called_once()
+        assert "SIM-OFI" in adapter._pending_entries
+
+    def test_ofi_bracket_draws_are_reproducible_per_seed(self):
+        def _pending_entry_for(seed: int) -> dict:
+            adapter = BotReplayAdapter(
+                market_id="MKT-1",
+                yes_asset_id="YES",
+                no_asset_id="NO",
+                stochastic_seed=seed,
+            )
+            adapter.engine = MagicMock()
+            adapter.engine.submit_order.return_value = MagicMock(order_id=f"SIM-OFI-{seed}")
+            adapter.on_init()
+            adapter.on_book_update(
+                "NO",
+                {
+                    "best_bid": 0.49,
+                    "best_ask": 0.51,
+                    "timestamp": 3600.0,
+                    "bid_levels": [(0.49, 95.0)],
+                    "ask_levels": [(0.51, 5.0)],
+                },
+            )
+            return adapter._pending_entries[f"SIM-OFI-{seed}"]
+
+        seeded_a = _pending_entry_for(11)
+        seeded_b = _pending_entry_for(11)
+        seeded_c = _pending_entry_for(12)
+
+        assert seeded_a["target_price"] == pytest.approx(seeded_b["target_price"])
+        assert seeded_a["stop_price"] == pytest.approx(seeded_b["stop_price"])
+        assert seeded_a["max_hold_seconds"] == pytest.approx(seeded_b["max_hold_seconds"])
+        assert (
+            seeded_a["target_price"],
+            seeded_a["stop_price"],
+            seeded_a["max_hold_seconds"],
+        ) != (
+            seeded_c["target_price"],
+            seeded_c["stop_price"],
+            seeded_c["max_hold_seconds"],
+        )
+
+    def test_yes_side_book_update_does_not_trigger_ofi_entry(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.engine.submit_order.return_value = MagicMock(order_id="SIM-OFI")
+        adapter.on_init()
+
+        adapter.on_book_update(
+            "YES",
+            {
+                "best_bid": 0.49,
+                "best_ask": 0.51,
+                "timestamp": 3600.0,
+                "bid_levels": [(0.49, 95.0)],
+                "ask_levels": [(0.51, 5.0)],
+            },
+        )
+
+        adapter.engine.submit_order.assert_not_called()
+
+
 class TestSignalGating:
     """Signal gating: zscore threshold, position limits."""
 
@@ -292,6 +381,263 @@ class TestFillRouting:
         # Should not raise
         adapter.on_fill(fill)
         assert len(adapter._positions) == 0
+
+    def test_ofi_stop_loss_forces_taker_exit(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.on_init()
+
+        entry_fill = Fill(
+            order_id="SIM-IN",
+            price=0.50,
+            size=10.0,
+            fee=0.05,
+            timestamp=500.0,
+            is_maker=False,
+            side=OrderSide.BUY,
+        )
+        pos = {
+            "entry_fill": entry_fill,
+            "entry_ctx": {"signal_source": "ofi_momentum"},
+            "exit_order_id": "SIM-EXIT",
+            "entry_time": 500.0,
+            "stop_price": 0.4925,
+            "max_hold_seconds": 300.0,
+            "signal_source": "ofi_momentum",
+            "exit_reason": "take_profit",
+        }
+        adapter._pending_exits["SIM-EXIT"] = pos
+        adapter._open_positions["SIM-EXIT"] = pos
+
+        def _simulate_fill(order_id, size, price=None, is_maker=True):
+            fill = Fill(
+                order_id=order_id,
+                price=price if price is not None else 0.49,
+                size=size,
+                fee=0.03,
+                timestamp=700.0,
+                is_maker=is_maker,
+                side=OrderSide.SELL,
+            )
+            adapter.on_fill(fill)
+            return fill
+
+        adapter.engine.simulate_fill.side_effect = _simulate_fill
+
+        adapter.on_book_update(
+            "NO",
+            {
+                "best_bid": 0.49,
+                "best_ask": 0.51,
+                "timestamp": 700.0,
+                "bid_levels": [(0.49, 100.0)],
+                "ask_levels": [(0.51, 100.0)],
+            },
+        )
+
+        adapter.engine.submit_order.assert_called_once_with(
+            side=OrderSide.SELL,
+            price=0.49,
+            size=10.0,
+            order_type="limit",
+            post_only=False,
+        )
+        adapter.engine.simulate_fill.assert_called_once_with(
+            adapter.engine.submit_order.return_value.order_id,
+            10.0,
+            price=0.49,
+            is_maker=False,
+        )
+        assert len(adapter._open_positions) == 0
+        assert adapter._positions[-1]["exit_reason"] == "stop_loss"
+
+    def test_ofi_time_stop_starts_smart_passive_maker_exit(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.on_init()
+
+        entry_fill = Fill(
+            order_id="SIM-IN",
+            price=0.50,
+            size=10.0,
+            fee=0.05,
+            timestamp=500.0,
+            is_maker=False,
+            side=OrderSide.BUY,
+        )
+        pos = {
+            "entry_fill": entry_fill,
+            "entry_ctx": {"signal_source": "ofi_momentum"},
+            "exit_order_id": "SIM-EXIT",
+            "entry_time": 500.0,
+            "stop_price": 0.4925,
+            "max_hold_seconds": 300.0,
+            "signal_source": "ofi_momentum",
+            "exit_reason": "take_profit",
+        }
+        adapter._pending_exits["SIM-EXIT"] = pos
+        adapter._open_positions["SIM-EXIT"] = pos
+        adapter.engine.cancel_order.return_value = True
+
+        passive_order = MagicMock()
+        passive_order.order_id = "SIM-TIMESTOP-MAKER"
+        adapter.engine.submit_order.return_value = passive_order
+
+        adapter._check_momentum_brackets(
+            {
+                "best_bid": 0.50,
+                "best_ask": 0.52,
+                "timestamp": 801.0,
+            }
+        )
+
+        adapter.engine.cancel_order.assert_called_once_with("SIM-EXIT")
+        adapter.engine.submit_order.assert_called_once_with(
+            side=OrderSide.SELL,
+            price=0.52,
+            size=10.0,
+            order_type="limit",
+            post_only=True,
+        )
+        assert "SIM-TIMESTOP-MAKER" in adapter._pending_exits
+        assert adapter._pending_exits["SIM-TIMESTOP-MAKER"]["exit_reason"] == "time_stop"
+        assert adapter._pending_exits["SIM-TIMESTOP-MAKER"]["smart_passive_deadline"] == pytest.approx(816.0)
+
+    def test_ofi_time_stop_passive_exit_falls_back_to_taker(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.on_init()
+
+        entry_fill = Fill(
+            order_id="SIM-IN",
+            price=0.50,
+            size=10.0,
+            fee=0.05,
+            timestamp=500.0,
+            is_maker=False,
+            side=OrderSide.BUY,
+        )
+        pos = {
+            "entry_fill": entry_fill,
+            "entry_ctx": {"signal_source": "ofi_momentum"},
+            "exit_order_id": "SIM-TIMESTOP-MAKER",
+            "entry_time": 500.0,
+            "stop_price": 0.4925,
+            "max_hold_seconds": 300.0,
+            "signal_source": "ofi_momentum",
+            "exit_reason": "time_stop",
+            "smart_passive_started_at": 801.0,
+            "smart_passive_deadline": 816.0,
+        }
+        adapter._pending_exits["SIM-TIMESTOP-MAKER"] = pos
+        adapter._open_positions["SIM-TIMESTOP-MAKER"] = pos
+        adapter.engine.cancel_order.return_value = True
+
+        taker_order = MagicMock()
+        taker_order.order_id = "SIM-TIMESTOP-TAKER"
+        adapter.engine.submit_order.return_value = taker_order
+
+        def _simulate_fill(order_id, size, price=None, is_maker=True):
+            fill = Fill(
+                order_id=order_id,
+                price=price if price is not None else 0.50,
+                size=size,
+                fee=0.03,
+                timestamp=801.0,
+                is_maker=is_maker,
+                side=OrderSide.SELL,
+            )
+            adapter.on_fill(fill)
+            return fill
+
+        adapter.engine.simulate_fill.side_effect = _simulate_fill
+
+        adapter._check_momentum_brackets(
+            {
+                "best_bid": 0.50,
+                "best_ask": 0.52,
+                "timestamp": 816.0,
+            },
+        )
+
+        adapter.engine.cancel_order.assert_called_once_with("SIM-TIMESTOP-MAKER")
+        adapter.engine.submit_order.assert_called_once_with(
+            side=OrderSide.SELL,
+            price=0.50,
+            size=10.0,
+            order_type="limit",
+            post_only=False,
+        )
+        adapter.engine.simulate_fill.assert_called_once_with(
+            "SIM-TIMESTOP-TAKER",
+            10.0,
+            price=0.50,
+            is_maker=False,
+        )
+        assert len(adapter._open_positions) == 0
+        assert adapter._positions[-1]["exit_reason"] == "time_stop"
+        assert adapter._smart_passive_fallbacks == 1
+
+    def test_ofi_time_stop_passive_exit_can_fill_as_maker(self):
+        adapter = BotReplayAdapter(
+            market_id="MKT-1",
+            yes_asset_id="YES",
+            no_asset_id="NO",
+        )
+        adapter.engine = MagicMock()
+        adapter.on_init()
+
+        entry_fill = Fill(
+            order_id="SIM-IN",
+            price=0.50,
+            size=10.0,
+            fee=0.05,
+            timestamp=500.0,
+            is_maker=False,
+            side=OrderSide.BUY,
+        )
+        pos = {
+            "entry_fill": entry_fill,
+            "entry_ctx": {"signal_source": "ofi_momentum"},
+            "exit_order_id": "SIM-TIMESTOP-MAKER",
+            "entry_time": 500.0,
+            "stop_price": 0.4925,
+            "max_hold_seconds": 300.0,
+            "signal_source": "ofi_momentum",
+            "exit_reason": "time_stop",
+            "smart_passive_started_at": 801.0,
+            "smart_passive_deadline": 816.0,
+        }
+        adapter._pending_exits["SIM-TIMESTOP-MAKER"] = pos
+        adapter._open_positions["SIM-TIMESTOP-MAKER"] = pos
+
+        maker_fill = Fill(
+            order_id="SIM-TIMESTOP-MAKER",
+            price=0.52,
+            size=10.0,
+            fee=0.0,
+            timestamp=810.0,
+            is_maker=True,
+            side=OrderSide.SELL,
+        )
+
+        adapter.on_fill(maker_fill)
+
+        assert len(adapter._open_positions) == 0
+        assert adapter._positions[-1]["exit_reason"] == "time_stop"
+        assert adapter._smart_passive_maker_filled == 1
 
 
 class TestOnEnd:

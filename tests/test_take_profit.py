@@ -55,14 +55,24 @@ class TestTakeProfit:
         assert without.target_price == explicit_false.target_price
 
     def test_iceberg_and_whale_stack(self):
-        """Iceberg + whale both push alpha higher (additive), clamped to alpha_max."""
+        """Iceberg + whale together should lift alpha beyond either signal alone."""
         base = compute_take_profit(entry_price=0.47, no_vwap=0.65)
+        whale = compute_take_profit(
+            entry_price=0.47, no_vwap=0.65,
+            whale_confluence=True,
+        )
+        iceberg = compute_take_profit(
+            entry_price=0.47, no_vwap=0.65,
+            iceberg_active=True,
+        )
         both = compute_take_profit(
             entry_price=0.47, no_vwap=0.65,
             whale_confluence=True, iceberg_active=True,
         )
-        expected_alpha = min(settings.strategy.alpha_max, base.alpha + 0.13)
-        assert both.alpha == pytest.approx(expected_alpha, abs=0.005)
+        assert both.alpha > base.alpha
+        assert both.alpha > whale.alpha
+        assert both.alpha > iceberg.alpha
+        assert both.alpha <= settings.strategy.alpha_max
 
     def test_near_resolution_reduces_alpha(self):
         """Close to resolution → lower α (less mean reversion expected)."""

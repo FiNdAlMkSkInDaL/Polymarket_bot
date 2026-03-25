@@ -11,15 +11,24 @@ from src.data.ohlcv import OHLCVAggregator, BAR_INTERVAL
 from src.data.websocket_client import TradeEvent
 
 
-def _make_trade(price: float, size: float, ts: float, asset_id: str = "NO_TOKEN") -> TradeEvent:
+def _make_trade(
+    price: float,
+    size: float,
+    ts: float,
+    asset_id: str = "NO_TOKEN",
+    *,
+    side: str = "buy",
+    is_taker: bool = False,
+) -> TradeEvent:
     return TradeEvent(
         timestamp=ts,
         market_id="MARKET_1",
         asset_id=asset_id,
-        side="buy",
+        side=side,
         price=price,
         size=size,
         is_yes=False,
+        is_taker=is_taker,
     )
 
 
@@ -85,6 +94,24 @@ class TestOHLCVAggregator:
         assert agg.current_price == 0.0
         assert agg.rolling_vwap == 0.0
         assert agg.rolling_volatility == 0.0
+
+    def test_trade_flow_moments_track_taker_buy_and_sell_volume(self):
+        agg = OHLCVAggregator("NO_TOKEN")
+        t0 = 1000.0
+
+        agg.on_trade(_make_trade(0.50, 5, t0, side="buy", is_taker=True))
+        agg.on_trade(_make_trade(0.49, 2, t0 + 0.5, side="sell", is_taker=True))
+
+        buy_volume, sell_volume = agg.trade_flow_moments(2000, current_time_ms=int((t0 + 1.0) * 1000))
+        assert buy_volume == pytest.approx(5.0)
+        assert sell_volume == pytest.approx(2.0)
+        assert agg.trade_flow_imbalance(2000, current_time_ms=int((t0 + 1.0) * 1000)) == pytest.approx(3.0 / 7.0)
+
+        agg.on_trade(_make_trade(0.48, 7, t0 + 3.0, side="sell", is_taker=True))
+        late_buy_volume, late_sell_volume = agg.trade_flow_moments(2000, current_time_ms=int((t0 + 3.1) * 1000))
+        assert late_buy_volume == pytest.approx(0.0)
+        assert late_sell_volume == pytest.approx(7.0)
+        assert agg.trade_flow_imbalance(2000, current_time_ms=int((t0 + 3.1) * 1000)) == pytest.approx(-1.0)
 
 
 # ── Pillar 11.2: Downside Semi-Variance EWMA ────────────────────────────

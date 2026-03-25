@@ -803,6 +803,23 @@ class TestBookDepth:
         assert book.depth_velocity() is None
 
     @pytest.mark.asyncio
+    async def test_buy_toxicity_index_rises_on_ask_sweep_and_evaporation(self):
+        book = L2OrderBook("ASSET_X", max_levels=50)
+        snap_data = _make_snapshot(
+            bids=[("0.47", "100")],
+            asks=[("0.53", "100")],
+            seq=0,
+        )
+        book.begin_buffering()
+        await book.load_snapshot(snap_data)
+
+        delta = _make_delta([("SELL", "0.53", "20")], seq=1)
+        book.on_delta(delta)
+
+        assert book.toxicity_index("BUY") > 0.0
+        assert book.toxicity_index("BUY") > book.toxicity_index("SELL")
+
+    @pytest.mark.asyncio
     async def test_levels_returns_copies(self):
         book = L2OrderBook("ASSET_X", max_levels=50)
         snap_data = _make_snapshot(
@@ -921,6 +938,7 @@ class TestL2OrderBookAdapter:
         assert adapter.has_data is True
         assert abs(adapter.spread_cents - 6.0) < 0.1
         assert adapter.book_depth_ratio > 0
+        assert adapter.toxicity_index("BUY") >= 0.0
 
     @pytest.mark.asyncio
     async def test_adapter_write_ops_are_noop(self):
