@@ -1,172 +1,270 @@
-# Polymarket HFT Market Maker And Latency Arb Engine
+# Polymarket Bot
 
-An automated Polymarket trading system centered on high-frequency pure market
-making, maker-first combinatorial arbitrage, and zero-overhead latency
-arbitrage.
+Institutional documentation for the current checked-in trading stack.
 
-This repo is no longer a mean-reversion panic bot as its primary live design.
-Legacy directional modules still exist for research and compatibility, but the
-current live architecture is driven by L2 market microstructure and external
-latency edges.
+This repository is no longer documented as a generic mean-reversion market
+maker. The repo now contains multiple strategy families, but the approved
+live posture is intentionally narrow:
 
-## Live Architecture
+- LIVE OPS: SI-9 combinatorial arbitrage only
+- DEPLOYMENT MODE: PAPER
+- RETIRED LIVE STRATEGY: PURE_MM passive market making
+- NEW DIRECTIONAL RESEARCH STACK: OFI momentum taker built on the refactored
+   O(1) OHLCV engine
 
+Use this file as the operator-facing source of truth. Use ARCHITECTURE.md for
+the full component-level explanation.
+
+## Current State
+
+### Live Ops
+
+- SI-9 combinatorial arbitrage is the only strategy that should be treated as
+   active live deployment.
+- The checked-in service and environment are configured for PAPER mode.
+- The live posture is intentionally separated from research and backtest-only
+   capabilities.
+
+### Backtest Ops
+
+- The replay stack supports both the legacy passive maker path and the newer
+   OFI momentum taker path.
+- Walk-forward optimization now assumes the OHLCV engine is incremental and
+   must be run with file logging disabled to avoid I/O bottlenecks.
+
+## The Pivot
+
+PURE_MM is deprecated as a live strategy.
+
+The retirement reason is not cosmetic. The market split into two losing
+regimes for passive quoting:
+
+- Long-tail markets produced too few passive fills to justify capital or
+   operational complexity. In practice, they behaved like zero-fill books.
+- Top 25 / high-volume markets did fill, but those fills were dominated by
+   toxic flow and adverse selection.
+
+The repo still contains the PURE_MM implementation and replay adapter because
+they remain useful for research, regression testing, and historical analysis.
+That should not be confused with approval for live deployment.
+
+For the current high-volume universe, recent out-of-sample WFO artifacts are
+treated as disqualifying evidence for passive deployment. Operationally,
+PURE_MM stays retired until the quoting model changes materially.
+
+## Strategy Status Matrix
+
+| Strategy | Status | Operational Meaning |
+| --- | --- | --- |
+| PURE_MM passive maker | Retired from live ops | Kept in code for replay, research, and historical comparison |
+| SI-9 combinatorial arbitrage | Active live strategy | Approved live paper strategy on VPS |
+| OFI momentum taker | Research / replay / rollout candidate | Implemented, wired, and documented, but not the primary live engine |
+| Legacy panic / drift directional paths | Legacy compatibility | Still present in the repo, not the strategic center of live ops |
+
+## Live Ops
+
+### Approved Production Posture
+
+The live VPS posture is:
+
+- PAPER mode
+- SI-9 enabled when running the combinatorial arb deployment
+- PURE_MM disabled on the current Top 25 / high-volume target map
+
+This distinction matters. The repo is a transitional system and still carries
+legacy and optional code paths. Live approval is narrower than code presence.
+
+### SI-9 Overview
+
+SI-9 trades mutually exclusive negRisk event clusters.
+
+Core idea:
+
+- If the sum of YES best bids across all legs is below $1.00$ by enough
+   margin, the event cluster can be bought as a Dutch-book style arb.
+
+Operational guardrails:
+
+- Ghost-town filter: reject clusters when $\sum bids < 0.85$
+- Reject implausible edge prints when edge exceeds $\$0.15$
+- Require minimum leg depth before sizing
+- Enforce max concurrent combos, max total combo exposure, and per-combo
+   collateral caps
+- Use maker-first routing for the bottleneck leg, then sweep taker legs only
+   after the maker leg fills
+- If a combo partially fills, the hanging-leg state machine either emergency
+   hedges the missing leg or dumps filled legs to eliminate naked exposure
+
+Institutional interpretation:
+
+- SI-9 is a tightly scoped execution strategy, not a generic market-making
+   engine.
+- Its risk control surface is explicit and leg-aware.
+
+## Momentum Architecture
+
+The repository now includes a new OFIMomentumSignal pipeline designed around
+aggressive taker entry rather than passive quote capture.
+
+### What It Does
+
+- Tracks rolling top-of-book volume imbalance over a millisecond window
+- Emits a directional momentum signal when rolling VI crosses a configured
+   threshold
+- Routes execution through an aggressive taker entry path instead of waiting
+   for maker fills
+
+### Why It Exists
+
+The strategy is built for the regime where waiting passively is the problem.
+If the signal is about fleeting order-flow imbalance, execution must cross the
+spread immediately or the edge disappears.
+
+### Hard Brackets
+
+OFI momentum uses hard post-entry bracket logic:
+
+- Take profit: 3.0%
+- Stop-loss: 1.5%
+- Time-stop: 300 seconds
+
+Those brackets are deliberate guardrails, not optional tuning ideas. The time
+stop exists because momentum that does not resolve quickly usually decays into
+inventory risk rather than edge.
+
+## Engine Optimization
+
+The OHLCV stack was refactored to remove repeated full-window recomputation.
+
+Current design:
+
+- OHLCV bars update incrementally on each trade
+- Rolling VWAP and rolling volatility maintain O(1) state updates
+- Return sums, squared-return sums, and rolling volume sums are updated as bars
+   enter and leave the window
+- The backtest engine skips duplicate aggregation when the strategy manages
+   its own trade aggregation
+
+This is the key March 24 engineering change that made momentum WFO practical.
+The prior model rebuilt rolling state too often and burned CPU on every tick.
+
+Important replay rule:
+
+- BotReplayAdapter aggregates its own trade stream
+- The backtest engine detects that via `self_aggregates_trades = True`
+- Engine-side duplicate OHLCV work is skipped
+
+That separation prevents the replay stack from paying for the same bar work
+twice.
+
+## Walk-Forward Optimization
+
+This repo now draws a hard operational line between LIVE OPS and BACKTEST OPS.
+Do not mix their assumptions.
+
+### Required Operator Rule
+
+Before running WFO, disable file logging:
+
+```powershell
+$env:BOT_DISABLE_FILE_LOGGING='1'
 ```
+
+Reason:
+
+- WFO runs many short child-process backtests
+- Structured file logging creates avoidable disk contention
+- The repo explicitly supports disabling rotating file output while preserving
+   stdout/stderr logging
+
+### Trial Timeout Wrapper
+
+Each trial is wrapped in a hard 60-second wall-clock timeout.
+
+Operational meaning:
+
+- A slow trial is not allowed to stall the study indefinitely
+- The optimizer runs each trial in a child process
+- If the child does not finish within 60 seconds, it is terminated and the
+   trial is marked as timed out
+
+This is a control mechanism, not just a convenience feature.
+
+### Generic WFO Command
+
+```powershell
+$env:BOT_DISABLE_FILE_LOGGING='1'
+python -m src.cli wfo `
+   --data-dir data/vps_march2026 `
+   --train-days 35 `
+   --test-days 7 `
+   --step-days 7 `
+   --anchored `
+   --embargo-days 1 `
+   --n-trials 500 `
+   --max-workers -1 `
+   --strategy-adapter bot_replay
+```
+
+### Top 25 OFI Momentum Wrapper
+
+```powershell
+$env:BOT_DISABLE_FILE_LOGGING='1'
+python wfo_ofi_momentum.py `
+   --train-days 35 `
+   --test-days 7 `
+   --step-days 7 `
+   --embargo-days 1 `
+   --n-trials 500 `
+   --max-workers -1 `
+   --trial-timeout-s 60
+```
+
+### WFO Interpretation Rules
+
+- Treat LIVE OPS and BACKTEST OPS as separate operating domains
+- PURE_MM backtests require L2 snapshots and deltas; trade-only data is not a
+   valid passive-maker evaluation dataset
+- OFI momentum WFO is only useful if logging overhead is controlled and the
+   OHLCV path stays incremental
+
+## Repository Layout
+
+```text
 src/
-├── core/           # Config, latency/risk guards, process orchestration
-├── data/           # CLOB streams, L2 books, oracle adapters, discovery
-├── signals/        # RPE, oracle signals, SI-9 combinatorial arb logic
-├── strategies/     # Pure market maker live strategy
-├── trading/        # Executor, position manager, fast-strike path, risk
-├── monitoring/     # SQLite trade store, Telegram alerts
-├── bot.py          # Main orchestrator
-└── cli.py          # CLI entry point
-
-scripts/
-├── vps_setup.sh            # Ubuntu VPS bootstrap
-├── decrypt_secrets.sh      # Age-encrypted .env decryption
-├── test_ws_oracles.py      # Tree News / oracle websocket smoke tests
-└── watchdog.sh             # Cron-based health check
+├── backtest/      Replay engine, matching engine, WFO optimizer
+├── core/          Config, logger, guards, process management
+├── data/          Discovery, OHLCV, L2 books, adapters
+├── execution/     Aggressive execution helpers such as momentum taker brackets
+├── monitoring/    Trade store, health reporting, Telegram notifications
+├── signals/       SI-9 detector, OFI momentum detector, legacy signal stack
+├── strategies/    PURE_MM live strategy implementation
+├── trading/       Position manager, stop-loss engine, combo lifecycle
+├── bot.py         Runtime orchestrator
+└── cli.py         Operator CLI
 ```
 
-## Active Strategies
+## Checked-In Code Versus Deployment Truth
 
-1. Pure Market Maker
-   The passive NO-token quoting engine remains in the codebase, but PURE_MM is
-   currently disabled on the Top 25 / high-volume live paper target map.
-   Recent out-of-sample WFO on that universe produced OOS Sharpe -79.5565,
-   confirming the books are currently too toxic for live passive deployment.
+This repo has experienced runtime-versus-source drift before. Documentation now
+separates:
 
-2. SI-9 Combinatorial Arbitrage
-   Maker-first state machine for mutually exclusive event clusters. Works the
-   bottleneck leg passively before completing the rest of the combo when a
-   Dutch-book style mispricing exists. This strategy is currently live in paper
-   mode. Current guardrails require minimum Σ bids of 0.85, maximum edge of
-   0.15 dollars, and throttle repeated rejection logs to 1 hour unless Σ bids
-   moves by more than 5 percentage points.
+- checked-in architecture
+- approved live deployment posture
+- historical artifacts and saved runtime observations
 
-3. Latency Arbitrage
-   SI-7 crypto fast-strike uses free BTC and ETH spot feeds plus
-   Black-Scholes-style RPE pricing to snipe stale crypto-linked Polymarket
-   orders.
+If a piece of code still exists, that does not automatically mean it is part of
+the approved live deployment.
 
-   SI-8 news arbitrage uses the Tree News WebSocket firehose to front-run the
-   book on breaking news. Paid non-crypto and paid sports feeds are outside the
-   intended zero-overhead live architecture.
+That distinction is especially important for:
 
-## Quick Start (Local / Paper Trading)
+- PURE_MM defaults that still exist in config
+- legacy directional code paths still present for compatibility
+- SI-9 and OFI components that are wired in source but used differently across
+   live paper, replay, and research workflows
 
-```bash
-# 1. Clone & setup
-cd polymarket-bot
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/Mac
-pip install -e ".[dev]"
+## Further Reading
 
-# 2. Configure
-cp .env.example .env
-# Edit .env with your Polymarket API credentials
-
-# 3. Run in paper mode (default)
-python -m src.cli run --paper
-
-# 4. Check stats
-python -m src.cli stats
-```
-
-## Backtesting And WFO
-
-The backtest and walk-forward stack has pivoted with the live strategy.
-
-- Pure market maker replay requires L2 snapshots and deltas.
-- Trade-only data is not sufficient to simulate passive maker fills, OFI, or
-   depth evaporation defensibly.
-- Pure-MM WFO intentionally fails fast when the dataset has no L2 book events.
-- Recent pure-MM OOS WFO on the current high-volume universe recorded OOS
-   Sharpe -79.5565, so PURE_MM is not the active live paper strategy on the
-   current target map.
-
-## Current Live Posture
-
-- SI-9 combinatorial arbitrage is live in paper mode.
-- Gamma discovery disables ONE_MARKET_PER_EVENT whenever SI-9 is enabled so all
-   negRisk legs survive discovery.
-- The live target map should stay below 25 markets in practice to maintain L2
-   WebSocket stability and avoid packet drops.
-
-If you are evaluating the current live architecture, assume L2 data is a hard
-requirement rather than an optional enhancement.
-
-## Offline Tools
-
-`scripts/visualize_l2_wicks.py` is a standalone offline analysis tool for local
-tick captures. It reconstructs the Level 2 top of book from snapshot and delta
-events, plots best bid and best ask over time, overlays trades, and flags
-potential liquidity vacuums or wick trades where executions occur more than 5%
-away from the rolling 1-minute mid-price baseline.
-
-Use it when you want to visually inspect market microstructure, deep sweeps,
-and flash-move executions without running the live bot.
-
-Example usage:
-
-```bash
-python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id>
-python scripts/visualize_l2_wicks.py data/vps_march2026_parquet/2026-03-18 <market_id> --output wick_chart.png
-python scripts/visualize_l2_wicks.py data/vps_march2026/ticks/2026-03-18 <market_id> --wick-threshold-pct 5 --window-seconds 60 --show
-```
-
-The script accepts either raw `.jsonl` captures or prepared `.parquet` files.
-If the selected dataset contains only trade prints and no L2 snapshot or delta
-events, the visualizer exits early because book reconstruction is not possible.
-
-`scripts/screen_wick_markets.py` is a standalone universe-selection screener.
-It queries the public Polymarket Gamma API for active markets, ranks them by
-`24h volume / resting liquidity`, and prints the top high-volume, thin-book
-candidates for next week's wick-catching watchlist.
-
-Example usage:
-
-```bash
-python scripts/screen_wick_markets.py
-python scripts/screen_wick_markets.py --top 25 --min-volume 1000
-```
-
-`scripts/screen_si9_clusters.py` is the offline SI-9 cluster screener.
-It queries the public Polymarket Gamma `/events` API, filters to active
-mutually exclusive negRisk clusters, groups markets by parent event, and ranks
-those clusters by aggregate `24h volume / resting liquidity`.
-
-Example usage:
-
-```bash
-python scripts/screen_si9_clusters.py
-python scripts/screen_si9_clusters.py --top 10 --min-volume 5000
-python scripts/screen_si9_clusters.py --export-json data/si9_clusters.json
-```
-
-Its JSON export preserves CLOB-compatible `conditionId` hex strings for every
-leg in each cluster, rather than Gamma numeric market IDs.
-
-## Testing
-
-```bash
-pytest tests/ -v
-```
-
-## VPS Deployment
-
-See `scripts/vps_setup.sh` for full bootstrap. Summary:
-
-1. Provision Hetzner CX22 (Helsinki) — Ubuntu 24.04
-2. Run `vps_setup.sh` as root
-3. Copy `.env.age` encrypted secrets
-4. `systemctl start polymarket-bot`
-
-## Security
-
-- Private keys stored in `.env`, encrypted at rest with `age`
-- Decrypted only into tmpfs (`/dev/shm/secrets/`) — RAM only
-- SSH key-only auth, `ufw` firewall, `fail2ban`
-- systemd runs with `NoNewPrivileges`, `ProtectSystem=strict`
+- See `ARCHITECTURE.md` for the full system architecture and rationale
+- See `src/backtest/wfo_optimizer.py` for timeout and study orchestration
+- See `src/data/ohlcv.py` for the incremental rolling-state implementation
