@@ -23,6 +23,7 @@ from src.core.config import settings
 from src.core.logger import get_logger
 from src.data.arb_clusters import ArbCluster
 from src.data.orderbook import OrderbookTracker
+from src.signals.ofi_momentum import OFIMomentumDetector
 from src.signals.signal_framework import BaseSignal, SignalGenerator, SignalResult
 
 log = get_logger(__name__)
@@ -73,6 +74,8 @@ class ComboArbSignal(BaseSignal):
     sum_best_bids: float = 0.0   # Σ YES best_bids across legs
     edge_cents: float = 0.0      # (1.0 - sum_best_bids)*100 - min_margin_cents
     margin_used: float = 0.0     # si9_min_margin_cents at evaluation time
+    latency_option_premium_dollars: float = 0.0
+    required_edge_dollars: float = 0.0
     target_shares: float = 0.0   # uniform share count across all legs
     total_collateral: float = 0.0  # Σ(target_price_i * target_shares)
 
@@ -82,6 +85,22 @@ class ComboArbSignal(BaseSignal):
         if self.maker_leg is None:
             return list(self.taker_legs)
         return [self.maker_leg, *self.taker_legs]
+
+
+@dataclass
+class ComboArbDeferral:
+    """Structured reason for an SI-9 cluster being deferred."""
+
+    event_id: str
+    reason: str
+    maker_leg: str
+    market_id: str
+    question: str = ""
+    rolling_vi: float = 0.0
+    current_vi: float = 0.0
+    threshold: float = 0.0
+    deferred_at: float = 0.0
+    defer_count: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -182,10 +201,16 @@ class ComboArbDetector(SignalGenerator):
     def __init__(
         self,
         book_trackers: dict[str, OrderbookTracker],
+        aggregators: dict[str, Any] | None = None,
     ) -> None:
         self._books = book_trackers
+        self._aggregators = aggregators or {}
         self._sizer = ComboSizer()
+        self._ofi_detectors: dict[str, OFIMomentumDetector] = {}
         self._guardrail_rejection_log_state: dict[str, tuple[float, float]] = {}
+        self._maker_leg_ofi_paused: dict[str, bool] = {}
+        self._active_deferrals: dict[str, ComboArbDeferral] = {}
+        self._recent_resumes: dict[str, ComboArbDeferral] = {}
 
     @property
     def name(self) -> str:
@@ -318,13 +343,12 @@ class ComboArbDetector(SignalGenerator):
                 daily_volume_usd=round(mkt.daily_volume_usd, 2),
             ))
 
-        # ── Arb check: Σ(YES best_bids) < 1.0 - margin ───────────────
-        threshold = 1.0 - min_margin
-        if sum_bids >= threshold:
-            return None  # no arb
-
         edge_dollars = 1.0 - sum_bids
-        edge_cents = edge_dollars * 100.0 - strat.si9_min_margin_cents
+
+        # ── Arb check: Σ(YES best_bids) < 1.0 - margin ───────────────
+        base_threshold = 1.0 - min_margin
+        if sum_bids >= base_threshold:
+            return None  # no arb
 
         # Reject ghost-town books with implausibly large gaps. SI-9 should
         # only work tight, liquid mispricings rather than dead markets.
@@ -350,8 +374,18 @@ class ComboArbDetector(SignalGenerator):
             ranked_legs,
         )
 
+        latency_option_premium = self._latency_option_premium(taker_legs)
+        required_edge_dollars = min_margin + latency_option_premium
+        if edge_dollars <= required_edge_dollars:
+            return None
+
+        edge_cents = (edge_dollars - required_edge_dollars) * 100.0
+
+        if self._maker_leg_has_toxic_ofi(cluster.event_id, maker_leg):
+            return None
+
         # ── Target prices: maker works passively, takers cross ─────────
-        if edge_dollars > min_margin + buffer:
+        if edge_dollars > required_edge_dollars + buffer:
             maker_leg.target_price = round(min(0.99, maker_leg.best_bid + 0.01), 2)
         else:
             maker_leg.target_price = round(maker_leg.best_bid, 2)
@@ -386,7 +420,9 @@ class ComboArbDetector(SignalGenerator):
             taker_legs=taker_legs,
             sum_best_bids=round(sum_bids, 4),
             edge_cents=round(edge_cents, 2),
-            margin_used=strat.si9_min_margin_cents,
+            margin_used=round(required_edge_dollars * 100.0, 2),
+            latency_option_premium_dollars=round(latency_option_premium, 6),
+            required_edge_dollars=round(required_edge_dollars, 6),
             target_shares=shares,
             total_collateral=round(total_collateral, 2),
         )
@@ -400,10 +436,117 @@ class ComboArbDetector(SignalGenerator):
             n_legs=len(ranked_legs),
             sum_bids=round(sum_bids, 4),
             edge_cents=round(edge_cents, 2),
+            latency_option_premium_dollars=round(latency_option_premium, 6),
             shares=shares,
             total_collateral=round(total_collateral, 2),
         )
         return signal
+
+    def _maker_leg_has_toxic_ofi(self, event_id: str, maker_leg: ComboLeg) -> bool:
+        book = self._books.get(maker_leg.yes_token_id)
+        if book is None:
+            return False
+
+        detector = self._ofi_detectors.get(maker_leg.yes_token_id)
+        if detector is None:
+            strat = settings.strategy
+            detector = OFIMomentumDetector(
+                market_id=maker_leg.market_id,
+                window_ms=strat.si9_ofi_window_ms,
+                threshold=strat.si9_toxic_ofi_threshold,
+                tvi_kappa=strat.ofi_tvi_kappa,
+            )
+            self._ofi_detectors[maker_leg.yes_token_id] = detector
+
+        signal = detector.generate_signal(
+            book=book,
+            trade_aggregator=self._aggregators.get(maker_leg.yes_token_id),
+        )
+        is_toxic = signal is not None and signal.direction == "SELL"
+        was_paused = self._maker_leg_ofi_paused.get(maker_leg.yes_token_id, False)
+
+        if is_toxic:
+            previous = self._active_deferrals.get(event_id)
+            self._active_deferrals[event_id] = ComboArbDeferral(
+                event_id=event_id,
+                reason="toxic_ofi",
+                maker_leg=maker_leg.yes_token_id,
+                market_id=maker_leg.market_id,
+                question=maker_leg.question,
+                rolling_vi=signal.rolling_vi,
+                current_vi=signal.current_vi,
+                threshold=signal.threshold,
+                deferred_at=time.time(),
+                defer_count=(previous.defer_count + 1) if previous else 1,
+            )
+            if not was_paused:
+                log.info(
+                    "combo_arb_ofi_paused",
+                    event_id=event_id,
+                    maker_leg=maker_leg.yes_token_id,
+                    market_id=maker_leg.market_id,
+                    direction=signal.direction,
+                    rolling_vi=signal.rolling_vi,
+                    current_vi=signal.current_vi,
+                    threshold=signal.threshold,
+                )
+            self._maker_leg_ofi_paused[maker_leg.yes_token_id] = True
+            return True
+
+        previous = self._active_deferrals.pop(event_id, None)
+        if was_paused:
+            log.info(
+                "combo_arb_ofi_resumed",
+                event_id=event_id,
+                maker_leg=maker_leg.yes_token_id,
+                market_id=maker_leg.market_id,
+                rolling_vi=round(detector.rolling_vi, 6),
+                current_vi=round(detector.current_vi, 6),
+                threshold=detector.threshold,
+            )
+            if previous is not None:
+                self._recent_resumes[event_id] = previous
+        self._maker_leg_ofi_paused[maker_leg.yes_token_id] = False
+        return False
+
+    def _latency_option_premium(self, taker_legs: list[ComboLeg]) -> float:
+        horizon_ms = max(0, int(settings.strategy.si9_latency_option_window_ms))
+        if horizon_ms <= 0 or not taker_legs:
+            return 0.0
+
+        horizon_minutes = horizon_ms / (1000.0 * 60.0)
+        if horizon_minutes <= 0:
+            return 0.0
+
+        sqrt_horizon = horizon_minutes ** 0.5
+        premium = 0.0
+        for leg in taker_legs:
+            agg = self._aggregators.get(leg.yes_token_id)
+            if agg is None:
+                continue
+
+            sigma = float(getattr(agg, "rolling_volatility_ewma", 0.0) or 0.0)
+            if sigma <= 0:
+                continue
+
+            reference_price = float(getattr(agg, "current_price", 0.0) or 0.0)
+            if reference_price <= 0:
+                reference_price = leg.best_ask if leg.best_ask > 0 else leg.best_bid
+            if reference_price <= 0:
+                continue
+
+            premium += reference_price * sigma * sqrt_horizon
+
+        return premium
+
+    def get_active_deferral(self, event_id: str) -> ComboArbDeferral | None:
+        return self._active_deferrals.get(event_id)
+
+    def active_deferrals(self) -> list[ComboArbDeferral]:
+        return list(self._active_deferrals.values())
+
+    def pop_recent_resume(self, event_id: str) -> ComboArbDeferral | None:
+        return self._recent_resumes.pop(event_id, None)
 
     def _should_log_guardrail_rejection(self, event_id: str, sum_bids: float) -> bool:
         now = time.time()

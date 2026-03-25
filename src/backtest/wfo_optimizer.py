@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -165,12 +166,21 @@ class WfoConfig:
     # Optional JSON file with narrowed search-space bounds (overrides SEARCH_SPACE)
     search_space_bounds_path: str | None = None
 
+    # Optional JSON file with explicit WFO target markets.
+    market_configs_path: str | None = None
+
+    # Optional JSON file describing SI-10 triplet relationships.
+    bayesian_relationships_path: str | None = None
+
     # Strategy adapter used by the single-backtest runner.
     # Supported: "bot_replay", "pure_market_maker"
     strategy_adapter: str = "bot_replay"
 
     # Optional subset of SEARCH_SPACE parameter names to optimise.
     search_space_params: tuple[str, ...] | None = None
+
+    # Hard wall-clock cap for a single trial replay.
+    trial_timeout_s: float = 60.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -342,6 +352,11 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     "volume_ratio_threshold": ("suggest_float", 0.1, 4.0),
     # Trend regime guard (wide range so WFO can find the right threshold)
     "trend_guard_pct": ("suggest_float", 0.05, 1.0),
+    # OFI momentum entry confirmation
+    "ofi_threshold": ("suggest_float", 0.60, 0.95),
+    "window_ms": ("suggest_int", 500, 5000),
+    "ofi_toxicity_scale_threshold": ("suggest_float", 0.40, 0.90),
+    "ofi_toxicity_size_boost_max": ("suggest_float", 1.0, 3.0),
     # Risk management
     # Hardened: SL must be ≥ min_spread_cents (4.0) to survive the spread.
     # Prior [2.0, 12.0] allowed Chop Trap: positive Sharpe, negative PnL.
@@ -349,6 +364,8 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     "trailing_stop_offset_cents": ("suggest_float", 0.5, 6.0),
     "kelly_fraction": ("suggest_float", 0.03, 0.40, True),             # log-scale
     "max_impact_pct": ("suggest_float", 0.03, 0.30, True),             # log-scale
+    "take_profit_pct": ("suggest_float", 0.01, 0.05),
+    "stop_loss_pct": ("suggest_float", 0.01, 0.05),
     # Take-profit
     "alpha_default": ("suggest_float", 0.25, 0.75),
     "tp_vol_sensitivity": ("suggest_float", 0.5, 3.0),
@@ -363,15 +380,28 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     "drift_vol_ceiling": ("suggest_float", 0.02, 0.15, True),     # log-scale
     # Pure market maker microstructure
     "pure_mm_wide_tier_enabled": ("suggest_categorical", (True,)),
-    "pure_mm_wide_spread_pct": ("suggest_float", 0.01, 0.05),
-    "pure_mm_inventory_penalty_coef": ("suggest_float", 2.0, 10.0),
-    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.30, 0.70),
-    "pure_mm_depth_evaporation_pct": ("suggest_float", 0.20, 0.80),
+    "pure_mm_wide_spread_pct": ("suggest_float", 0.10, 0.25),
+    "pure_mm_inventory_penalty_coef": ("suggest_float", 0.5, 1.5),
+    "pure_mm_toxic_ofi_ratio": ("suggest_float", 0.95, 1.0),
+    "pure_mm_depth_evaporation_pct": ("suggest_float", 0.95, 1.0),
     # PCE (Pillar 15)
     "pce_max_portfolio_var_usd": ("suggest_float", 20.0, 100.0),
     "pce_correlation_haircut_threshold": ("suggest_float", 0.30, 0.80),
     "pce_structural_prior_weight": ("suggest_int", 5, 30),
     "pce_holding_period_minutes": ("suggest_int", 30, 360),
+    # SI-10: Domino contagion arb
+    "contagion_arb_min_correlation": ("suggest_float", 0.70, 0.95),
+    "contagion_arb_trigger_percentile": ("suggest_float", 0.90, 0.99),
+    "contagion_arb_min_history": ("suggest_int", 8, 64),
+    "contagion_arb_min_leader_shift": ("suggest_float", 0.002, 0.03, True),
+    "contagion_arb_min_residual_shift": ("suggest_float", 0.002, 0.03, True),
+    "contagion_arb_toxicity_impulse_scale": ("suggest_float", 0.01, 0.20, True),
+    "contagion_arb_cooldown_seconds": ("suggest_float", 10.0, 180.0),
+    "contagion_arb_max_lagging_spread_pct": ("suggest_float", 0.5, 3.0),
+    "contagion_arb_max_last_trade_age_s": ("suggest_float", 30.0, 300.0),
+    # SI-10: Bayesian joint-probability arb
+    "si10_min_net_edge_usd": ("suggest_float", 0.01, 2.0, True),
+    "si10_maker_ofi_tolerance": ("suggest_float", 0.70, 0.98),
     # SI-2: Iceberg detector alpha modifiers
     "iceberg_eqs_bonus": ("suggest_float", 0.05, 0.25),
     "iceberg_tp_alpha": ("suggest_float", 0.02, 0.10),
@@ -600,7 +630,7 @@ def _build_data_loader(
 def _compute_gap_ratio(
     data_dir: str,
     dates: list[str],
-    market_id: str,
+    market_id: str | None,
     asset_ids: set[str],
     max_interval_s: float,
 ) -> float:
@@ -635,31 +665,74 @@ def _compute_gap_ratio(
     return gaps / total if total > 0 else 0.0
 
 
-def _load_market_configs(data_dir: str) -> list[dict]:
-    """Load market_map.json and return a list of {market_id, yes_asset_id, no_asset_id}.
+def _normalise_market_configs(raw: list[dict[str, Any]], source: Path) -> list[dict[str, str]]:
+    """Normalise market config JSON into {market_id, yes_asset_id, no_asset_id} rows."""
+    configs: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        market_id = str(entry.get("market_id") or "").strip()
+        yes_asset_id = str(entry.get("yes_asset_id") or entry.get("yes_id") or "").strip()
+        no_asset_id = str(entry.get("no_asset_id") or entry.get("no_id") or "").strip()
+        if yes_asset_id and no_asset_id:
+            configs.append(
+                {
+                    "market_id": market_id or f"TARGET_{index}_{yes_asset_id}_{no_asset_id}",
+                    "yes_asset_id": yes_asset_id,
+                    "no_asset_id": no_asset_id,
+                    "question": str(entry.get("question") or ""),
+                    "event_id": str(entry.get("event_id") or entry.get("group") or ""),
+                    "tags": str(entry.get("tags") or entry.get("theme") or ""),
+                    "liquidity_usd": float(entry.get("liquidity_usd", 0.0) or 0.0),
+                    "daily_volume_usd": float(entry.get("daily_volume_usd", 0.0) or 0.0),
+                    "accepting_orders": bool(entry.get("accepting_orders", True)),
+                    "end_date": entry.get("end_date") or entry.get("end_date_iso") or entry.get("end_time"),
+                }
+            )
+    if configs:
+        log.info("wfo_market_configs_loaded", n_markets=len(configs), path=str(source))
+    return configs
 
-    Searches ``data_dir``, its parent, and the ``data/`` directory relative to
-    the current working directory.  Returns an empty list when not found.
+
+def _load_market_configs(data_dir: str, market_configs_path: str | None = None) -> list[dict]:
+    """Load market configs and return {market_id, yes_asset_id, no_asset_id} rows.
+
+    If ``market_configs_path`` is provided, that file is used directly.
+    Otherwise searches ``data_dir``, its parent, and the ``data/`` directory
+    relative to the current working directory for ``market_map.json``.
+    Returns an empty list when nothing valid is found.
     """
     import json
 
-    base = Path(data_dir)
-    candidates = [base / "market_map.json", base.parent / "market_map.json", Path("data") / "market_map.json"]
+    candidates: list[Path]
+    if market_configs_path:
+        candidates = [Path(market_configs_path)]
+    else:
+        base = Path(data_dir)
+        candidates = [base / "market_map.json", base.parent / "market_map.json", Path("data") / "market_map.json"]
+
     for candidate in candidates:
         if candidate.exists():
             with open(candidate, encoding="utf-8") as fh:
                 raw = json.load(fh)
-            configs = []
-            for entry in raw:
-                mid = entry.get("market_id", "")
-                yid = str(entry.get("yes_id", ""))
-                nid = str(entry.get("no_id", ""))
-                if mid and yid and nid:
-                    configs.append({"market_id": mid, "yes_asset_id": yid, "no_asset_id": nid})
-            if configs:
-                log.info("wfo_market_configs_loaded", n_markets=len(configs), path=str(candidate))
-            return configs
+            if isinstance(raw, list):
+                return _normalise_market_configs(raw, candidate)
+            log.warning("wfo_market_configs_invalid", path=str(candidate), reason="expected JSON list")
+            return []
     return []
+
+
+def _load_bayesian_relationships(path: str | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    candidate = Path(path)
+    if not candidate.exists():
+        log.warning("wfo_bayesian_relationships_not_found", path=path)
+        return []
+    with open(candidate, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    if not isinstance(raw, list):
+        log.warning("wfo_bayesian_relationships_invalid", path=path)
+        return []
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _run_multi_market_backtest(
@@ -674,12 +747,42 @@ def _run_multi_market_backtest(
     strategy_adapter: str = "bot_replay",
     gap_threshold: float = 0.01,
     gap_max_interval_s: float = 300.0,
+    bayesian_relationships: list[dict[str, Any]] | None = None,
+    stochastic_seed: int | None = None,
 ) -> dict | None:
     """Run one backtest per market config and return averaged metrics.
 
     Markets that produce zero fills are excluded from the average.
     Returns ``None`` when no market yields any fills.
     """
+    if strategy_adapter == "contagion_arb":
+        return _run_contagion_multi_market_backtest(
+            data_dir=data_dir,
+            dates=dates,
+            param_overrides=param_overrides,
+            market_configs=market_configs,
+            initial_cash=initial_cash,
+            latency_ms=latency_ms,
+            fee_max_pct=fee_max_pct,
+            fee_enabled=fee_enabled,
+            gap_threshold=gap_threshold,
+            gap_max_interval_s=gap_max_interval_s,
+        )
+    if strategy_adapter == "bayesian_arb":
+        return _run_bayesian_multi_market_backtest(
+            data_dir=data_dir,
+            dates=dates,
+            param_overrides=param_overrides,
+            market_configs=market_configs,
+            initial_cash=initial_cash,
+            latency_ms=latency_ms,
+            fee_max_pct=fee_max_pct,
+            fee_enabled=fee_enabled,
+            gap_threshold=gap_threshold,
+            gap_max_interval_s=gap_max_interval_s,
+            bayesian_relationships=bayesian_relationships,
+        )
+
     all_metrics = []
     for mc in market_configs:
         result = _run_single_backtest(
@@ -696,6 +799,7 @@ def _run_multi_market_backtest(
             strategy_adapter=strategy_adapter,
             gap_threshold=gap_threshold,
             gap_max_interval_s=gap_max_interval_s,
+            stochastic_seed=stochastic_seed,
         )
         if result is not None and result.get("total_fills", 0) >= 1:
             all_metrics.append(result)
@@ -717,6 +821,195 @@ def _run_multi_market_backtest(
     return avg
 
 
+def _run_contagion_multi_market_backtest(
+    data_dir: str,
+    dates: list[str],
+    param_overrides: dict[str, float],
+    market_configs: list[dict[str, Any]],
+    initial_cash: float,
+    latency_ms: float,
+    fee_max_pct: float,
+    fee_enabled: bool,
+    gap_threshold: float = 0.01,
+    gap_max_interval_s: float = 300.0,
+) -> dict[str, Any] | None:
+    """Run a true shared replay for the contagion arb across all configured markets."""
+    from src.backtest.engine import BacktestConfig, BacktestEngine
+    from src.backtest.strategy import ContagionReplayAdapter, split_strategy_and_legacy_params
+    from src.core.config import StrategyParams
+
+    asset_ids: set[str] = set()
+    for config in market_configs:
+        asset_ids.add(str(config.get("yes_asset_id") or ""))
+        asset_ids.add(str(config.get("no_asset_id") or ""))
+    asset_ids.discard("")
+    loader = _build_data_loader(data_dir, dates, asset_ids=asset_ids)
+    if loader is None:
+        return None
+
+    if gap_threshold > 0:
+        gap_ratio = _compute_gap_ratio(
+            data_dir,
+            dates,
+            None,
+            asset_ids,
+            gap_max_interval_s,
+        )
+        if gap_ratio > gap_threshold:
+            log.warning(
+                "wfo_data_quality_abort",
+                dates=f"{dates[0]}..{dates[-1]}",
+                gap_ratio=round(gap_ratio, 4),
+                threshold=gap_threshold,
+                strategy_adapter="contagion_arb",
+            )
+            return None
+
+    strategy_param_overrides, _legacy_signal_params = split_strategy_and_legacy_params(
+        param_overrides
+    )
+    params = StrategyParams(**strategy_param_overrides)
+    strategy = ContagionReplayAdapter(
+        market_configs=market_configs,
+        fee_enabled=fee_enabled,
+        initial_bankroll=initial_cash,
+        params=params,
+    )
+    config = BacktestConfig(
+        initial_cash=initial_cash,
+        latency_ms=latency_ms,
+        fee_max_pct=fee_max_pct,
+        fee_enabled=fee_enabled,
+    )
+
+    engine = BacktestEngine(strategy=strategy, data_loader=loader, config=config)
+    result = engine.run()
+    return result.metrics.to_dict()
+
+
+def _run_bayesian_multi_market_backtest(
+    data_dir: str,
+    dates: list[str],
+    param_overrides: dict[str, float],
+    market_configs: list[dict[str, Any]],
+    initial_cash: float,
+    latency_ms: float,
+    fee_max_pct: float,
+    fee_enabled: bool,
+    gap_threshold: float = 0.01,
+    gap_max_interval_s: float = 300.0,
+    bayesian_relationships: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Run a shared replay for SI-10 across all configured markets."""
+    from src.backtest.engine import BacktestConfig, BacktestEngine
+    from src.backtest.strategy import BayesianReplayAdapter, split_strategy_and_legacy_params
+    from src.core.config import StrategyParams
+
+    if not bayesian_relationships:
+        return None
+
+    asset_ids: set[str] = set()
+    for config in market_configs:
+        asset_ids.add(str(config.get("yes_asset_id") or ""))
+        asset_ids.add(str(config.get("no_asset_id") or ""))
+    asset_ids.discard("")
+    loader = _build_data_loader(data_dir, dates, asset_ids=asset_ids)
+    if loader is None:
+        return None
+
+    if gap_threshold > 0:
+        gap_ratio = _compute_gap_ratio(
+            data_dir,
+            dates,
+            None,
+            asset_ids,
+            gap_max_interval_s,
+        )
+        if gap_ratio > gap_threshold:
+            log.warning(
+                "wfo_data_quality_abort",
+                dates=f"{dates[0]}..{dates[-1]}",
+                gap_ratio=round(gap_ratio, 4),
+                threshold=gap_threshold,
+                strategy_adapter="bayesian_arb",
+            )
+            return None
+
+    strategy_param_overrides, _legacy_signal_params = split_strategy_and_legacy_params(
+        param_overrides
+    )
+    params = StrategyParams(**strategy_param_overrides)
+    strategy = BayesianReplayAdapter(
+        market_configs=market_configs,
+        relationships=bayesian_relationships,
+        fee_enabled=fee_enabled,
+        initial_bankroll=initial_cash,
+        params=params,
+    )
+    config = BacktestConfig(
+        initial_cash=initial_cash,
+        latency_ms=latency_ms,
+        fee_max_pct=fee_max_pct,
+        fee_enabled=fee_enabled,
+    )
+
+    engine = BacktestEngine(strategy=strategy, data_loader=loader, config=config)
+    result = engine.run()
+    return result.metrics.to_dict()
+
+
+def _trial_backtest_worker(
+    queue: Any,
+    *,
+    multi_market: bool,
+    kwargs: dict[str, Any],
+) -> None:
+    """Run a trial replay in a separate process so it can be hard-killed."""
+    try:
+        if multi_market:
+            result = _run_multi_market_backtest(**kwargs)
+        else:
+            result = _run_single_backtest(**kwargs)
+        queue.put(("ok", result))
+    except Exception as exc:  # pragma: no cover - defensive child-process path
+        queue.put(("error", repr(exc)))
+
+
+def _run_backtest_with_timeout(
+    *,
+    timeout_s: float,
+    multi_market: bool,
+    kwargs: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None | str]:
+    """Execute a backtest in a child process and enforce a wall-clock timeout."""
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_trial_backtest_worker,
+        kwargs={
+            "queue": queue,
+            "multi_market": multi_market,
+            "kwargs": kwargs,
+        },
+    )
+    proc.start()
+    proc.join(timeout_s)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5.0)
+        return ("timeout", None)
+
+    if queue.empty():
+        return ("ok", None)
+
+    status, payload = queue.get()
+    return status, payload
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Single-backtest runner (must be picklable → top-level function)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -735,6 +1028,8 @@ def _run_single_backtest(
     strategy_adapter: str = "bot_replay",
     gap_threshold: float = 0.01,
     gap_max_interval_s: float = 300.0,
+    bayesian_relationships: list[dict[str, Any]] | None = None,
+    stochastic_seed: int | None = None,
 ) -> dict[str, Any] | None:
     """Run one backtest and return serialised metrics.
 
@@ -748,10 +1043,13 @@ def _run_single_backtest(
     from src.backtest.engine import BacktestConfig, BacktestEngine
     from src.backtest.strategy import (
         BotReplayAdapter,
+        ContagionReplayAdapter,
         PureMarketMakerReplayAdapter,
         split_strategy_and_legacy_params,
     )
     from src.core.config import StrategyParams
+
+    del bayesian_relationships
 
     loader = _build_data_loader(
         data_dir,
@@ -785,6 +1083,8 @@ def _run_single_backtest(
     )
     params = StrategyParams(**strategy_param_overrides)
 
+    if strategy_adapter == "contagion_arb":
+        return None
     if strategy_adapter == "pure_market_maker":
         strategy = PureMarketMakerReplayAdapter(
             market_id=market_id,
@@ -804,6 +1104,7 @@ def _run_single_backtest(
             initial_bankroll=initial_cash,
             params=params,
             legacy_signal_params=legacy_signal_params,
+            stochastic_seed=stochastic_seed,
         )
 
     config = BacktestConfig(
@@ -914,17 +1215,51 @@ def _objective(
         strategy_adapter=wfo_cfg.strategy_adapter,
         gap_threshold=wfo_cfg.gap_threshold,
         gap_max_interval_s=wfo_cfg.gap_max_interval_s,
+        bayesian_relationships=_load_bayesian_relationships(wfo_cfg.bayesian_relationships_path),
+        stochastic_seed=trial.number,
     )
 
     if market_configs:
-        metrics = _run_multi_market_backtest(market_configs=market_configs, **_common)
-    else:
-        metrics = _run_single_backtest(
-            market_id=wfo_cfg.market_id,
-            yes_asset_id=wfo_cfg.yes_asset_id,
-            no_asset_id=wfo_cfg.no_asset_id,
-            **_common,
+        run_status, payload = _run_backtest_with_timeout(
+            timeout_s=wfo_cfg.trial_timeout_s,
+            multi_market=True,
+            kwargs={"market_configs": market_configs, **_common},
         )
+    else:
+        run_status, payload = _run_backtest_with_timeout(
+            timeout_s=wfo_cfg.trial_timeout_s,
+            multi_market=False,
+            kwargs={
+                "market_id": wfo_cfg.market_id,
+                "yes_asset_id": wfo_cfg.yes_asset_id,
+                "no_asset_id": wfo_cfg.no_asset_id,
+                **_common,
+            },
+        )
+
+    if run_status == "timeout":
+        trial.set_user_attr("timed_out", True)
+        trial.set_user_attr("timed_out_params", suggested)
+        log.warning(
+            "wfo_trial_timeout",
+            trial=trial.number,
+            timeout_s=wfo_cfg.trial_timeout_s,
+            window_ms=suggested.get("window_ms"),
+            params=suggested,
+        )
+        return -9999.0
+
+    if run_status == "error":
+        log.warning(
+            "wfo_trial_worker_error",
+            trial=trial.number,
+            window_ms=suggested.get("window_ms"),
+            params=suggested,
+            error=payload,
+        )
+        return float("-inf")
+
+    metrics = payload
 
     if metrics is None:
         return float("-inf")
@@ -1163,9 +1498,9 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
     # ── Load market configs (auto-detect from market_map.json) ─────────
     market_configs: list[dict] | None = None
     _SYNTH_PLACEHOLDERS = {"YES_TOKEN", "0x" + "a1" * 16}
-    if cfg.yes_asset_id in _SYNTH_PLACEHOLDERS:
+    if cfg.market_configs_path or cfg.yes_asset_id in _SYNTH_PLACEHOLDERS:
         # No specific market provided → multi-market mode
-        loaded = _load_market_configs(cfg.data_dir)
+        loaded = _load_market_configs(cfg.data_dir, cfg.market_configs_path)
         if loaded:
             if cfg.max_markets is not None and cfg.max_markets < len(loaded):
                 loaded = loaded[:cfg.max_markets]
@@ -1173,7 +1508,14 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             market_configs = loaded
             log.info("wfo_multi_market_mode", n_markets=len(market_configs))
         else:
-            log.warning("wfo_no_market_configs", msg="market_map.json not found; using placeholder IDs")
+            log.warning(
+                "wfo_no_market_configs",
+                msg=(
+                    f"market config file not found: {cfg.market_configs_path}"
+                    if cfg.market_configs_path
+                    else "market_map.json not found; using placeholder IDs"
+                ),
+            )
 
     # ── Serialise config for child processes ───────────────────────────
     cfg_dict = {
@@ -1205,9 +1547,12 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         "gap_threshold": cfg.gap_threshold,
         "gap_max_interval_s": cfg.gap_max_interval_s,
         "output_params_path": cfg.output_params_path,
+        "market_configs_path": cfg.market_configs_path,
+        "bayesian_relationships_path": cfg.bayesian_relationships_path,
         "search_space_bounds_path": cfg.search_space_bounds_path,
         "strategy_adapter": cfg.strategy_adapter,
         "search_space_params": cfg.search_space_params,
+        "trial_timeout_s": cfg.trial_timeout_s,
     }
 
     fold_results: list[FoldResult] = []
@@ -1249,32 +1594,53 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
                 log.warning("wfo_warm_start_failed", fold=fold.index)
 
         # ── Parallel trial execution ──────────────────────────────────
-        trials_per_worker = max(1, math.ceil(cfg.n_trials / cfg.max_workers))
+        completed_trials = len(study.trials)
+        remaining_trials = max(cfg.n_trials - completed_trials, 0)
 
-        if cfg.max_workers > 1:
-            with ProcessPoolExecutor(max_workers=cfg.max_workers) as pool:
-                futures = [
-                    pool.submit(
-                        _worker,
-                        study_name,
-                        cfg.storage_url,
-                        fold.train_dates,
-                        cfg_dict,
-                        trials_per_worker,
-                        market_configs,
-                        bounds_override,
-                    )
-                    for _ in range(cfg.max_workers)
-                ]
-                for fut in futures:
-                    fut.result()  # propagate exceptions
-        else:
-            # Single-process mode (simpler debugging / testing)
-            study.optimize(
-                lambda trial: _objective(trial, fold.train_dates, cfg, market_configs, bounds_override),
-                n_trials=cfg.n_trials,
-                n_jobs=1,
+        if remaining_trials == 0:
+            log.info(
+                "wfo_fold_trials_already_complete",
+                fold=fold.index,
+                existing_trials=completed_trials,
+                target_trials=cfg.n_trials,
             )
+        else:
+            log.info(
+                "wfo_fold_resume_progress",
+                fold=fold.index,
+                existing_trials=completed_trials,
+                remaining_trials=remaining_trials,
+                target_trials=cfg.n_trials,
+            )
+
+        if remaining_trials > 0:
+            trials_per_worker = max(1, math.ceil(remaining_trials / cfg.max_workers))
+
+            if cfg.max_workers > 1:
+                worker_count = min(cfg.max_workers, remaining_trials)
+                with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                    futures = [
+                        pool.submit(
+                            _worker,
+                            study_name,
+                            cfg.storage_url,
+                            fold.train_dates,
+                            cfg_dict,
+                            trials_per_worker,
+                            market_configs,
+                            bounds_override,
+                        )
+                        for _ in range(worker_count)
+                    ]
+                    for fut in futures:
+                        fut.result()  # propagate exceptions
+            else:
+                # Single-process mode (simpler debugging / testing)
+                study.optimize(
+                    lambda trial: _objective(trial, fold.train_dates, cfg, market_configs, bounds_override),
+                    n_trials=remaining_trials,
+                    n_jobs=1,
+                )
 
         # Re-load study to pick up all worker results
         study = optuna.load_study(study_name=study_name, storage=cfg.storage_url)
@@ -1285,6 +1651,7 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
         best_params = study.best_params
         best_score = study.best_value
+        best_trial_number = study.best_trial.number
         prev_best_params = dict(best_params)  # for warm-start
 
         log.info(
@@ -1305,6 +1672,8 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             strategy_adapter=cfg.strategy_adapter,
             gap_threshold=cfg.gap_threshold,
             gap_max_interval_s=cfg.gap_max_interval_s,
+            bayesian_relationships=_load_bayesian_relationships(cfg.bayesian_relationships_path),
+            stochastic_seed=best_trial_number,
         )
 
         def _replay(dates: list[str]) -> dict | None:

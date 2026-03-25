@@ -396,11 +396,12 @@ class BacktestEngine:
             is_taker=data.get("is_taker", False),
         )
 
-        # Feed aggregator for bar generation
-        agg = self._get_aggregator(event.asset_id)
-        bar = agg.on_trade(trade_event)
-        if bar is not None:
-            self.strategy.on_bar(event.asset_id, bar)
+        # Strategies that self-aggregate should not pay for a second OHLCV pass.
+        if not getattr(self.strategy, "self_aggregates_trades", False):
+            agg = self._get_aggregator(event.asset_id)
+            bar = agg.on_trade(trade_event)
+            if bar is not None:
+                self.strategy.on_bar(event.asset_id, bar)
 
         # Notify strategy
         self.strategy.on_trade(event.asset_id, trade_event)

@@ -106,6 +106,16 @@ class StrategyParams:
     alpha_min: float = _env_float("ALPHA_MIN", 0.40)
     alpha_max: float = _env_float("ALPHA_MAX", 0.55)
     min_spread_cents: float = _env_float("MIN_SPREAD_CENTS", 4.0)
+    ofi_threshold: float = _env_float("OFI_THRESHOLD", 0.75)
+    window_ms: int = _env_int("OFI_WINDOW_MS", 2000)
+    ofi_tvi_kappa: float = _env_float("OFI_TVI_KAPPA", 1.0)
+    toxicity_window_ms: int = _env_int("TOXICITY_WINDOW_MS", 2000)
+    toxicity_depth_evaporation_pct: float = _env_float("TOXICITY_DEPTH_EVAPORATION_PCT", 0.20)
+    toxicity_sweep_depth_ratio: float = _env_float("TOXICITY_SWEEP_DEPTH_RATIO", 0.25)
+    ofi_toxicity_scale_threshold: float = _env_float("OFI_TOXICITY_SCALE_THRESHOLD", 0.60)
+    ofi_toxicity_size_boost_max: float = _env_float("OFI_TOXICITY_SIZE_BOOST_MAX", 2.0)
+    take_profit_pct: float = _env_float("TAKE_PROFIT_PCT", 0.02)
+    stop_loss_pct: float = _env_float("STOP_LOSS_PCT", 0.02)
 
     # Edge quality filter: minimum EQS (0-100) for entry.  Uses binary
     # entropy, fee efficiency, tick viability, and signal strength.
@@ -586,6 +596,20 @@ class StrategyParams:
     cross_mkt_z_entry: float = _env_float("CROSS_MKT_Z_ENTRY", 2.0)
     cross_mkt_spread_ewma_lambda: float = _env_float("CROSS_MKT_SPREAD_EWMA_LAMBDA", 0.94)
 
+    # SI-10: L2 Toxicity Contagion Arb
+    contagion_arb_enabled: bool = _env_bool("CONTAGION_ARB_ENABLED", True)
+    contagion_arb_shadow: bool = _env_bool("CONTAGION_ARB_SHADOW", True)
+    contagion_arb_min_correlation: float = _env_float("CONTAGION_ARB_MIN_CORRELATION", 0.35)
+    contagion_arb_trigger_percentile: float = _env_float("CONTAGION_ARB_TRIGGER_PERCENTILE", 0.95)
+    contagion_arb_min_history: int = _env_int("CONTAGION_ARB_MIN_HISTORY", 24)
+    contagion_arb_min_leader_shift: float = _env_float("CONTAGION_ARB_MIN_LEADER_SHIFT", 0.01)
+    contagion_arb_min_residual_shift: float = _env_float("CONTAGION_ARB_MIN_RESIDUAL_SHIFT", 0.01)
+    contagion_arb_toxicity_impulse_scale: float = _env_float("CONTAGION_ARB_TOXICITY_IMPULSE_SCALE", 0.06)
+    contagion_arb_cooldown_seconds: float = _env_float("CONTAGION_ARB_COOLDOWN_SECONDS", 45.0)
+    contagion_arb_max_pairs_per_leader: int = _env_int("CONTAGION_ARB_MAX_PAIRS_PER_LEADER", 3)
+    contagion_arb_max_lagging_spread_pct: float = _env_float("CONTAGION_ARB_MAX_LAGGING_SPREAD_PCT", 3.0)
+    contagion_arb_max_last_trade_age_s: float = _env_float("CONTAGION_ARB_MAX_LAST_TRADE_AGE_S", 300.0)
+
     # â”€â”€ SI-4: Stealth Execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Time-sliced order splitting to reduce market footprint.
     stealth_enabled: bool = _env_bool("STEALTH_ENABLED", True)
@@ -664,12 +688,32 @@ class StrategyParams:
     si9_chase_interval_ms: int = _env_int("SI9_CHASE_INTERVAL_MS", 500)
     si9_scan_interval_ms: int = _env_int("SI9_SCAN_INTERVAL_MS", 500)
     si9_min_leg_depth_usd: float = _env_float("SI9_MIN_LEG_DEPTH_USD", 50.0)
+    # Pause maker-leg entry when rolling top-of-book imbalance shows
+    # an extreme wave against our passive BUY.
+    si9_ofi_window_ms: int = _env_int("SI9_OFI_WINDOW_MS", 2000)
+    si9_toxic_ofi_threshold: float = _env_float("SI9_TOXIC_OFI_THRESHOLD", 0.85)
+    si9_latency_option_window_ms: int = _env_int("SI9_LATENCY_OPTION_WINDOW_MS", 5000)
     # Max taker fee (cents) tolerated when emergency-hedging a hanging leg.
     # If the taker cost exceeds this, the bot dumps filled legs instead.
     si9_emergency_taker_max_cents: float = _env_float("SI9_EMERGENCY_TAKER_MAX_CENTS", 4.0)
     # Max spread (cents) on best_ask for a lagging leg before the bot
     # gives up crossing and dumps filled legs instead.
     si9_emergency_max_spread_cents: float = _env_float("SI9_EMERGENCY_MAX_SPREAD_CENTS", 5.0)
+
+    # SI-10: Bayesian Joint-Probability Arbitrage
+    # Relationships are configured as a JSON array of objects containing
+    # base_a_condition_id, base_b_condition_id, joint_condition_id, and
+    # optional relationship_id / label fields.
+    si10_bayesian_arb_enabled: bool = _env_bool("SI10_BAYESIAN_ARB_ENABLED", False)
+    si10_min_margin_cents: float = _env_float("SI10_MIN_MARGIN_CENTS", 2.0)
+    si10_margin_buffer_cents: float = _env_float("SI10_MARGIN_BUFFER_CENTS", 1.0)
+    si10_scan_interval_ms: int = _env_int("SI10_SCAN_INTERVAL_MS", 500)
+    si10_min_leg_depth_usd: float = _env_float("SI10_MIN_LEG_DEPTH_USD", 50.0)
+    si10_min_net_edge_usd: float = _env_float("SI10_MIN_NET_EDGE_USD", 0.10)
+    si10_min_annualized_yield: float = _env_float("SI10_MIN_ANNUALIZED_YIELD", 0.15)
+    si10_maker_ofi_tolerance: float = _env_float("SI10_MAKER_OFI_TOLERANCE", 0.85)
+    si10_default_days_to_resolution: float = _env_float("SI10_DEFAULT_DAYS_TO_RESOLUTION", 7.0)
+    si10_relationships_json: str = _env("SI10_RELATIONSHIPS_JSON", "[]")
 
 
 @dataclass(frozen=True)

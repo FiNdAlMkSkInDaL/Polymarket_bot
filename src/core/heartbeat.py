@@ -1,10 +1,9 @@
 """
-Tiered WebSocket health monitor — transport-layer heartbeat with
-position-aware asset staleness checks.
+Tiered WebSocket health monitor focused on transport-layer liveness.
 
 Architecture
 ────────────
-The monitor operates on two independent layers:
+The monitor operates on two liveness layers:
 
 1. **Transport layer** — checks ``L2WebSocket._last_message_time``,
    which is updated on every incoming WS data frame (deltas,
@@ -18,16 +17,14 @@ The monitor operates on two independent layers:
    ``ws_silence_timeout_s`` watchdog provides the hard safety net for
    truly dead connections.
 
-2. **Position layer** — for assets with **open positions only**,
-   checks per-book ``_last_update`` to ensure the specific books
-   we are *trading against* are receiving data.  Inactive markets
-   without positions are ignored — they are irrelevant to execution
-   safety.
+2. **Legacy fallback layer** — when no WS transport is wired
+    (tests, offline modes, legacy non-L2 paths), scans tracker
+    timestamps to detect a genuinely stale local data pipeline.
 
-Suspension occurs when either layer is stale for ``stale_ms``
-(transport requires consecutive confirmation).  Recovery requires
-the transport layer to be healthy (the WS must be alive), at which
-point individual books will naturally re-sync.
+In live execution, suspension occurs only when the WebSocket transport
+itself is stale for ``stale_ms`` (with consecutive confirmation), not
+when a single market book is simply quiet.  Recovery requires the
+transport layer to become healthy again.
 
 Usage::
 
@@ -78,7 +75,8 @@ class BookHeartbeat:
         contents.
     latency_guard:
         Shared ``LatencyGuard``.  Will be force-blocked when the
-        transport or a positioned asset goes stale.
+        transport goes stale, or when legacy fallback detects no fresh
+        local data path.
     fast_kill_event:
         Shared ``asyncio.Event`` from the adverse-selection guard.
         Cleared on stale detection to pause all chasers.
@@ -90,8 +88,8 @@ class BookHeartbeat:
         back to per-tracker scanning (legacy mode / tests).
     get_position_assets:
         Callable returning the set of ``asset_id`` strings that currently
-        have open positions.  Only these assets are checked at the
-        position layer.
+        have open positions.  Retained for compatibility with existing
+        bot wiring.
     telegram:
         Optional ``TelegramAlerter`` for notifications.
     polygon_checker:
@@ -198,40 +196,7 @@ class BookHeartbeat:
                     await self._resume()
                     return
 
-        # ── Layer 2: Positioned-asset health ──────────────────────────
-        #
-        # Only check assets we have open positions on.  Low-activity
-        # markets without positions are irrelevant — a 10s gap on them
-        # is not a safety concern.
-        position_assets = self._get_position_assets()
-        if position_assets:
-            stalest_ms = 0.0
-            stalest_asset = ""
-            for asset_id in position_assets:
-                tracker = self._books.get(asset_id)
-                if tracker is None or tracker._last_update <= 0:
-                    continue
-                age_ms = (now - tracker._last_update) * 1000
-                if age_ms > stalest_ms:
-                    stalest_ms = age_ms
-                    stalest_asset = asset_id
-
-            # Position-level stale: the book we are actively trading
-            # against hasn't updated.  Use a larger multiplier (6×)
-            # since individual markets are naturally less frequent.
-            position_stale_ms = self._stale_ms * 6
-            if stalest_ms > position_stale_ms:
-                if not self._is_suspended:
-                    await self._suspend(
-                        stalest_ms,
-                        reason="position_book_stale",
-                        detail=stalest_asset[:16],
-                    )
-                else:
-                    await self._escalate_cancel_if_needed()
-                return
-
-        # ── Layer 2.5: Polygon head-lag health ─────────────────────────
+        # ── Layer 2: Polygon head-lag health ───────────────────────────
         #
         # If a PolygonHeadLagChecker is wired, check blockchain head lag.
         # Excessive lag indicates Polygon is stalled, which affects

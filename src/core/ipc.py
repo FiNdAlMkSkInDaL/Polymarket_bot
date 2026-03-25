@@ -14,14 +14,14 @@ Components
 ``SharedBookReader``
     Used in the main process to read the latest book state.
 
-Memory layout (per asset, total = 3_424 bytes):
+Memory layout (per asset, total = 3_432 bytes):
     Control region (16 bytes):
         seqlock_counter uint64      8   (even = idle, odd = write in progress)
         active_block    uint8       1   (0 = Block A active, 1 = Block B active)
         _pad            7 bytes
 
-    Block A — Data block (1_704 bytes), offset 16:
-        Header (104 bytes):
+    Block A — Data block (1_708 bytes), offset 16:
+        Header (108 bytes):
             seq             uint64      8
             timestamp       float64     8
             server_time     float64     8
@@ -31,6 +31,8 @@ Memory layout (per asset, total = 3_424 bytes):
             ask_depth_usd   float64     8
             spread_score    float64     8
             depth_near_mid  float64     8   (pre-computed for ASG fast-path)
+            buy_toxicity    float64     8
+            sell_toxicity   float64     8
             state           uint8       1
             latency_state   uint8       1   (0=HEALTHY 1=DEGRADED 2=BLOCKED)
             is_reliable     uint8       1
@@ -46,7 +48,7 @@ Memory layout (per asset, total = 3_424 bytes):
             price           float64     8
             size            float64     8
 
-    Block B — Data block (1_704 bytes), offset 1_720:
+    Block B — Data block (1_708 bytes), offset 1_724:
         (identical layout to Block A)
 """
 
@@ -66,8 +68,8 @@ _log = logging.getLogger(__name__)
 
 # ── Layout constants ───────────────────────────────────────────────────────
 MAX_LEVELS = 50
-_HEADER_FMT = "<QddddddddBBB5xHHII"  # little-endian
-_HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 104 bytes
+_HEADER_FMT = "<QddddddddddBBB5xHHII"  # little-endian
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 108 bytes
 _LEVEL_FMT = "<dd"  # price + size
 _LEVEL_SIZE = struct.calcsize(_LEVEL_FMT)  # 16 bytes
 _LEVELS_BLOCK = MAX_LEVELS * _LEVEL_SIZE  # 800 bytes per side
@@ -82,12 +84,12 @@ _SEQ_OFFSET = 0
 _ACTIVE_OFFSET = _SEQ_SIZE                             # 8
 
 # ── Data block (header + bids + asks, NO lock byte) ────────────────────────
-_DATA_BLOCK_SIZE = _HEADER_SIZE + 2 * _LEVELS_BLOCK    # 1704 bytes
+_DATA_BLOCK_SIZE = _HEADER_SIZE + 2 * _LEVELS_BLOCK    # 1708 bytes
 
 # ── Block offsets within shared memory ─────────────────────────────────────
 _BLOCK_A_OFFSET = _CONTROL_SIZE                        # 16
-_BLOCK_B_OFFSET = _CONTROL_SIZE + _DATA_BLOCK_SIZE     # 1720
-BLOCK_SIZE = _CONTROL_SIZE + 2 * _DATA_BLOCK_SIZE      # 3424 bytes
+_BLOCK_B_OFFSET = _CONTROL_SIZE + _DATA_BLOCK_SIZE     # 1724
+BLOCK_SIZE = _CONTROL_SIZE + 2 * _DATA_BLOCK_SIZE      # 3432 bytes
 
 # ── Seqlock reader limits ──────────────────────────────────────────────────
 _MAX_SEQLOCK_RETRIES = 10
@@ -129,6 +131,8 @@ class SharedBookSnapshot:
     ask_depth_usd: float = 0.0
     spread_score: float = 0.0
     depth_near_mid: float = 0.0
+    buy_toxicity: float = 0.0
+    sell_toxicity: float = 0.0
     state: int = 0  # raw enum value
     latency_state: int = 0
     is_reliable: bool = True
@@ -199,6 +203,8 @@ class SharedBookWriter:
         ask_depth_usd: float,
         spread_score: float,
         depth_near_mid: float,
+        buy_toxicity: float,
+        sell_toxicity: float,
         state: int,
         latency_state: int,
         is_reliable: bool,
@@ -245,6 +251,8 @@ class SharedBookWriter:
             ask_depth_usd,
             spread_score,
             depth_near_mid,
+            buy_toxicity,
+            sell_toxicity,
             state,
             latency_state,
             1 if is_reliable else 0,
@@ -352,6 +360,7 @@ class SharedBookReader:
             (
                 seq, timestamp, server_time, best_bid, best_ask,
                 bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
+                buy_toxicity, sell_toxicity,
                 state, latency_state, is_reliable_byte,
                 n_bid, n_ask, delta_count, desync_total,
             ) = fields
@@ -368,6 +377,8 @@ class SharedBookReader:
                 ask_depth_usd=ask_depth_usd,
                 spread_score=spread_score,
                 depth_near_mid=depth_near_mid,
+                buy_toxicity=buy_toxicity,
+                sell_toxicity=sell_toxicity,
                 state=state,
                 latency_state=latency_state,
                 is_reliable=bool(is_reliable_byte),
@@ -411,6 +422,7 @@ class SharedBookReader:
             (
                 seq, timestamp, server_time, best_bid, best_ask,
                 bid_depth_usd, ask_depth_usd, spread_score, depth_near_mid,
+                buy_toxicity, sell_toxicity,
                 state, latency_state, is_reliable_byte,
                 n_bid, n_ask, delta_count, desync_total,
             ) = fields
@@ -447,6 +459,8 @@ class SharedBookReader:
                 ask_depth_usd=ask_depth_usd,
                 spread_score=spread_score,
                 depth_near_mid=depth_near_mid,
+                buy_toxicity=buy_toxicity,
+                sell_toxicity=sell_toxicity,
                 state=state,
                 latency_state=latency_state,
                 is_reliable=bool(is_reliable_byte),

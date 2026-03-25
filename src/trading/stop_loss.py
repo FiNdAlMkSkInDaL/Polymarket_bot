@@ -135,6 +135,22 @@ class StopLossMonitor:
 
     async def _evaluate_position(self, pos) -> None:
         """Evaluate stop-loss for a single position."""
+        if getattr(pos, "signal_type", "") == "ofi_momentum":
+            was_closed = pos.state == PositionState.CLOSED
+            await self._pm.evaluate_ofi_local_exit(pos)
+            if not was_closed and pos.state == PositionState.CLOSED:
+                await self._store.record(pos)
+                setattr(pos, "_recorded", True)
+                await self._telegram.notify_exit(
+                    pos.id,
+                    pos.entry_price,
+                    pos.exit_price,
+                    pos.pnl_cents,
+                    pos.exit_reason,
+                    self._pm.smart_passive_counters,
+                )
+            return
+
         eval_asset = pos.trade_asset_id or pos.no_asset_id
         mid = self._get_mid_price(eval_asset)
         if mid <= 0:

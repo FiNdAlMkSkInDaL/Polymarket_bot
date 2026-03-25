@@ -22,6 +22,7 @@ from src.core.logger import get_logger
 from src.data.types import Level as _Level
 
 log = get_logger(__name__)
+_TOP_DEPTH_EWMA_ALPHA = 0.2
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -81,6 +82,8 @@ class OrderbookTracker:
         self._prev_best_ask: float = 0.0
         # Depth history ring buffer for Ghost Liquidity detection
         self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
+        self._bid_depth_ewma: float = 0.0
+        self._ask_depth_ewma: float = 0.0
 
     def on_price_change(self, data: dict) -> None:
         """Process a ``price_change`` WS event.
@@ -229,6 +232,18 @@ class OrderbookTracker:
                 depth += lv.price * lv.size
         return depth
 
+    def toxicity_index(self, side: str = "BUY") -> float:
+        del side
+        return 0.0
+
+    def toxicity_metrics(self, side: str = "BUY") -> dict[str, float]:
+        del side
+        return {
+            "toxicity_index": 0.0,
+            "toxicity_depth_evaporation": 0.0,
+            "toxicity_sweep_ratio": 0.0,
+        }
+
     @property
     def spread_cents(self) -> float:
         """Current spread in cents (convenience)."""
@@ -295,14 +310,39 @@ class OrderbookTracker:
     # ── depth tracking for Ghost Liquidity detection ─────────────────────
     def _record_depth(self) -> None:
         """Append current total depth to the ring buffer."""
-        depth = self.current_total_depth()
+        bid_depth, ask_depth = self.top_depths_usd()
+        if self._bid_depth_ewma <= 0:
+            self._bid_depth_ewma = bid_depth
+        else:
+            self._bid_depth_ewma = (
+                _TOP_DEPTH_EWMA_ALPHA * bid_depth
+                + (1.0 - _TOP_DEPTH_EWMA_ALPHA) * self._bid_depth_ewma
+            )
+        if self._ask_depth_ewma <= 0:
+            self._ask_depth_ewma = ask_depth
+        else:
+            self._ask_depth_ewma = (
+                _TOP_DEPTH_EWMA_ALPHA * ask_depth
+                + (1.0 - _TOP_DEPTH_EWMA_ALPHA) * self._ask_depth_ewma
+            )
+        depth = round(bid_depth + ask_depth, 2)
         self._depth_history.append((time.time(), depth))
 
     def current_total_depth(self) -> float:
         """Return combined top-5 bid + ask depth in USD."""
+        bid_d, ask_d = self.top_depths_usd()
+        return round(bid_d + ask_d, 2)
+
+    def top_depths_usd(self) -> tuple[float, float]:
         bid_d = sum(l.price * l.size for l in self._bids[:5])
         ask_d = sum(l.price * l.size for l in self._asks[:5])
-        return round(bid_d + ask_d, 2)
+        return round(bid_d, 2), round(ask_d, 2)
+
+    def top_depth_ewma(self, side: str) -> float:
+        current_bid, current_ask = self.top_depths_usd()
+        if side.lower() in ("bid", "buy"):
+            return round(self._bid_depth_ewma or current_bid, 2)
+        return round(self._ask_depth_ewma or current_ask, 2)
 
     def depth_velocity(self, window_s: float = 2.0) -> float | None:
         """Compute the fractional depth change over *window_s* seconds.
@@ -458,11 +498,32 @@ class L2OrderBookAdapter(OrderbookTracker):
     def current_total_depth(self) -> float:
         return self._l2.current_total_depth()
 
+    def top_depths_usd(self) -> tuple[float, float]:
+        if hasattr(self._l2, "top_depths_usd"):
+            return self._l2.top_depths_usd()
+        snap = self._l2.snapshot()
+        return (
+            round(getattr(snap, "bid_depth_usd", 0.0), 2),
+            round(getattr(snap, "ask_depth_usd", 0.0), 2),
+        )
+
+    def top_depth_ewma(self, side: str) -> float:
+        if hasattr(self._l2, "top_depth_ewma"):
+            return self._l2.top_depth_ewma(side)
+        bid_depth, ask_depth = self.top_depths_usd()
+        return bid_depth if side.lower() in ("bid", "buy") else ask_depth
+
     def depth_velocity(self, window_s: float = 2.0) -> float | None:
         return self._l2.depth_velocity(window_s)
 
     def depth_near_mid_usd(self, cents: float, max_levels: int = 50) -> float:
         return self._l2.depth_near_mid_usd(cents, max_levels)
+
+    def toxicity_index(self, side: str = "BUY") -> float:
+        return self._l2.toxicity_index(side)
+
+    def toxicity_metrics(self, side: str = "BUY") -> dict[str, float]:
+        return self._l2.toxicity_metrics(side)
 
 
 class SharedBookReaderAdapter(OrderbookTracker):
@@ -581,6 +642,14 @@ class SharedBookReaderAdapter(OrderbookTracker):
         snap = self._reader.read_header()
         return round(snap.bid_depth_usd + snap.ask_depth_usd, 2)
 
+    def top_depths_usd(self) -> tuple[float, float]:
+        snap = self._reader.read_header()
+        return round(snap.bid_depth_usd, 2), round(snap.ask_depth_usd, 2)
+
+    def top_depth_ewma(self, side: str) -> float:
+        bid_depth, ask_depth = self.top_depths_usd()
+        return bid_depth if side.lower() in ("bid", "buy") else ask_depth
+
     def depth_velocity(self, window_s: float = 2.0) -> float | None:
         # Depth history is maintained in-process by L2OrderBook —
         # not available via shared memory.  Return None (safe default:
@@ -605,3 +674,16 @@ class SharedBookReaderAdapter(OrderbookTracker):
                 if abs(price - mid) <= threshold:
                     depth += price * size
         return depth
+
+    def toxicity_index(self, side: str = "BUY") -> float:
+        snap = self._reader.read_header()
+        if side.upper() == "SELL":
+            return float(snap.sell_toxicity or 0.0)
+        return float(snap.buy_toxicity or 0.0)
+
+    def toxicity_metrics(self, side: str = "BUY") -> dict[str, float]:
+        return {
+            "toxicity_index": round(self.toxicity_index(side), 6),
+            "toxicity_depth_evaporation": 0.0,
+            "toxicity_sweep_ratio": 0.0,
+        }

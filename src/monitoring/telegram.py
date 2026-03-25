@@ -108,20 +108,152 @@ class TelegramAlerter:
         )
 
     async def notify_exit(
-        self, pos_id: str, entry: float, exit_p: float, pnl: float, reason: str
+        self,
+        pos_id: str,
+        entry: float,
+        exit_p: float,
+        pnl: float,
+        reason: str,
+        smart_passive_counters: dict[str, int] | None = None,
     ) -> None:
         emoji = "✅" if pnl > 0 else "❌"
+        counters_block = self._format_smart_passive_counters(
+            smart_passive_counters,
+            include_zero=False,
+        )
         await self.send(
             f"{emoji} <b>Position Closed</b>\n"
             f"Pos: {pos_id}\n"
             f"Entry: {entry:.2f}¢ → Exit: {exit_p:.2f}¢\n"
             f"PnL: {pnl:+.2f}¢  ({reason})"
+            f"{counters_block}"
         )
 
     async def notify_stats(self, stats: dict) -> None:
         lines = [f"📊 <b>Stats Update</b>"]
         for k, v in stats.items():
+            if k == "smart_passive_counters" and isinstance(v, dict):
+                lines.append(
+                    "  smart_passive: "
+                    f"started={int(v.get('smart_passive_started', 0))} | "
+                    f"maker_filled={int(v.get('maker_filled', 0))} | "
+                    f"fallback={int(v.get('fallback_triggered', 0))}"
+                )
+                continue
             lines.append(f"  {k}: {v}")
+        await self.send("\n".join(lines))
+
+    async def notify_combo_arb_deferred(
+        self,
+        event_id: str,
+        maker_leg: str,
+        rolling_vi: float,
+        threshold: float,
+        *,
+        current_vi: float = 0.0,
+        question: str = "",
+    ) -> None:
+        safe_event = _html.escape(event_id[:24])
+        safe_leg = _html.escape(maker_leg[:24])
+        safe_question = _html.escape(question[:80])
+        question_line = f"Market: {safe_question}\n" if safe_question else ""
+        await self.send(
+            f"⏸️ <b>SI-9 Deferred</b>\n"
+            f"Event: <code>{safe_event}</code>\n"
+            f"{question_line}"
+            f"Maker leg: <code>{safe_leg}</code>\n"
+            f"Reason: toxic OFI wave\n"
+            f"Rolling VI: {rolling_vi:.3f}  |  Current VI: {current_vi:.3f}\n"
+            f"Threshold: {threshold:.3f}"
+        )
+
+    async def notify_combo_arb_resumed(
+        self,
+        event_id: str,
+        maker_leg: str,
+        defer_count: int,
+        *,
+        question: str = "",
+    ) -> None:
+        safe_event = _html.escape(event_id[:24])
+        safe_leg = _html.escape(maker_leg[:24])
+        safe_question = _html.escape(question[:80])
+        question_line = f"Market: {safe_question}\n" if safe_question else ""
+        await self.send(
+            f"▶️ <b>SI-9 Resumed</b>\n"
+            f"Event: <code>{safe_event}</code>\n"
+            f"{question_line}"
+            f"Maker leg: <code>{safe_leg}</code>\n"
+            f"Deferred scans cleared: {defer_count}"
+        )
+
+    async def notify_bayesian_arb_signal(
+        self,
+        relationship_id: str,
+        *,
+        label: str,
+        bound_title: str,
+        bound_expression: str,
+        observed_yes_prices: dict[str, float],
+        traded_leg_prices: dict[str, dict[str, float | str]],
+        shares: float,
+        edge_cents: float,
+        gross_edge_cents: float,
+        spread_cost_cents: float,
+        taker_fee_cents: float,
+        net_ev_usd: float,
+        annualized_yield: float,
+        days_to_resolution: float,
+        collateral_usd: float,
+    ) -> None:
+        safe_relationship = _html.escape(relationship_id[:24])
+        safe_label = _html.escape(label[:80])
+        safe_bound_title = _html.escape(bound_title)
+        safe_expression = _html.escape(bound_expression)
+        observed_block = (
+            f"A YES: {float(observed_yes_prices.get('base_a_yes', 0.0)):.4f}\n"
+            f"B YES: {float(observed_yes_prices.get('base_b_yes', 0.0)):.4f}\n"
+            f"Joint YES: {float(observed_yes_prices.get('joint_yes', 0.0)):.4f}"
+        )
+        leg_lines: list[str] = []
+        for asset_id, leg in traded_leg_prices.items():
+            leg_lines.append(
+                f"<code>{_html.escape(asset_id[:20])}</code> "
+                f"{_html.escape(str(leg.get('role', '')))} "
+                f"{_html.escape(str(leg.get('trade_side', '')))} "
+                f"bid={float(leg.get('best_bid', 0.0)):.4f} "
+                f"ask={float(leg.get('best_ask', 0.0)):.4f} "
+                f"target={float(leg.get('target_price', 0.0)):.4f} "
+                f"fee={int(float(leg.get('fee_bps', 0.0) or 0.0))}bps"
+            )
+
+        await self.send(
+            f"📐 <b>SI-10 Bayesian Arb</b>\n"
+            f"Relationship: <code>{safe_relationship}</code>\n"
+            f"Label: {safe_label}\n"
+            f"{safe_bound_title}\n"
+            f"Math: {safe_expression}\n"
+            f"Observed YES prices:\n{observed_block}\n"
+            f"Traded legs:\n" + "\n".join(leg_lines) + "\n"
+            f"Shares: {shares:.2f}  |  Net edge: {edge_cents:.2f}¢  |  Collateral: ${collateral_usd:.2f}\n"
+            f"Gross: {gross_edge_cents:.2f}¢  |  Spread: {spread_cost_cents:.2f}¢  |  Fees: {taker_fee_cents:.2f}¢\n"
+            f"Net EV: ${net_ev_usd:.4f}  |  Annualized: {annualized_yield * 100.0:.2f}%  |  Horizon: {days_to_resolution:.1f}d"
+        )
+
+    async def notify_toxicity_rankings(self, rankings: list[dict[str, Any]]) -> None:
+        if not rankings:
+            return
+
+        lines = ["☣️ <b>Top Market Toxicity</b>"]
+        for idx, row in enumerate(rankings[:5], 1):
+            question = _html.escape(str(row.get("question", ""))[:48])
+            condition_id = _html.escape(str(row.get("condition_id", ""))[:16])
+            lines.append(
+                f"{idx}. <code>{condition_id}</code> {question}\n"
+                f"   {row.get('dominant_side', 'BUY')} tox={float(row.get('toxicity_index', 0.0)):.2f}  "
+                f"evap={float(row.get('depth_evaporation', 0.0)):.2f}  "
+                f"sweep={float(row.get('sweep_ratio', 0.0)):.2f}"
+            )
         await self.send("\n".join(lines))
 
     async def notify_rpe_signal(
@@ -208,7 +340,50 @@ class TelegramAlerter:
             f"Positions: {n_pos}  |  Gross: ${gross:.2f}  |  Net: ${net:.2f}"
         )
 
-    async def notify_paper_summary(self, stats: dict, uptime_h: float) -> None:
+    async def notify_contagion_matrix(self, data: dict[str, Any]) -> None:
+        """Send a structured Domino shadow/live matrix alert."""
+        mode = "👻 SHADOW" if data.get("shadow", True) else "🎯 LIVE"
+        if data.get("suppressed"):
+            mode = f"{mode} SUPPRESSED"
+
+        leader_id = _html.escape(str(data.get("leader_market_id", ""))[:24])
+        lagger_id = _html.escape(str(data.get("lagging_market_id", ""))[:24])
+        leader_q = _html.escape(str(data.get("leader_question", ""))[:72])
+        lagger_q = _html.escape(str(data.get("lagging_question", ""))[:72])
+        question_block = ""
+        if leader_q or lagger_q:
+            question_block = (
+                f"Leader: {leader_q or leader_id}\n"
+                f"Lagger: {lagger_q or lagger_id}\n"
+            )
+
+        suppression = ""
+        if data.get("suppressed"):
+            suppression = f"\nSuppressed: {_html.escape(str(data.get('suppression_reason', 'unknown')))}"
+
+        await self.send(
+            f"🧩 {mode} <b>Domino Matrix</b>\n"
+            f"{question_block}"
+            f"Leader <code>{leader_id}</code> {data.get('leader_direction', '')} tox-excess="
+            f"{float(data.get('leader_toxicity_excess', 0.0)):.3f}\n"
+            f"Lagger <code>{lagger_id}</code> corr={float(data.get('correlation', 0.0)):.3f}  |  "
+            f"theme={_html.escape(str(data.get('thematic_group', ''))[:24])}\n"
+            f"Shift math: Δleader={float(data.get('leader_price_shift_cents', 0.0)):+.2f}¢  ×  "
+            f"ρ={float(data.get('correlation', 0.0)):.3f}  →  Δfair={float(data.get('expected_shift_cents', 0.0)):+.2f}¢\n"
+            f"Fair={float(data.get('fair_value', 0.0)):.3f}  |  Market={float(data.get('market_price', 0.0)):.3f}  |  "
+            f"Edge={float(data.get('edge_cents', 0.0)):+.2f}¢\n"
+            f"Cross slip={float(data.get('cross_spread_slip_cents', 0.0)):.2f}¢  |  "
+            f"Last trade age={float(data.get('last_trade_age_s', -1.0)):.1f}s"
+            f"{suppression}"
+        )
+
+    async def notify_paper_summary(
+        self,
+        stats: dict,
+        uptime_h: float,
+        *,
+        toxicity_rankings: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Send a formatted paper trade performance summary.
 
         Parameters
@@ -226,9 +401,26 @@ class TelegramAlerter:
         total_pnl = stats.get("total_pnl", 0.0)
         best = stats.get("best_trade", 0.0)
         worst = stats.get("worst_trade", 0.0)
+        counters_block = self._format_smart_passive_counters(
+            stats.get("smart_passive_counters"),
+            include_zero=True,
+        )
 
         emoji = "📈" if total_pnl >= 0 else "📉"
         tph = total / max(0.01, uptime_h)
+        toxicity_lines = ""
+        if toxicity_rankings:
+            ranked_lines = []
+            for idx, row in enumerate(toxicity_rankings[:5], 1):
+                condition_id = _html.escape(str(row.get("condition_id", ""))[:16])
+                question = _html.escape(str(row.get("question", ""))[:36])
+                ranked_lines.append(
+                    f"{idx}. <code>{condition_id}</code> {question}\n"
+                    f"   {row.get('dominant_side', 'BUY')} tox={float(row.get('toxicity_index', 0.0)):.2f}  "
+                    f"evap={float(row.get('depth_evaporation', 0.0)):.2f}  "
+                    f"sweep={float(row.get('sweep_ratio', 0.0)):.2f}"
+                )
+            toxicity_lines = "\n☣️ <b>Top Toxicity</b>\n" + "\n".join(ranked_lines)
 
         await self.send(
             f"{emoji} <b>Paper Trade Summary</b>\n"
@@ -237,6 +429,30 @@ class TelegramAlerter:
             f"Avg PnL: {avg_pnl:+.2f}¢  |  Total: {total_pnl:+.2f}¢\n"
             f"Best: {best:+.2f}¢  |  Worst: {worst:+.2f}¢\n"
             f"Uptime: {uptime_h:.1f}h"
+            f"{counters_block}"
+            f"{toxicity_lines}"
+        )
+
+    @staticmethod
+    def _format_smart_passive_counters(
+        counters: dict[str, int] | None,
+        *,
+        include_zero: bool,
+    ) -> str:
+        if not counters:
+            return ""
+
+        started = int(counters.get("smart_passive_started", 0) or 0)
+        maker_filled = int(counters.get("maker_filled", 0) or 0)
+        fallback = int(counters.get("fallback_triggered", 0) or 0)
+        if not include_zero and started == 0 and maker_filled == 0 and fallback == 0:
+            return ""
+
+        return (
+            "\n"
+            f"Smart-passive: {started} started  |  "
+            f"{maker_filled} maker-filled  |  "
+            f"{fallback} fallback"
         )
 
     async def notify_kill(self) -> None:

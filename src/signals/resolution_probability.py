@@ -837,6 +837,10 @@ class ResolutionProbabilityEngine(SignalGenerator):
     def shadow_mode(self) -> bool:
         return self._shadow_mode
 
+    @property
+    def min_confidence(self) -> float:
+        return self._min_confidence
+
     def get_estimate(self, market_id: str) -> ModelEstimate | None:
         """Return the latest model estimate for a market, or None."""
         return self._estimates.get(market_id)
@@ -850,6 +854,83 @@ class ResolutionProbabilityEngine(SignalGenerator):
         """
         self._estimates.pop(condition_id, None)
         log.info("rpe_market_cleared", condition_id=condition_id)
+
+    def evaluate_probability_dislocation(
+        self,
+        *,
+        market_id: str,
+        market_price: float,
+        implied_probability: float,
+        confidence: float,
+        model_name: str,
+        shadow_mode: bool | None = None,
+        model_metadata: dict[str, Any] | None = None,
+        signal_name: str | None = None,
+    ) -> SignalResult | None:
+        """Apply the standard RPE threshold math to an external fair value.
+
+        Used by secondary alpha engines that derive a fair YES probability
+        outside the built-in model stack but still want identical divergence,
+        confidence, and direction logic before routing into the RPE execution
+        funnel.
+        """
+        if market_price <= 0 or market_price >= 1:
+            return None
+
+        prob = max(0.01, min(0.99, float(implied_probability)))
+        conf = max(0.01, min(0.99, float(confidence)))
+        shadow = self._shadow_mode if shadow_mode is None else shadow_mode
+
+        if conf < self._min_confidence:
+            log.debug(
+                "rpe_low_confidence",
+                market=market_id,
+                confidence=round(conf, 3),
+                min_required=self._min_confidence,
+                model=model_name,
+            )
+            return None
+
+        divergence = market_price - prob
+        abs_div = abs(divergence)
+        effective_threshold = self._confidence_threshold * (1.0 + (1.0 - conf))
+        if abs_div <= effective_threshold:
+            return None
+
+        direction = "buy_no" if divergence > 0 else "buy_yes"
+        score = min(1.0, abs_div / 0.20)
+
+        log.info(
+            "rpe_signal_fired",
+            market=market_id,
+            model=model_name,
+            model_prob=round(prob, 4),
+            market_price=round(market_price, 4),
+            divergence=round(divergence, 4),
+            confidence=round(conf, 3),
+            direction=direction,
+            score=round(score, 3),
+            shadow=shadow,
+            threshold=round(effective_threshold, 4),
+        )
+
+        return SignalResult(
+            name=signal_name or self.name,
+            market_id=market_id,
+            score=score,
+            metadata={
+                "model_probability": prob,
+                "confidence": conf,
+                "divergence": divergence,
+                "direction": direction,
+                "model_name": model_name,
+                "shadow_mode": shadow,
+                "model_metadata": model_metadata or {},
+                "effective_threshold": effective_threshold,
+                "uncertainty_penalty": 1.0 - conf,
+            },
+            timestamp=time.time(),
+        )
 
     def evaluate(self, **kwargs: Any) -> SignalResult | None:
         """Evaluate the RPE signal for a single market.
@@ -913,69 +994,14 @@ class ResolutionProbabilityEngine(SignalGenerator):
             )
             return None
 
-        # ── Confidence gate ─────────────────────────────────────────────
-        if estimate.confidence < self._min_confidence:
-            log.debug(
-                "rpe_low_confidence",
-                market=market.condition_id,
-                confidence=round(estimate.confidence, 3),
-                min_required=self._min_confidence,
-                model=estimate.model_name,
-            )
-            return None
-
-        # ── Divergence check ────────────────────────────────────────────
-        divergence = market_price - estimate.probability
-        abs_div = abs(divergence)
-
-        # Adaptive threshold: widens with uncertainty (1 - confidence)
-        effective_threshold = self._confidence_threshold * (
-            1.0 + (1.0 - estimate.confidence)
-        )
-
-        if abs_div <= effective_threshold:
-            return None
-
-        # ── Direction ───────────────────────────────────────────────────
-        # If market_price > model_estimate: market overvalues YES → buy NO
-        # If market_price < model_estimate: market undervalues YES → buy YES
-        direction = "buy_no" if divergence > 0 else "buy_yes"
-
-        # ── Score (0–1, saturates at 20¢ divergence) ────────────────────
-        score = min(1.0, abs_div / 0.20)
-
-        log.info(
-            "rpe_signal_fired",
-            market=market.condition_id,
-            model=estimate.model_name,
-            model_prob=round(estimate.probability, 4),
-            market_price=round(market_price, 4),
-            divergence=round(divergence, 4),
-            confidence=round(estimate.confidence, 3),
-            direction=direction,
-            score=round(score, 3),
-            shadow=self._shadow_mode,
-            threshold=round(effective_threshold, 4),
-        )
-
-        return SignalResult(
-            name=self.name,
+        return self.evaluate_probability_dislocation(
             market_id=market.condition_id,
-            score=score,
-            metadata={
-                "model_probability": estimate.probability,
-                "confidence": estimate.confidence,
-                "divergence": divergence,
-                "direction": direction,
-                "model_name": estimate.model_name,
-                "shadow_mode": self._shadow_mode,
-                "model_metadata": estimate.metadata,
-                "effective_threshold": effective_threshold,
-                # Uncertainty penalty for Kelly sizer integration:
-                # higher confidence → lower penalty → larger positions
-                "uncertainty_penalty": 1.0 - estimate.confidence,
-            },
-            timestamp=time.time(),
+            market_price=market_price,
+            implied_probability=estimate.probability,
+            confidence=estimate.confidence,
+            model_name=estimate.model_name,
+            shadow_mode=self._shadow_mode,
+            model_metadata=estimate.metadata,
         )
 
 
