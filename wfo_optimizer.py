@@ -115,6 +115,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-trials", type=int, default=40)
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--max-markets", type=int, default=25)
+    parser.add_argument(
+        "--market-configs",
+        default=None,
+        help="Path to a JSON list of target markets with yes/no asset IDs.",
+    )
     parser.add_argument("--storage-path", default=str(DEFAULT_STORAGE_PATH))
     parser.add_argument("--report-path", default=str(DEFAULT_REPORT_PATH))
     parser.add_argument("--params-path", default=str(DEFAULT_PARAMS_PATH))
@@ -143,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         storage_url=f"sqlite:///{Path(args.storage_path).as_posix()}",
         output_params_path=str(params_path),
         max_markets=args.max_markets,
+        market_configs_path=args.market_configs,
         strategy_adapter="pure_market_maker",
         search_space_params=TARGET_PARAMS,
     )

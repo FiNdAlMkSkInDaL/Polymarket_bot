@@ -44,6 +44,7 @@ from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
 from src.signals.signal_framework import BaseSignal, VacuumSignal
 from src.trading.executor import Order, OrderExecutor, OrderSide, OrderStatus
+from src.trading.ensemble_risk import EnsembleRiskManager
 from src.trading.fees import (
     compute_adaptive_stop_loss_cents,
     compute_adaptive_trailing_offset_cents,
@@ -157,6 +158,7 @@ class Position:
 
     # Pillar 16: Alpha-source attribution
     signal_type: str = ""         # "panic", "drift", "rpe", "stink_bid"
+    strategy_source: str = ""
     meta_weight: float = 1.0     # SI-6 MetaStrategyController weight at entry
 
     # Pillar 11.3: initial vol multiplier used at open time so the
@@ -255,6 +257,7 @@ class PositionManager:
         book_trackers: dict[str, Any] | None = None,
         maker_monitor: Any | None = None,
         iceberg_detectors: dict[str, IcebergDetector] | None = None,
+        ensemble_risk: EnsembleRiskManager | None = None,
     ):
         self.executor = executor
         self.max_open = max_open_positions or settings.strategy.max_open_positions
@@ -267,6 +270,7 @@ class PositionManager:
         self._book_trackers = book_trackers or {}  # asset_id → OrderbookTracker
         self._maker_monitor = maker_monitor  # AdverseSelectionMonitor (V1/V4)
         self._iceberg_detectors = iceberg_detectors or {}  # asset_id → IcebergDetector
+        self._ensemble_risk = ensemble_risk or EnsembleRiskManager()
         self._stealth = None  # StealthExecutor — injected by bot.py when stealth_enabled
         self._ohlcv_aggs: dict[str, OHLCVAggregator] | None = None  # asset_id → aggregator; injected by bot.py
         self._positions: dict[str, Position] = {}
@@ -301,6 +305,87 @@ class PositionManager:
         self._smart_passive_started_count: int = 0
         self._smart_passive_maker_filled_count: int = 0
         self._smart_passive_fallback_triggered_count: int = 0
+
+    @property
+    def ensemble_risk(self) -> EnsembleRiskManager:
+        return self._ensemble_risk
+
+    @staticmethod
+    def _normalize_strategy_source(strategy_source: str | None) -> str:
+        value = (strategy_source or "").strip()
+        return value or "unknown_strategy"
+
+    def _resolve_strategy_source(
+        self,
+        signal: BaseSignal | None = None,
+        signal_metadata: dict[str, Any] | None = None,
+        *,
+        fallback: str = "unknown_strategy",
+    ) -> str:
+        meta = signal_metadata or {}
+        source = meta.get("signal_source") or getattr(signal, "signal_source", "")
+        return self._normalize_strategy_source(source or fallback)
+
+    def _ensemble_allows_entry(
+        self,
+        *,
+        market_id: str,
+        direction: str,
+        strategy_source: str,
+        log_event: str,
+    ) -> bool:
+        allowed, reason = self._ensemble_risk.can_enter(
+            market_id=market_id,
+            strategy_source=strategy_source,
+            direction=direction,
+        )
+        if allowed:
+            return True
+        log.info(
+            log_event,
+            market_id=market_id,
+            direction=reason["direction"] if reason else direction,
+            strategy_source=strategy_source,
+            blocking_strategy=(reason or {}).get("blocking_strategy", ""),
+        )
+        return False
+
+    def _ensemble_allows_batch_entry(
+        self,
+        *,
+        strategy_source: str,
+        exposures: list[tuple[str, str]],
+        log_event: str,
+        entry_id: str,
+    ) -> bool:
+        allowed, reason = self._ensemble_risk.can_enter_batch(
+            strategy_source=strategy_source,
+            exposures=exposures,
+        )
+        if allowed:
+            return True
+        log.info(
+            log_event,
+            entry_id=entry_id,
+            market_id=(reason or {}).get("market_id", ""),
+            direction=(reason or {}).get("direction", ""),
+            strategy_source=strategy_source,
+            blocking_strategy=(reason or {}).get("blocking_strategy", ""),
+        )
+        return False
+
+    def _register_ensemble_position(self, pos: Position) -> None:
+        if pos.filled_size <= 0 and pos.entry_size <= 0:
+            return
+        self._ensemble_risk.register_position(
+            position_id=pos.id,
+            market_id=pos.market_id,
+            strategy_source=pos.strategy_source,
+            direction=pos.trade_side or "NO",
+        )
+
+    def _release_ensemble_position(self, pos: Position) -> None:
+        self._ensemble_risk.release_position(pos.id)
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -389,6 +474,7 @@ class PositionManager:
                 pos.state = PositionState.ENTRY_FILLED
                 pos.filled_size = order.filled_size or pos.entry_size
                 pos.entry_price = order.filled_avg_price or cross_price
+                self._register_ensemble_position(pos)
                 log.info(
                     "combo_taker_leg_filled",
                     combo_id=combo.combo_id,
@@ -433,6 +519,7 @@ class PositionManager:
             pos.state = PositionState.ENTRY_FILLED
             pos.filled_size = order.filled_size or pos.entry_size
             pos.entry_price = order.filled_avg_price or order.price or pos.entry_price
+            self._register_ensemble_position(pos)
 
             if market_id == combo.maker_market_id and not combo.sweep_triggered:
                 log.info(
@@ -819,6 +906,19 @@ class PositionManager:
     ) -> Position | None:
         """Open a strict taker-routed OFI momentum position."""
         del no_aggregator
+        strategy_source = self._resolve_strategy_source(
+            signal,
+            signal_metadata,
+            fallback="ofi_momentum",
+        )
+
+        if not self._ensemble_allows_entry(
+            market_id=signal.market_id,
+            direction="NO",
+            strategy_source=strategy_source,
+            log_event="ensemble_risk_blocked_momentum_entry",
+        ):
+            return None
 
         passed, max_trade, var_was_bisected = await self._check_risk_gates(
             signal.market_id, event_id,
@@ -984,6 +1084,7 @@ class PositionManager:
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=0,
             signal_type="ofi_momentum",
+            strategy_source=strategy_source,
             meta_weight=meta_weight,
             max_hold_seconds=max_hold_seconds,
             entry_toxicity_index=round(toxicity_index, 6),
@@ -1025,6 +1126,19 @@ class PositionManager:
     ) -> Position | None:
         """Inner implementation of open_position (runs under _entry_lock)."""
         strat = settings.strategy
+        strategy_source = self._resolve_strategy_source(
+            signal,
+            signal_metadata,
+            fallback="panic",
+        )
+
+        if not self._ensemble_allows_entry(
+            market_id=signal.market_id,
+            direction="NO",
+            strategy_source=strategy_source,
+            log_event="ensemble_risk_blocked_position_entry",
+        ):
+            return None
 
         passed, max_trade, var_was_bisected = await self._check_risk_gates(
             signal.market_id, event_id,
@@ -1481,6 +1595,7 @@ class PositionManager:
             is_probe=is_probe,
             sl_vol_multiplier=_sl_vol_mult,
             signal_type=_signal_type,
+            strategy_source=strategy_source,
             meta_weight=_meta_weight,
         )
 
@@ -1581,6 +1696,10 @@ class PositionManager:
     ) -> Position | None:
         """Inner implementation of open_rpe_position (runs under _entry_lock)."""
         strat = settings.strategy
+        strategy_source = self._resolve_strategy_source(
+            signal_metadata=signal_metadata,
+            fallback="rpe",
+        )
 
         # Shadow mode: log but do not trade
         if strat.rpe_shadow_mode:
@@ -1596,6 +1715,14 @@ class PositionManager:
 
         # Determine trade direction before risk gates for PCE directional awareness
         trade_direction = "YES" if direction == "buy_yes" else "NO"
+
+        if not self._ensemble_allows_entry(
+            market_id=market_id,
+            direction=trade_direction,
+            strategy_source=strategy_source,
+            log_event="ensemble_risk_blocked_rpe_entry",
+        ):
+            return None
 
         passed, max_trade, var_was_bisected = await self._check_risk_gates(
             market_id, event_id, trade_direction=trade_direction,
@@ -1901,6 +2028,7 @@ class PositionManager:
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=0,
             signal_type="rpe",
+            strategy_source=strategy_source,
             meta_weight=_rpe_meta_weight,
         )
 
@@ -1939,6 +2067,7 @@ class PositionManager:
         pos.state = PositionState.ENTRY_FILLED
         pos.entry_price = pos.entry_order.filled_avg_price or pos.entry_price
         pos.entry_toxicity_index = self._capture_fill_toxicity_index(pos, side="BUY")
+        self._register_ensemble_position(pos)
 
         if pos.signal_type == "ofi_momentum":
             log.info(
@@ -2032,6 +2161,8 @@ class PositionManager:
             and pos.exit_order.status == OrderStatus.FILLED
         ):
             self._smart_passive_maker_filled_count += 1
+
+        self._release_ensemble_position(pos)
 
         pos.state = PositionState.CLOSED
         pos.exit_price = (
@@ -3085,8 +3216,28 @@ class PositionManager:
         if not self._is_combo_like_signal(signal):
             return None
 
+        strategy_source = self._normalize_strategy_source(
+            getattr(signal, "signal_source", "")
+            or ("si10_bayesian_arb" if hasattr(signal, "relationship_label") else "si9_combo_arb")
+        )
+        proposed_exposures = [
+            (
+                getattr(leg, "market_id", ""),
+                getattr(leg, "trade_side", "YES") or "YES",
+            )
+            for leg in signal.legs
+        ]
+
         strat = settings.strategy
         async with self._entry_lock:
+            if not self._ensemble_allows_batch_entry(
+                strategy_source=strategy_source,
+                exposures=proposed_exposures,
+                log_event="ensemble_risk_blocked_combo_entry",
+                entry_id=getattr(signal, "cluster_event_id", ""),
+            ):
+                return None
+
             # ── Combo-specific risk gates ──────────────────────────────
             if self._circuit_breaker_tripped:
                 log.warning("combo_blocked_circuit_breaker")
@@ -3189,6 +3340,7 @@ class PositionManager:
                 trade_side=maker_trade_side,
                 yes_asset_id=maker_leg.yes_token_id,
                 signal_type="combo_arb",
+                strategy_source=strategy_source,
                 fee_enabled=False,
             )
             self._positions[maker_pos.id] = maker_pos
@@ -3211,6 +3363,7 @@ class PositionManager:
                     trade_side=leg_trade_side,
                     yes_asset_id=leg.yes_token_id,
                     signal_type="combo_arb",
+                    strategy_source=strategy_source,
                     fee_enabled=True,
                 )
                 legs[pos.market_id] = pos
@@ -3337,6 +3490,7 @@ class PositionManager:
 
             maker_pos.filled_size = maker_pos.entry_order.filled_size
             maker_pos.state = PositionState.ENTRY_FILLED
+            self._register_ensemble_position(maker_pos)
 
             book = self._book_trackers.get(maker_pos.trade_asset_id or maker_pos.yes_asset_id)
             bid = book.best_bid if book is not None else 0.01
@@ -3435,6 +3589,7 @@ class PositionManager:
                     pos.state = PositionState.ENTRY_FILLED
                     pos.filled_size = pos.entry_size
                     pos.entry_price = best_ask
+                    self._register_ensemble_position(pos)
                     log.info(
                         "combo_emergency_taker_fill",
                         combo_id=combo.combo_id,

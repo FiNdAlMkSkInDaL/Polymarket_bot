@@ -11,10 +11,11 @@ from __future__ import annotations
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from src.core.config import settings
 from src.core.logger import get_logger
+from src.signals.microstructure_utils import CrossBookSyncGate
 from src.signals.resolution_probability import ResolutionProbabilityEngine
 
 if TYPE_CHECKING:
@@ -80,6 +81,8 @@ class ContagionArbDetector:
     correlation estimates are delegated to the PortfolioCorrelationEngine.
     """
 
+    _DEBUG_FORCE_MOVE_THRESHOLD = 0.01
+
     def __init__(
         self,
         pce: object,
@@ -95,6 +98,8 @@ class ContagionArbDetector:
         cooldown_seconds: float | None = None,
         max_pairs_per_leader: int | None = None,
         shadow_mode: bool | None = None,
+        max_cross_book_desync_ms: float | None = None,
+        on_sync_block: Callable[[Any], None] | None = None,
     ) -> None:
         strat = settings.strategy
         self._pce = pce
@@ -133,16 +138,39 @@ class ContagionArbDetector:
         )
         self._max_pairs = max_pairs_per_leader or strat.contagion_arb_max_pairs_per_leader
         self._shadow = shadow_mode if shadow_mode is not None else strat.contagion_arb_shadow
+        self._debug_force_signal = bool(strat.debug_force_contagion_signal)
+        self._sync_gate = CrossBookSyncGate(max_cross_book_desync_ms)
+        self._on_sync_block = on_sync_block
 
         self._markets: dict[str, MarketInfo] = {}
         self._snapshots: dict[str, ContagionSnapshot] = {}
         self._last_price_shift: dict[str, float] = {}
         self._toxicity_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=512))
         self._last_signal_at: dict[str, float] = {}
+        self._diagnostics: dict[str, int] = {
+            "evaluations_total": 0,
+            "reject_no_toxicity_spike": 0,
+            "reject_insufficient_leader_impulse": 0,
+            "reject_correlation_too_low": 0,
+            "reject_residual_shift_too_small": 0,
+            "signals_emitted": 0,
+            "forced_signals_emitted": 0,
+        }
+        self._top_leader_shift_samples: list[dict[str, Any]] = []
+        self._top_toxicity_impulse_samples: list[dict[str, Any]] = []
 
     @property
     def shadow_mode(self) -> bool:
         return self._shadow
+
+    def diagnostics_snapshot(self) -> dict[str, Any]:
+        return {
+            **self._diagnostics,
+            "debug_force_contagion_signal": self._debug_force_signal,
+            "debug_force_move_threshold": self._DEBUG_FORCE_MOVE_THRESHOLD,
+            "top_leader_shift_samples": [dict(sample) for sample in self._top_leader_shift_samples],
+            "top_toxicity_impulse_samples": [dict(sample) for sample in self._top_toxicity_impulse_samples],
+        }
 
     def register_market(self, market: MarketInfo) -> None:
         self._markets[market.condition_id] = market
@@ -172,15 +200,27 @@ class ContagionArbDetector:
         no_buy_toxicity: float,
         timestamp: float | None = None,
         universe: list[MarketInfo] | None = None,
+        book_snapshots: tuple[Any, ...] | None = None,
     ) -> list[ContagionArbSignal]:
+        self._diagnostics["evaluations_total"] += 1
+        sync_assessment = None
+        if book_snapshots:
+            sync_assessment = self._sync_gate.assess(book_snapshots)
+            if not sync_assessment.is_synchronized:
+                if self._on_sync_block is not None:
+                    self._on_sync_block(sync_assessment)
+                return []
+
         now = timestamp if timestamp is not None else time.time()
+        if sync_assessment is not None and sync_assessment.latest_timestamp > 0.0:
+            now = sync_assessment.latest_timestamp
         current_price = _clamp_probability(yes_price)
         tags = _normalise_tags(getattr(market, "tags", ""))
 
         previous = self._snapshots.get(market.condition_id)
         leader_shift = 0.0 if previous is None else current_price - previous.yes_price
         self._last_price_shift[market.condition_id] = leader_shift
-        self._snapshots[market.condition_id] = ContagionSnapshot(
+        leader_snapshot = ContagionSnapshot(
             market_id=market.condition_id,
             yes_price=current_price,
             yes_buy_toxicity=max(0.0, min(1.0, float(yes_buy_toxicity))),
@@ -188,6 +228,7 @@ class ContagionArbDetector:
             timestamp=now,
             tags=tags,
         )
+        self._snapshots[market.condition_id] = leader_snapshot
 
         spikes: list[tuple[str, float, float]] = []
         yes_threshold = self._current_percentile(f"{market.condition_id}:buy_yes")
@@ -200,26 +241,75 @@ class ContagionArbDetector:
         self._toxicity_history[f"{market.condition_id}:buy_yes"].append(float(yes_buy_toxicity))
         self._toxicity_history[f"{market.condition_id}:buy_no"].append(float(no_buy_toxicity))
 
-        if previous is None or not spikes:
+        if previous is None:
+            return []
+
+        if self._debug_force_signal:
+            return self._evaluate_forced_signal(
+                market=market,
+                leader_snapshot=leader_snapshot,
+                leader_shift=leader_shift,
+                timestamp=now,
+                universe=universe,
+            )
+
+        if not spikes:
+            self._diagnostics["reject_no_toxicity_spike"] += 1
             return []
 
         signals: list[ContagionArbSignal] = []
         candidate_universe = universe[: self._universe_size] if universe else list(self._markets.values())[: self._universe_size]
         for direction, leader_toxicity, threshold in sorted(spikes, key=lambda row: row[1], reverse=True):
             direction_sign = 1.0 if direction == "buy_yes" else -1.0
-            directional_move = max(0.0, direction_sign * leader_shift)
+            directional_leader_shift = direction_sign * leader_shift
+            directional_move = max(0.0, directional_leader_shift)
             toxicity_impulse = max(0.0, leader_toxicity - threshold) * self._toxicity_impulse_scale
+            self._record_top_sample(
+                self._top_leader_shift_samples,
+                directional_move,
+                {
+                    "market_id": market.condition_id,
+                    "timestamp": round(now, 6),
+                    "direction": direction,
+                    "raw_leader_shift": round(leader_shift, 6),
+                    "directional_leader_shift": round(directional_leader_shift, 6),
+                    "leader_toxicity": round(leader_toxicity, 6),
+                    "toxicity_threshold": round(threshold, 6),
+                },
+            )
+            self._record_top_sample(
+                self._top_toxicity_impulse_samples,
+                toxicity_impulse,
+                {
+                    "market_id": market.condition_id,
+                    "timestamp": round(now, 6),
+                    "direction": direction,
+                    "raw_leader_shift": round(leader_shift, 6),
+                    "directional_leader_shift": round(directional_leader_shift, 6),
+                    "leader_toxicity": round(leader_toxicity, 6),
+                    "toxicity_threshold": round(threshold, 6),
+                },
+            )
             leader_impulse = max(directional_move, toxicity_impulse)
             if leader_impulse < self._min_leader_shift:
+                self._diagnostics["reject_insufficient_leader_impulse"] += 1
                 continue
 
-            for lagger in self._candidate_laggers(market, candidate_universe):
+            for lagger in candidate_universe:
+                if lagger.condition_id == market.condition_id:
+                    continue
                 lag_snapshot = self._snapshots.get(lagger.condition_id)
                 if lag_snapshot is None:
+                    continue
+                lag_sync_assessment = self._sync_gate.assess((leader_snapshot, lag_snapshot))
+                if not lag_sync_assessment.is_synchronized:
+                    if self._on_sync_block is not None:
+                        self._on_sync_block(lag_sync_assessment)
                     continue
 
                 correlation = self._pair_correlation(market.condition_id, lagger.condition_id)
                 if correlation < self._min_corr:
+                    self._diagnostics["reject_correlation_too_low"] += 1
                     continue
 
                 thematic_group = self._shared_theme(market, lagger)
@@ -233,6 +323,7 @@ class ContagionArbDetector:
                 expected_shift = correlation * leader_impulse
                 residual_shift = expected_shift - lag_directional_shift
                 if residual_shift < self._min_residual_shift:
+                    self._diagnostics["reject_residual_shift_too_small"] += 1
                     continue
 
                 if now - self._last_signal_at.get(lagger.condition_id, 0.0) < self._cooldown_seconds:
@@ -272,6 +363,7 @@ class ContagionArbDetector:
 
                 lagging_asset_id = lagger.yes_token_id if direction == "buy_yes" else lagger.no_token_id
                 self._last_signal_at[lagger.condition_id] = now
+                self._diagnostics["signals_emitted"] += 1
                 signals.append(
                     ContagionArbSignal(
                         leading_market_id=market.condition_id,
@@ -295,6 +387,85 @@ class ContagionArbDetector:
                 )
 
         signals.sort(key=lambda item: (-item.score, -item.correlation, -item.leader_toxicity))
+        return signals[: self._max_pairs]
+
+    def _evaluate_forced_signal(
+        self,
+        *,
+        market: MarketInfo,
+        leader_snapshot: ContagionSnapshot,
+        leader_shift: float,
+        timestamp: float,
+        universe: list[MarketInfo] | None,
+    ) -> list[ContagionArbSignal]:
+        if abs(leader_shift) < self._DEBUG_FORCE_MOVE_THRESHOLD:
+            self._diagnostics["reject_insufficient_leader_impulse"] += 1
+            return []
+
+        direction = "buy_yes" if leader_shift > 0 else "buy_no"
+        direction_sign = 1.0 if direction == "buy_yes" else -1.0
+        leader_toxicity = (
+            leader_snapshot.yes_buy_toxicity if direction == "buy_yes" else leader_snapshot.no_buy_toxicity
+        )
+        candidate_universe = universe[: self._universe_size] if universe else list(self._markets.values())[: self._universe_size]
+        signals: list[ContagionArbSignal] = []
+        for lagger in candidate_universe:
+            if lagger.condition_id == market.condition_id:
+                continue
+
+            lag_snapshot = self._snapshots.get(lagger.condition_id)
+            if lag_snapshot is None:
+                continue
+
+            lag_sync_assessment = self._sync_gate.assess((leader_snapshot, lag_snapshot))
+            if not lag_sync_assessment.is_synchronized:
+                if self._on_sync_block is not None:
+                    self._on_sync_block(lag_sync_assessment)
+                continue
+
+            thematic_group = self._shared_theme(market, lagger)
+            if not thematic_group:
+                continue
+
+            if timestamp - self._last_signal_at.get(lagger.condition_id, 0.0) < self._cooldown_seconds:
+                continue
+
+            implied_probability = _clamp_probability(lag_snapshot.yes_price + leader_shift)
+            lagging_asset_id = lagger.yes_token_id if direction == "buy_yes" else lagger.no_token_id
+            correlation = self._pair_correlation(market.condition_id, lagger.condition_id)
+            self._last_signal_at[lagger.condition_id] = timestamp
+            self._diagnostics["signals_emitted"] += 1
+            self._diagnostics["forced_signals_emitted"] += 1
+            signals.append(
+                ContagionArbSignal(
+                    leading_market_id=market.condition_id,
+                    lagging_market_id=lagger.condition_id,
+                    lagging_asset_id=lagging_asset_id,
+                    direction=direction,
+                    implied_probability=implied_probability,
+                    lagging_market_price=lag_snapshot.yes_price,
+                    confidence=0.95,
+                    correlation=correlation,
+                    thematic_group=thematic_group,
+                    toxicity_percentile=0.0,
+                    leader_toxicity=leader_toxicity,
+                    leader_price_shift=leader_shift,
+                    expected_probability_shift=direction_sign * abs(leader_shift),
+                    timestamp=timestamp,
+                    score=1.0 + abs(leader_shift),
+                    is_shadow=self._shadow,
+                    signal_source="debug_force_contagion",
+                    metadata={
+                        "leading_market_id": market.condition_id,
+                        "debug_forced": True,
+                        "leader_price_shift": round(leader_shift, 6),
+                        "thematic_group": thematic_group,
+                        "correlation": round(correlation, 6),
+                    },
+                )
+            )
+
+        signals.sort(key=lambda item: (-item.score, -item.correlation, item.lagging_market_id))
         return signals[: self._max_pairs]
 
     def _candidate_laggers(
@@ -329,6 +500,20 @@ class ContagionArbDetector:
         if matrix is None or not hasattr(matrix, "get"):
             return 0.0
         return max(0.0, min(1.0, float(matrix.get(market_a, market_b))))
+
+    def _record_top_sample(
+        self,
+        bucket: list[dict[str, Any]],
+        magnitude: float,
+        sample: dict[str, Any],
+    ) -> None:
+        candidate = {
+            **sample,
+            "observed_value": round(float(magnitude), 6),
+        }
+        bucket.append(candidate)
+        bucket.sort(key=lambda item: float(item["observed_value"]), reverse=True)
+        del bucket[5:]
 
     def _shared_theme(self, market_a: MarketInfo, market_b: MarketInfo) -> str:
         tags_a = set(_normalise_tags(getattr(market_a, "tags", "")))

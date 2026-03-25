@@ -1,0 +1,50 @@
+[
+  {
+    "relationship_id": "si10-taiwan-escalation-jun30-h1",
+    "label": "China invade Taiwan by Jun 30 AND China blockade Taiwan by Jun 30",
+    "base_a_condition_id": "0xa0b56d7e621c7cbcfa47fe1a9c24f3409e189180fd6bda55b7a8113129839afc",
+    "base_b_condition_id": "0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+    "joint_condition_id": "0x4c80df6f557bb0b9de08c0301ebdce500dd9bdc58400d9269fb8fab1709ed584",
+    "confidence": "medium",
+    "base_a_question": "Will China invade Taiwan by June 30, 2026?",
+    "base_b_question": "Will China blockade Taiwan by June 30?",
+    "joint_question_hypothesis": "Unresolved Taiwan escalation sibling from archived top25 cluster",
+    "evidence": [
+      "data/vps_march2026/logs/bot.jsonl.5 maps 0xa0b56d7e... to 'Will China invade Taiwan by June 30, 2026?'",
+      "data/vps_march2026/logs/bot.jsonl.5 maps 0xb215decb... to 'Will China blockade Taiwan by June 30?'",
+      "data/vps_march2026/logs/bot.jsonl.5 shows 0x4c80df6f... resolving in the same Taiwan-family batch"
+    ]
+  },
+  {
+    "relationship_id": "si10-iran-escalation-before2027-h1",
+    "label": "US invade Iran before 2027 AND Iranian regime falls before 2027",
+    "base_a_condition_id": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846",
+    "base_b_condition_id": "0xbb4d51e6364066d92eb6f9b8413dd7193de70966736044463b205834805a1f3b",
+    "joint_condition_id": "0x9345d5142a67f5541264c96515496affee02580f1c572680759eac9fd2a1588a",
+    "confidence": "low",
+    "base_a_question": "Will the U.S. invade Iran before 2027?",
+    "base_b_question": "Will the Iranian regime fall before 2027?",
+    "joint_question_hypothesis": "Unresolved Iran escalation sibling from archived top25 cluster",
+    "evidence": [
+      "data/mid_tier_reward_audit_2026_03_23.json maps 0x5db999fa... to 'Will the U.S. invade Iran before 2027?'",
+      "data/vps_march2026/logs/bot.jsonl.5 maps 0xbb4d51e6... to 'Will the Iranian regime fall before 2027?'",
+      "data/vps_march2026/logs/bot.jsonl.5 shows 0x9345d514... resolving in the same March 2026 geopolitical archive"
+    ]
+  },
+  {
+    "relationship_id": "si10-trump-china-cluster-h1",
+    "label": "Trump visits China by Apr 30 AND Xi Jinping out before 2027",
+    "base_a_condition_id": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606",
+    "base_b_condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+    "joint_condition_id": "0x0ea8005efbc460378340a2f28a6d97b0d1d9d9d7fba4d16f529b8a415dca77a2",
+    "confidence": "low",
+    "base_a_question": "Will Trump visit China by April 30?",
+    "base_b_question": "Xi Jinping out before 2027?",
+    "joint_question_hypothesis": "Unresolved China-linked sibling archived in same March 2026 top25 set",
+    "evidence": [
+      "data/farming_efficiency_top25.json maps 0x48fbf70c... to 'Will Trump visit China by April 30?'",
+      "data/vps_march2026/logs/bot.jsonl.5 maps 0xa467b14d... to 'Xi Jinping out before 2027?'",
+      "data/vps_march2026/logs/bot.jsonl.5 shows 0x0ea8005e... resolving in the same archived March 2026 batch as 0x48fbf70c..."
+    ]
+  }
+]

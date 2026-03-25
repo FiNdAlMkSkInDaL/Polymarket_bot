@@ -15,6 +15,11 @@ from enum import Enum
 from pathlib import Path
 
 from dotenv import load_dotenv
+from src.core.live_hyperparameters import (
+    LiveHyperparameterValidationError,
+    apply_live_hyperparameter_overrides,
+    default_live_hyperparameters_path,
+)
 
 
 # â”€â”€ Deployment phases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -609,6 +614,11 @@ class StrategyParams:
     contagion_arb_max_pairs_per_leader: int = _env_int("CONTAGION_ARB_MAX_PAIRS_PER_LEADER", 3)
     contagion_arb_max_lagging_spread_pct: float = _env_float("CONTAGION_ARB_MAX_LAGGING_SPREAD_PCT", 3.0)
     contagion_arb_max_last_trade_age_s: float = _env_float("CONTAGION_ARB_MAX_LAST_TRADE_AGE_S", 300.0)
+    debug_force_contagion_signal: bool = _env_bool("DEBUG_FORCE_CONTAGION_SIGNAL", False)
+    max_cross_book_desync_ms: float = _env_float(
+        "MAX_CROSS_BOOK_DESYNC_MS",
+        _env_float("CROSS_BOOK_SYNC_MAX_DESYNC_MS", 400.0),
+    )
 
     # â”€â”€ SI-4: Stealth Execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Time-sliced order splitting to reduce market footprint.
@@ -853,4 +863,16 @@ class Settings:
 
 # Singleton
 settings = Settings()
+
+try:
+    object.__setattr__(
+        settings,
+        "strategy",
+        apply_live_hyperparameter_overrides(settings.strategy),
+    )
+except LiveHyperparameterValidationError as exc:
+    raise ValueError(
+        "Invalid live hyperparameters in "
+        f"{default_live_hyperparameters_path()}: {exc}"
+    ) from exc
 

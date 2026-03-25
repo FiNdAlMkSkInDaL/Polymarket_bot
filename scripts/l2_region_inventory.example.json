@@ -1,0 +1,26 @@
+[
+  {
+    "label": "aws-us-east-1",
+    "host": "ubuntu@203.0.113.10",
+    "remote_dir": "~/l2-region-probe",
+    "python_bin": "python3"
+  },
+  {
+    "label": "aws-eu-central-1",
+    "host": "ubuntu@203.0.113.20",
+    "remote_dir": "~/l2-region-probe",
+    "python_bin": "python3"
+  },
+  {
+    "label": "gcp-europe-west2",
+    "host": "ubuntu@203.0.113.30",
+    "remote_dir": "~/l2-region-probe",
+    "python_bin": "python3"
+  },
+  {
+    "label": "gcp-asia-northeast1",
+    "host": "ubuntu@203.0.113.40",
+    "remote_dir": "~/l2-region-probe",
+    "python_bin": "python3"
+  }
+]

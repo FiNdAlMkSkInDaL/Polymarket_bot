@@ -1,0 +1,56 @@
+{
+  "label": "local-validation",
+  "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+  "channel": "book",
+  "asset_ids": [
+    "95344728193244020854716971584323868633691370479151373416918812532794690491367"
+  ],
+  "started_at": "2026-03-24T22:42:08.770690Z",
+  "ended_at": "2026-03-24T22:42:24.054056Z",
+  "duration_s": 15.274197800001275,
+  "connect_attempts": 1,
+  "successful_connections": 1,
+  "disconnect_count": 0,
+  "total_frames": 1,
+  "total_events": 1,
+  "silence_gap_threshold_ms": 1500.0,
+  "silence_gap_count": 0,
+  "max_silence_gap_ms": 0.0,
+  "connection_uptime_s": {
+    "count": 1,
+    "mean": 15.030544599998393,
+    "stdev": 0.0,
+    "minimum": 15.030544599998393,
+    "p50": 15.030544599998393,
+    "p95": 15.030544599998393,
+    "p99": 15.030544599998393,
+    "maximum": 15.030544599998393
+  },
+  "frame_gap_ms": {
+    "count": 0,
+    "mean": null,
+    "stdev": null,
+    "minimum": null,
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "maximum": null
+  },
+  "exchange_lag_ms": {
+    "count": 0,
+    "mean": null,
+    "stdev": null,
+    "minimum": null,
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "maximum": null
+  },
+  "per_event_type": {
+    "book": 1
+  },
+  "disconnect_reasons": {},
+  "notes": [
+    "No exchange timestamps were observed in received payloads; ranking will rely on frame gaps and disconnects."
+  ]
+}

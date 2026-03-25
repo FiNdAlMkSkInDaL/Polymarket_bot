@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.backtest.strategy import (
     LEGACY_BACKTEST_SIGNAL_DEFAULTS,
@@ -24,6 +24,7 @@ from src.backtest.strategy import (
     split_strategy_and_legacy_params,
 )
 from src.backtest.wfo_optimizer import (
+    Fold,
     FoldResult,
     WfoConfig,
     WfoReport,
@@ -1246,3 +1247,45 @@ class TestBackwardCompatibility:
         )
         assert fr.is_sharpe == 1.5
         assert fr.oos_sharpe == 1.2
+
+
+class TestRunWfoReplayTimeouts:
+    """run_wfo should complete even if best-params replays time out."""
+
+    def test_replay_timeouts_do_not_abort_report(self, tmp_path: Path):
+        import src.backtest.wfo_optimizer as wfo
+
+        dates = [f"2026-01-{day:02d}" for day in range(1, 38)]
+        fold = Fold(index=0, train_dates=dates[:30], test_dates=dates[30:37])
+        storage_path = tmp_path / "wfo_optuna.db"
+        cfg = WfoConfig(
+            data_dir=str(tmp_path),
+            market_id="market",
+            yes_asset_id="yes",
+            no_asset_id="no",
+            allowed_dates=tuple(dates),
+            n_trials=1,
+            max_workers=1,
+            storage_url=f"sqlite:///{storage_path.as_posix()}",
+            output_params_path=None,
+            trial_timeout_s=1.0,
+            search_space_params=("ofi_threshold",),
+        )
+        objective_metrics = {
+            "sharpe_ratio": 1.0,
+            "sortino_ratio": 1.0,
+            "max_drawdown": 0.01,
+            "profit_factor": 1.2,
+            "total_fills": 10,
+        }
+
+        with patch("src.backtest.data_recorder.MarketDataRecorder.available_dates", return_value=dates), \
+             patch.object(wfo, "generate_folds", return_value=[fold]), \
+             patch.object(wfo, "_run_backtest_with_timeout", side_effect=[("ok", objective_metrics), ("timeout", None), ("timeout", None)]):
+            report = wfo.run_wfo(cfg)
+
+        assert len(report.folds) == 1
+        assert report.folds[0].n_trials_completed == 1
+        assert report.folds[0].best_trial_score != float("-inf")
+        assert report.folds[0].is_total_pnl == 0.0
+        assert report.folds[0].oos_total_pnl == 0.0

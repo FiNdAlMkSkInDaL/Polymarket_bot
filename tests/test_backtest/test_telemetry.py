@@ -376,9 +376,11 @@ class TestEquityCurve:
     def test_summary_string(self):
         tel = Telemetry(initial_cash=1000.0)
         tel.record_equity(0.0, 1000.0)
+        tel.set_smart_passive_counters(started=3, maker_filled=2, fallback_triggered=1)
         m = tel.finalize(final_equity=1000.0)
         s = m.summary()
         assert "BACKTEST TELEMETRY REPORT" in s
+        assert "Smart-Passive" in s
 
 
 class TestReset:
@@ -408,6 +410,7 @@ class TestSerialization:
         tel.record_fill(_make_fill(fee=0.5, is_maker=False))
         tel.record_equity(0.0, 1000.0)
         tel.record_equity(1.0, 1005.0)
+        tel.set_smart_passive_counters(started=4, maker_filled=1, fallback_triggered=3)
 
         m = tel.finalize(final_equity=1005.0)
         d = m.to_dict()
@@ -415,4 +418,5 @@ class TestSerialization:
         assert isinstance(d, dict)
         assert "total_pnl" in d
         assert "equity_curve" in d
+        assert d["smart_passive_counters"]["smart_passive_started"] == 4
         assert isinstance(d["equity_curve"], list)

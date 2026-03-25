@@ -208,6 +208,71 @@ class TestTradeStore:
         assert summary == []
         await store.close()
 
+    @pytest.mark.asyncio
+    async def test_get_stochastic_execution_slippage_groups_ofi_exits(self, store):
+        await store.init()
+
+        target_trade = _make_ofi_position(
+            "OFI-TARGET",
+            0.50,
+            0.56,
+            toxicity_index=0.20,
+        )
+        target_trade.drawn_tp = 0.55
+        target_trade.drawn_stop = 0.49
+        target_trade.exit_reason = "target"
+
+        stop_trade = _make_ofi_position(
+            "OFI-STOP",
+            0.50,
+            0.48,
+            toxicity_index=0.35,
+        )
+        stop_trade.drawn_tp = 0.54
+        stop_trade.drawn_stop = 0.49
+        stop_trade.exit_reason = "stop_loss"
+
+        time_stop_trade = _make_ofi_position(
+            "OFI-TIMESTOP",
+            0.50,
+            0.53,
+            toxicity_index=0.52,
+        )
+        time_stop_trade.drawn_tp = 0.57
+        time_stop_trade.drawn_stop = 0.48
+        time_stop_trade.exit_reason = "time_stop"
+
+        await store.record(target_trade)
+        await store.record(stop_trade)
+        await store.record(time_stop_trade)
+
+        summary = await store.get_stochastic_execution_slippage()
+
+        assert [row["exit_bucket"] for row in summary] == ["target", "stop", "time_stop"]
+
+        target = summary[0]
+        assert target["trade_count"] == 1
+        assert target["avg_exit_minus_drawn_tp_cents"] == pytest.approx(1.0)
+        assert target["avg_exit_minus_drawn_stop_cents"] == pytest.approx(7.0)
+        assert target["avg_reference_slippage_cents"] == pytest.approx(1.0)
+        assert target["avg_abs_reference_slippage_cents"] == pytest.approx(1.0)
+
+        stop = summary[1]
+        assert stop["trade_count"] == 1
+        assert stop["avg_exit_minus_drawn_tp_cents"] == pytest.approx(-6.0)
+        assert stop["avg_exit_minus_drawn_stop_cents"] == pytest.approx(-1.0)
+        assert stop["avg_reference_slippage_cents"] == pytest.approx(-1.0)
+        assert stop["avg_abs_reference_slippage_cents"] == pytest.approx(1.0)
+
+        time_stop = summary[2]
+        assert time_stop["trade_count"] == 1
+        assert time_stop["avg_exit_minus_drawn_tp_cents"] == pytest.approx(-4.0)
+        assert time_stop["avg_exit_minus_drawn_stop_cents"] == pytest.approx(5.0)
+        assert time_stop["avg_reference_slippage_cents"] == pytest.approx(0.0)
+        assert time_stop["avg_abs_reference_slippage_cents"] == pytest.approx(0.0)
+
+        await store.close()
+
 
 # ── State-persistence tests ─────────────────────────────────────────────────
 

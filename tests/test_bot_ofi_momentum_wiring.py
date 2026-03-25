@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot import TradingBot
+from src.data.ohlcv import OHLCVAggregator
+from src.signals.ofi_momentum import OFIMomentumSignal
 from src.signals.ofi_momentum import OFIMomentumDetector
 
 
@@ -30,6 +32,7 @@ class FakeSnapshot:
     best_bid: float
     best_ask: float
     timestamp: float
+    ask_depth_usd: float = 50.0
 
 
 class FakeBook:
@@ -43,6 +46,7 @@ class FakeBook:
         best_ask: float,
         ask_size: float,
         timestamp_s: float,
+        ask_depth_usd: float = 50.0,
         *,
         toxicity_buy: float = 0.82,
         toxicity_sell: float = 0.0,
@@ -51,7 +55,12 @@ class FakeBook:
     ) -> None:
         self._bid = FakeLevel(best_bid, bid_size)
         self._ask = FakeLevel(best_ask, ask_size)
-        self._snapshot = FakeSnapshot(best_bid=best_bid, best_ask=best_ask, timestamp=timestamp_s)
+        self._snapshot = FakeSnapshot(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            timestamp=timestamp_s,
+            ask_depth_usd=ask_depth_usd,
+        )
         self._toxicity_buy = toxicity_buy
         self._toxicity_sell = toxicity_sell
         self._depth_evaporation = depth_evaporation
@@ -160,3 +169,37 @@ def test_top_toxicity_rankings_uses_active_l2_markets() -> None:
     assert rankings[0]["toxicity_index"] == pytest.approx(0.91, abs=1e-6)
     assert rankings[1]["dominant_side"] == "BUY"
     assert rankings[1]["toxicity_index"] == pytest.approx(0.82, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_on_panic_signal_suppresses_same_direction_ensemble_overlap() -> None:
+    bot = TradingBot(paper_mode=True)
+    market = FakeMarketInfo(condition_id="MKT-OFI", yes_token_id="YES-1", no_token_id="NO-1")
+    bot._book_trackers[market.no_token_id] = FakeBook(0.49, 95.0, 0.51, 5.0, 1.0)
+    bot.positions.open_position = AsyncMock()
+
+    bot.ensemble_risk.register_position(
+        position_id="LIVE-CONTAGION",
+        market_id=market.condition_id,
+        strategy_source="si10_contagion_arb",
+        direction="NO",
+    )
+
+    signal = OFIMomentumSignal(
+        market_id=market.condition_id,
+        no_asset_id=market.no_token_id,
+        no_best_ask=0.51,
+        signal_source="ofi_momentum",
+        direction="BUY",
+    )
+    no_agg = OHLCVAggregator(market.no_token_id)
+    no_agg.rolling_vwap = 0.50
+
+    await bot._on_panic_signal(
+        signal,
+        no_agg,
+        market,
+        signal_metadata={"signal_source": "ofi_momentum"},
+    )
+
+    bot.positions.open_position.assert_not_awaited()

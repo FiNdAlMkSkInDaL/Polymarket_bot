@@ -355,6 +355,7 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     # OFI momentum entry confirmation
     "ofi_threshold": ("suggest_float", 0.60, 0.95),
     "window_ms": ("suggest_int", 500, 5000),
+    "ofi_tvi_kappa": ("suggest_float", 0.0, 2.0),
     "ofi_toxicity_scale_threshold": ("suggest_float", 0.40, 0.90),
     "ofi_toxicity_size_boost_max": ("suggest_float", 1.0, 3.0),
     # Risk management
@@ -390,18 +391,20 @@ SEARCH_SPACE: dict[str, tuple[Any, ...]] = {
     "pce_structural_prior_weight": ("suggest_int", 5, 30),
     "pce_holding_period_minutes": ("suggest_int", 30, 360),
     # SI-10: Domino contagion arb
-    "contagion_arb_min_correlation": ("suggest_float", 0.70, 0.95),
-    "contagion_arb_trigger_percentile": ("suggest_float", 0.90, 0.99),
+    "contagion_arb_min_correlation": ("suggest_float", 0.30, 0.95),
+    "contagion_arb_trigger_percentile": ("suggest_float", 0.50, 0.99),
     "contagion_arb_min_history": ("suggest_int", 8, 64),
-    "contagion_arb_min_leader_shift": ("suggest_float", 0.002, 0.03, True),
-    "contagion_arb_min_residual_shift": ("suggest_float", 0.002, 0.03, True),
+    "contagion_arb_min_leader_shift": ("suggest_float", 0.001, 0.03, True),
+    "contagion_arb_min_residual_shift": ("suggest_float", 0.001, 0.03, True),
     "contagion_arb_toxicity_impulse_scale": ("suggest_float", 0.01, 0.20, True),
     "contagion_arb_cooldown_seconds": ("suggest_float", 10.0, 180.0),
     "contagion_arb_max_lagging_spread_pct": ("suggest_float", 0.5, 3.0),
     "contagion_arb_max_last_trade_age_s": ("suggest_float", 30.0, 300.0),
+    "max_cross_book_desync_ms": ("suggest_int", 100, 1200),
     # SI-10: Bayesian joint-probability arb
     "si10_min_net_edge_usd": ("suggest_float", 0.01, 2.0, True),
     "si10_maker_ofi_tolerance": ("suggest_float", 0.70, 0.98),
+    "si9_latency_option_window_ms": ("suggest_int", 1000, 10000),
     # SI-2: Iceberg detector alpha modifiers
     "iceberg_eqs_bonus": ("suggest_float", 0.05, 0.25),
     "iceberg_tp_alpha": ("suggest_float", 0.02, 0.10),
@@ -884,7 +887,9 @@ def _run_contagion_multi_market_backtest(
 
     engine = BacktestEngine(strategy=strategy, data_loader=loader, config=config)
     result = engine.run()
-    return result.metrics.to_dict()
+    metrics = result.metrics.to_dict()
+    metrics["contagion_detector_diagnostics"] = strategy.detector_diagnostics()
+    return metrics
 
 
 def _run_bayesian_multi_market_backtest(
@@ -983,7 +988,7 @@ def _run_backtest_with_timeout(
 ) -> tuple[str, dict[str, Any] | None | str]:
     """Execute a backtest in a child process and enforce a wall-clock timeout."""
     ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
+    queue = ctx.SimpleQueue()
     proc = ctx.Process(
         target=_trial_backtest_worker,
         kwargs={
@@ -993,7 +998,17 @@ def _run_backtest_with_timeout(
         },
     )
     proc.start()
-    proc.join(timeout_s)
+
+    try:
+        proc.join(timeout_s)
+    except KeyboardInterrupt:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(5.0)
+        return ("interrupted", None)
 
     if proc.is_alive():
         proc.terminate()
@@ -1249,6 +1264,18 @@ def _objective(
         )
         return -9999.0
 
+    if run_status == "interrupted":
+        trial.set_user_attr("interrupted", True)
+        trial.set_user_attr("interrupted_params", suggested)
+        log.warning(
+            "wfo_trial_join_interrupted",
+            trial=trial.number,
+            timeout_s=wfo_cfg.trial_timeout_s,
+            window_ms=suggested.get("window_ms"),
+            params=suggested,
+        )
+        return -9999.0
+
     if run_status == "error":
         log.warning(
             "wfo_trial_worker_error",
@@ -1427,6 +1454,53 @@ def _compute_stitched_metrics(
     return sharpe, max_dd, total_pnl
 
 
+def _cleanup_stale_running_trials(study: Any) -> int:
+    """Mark stale RUNNING trials as FAIL before resuming a fold study."""
+    import optuna
+
+    running_trials = study.get_trials(
+        deepcopy=False,
+        states=(optuna.trial.TrialState.RUNNING,),
+    )
+    if not running_trials:
+        return 0
+
+    cleaned = 0
+    cleaned_numbers: list[int] = []
+    for frozen_trial in running_trials:
+        trial_id = getattr(frozen_trial, "_trial_id", None)
+        if trial_id is None:
+            continue
+        try:
+            transitioned = study._storage.set_trial_state_values(  # type: ignore[attr-defined]
+                trial_id,
+                optuna.trial.TrialState.FAIL,
+                values=None,
+            )
+        except Exception as exc:
+            log.warning(
+                "wfo_stale_trial_cleanup_failed",
+                study_name=study.study_name,
+                trial_number=frozen_trial.number,
+                error=str(exc),
+            )
+            continue
+
+        if transitioned:
+            cleaned += 1
+            cleaned_numbers.append(frozen_trial.number)
+
+    if cleaned:
+        log.warning(
+            "wfo_stale_trials_cleaned",
+            study_name=study.study_name,
+            cleaned_trials=cleaned,
+            trial_numbers=cleaned_numbers,
+        )
+
+    return cleaned
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1580,6 +1654,8 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
             ),
         )
 
+        _cleanup_stale_running_trials(study)
+
         # ── Warm-start: seed with previous fold's best params ─────────
         if cfg.warm_start and prev_best_params is not None:
             try:
@@ -1594,7 +1670,11 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
                 log.warning("wfo_warm_start_failed", fold=fold.index)
 
         # ── Parallel trial execution ──────────────────────────────────
-        completed_trials = len(study.trials)
+        completed_trials = sum(
+            1
+            for trial in study.trials
+            if trial.state != optuna.trial.TrialState.WAITING
+        )
         remaining_trials = max(cfg.n_trials - completed_trials, 0)
 
         if remaining_trials == 0:
@@ -1678,14 +1758,35 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
 
         def _replay(dates: list[str]) -> dict | None:
             if market_configs:
-                return _run_multi_market_backtest(dates=dates, market_configs=market_configs, **_replay_kwargs)
-            return _run_single_backtest(
-                dates=dates,
-                market_id=cfg.market_id,
-                yes_asset_id=cfg.yes_asset_id,
-                no_asset_id=cfg.no_asset_id,
-                **_replay_kwargs,
+                run_status, payload = _run_backtest_with_timeout(
+                    timeout_s=cfg.trial_timeout_s,
+                    multi_market=True,
+                    kwargs={"market_configs": market_configs, "dates": dates, **_replay_kwargs},
+                )
+            else:
+                run_status, payload = _run_backtest_with_timeout(
+                    timeout_s=cfg.trial_timeout_s,
+                    multi_market=False,
+                    kwargs={
+                        "dates": dates,
+                        "market_id": cfg.market_id,
+                        "yes_asset_id": cfg.yes_asset_id,
+                        "no_asset_id": cfg.no_asset_id,
+                        **_replay_kwargs,
+                    },
+                )
+
+            if run_status == "ok":
+                return payload if isinstance(payload, dict) or payload is None else None
+
+            log.warning(
+                "wfo_replay_unavailable",
+                status=run_status,
+                dates=f"{dates[0]}..{dates[-1]}",
+                timeout_s=cfg.trial_timeout_s,
+                fold=fold.index,
             )
+            return None
 
         # ── Replay IS with best params (for decay comparison) ─────────
         is_metrics = _replay(fold.train_dates)
@@ -1696,7 +1797,11 @@ def run_wfo(cfg: WfoConfig) -> WfoReport:
         fr = FoldResult(
             fold_index=fold.index,
             best_params=best_params,
-            n_trials_completed=len(study.trials),
+            n_trials_completed=sum(
+                1
+                for trial in study.trials
+                if trial.state != optuna.trial.TrialState.WAITING
+            ),
             best_trial_score=best_score,
             train_dates=fold.train_dates,
             test_dates=fold.test_dates,

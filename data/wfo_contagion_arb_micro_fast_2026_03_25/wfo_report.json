@@ -1,0 +1,117 @@
+{
+  "folds": [
+    {
+      "fold_index": 0,
+      "best_params": {
+        "contagion_arb_min_correlation": 0.7194886392550415,
+        "contagion_arb_trigger_percentile": 0.9459018800393078,
+        "contagion_arb_toxicity_impulse_scale": 0.014250823159455632,
+        "max_cross_book_desync_ms": 349
+      },
+      "is_sharpe": 0.0,
+      "is_max_drawdown": 0.0,
+      "is_total_pnl": 0.0,
+      "is_sortino": 0.0,
+      "is_win_rate": 0.0,
+      "is_profit_factor": 0.0,
+      "is_total_fills": 0,
+      "oos_sharpe": 0.0,
+      "oos_max_drawdown": 0.0,
+      "oos_total_pnl": 0.0,
+      "oos_sortino": 0.0,
+      "oos_win_rate": 0.0,
+      "oos_profit_factor": 0.0,
+      "oos_total_fills": 0,
+      "is_equity_curve": [],
+      "oos_equity_curve": [],
+      "n_trials_completed": 12,
+      "best_trial_score": -Infinity,
+      "train_dates": [
+        "2026-02-26",
+        "2026-02-27",
+        "2026-02-28",
+        "2026-03-01",
+        "2026-03-02"
+      ],
+      "test_dates": [
+        "2026-03-03"
+      ],
+      "sharpe_decay_pct": 0.0
+    },
+    {
+      "fold_index": 1,
+      "best_params": {
+        "contagion_arb_min_correlation": 0.7194886392550415,
+        "contagion_arb_trigger_percentile": 0.9459018800393078,
+        "contagion_arb_toxicity_impulse_scale": 0.014250823159455632,
+        "max_cross_book_desync_ms": 349
+      },
+      "is_sharpe": 0.0,
+      "is_max_drawdown": 0.0,
+      "is_total_pnl": 0.0,
+      "is_sortino": 0.0,
+      "is_win_rate": 0.0,
+      "is_profit_factor": 0.0,
+      "is_total_fills": 0,
+      "oos_sharpe": 0.0,
+      "oos_max_drawdown": 0.0,
+      "oos_total_pnl": 0.0,
+      "oos_sortino": 0.0,
+      "oos_win_rate": 0.0,
+      "oos_profit_factor": 0.0,
+      "oos_total_fills": 0,
+      "is_equity_curve": [],
+      "oos_equity_curve": [],
+      "n_trials_completed": 12,
+      "best_trial_score": -Infinity,
+      "train_dates": [
+        "2026-02-27",
+        "2026-02-28",
+        "2026-03-01",
+        "2026-03-02",
+        "2026-03-03"
+      ],
+      "test_dates": [
+        "2026-03-04"
+      ],
+      "sharpe_decay_pct": 0.0
+    }
+  ],
+  "stitched_equity_curve": [],
+  "aggregate_oos_sharpe": 0.0,
+  "aggregate_oos_max_drawdown": 0.0,
+  "aggregate_oos_total_pnl": 0.0,
+  "aggregate_oos_win_rate": 0.0,
+  "aggregate_oos_profit_factor": 0.0,
+  "aggregate_oos_trade_count": 0,
+  "parameter_stability": {
+    "contagion_arb_min_correlation": [
+      0.7194886392550415,
+      0.7194886392550415
+    ],
+    "contagion_arb_trigger_percentile": [
+      0.9459018800393078,
+      0.9459018800393078
+    ],
+    "contagion_arb_toxicity_impulse_scale": [
+      0.014250823159455632,
+      0.014250823159455632
+    ],
+    "max_cross_book_desync_ms": [
+      349,
+      349
+    ]
+  },
+  "total_elapsed_s": 135.96800000000803,
+  "avg_sharpe_decay_pct": 0.0,
+  "overfit_probability": 0.0,
+  "unstable_params": [],
+  "champion_params": {
+    "contagion_arb_min_correlation": 0.7194886392550415,
+    "contagion_arb_trigger_percentile": 0.9459018800393078,
+    "contagion_arb_toxicity_impulse_scale": 0.014250823159455632,
+    "max_cross_book_desync_ms": 349
+  },
+  "champion_fold_index": 0,
+  "champion_degradation_pct": 0.0
+}

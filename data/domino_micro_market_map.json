@@ -1,0 +1,52 @@
+[
+  {
+    "market_id": "0x24fb7c2d95c93a68018e6c4a90d88043bb67d32fd1454924cef8ebdd550228f3",
+    "yes_id": "62174615336627888814453166657652087168672936561990669762061326057126859157348",
+    "no_id": "109194950528471238221689772140031366300756554661469112835221485697222266375845",
+    "yes_price": 0.8,
+    "no_price": 0.2,
+    "question": "Domino micro market 1",
+    "event_id": "domino-micro-debug-2026-03",
+    "tags": ["domino-debug", "march-cluster", "contagion"]
+  },
+  {
+    "market_id": "0x1d54eb5eac2cee8f595f3097c65da7d07f8ab5dee63d7c0c6883eb70e1e9af30",
+    "yes_id": "82991837887127223585838300135823820957946688171642633953055760547186260528157",
+    "no_id": "24394670903706558879845790079760859552309100903651562795058188175118941818512",
+    "yes_price": 0.9,
+    "no_price": 0.1,
+    "question": "Domino micro market 2",
+    "event_id": "domino-micro-debug-2026-03",
+    "tags": ["domino-debug", "march-cluster", "contagion"]
+  },
+  {
+    "market_id": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606",
+    "yes_id": "81197514885731569817347387229955339496528996514718498705783416912577413567672",
+    "no_id": "44446804496889907209027787393532554522900719536131325061789855807185516080089",
+    "yes_price": 0.75,
+    "no_price": 0.25,
+    "question": "Domino micro market 3",
+    "event_id": "domino-micro-debug-2026-03",
+    "tags": ["domino-debug", "march-cluster", "contagion"]
+  },
+  {
+    "market_id": "0x2701e5a5b751418c5c5bf0faaafdea60ac9fc893eb75fd88e902cd97458d375b",
+    "yes_id": "45508526462946448093261964971924605068149154773851783510479883418527084296876",
+    "no_id": "106549993070946237758310281255754864390927967486677098278324584793561067743644",
+    "yes_price": 0.752,
+    "no_price": 0.248,
+    "question": "Domino micro market 4",
+    "event_id": "domino-micro-debug-2026-03",
+    "tags": ["domino-debug", "march-cluster", "contagion"]
+  },
+  {
+    "market_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+    "yes_id": "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+    "no_id": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+    "yes_price": 0.89,
+    "no_price": 0.11,
+    "question": "Domino micro market 5",
+    "event_id": "domino-micro-debug-2026-03",
+    "tags": ["domino-debug", "march-cluster", "contagion"]
+  }
+]

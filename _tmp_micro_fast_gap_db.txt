@@ -1,0 +1,6 @@
+states
+('polymarket_wfo_fold_0', 'COMPLETE', 12)
+('polymarket_wfo_fold_1', 'COMPLETE', 12)
+values
+('polymarket_wfo_fold_0', None, None, None)
+('polymarket_wfo_fold_1', None, None, None)
