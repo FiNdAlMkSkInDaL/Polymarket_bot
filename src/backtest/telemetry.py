@@ -85,6 +85,8 @@ class BacktestMetrics:
     max_portfolio_var: float = 0.0
     pce_rejections: int = 0
     diversification_ratio: float = 0.0  # gross VaR / net VaR (≥1 = diversified)
+    smart_passive_counters: dict[str, int] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
         d = {}
@@ -99,6 +101,7 @@ class BacktestMetrics:
 
     def summary(self) -> str:
         """Human-readable summary string."""
+        smart_passive = self.smart_passive_counters or {}
         lines = [
             "═══════════════════════════════════════════════════════════",
             "           BACKTEST TELEMETRY REPORT",
@@ -108,6 +111,9 @@ class BacktestMetrics:
             f"  Total Fees Paid:      ${self.total_fees_paid:>10.4f}",
             f"  Maker / Taker Ratio:   {self.maker_taker_ratio:>10.2f}  "
             f"({self.maker_fills}M / {self.taker_fills}T)",
+            f"  Smart-Passive:         {int(smart_passive.get('smart_passive_started', 0)):>3d} started  "
+            f"{int(smart_passive.get('maker_filled', 0)):>3d} maker  "
+            f"{int(smart_passive.get('fallback_triggered', 0)):>3d} fallback",
             f"  Slippage vs Mid:      ${self.total_slippage:>+10.4f}  "
             f"({self.avg_slippage_bps:+.1f} bps avg)",
             "───────────────────────────────────────────────────────────",
@@ -160,6 +166,11 @@ class Telemetry:
         # ── PCE snapshots (Pillar 15) ───────────────────────────────────
         self._pce_snapshots: list[dict] = []  # [{ts, var, avg_corr, n_pos}]
         self._pce_rejection_count: int = 0
+        self._smart_passive_counters: dict[str, int] = {
+            "smart_passive_started": 0,
+            "maker_filled": 0,
+            "fallback_triggered": 0,
+        }
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Recording methods (called during the replay loop)
@@ -241,6 +252,20 @@ class Telemetry:
     def set_pce_rejections(self, count: int) -> None:
         """Set the PCE rejection count (called by strategy before finalize)."""
         self._pce_rejection_count = count
+
+    def set_smart_passive_counters(
+        self,
+        *,
+        started: int,
+        maker_filled: int,
+        fallback_triggered: int,
+    ) -> None:
+        """Attach replay smart-passive counters to the final metrics object."""
+        self._smart_passive_counters = {
+            "smart_passive_started": int(started),
+            "maker_filled": int(maker_filled),
+            "fallback_triggered": int(fallback_triggered),
+        }
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Finalisation — compute all metrics
@@ -363,6 +388,7 @@ class Telemetry:
         # pce_rejections: set externally by strategy after finalize,
         # or pre-populated via set_pce_rejections() before finalize.
         m.pce_rejections = self._pce_rejection_count
+        m.smart_passive_counters = dict(self._smart_passive_counters)
 
         # Diversification ratio: gross VaR / net VaR from last snapshot.
         # If no snapshots, leave at 0.0.
@@ -391,3 +417,8 @@ class Telemetry:
         self._round_trips.clear()
         self._pce_snapshots.clear()
         self._pce_rejection_count = 0
+        self._smart_passive_counters = {
+            "smart_passive_started": 0,
+            "maker_filled": 0,
+            "fallback_triggered": 0,
+        }

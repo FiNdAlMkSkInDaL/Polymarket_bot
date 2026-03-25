@@ -416,7 +416,7 @@ class CompositeSignalEvaluator:
 class MetaDecision:
     """Output of the MetaStrategyController."""
 
-    signal_type: str          # "panic", "drift", or "rpe"
+    signal_type: str          # "panic", "drift", "ofi_momentum", or "rpe"
     weight: float             # multiplier applied to entry size
     vetoed: bool              # True → entry should be skipped
     veto_reason: str          # human-readable reason (empty if not vetoed)
@@ -434,11 +434,11 @@ class MetaStrategyController:
     Decision matrix
     ---------------
     +-----------+------------------+-----------+-----------+
-    | Regime    | Panic / Drift    |    RPE    |   Veto?   |
+    | Regime    | Panic / Drift    | OFI Mom.  |    RPE    |
     +-----------+------------------+-----------+-----------+
-    | Deep MR   | 1.5× weight      |  0.5×     |    —      |
-    | Neutral   | 1.0×             |  1.0×     |    —      |
-    | Trending  | veto             | 1.0×      | panic/dft |
+    | Deep MR   | 1.5× weight      | veto      |  0.5×     |
+    | Neutral   | 1.0×             | 1.0×      |  1.0×     |
+    | Trending  | veto             | 1.5×      |  1.0×     |
     +-----------+------------------+-----------+-----------+
     """
 
@@ -474,6 +474,14 @@ class MetaStrategyController:
                     veto_reason="",
                     regime_score=regime_score,
                 )
+            if signal_type == "ofi_momentum":
+                return MetaDecision(
+                    signal_type=signal_type,
+                    weight=0.0,
+                    vetoed=True,
+                    veto_reason="regime_mean_revert_veto",
+                    regime_score=regime_score,
+                )
             # RPE gets halved in deep MR — panic alpha dominates
             return MetaDecision(
                 signal_type=signal_type,
@@ -491,6 +499,14 @@ class MetaStrategyController:
                     weight=0.0,
                     vetoed=True,
                     veto_reason="regime_trend_veto",
+                    regime_score=regime_score,
+                )
+            if signal_type == "ofi_momentum":
+                return MetaDecision(
+                    signal_type=signal_type,
+                    weight=1.5,
+                    vetoed=False,
+                    veto_reason="",
                     regime_score=regime_score,
                 )
             # RPE keeps full weight in trends

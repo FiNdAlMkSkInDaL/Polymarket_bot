@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_fee_bps    INTEGER DEFAULT 0,
     entry_toxicity_index REAL DEFAULT 0.0,
     exit_toxicity_index REAL DEFAULT 0.0,
+    drawn_tp        REAL DEFAULT 0.0,
+    drawn_stop      REAL DEFAULT 0.0,
+    drawn_time      REAL DEFAULT 0.0,
     created_at      REAL,
     is_probe        INTEGER DEFAULT 0,
     signal_type     TEXT DEFAULT '',
@@ -114,6 +117,9 @@ CREATE TABLE IF NOT EXISTS live_positions (
     entry_time      REAL,
     target_price    REAL,
     exit_reason     TEXT DEFAULT '',
+    drawn_tp        REAL DEFAULT 0.0,
+    drawn_stop      REAL DEFAULT 0.0,
+    drawn_time      REAL DEFAULT 0.0,
     fee_enabled     INTEGER DEFAULT 1,
     sl_trigger_cents REAL DEFAULT 0.0,
     entry_fee_bps   INTEGER DEFAULT 0,
@@ -174,6 +180,18 @@ class TradeStore:
                 await self._db.execute(
                     "ALTER TABLE trades ADD COLUMN exit_toxicity_index REAL DEFAULT 0.0"
                 )
+            if "drawn_tp" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN drawn_tp REAL DEFAULT 0.0"
+                )
+            if "drawn_stop" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN drawn_stop REAL DEFAULT 0.0"
+                )
+            if "drawn_time" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE trades ADD COLUMN drawn_time REAL DEFAULT 0.0"
+                )
             if "entry_fee_bps" not in cols:
                 await self._db.execute(
                     "ALTER TABLE trades ADD COLUMN entry_fee_bps INTEGER DEFAULT 0"
@@ -185,6 +203,25 @@ class TradeStore:
             await self._db.commit()
         except Exception:
             log.warning("schema_migration_skipped", exc_info=True)
+
+        try:
+            cursor = await self._db.execute("PRAGMA table_info(live_positions)")
+            cols = {row[1] for row in await cursor.fetchall()}
+            if "drawn_tp" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE live_positions ADD COLUMN drawn_tp REAL DEFAULT 0.0"
+                )
+            if "drawn_stop" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE live_positions ADD COLUMN drawn_stop REAL DEFAULT 0.0"
+                )
+            if "drawn_time" not in cols:
+                await self._db.execute(
+                    "ALTER TABLE live_positions ADD COLUMN drawn_time REAL DEFAULT 0.0"
+                )
+            await self._db.commit()
+        except Exception:
+            log.warning("live_positions_migration_skipped", exc_info=True)
 
         # ── Schema migration: add shadow_trades if missing ────────────
         try:
@@ -262,9 +299,10 @@ class TradeStore:
             (id, market_id, state, entry_price, entry_size, entry_time,
              target_price, exit_price, exit_time, exit_reason, pnl_cents,
              hold_seconds, alpha, zscore, volume_ratio, whale,
-             entry_fee_bps, exit_fee_bps, entry_toxicity_index, exit_toxicity_index, created_at,
+             entry_fee_bps, exit_fee_bps, entry_toxicity_index, exit_toxicity_index,
+             drawn_tp, drawn_stop, drawn_time, created_at,
              is_probe, signal_type, meta_weight)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 pos.id,
@@ -287,6 +325,9 @@ class TradeStore:
                 int(getattr(pos, "exit_fee_bps", 0) or 0),
                 float(getattr(pos, "entry_toxicity_index", 0.0) or 0.0),
                 float(getattr(pos, "exit_toxicity_index", 0.0) or 0.0),
+                float(getattr(pos, "drawn_tp", 0.0) or 0.0),
+                float(getattr(pos, "drawn_stop", 0.0) or 0.0),
+                float(getattr(pos, "drawn_time", 0.0) or 0.0),
                 pos.created_at,
                 int(getattr(pos, 'is_probe', False)),
                 getattr(pos, 'signal_type', ''),
@@ -418,24 +459,6 @@ class TradeStore:
             )
 
         return summaries
-
-
-async def get_ofi_toxicity_pnl_summary(
-    buckets: int = 10,
-    *,
-    db_path: str | Path | None = None,
-) -> list[dict[str, float | int | str]]:
-    """Convenience wrapper for OFI toxicity aggregation from SQLite.
-
-    This thin helper exists so offline analysis scripts can import a single
-    public function from ``src.monitoring.trade_store`` without manually
-    managing a ``TradeStore`` lifecycle.
-    """
-    store = TradeStore(db_path=db_path)
-    try:
-        return await store.get_ofi_toxicity_pnl_summary(buckets=buckets)
-    finally:
-        await store.close()
 
     @staticmethod
     def _compute_decayed_wr(
@@ -615,9 +638,10 @@ async def get_ofi_toxicity_pnl_summary(
                     INSERT INTO live_positions
                     (id, market_id, no_asset_id, event_id, state, entry_price,
                      entry_size, entry_time, target_price, exit_reason,
+                     drawn_tp, drawn_stop, drawn_time,
                      fee_enabled, sl_trigger_cents, entry_fee_bps, exit_fee_bps,
                      entry_order_id, exit_order_id, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         p.id,
@@ -630,6 +654,9 @@ async def get_ofi_toxicity_pnl_summary(
                         p.entry_time,
                         p.target_price,
                         p.exit_reason,
+                        float(getattr(p, "drawn_tp", 0.0) or 0.0),
+                        float(getattr(p, "drawn_stop", 0.0) or 0.0),
+                        float(getattr(p, "drawn_time", 0.0) or 0.0),
                         int(p.fee_enabled),
                         p.sl_trigger_cents,
                         p.entry_fee_bps,
@@ -681,7 +708,7 @@ async def get_ofi_toxicity_pnl_summary(
 
         cursor = await self._db.execute(
             "SELECT id, market_id, no_asset_id, event_id, state, entry_price, "
-            "entry_size, entry_time, target_price, exit_reason, "
+            "entry_size, entry_time, target_price, exit_reason, drawn_tp, drawn_stop, drawn_time, "
             "fee_enabled, sl_trigger_cents, entry_fee_bps, exit_fee_bps, "
             "entry_order_id, exit_order_id, created_at FROM live_positions"
         )
@@ -698,13 +725,16 @@ async def get_ofi_toxicity_pnl_summary(
                 "entry_time": r[7],
                 "target_price": r[8],
                 "exit_reason": r[9],
-                "fee_enabled": bool(r[10]),
-                "sl_trigger_cents": r[11],
-                "entry_fee_bps": r[12],
-                "exit_fee_bps": r[13],
-                "entry_order_id": r[14],
-                "exit_order_id": r[15],
-                "created_at": r[16],
+                "drawn_tp": r[10],
+                "drawn_stop": r[11],
+                "drawn_time": r[12],
+                "fee_enabled": bool(r[13]),
+                "sl_trigger_cents": r[14],
+                "entry_fee_bps": r[15],
+                "exit_fee_bps": r[16],
+                "entry_order_id": r[17],
+                "exit_order_id": r[18],
+                "created_at": r[19],
             }
             for r in rows
         ]
@@ -873,3 +903,21 @@ async def get_ofi_toxicity_pnl_summary(
             return False, stats
 
         return True, stats
+
+
+async def get_ofi_toxicity_pnl_summary(
+    buckets: int = 10,
+    *,
+    db_path: str | Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Convenience wrapper for OFI toxicity aggregation from SQLite.
+
+    This thin helper exists so offline analysis scripts can import a single
+    public function from ``src.monitoring.trade_store`` without manually
+    managing a ``TradeStore`` lifecycle.
+    """
+    store = TradeStore(db_path=db_path)
+    try:
+        return await store.get_ofi_toxicity_pnl_summary(buckets=buckets)
+    finally:
+        await store.close()

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import queue as _queue_mod
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,8 +30,16 @@ from src.core.guard import DeploymentGuard
 from src.core.logger import get_logger
 from src.data.ohlcv import OHLCVAggregator
 from src.data.orderbook import OrderbookTracker
+from src.execution.momentum_taker import (
+    DEFAULT_MOMENTUM_MAX_HOLD_SECONDS,
+    DrawnMomentumBracket,
+    MomentumBracket,
+    MomentumTakerExecutor,
+    draw_stochastic_momentum_bracket,
+)
 from src.signals.edge_filter import ConfluenceContext, compute_confluence_discount, compute_edge_score
 from src.signals.iceberg_detector import IcebergDetector
+from src.signals.ofi_momentum import OFIMomentumSignal, compute_toxicity_size_multiplier
 from src.signals.panic_detector import PanicSignal
 from src.signals.drift_signal import DriftSignal
 from src.signals.signal_framework import BaseSignal, VacuumSignal
@@ -52,6 +61,10 @@ from src.trading.take_profit import TakeProfitResult, compute_take_profit
 log = get_logger(__name__)
 
 LEGACY_SIGNAL_ZSCORE_THRESHOLD = 0.20
+OFI_SMART_PASSIVE_TIMEOUT_SECONDS = 15.0
+OFI_TIME_STOP_VACUUM_RATIO = 0.35
+OFI_TIME_STOP_RECOVERY_RATIO = 0.60
+OFI_TIME_STOP_SPREAD_MULTIPLIER = 1.75
 
 
 class PositionState(str, Enum):
@@ -93,10 +106,18 @@ class Position:
     # Exit
     exit_order: Order | None = None
     target_price: float = 0.0
+    stop_price: float = 0.0
     tp_result: TakeProfitResult | None = None
     exit_price: float = 0.0
     exit_time: float = 0.0
     exit_reason: str = ""
+    max_hold_seconds: float = 0.0
+    smart_passive_exit_deadline: float = 0.0
+    drawn_tp: float = 0.0
+    drawn_stop: float = 0.0
+    drawn_time: float = 0.0
+    drawn_tp_pct: float = 0.0
+    drawn_stop_pct: float = 0.0
 
     # Bidirectional support (RPE)
     trade_asset_id: str = ""   # actual token traded (YES or NO); fallback to no_asset_id
@@ -105,6 +126,11 @@ class Position:
 
     # Signal metadata
     signal: BaseSignal | None = None
+    signal_zscore: float | None = None
+    signal_volume_ratio: float | None = None
+    signal_whale_confluence: bool = False
+    entry_toxicity_index: float = 0.0
+    exit_toxicity_index: float = 0.0
 
     # Sizing metadata
     sizing: SizingResult | None = None
@@ -247,6 +273,8 @@ class PositionManager:
         self._next_id = 1
         self._wallet_balance_usd: float = 0.0
         self._daily_pnl_cents: float = 0.0
+        self._momentum_taker = MomentumTakerExecutor(executor)
+        self._ofi_rng = random.Random()
 
         # ── Trade store stats cache (OE-1) ─────────────────────────────
         # Caches get_stats() results with a 5-second TTL to avoid
@@ -270,6 +298,9 @@ class PositionManager:
         self._stop_loss_cooldowns: dict[str, float] = {}
         # Combo order routing: order_id → (event_id, market_id)
         self._combo_order_map: dict[str, tuple[str, str]] = {}
+        self._smart_passive_started_count: int = 0
+        self._smart_passive_maker_filled_count: int = 0
+        self._smart_passive_fallback_triggered_count: int = 0
 
     # ── Wallet balance ─────────────────────────────────────────────────────
     def set_wallet_balance(self, usd: float) -> None:
@@ -281,6 +312,14 @@ class PositionManager:
 
     def is_combo_order(self, order_id: str) -> bool:
         return order_id in self._combo_order_map
+
+    @property
+    def smart_passive_counters(self) -> dict[str, int]:
+        return {
+            "smart_passive_started": self._smart_passive_started_count,
+            "maker_filled": self._smart_passive_maker_filled_count,
+            "fallback_triggered": self._smart_passive_fallback_triggered_count,
+        }
 
     def _register_combo_order(self, combo: ComboPosition, pos: Position) -> None:
         if pos.entry_order is None:
@@ -318,7 +357,7 @@ class PositionManager:
         )
 
         for pos in combo.taker_positions:
-            asset_id = pos.yes_asset_id or pos.trade_asset_id
+            asset_id = pos.trade_asset_id or pos.yes_asset_id
             book = self._book_trackers.get(asset_id)
             best_ask = book.best_ask if book is not None else 0.0
             reference_ask = best_ask if best_ask > 0 else pos.entry_price
@@ -740,6 +779,15 @@ class PositionManager:
             Used to compute the fee-adaptive stop-loss and net PnL.
         """
         async with self._entry_lock:
+            if self._is_momentum_signal(signal, signal_metadata):
+                return await self._open_momentum_position_inner(
+                    signal,
+                    no_aggregator,
+                    no_book=no_book,
+                    event_id=event_id,
+                    fee_enabled=fee_enabled,
+                    signal_metadata=signal_metadata,
+                )
             return await self._open_position_inner(
                 signal, no_aggregator,
                 no_book=no_book, event_id=event_id,
@@ -748,6 +796,220 @@ class PositionManager:
                 fee_enabled=fee_enabled,
                 signal_metadata=signal_metadata,
             )
+
+    @staticmethod
+    def _is_momentum_signal(
+        signal: BaseSignal,
+        signal_metadata: dict | None = None,
+    ) -> bool:
+        if getattr(signal, "signal_source", "") == "ofi_momentum":
+            return True
+        meta = signal_metadata or {}
+        return meta.get("signal_source") == "ofi_momentum"
+
+    async def _open_momentum_position_inner(
+        self,
+        signal: BaseSignal,
+        no_aggregator: OHLCVAggregator,
+        *,
+        no_book: OrderbookTracker | None = None,
+        event_id: str = "",
+        fee_enabled: bool = True,
+        signal_metadata: dict | None = None,
+    ) -> Position | None:
+        """Open a strict taker-routed OFI momentum position."""
+        del no_aggregator
+
+        passed, max_trade, var_was_bisected = await self._check_risk_gates(
+            signal.market_id, event_id,
+        )
+        if not passed:
+            return None
+
+        best_ask = 0.0
+        if no_book is not None and no_book.has_data:
+            snap = no_book.snapshot()
+            best_ask = getattr(snap, "best_ask", 0.0)
+        if best_ask <= 0:
+            best_ask = getattr(signal, "best_ask", 0.0) or signal.no_best_ask
+        if best_ask <= 0 or best_ask >= 1:
+            log.warning("momentum_entry_price_invalid", ask=best_ask, market=signal.market_id)
+            return None
+
+        if no_book is not None:
+            sizing = compute_depth_aware_size(
+                book=no_book,
+                entry_price=best_ask,
+                max_trade_usd=max_trade,
+                side="BUY",
+            )
+        else:
+            fallback_usd = max_trade * 0.50
+            shares = round(fallback_usd / best_ask, 2)
+            if shares < 1:
+                shares = 0.0
+                fallback_usd = 0.0
+            sizing = SizingResult(
+                size_usd=fallback_usd,
+                size_shares=shares,
+                available_liq_usd=0.0,
+                method="fallback_no_book",
+                capped=False,
+            )
+
+        meta = signal_metadata or {}
+        meta_weight = max(0.0, float(meta.get("meta_weight", 1.0)))
+        entry_size = round(sizing.size_shares * meta_weight, 2)
+        toxicity_index = float(meta.get("toxicity_index", 0.0) or 0.0)
+        if toxicity_index <= 0.0 and no_book is not None and hasattr(no_book, "toxicity_metrics"):
+            try:
+                toxicity_index = float(
+                    no_book.toxicity_metrics("BUY").get("toxicity_index", 0.0) or 0.0
+                )
+            except Exception:
+                log.warning(
+                    "momentum_toxicity_snapshot_failed",
+                    market=signal.market_id,
+                    exc_info=True,
+                )
+        if toxicity_index <= 0.0:
+            toxicity_index = float(getattr(signal, "toxicity_index", 0.0) or 0.0)
+        toxicity_index = max(0.0, toxicity_index)
+        toxicity_size_mult = compute_toxicity_size_multiplier(
+            toxicity_index,
+            elevated_threshold=settings.strategy.ofi_toxicity_scale_threshold,
+            max_multiplier=settings.strategy.ofi_toxicity_size_boost_max,
+        )
+        if toxicity_size_mult > 1.0:
+            entry_size = round(entry_size * toxicity_size_mult, 2)
+            log.info(
+                "momentum_toxicity_size_boost_applied",
+                market=signal.market_id,
+                toxicity_index=round(toxicity_index, 4),
+                size_multiplier=round(toxicity_size_mult, 4),
+                new_size=entry_size,
+            )
+
+        if self._pce is not None and not var_was_bisected:
+            pce_haircut = self._pce.compute_concentration_haircut(
+                signal.market_id, self.get_open_positions()
+            )
+            if pce_haircut < 1.0:
+                entry_size = max(1.0, round(entry_size * pce_haircut, 2))
+                log.info(
+                    "momentum_pce_size_haircut_applied",
+                    haircut=round(pce_haircut, 4),
+                    new_size=entry_size,
+                )
+        elif self._pce is not None and var_was_bisected:
+            log.info(
+                "momentum_pce_haircut_skipped_bisected",
+                market=signal.market_id,
+                reason="var_bisection_already_applied",
+            )
+
+        if self._guard is not None:
+            entry_size = self._guard.get_allowed_trade_shares(entry_size, best_ask)
+
+        if isinstance(signal, OFIMomentumSignal):
+            max_hold_seconds = float(
+                signal.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+            )
+        else:
+            max_hold_seconds = float(
+                getattr(signal, "max_hold_seconds", 0) or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+            )
+        drawn_bracket = draw_stochastic_momentum_bracket(
+            mean_max_hold_seconds=max_hold_seconds,
+            rng=self._ofi_rng,
+        )
+        sl_trigger = drawn_bracket.stop_loss_cents(best_ask)
+        stop_price = drawn_bracket.stop_price(best_ask)
+        target_price = drawn_bracket.target_price(best_ask)
+        max_hold_seconds = float(drawn_bracket.max_hold_seconds)
+
+        max_loss_cents = settings.strategy.max_loss_per_trade_cents
+        if max_loss_cents > 0 and best_ask > 0 and sl_trigger > 0:
+            max_shares_for_risk = max_loss_cents / sl_trigger
+            if entry_size > max_shares_for_risk:
+                entry_size = round(max_shares_for_risk, 2)
+                log.info(
+                    "momentum_dollar_risk_cap_applied",
+                    max_loss_cents=max_loss_cents,
+                    capped_size=entry_size,
+                )
+
+        if entry_size < 1:
+            log.info(
+                "skip_momentum_entry_insufficient_size",
+                sizing_method=sizing.method,
+                meta_weight=meta_weight,
+            )
+            return None
+
+        entry_fee_frac = get_fee_rate(best_ask, fee_enabled=fee_enabled)
+        entry_fee_bps = round(entry_fee_frac * 10000)
+
+        pos_id = f"MOMO-{self._next_id}"
+        self._next_id += 1
+
+        order, entry_price = await self._momentum_taker.place_buy(
+            market_id=signal.market_id,
+            asset_id=signal.no_asset_id,
+            size=entry_size,
+            best_ask=best_ask,
+        )
+
+        pos = Position(
+            id=pos_id,
+            market_id=signal.market_id,
+            no_asset_id=signal.no_asset_id,
+            trade_asset_id=signal.no_asset_id,
+            event_id=event_id,
+            state=PositionState.ENTRY_PENDING,
+            entry_order=order,
+            entry_price=entry_price,
+            entry_size=entry_size,
+            entry_time=time.time(),
+            signal=signal,
+            signal_zscore=getattr(signal, "zscore", None),
+            signal_volume_ratio=getattr(signal, "volume_ratio", None),
+            signal_whale_confluence=bool(getattr(signal, "whale_confluence", False)),
+            target_price=target_price,
+            stop_price=stop_price,
+            sizing=sizing,
+            fee_enabled=fee_enabled,
+            sl_trigger_cents=sl_trigger,
+            trailing_offset_cents=0.0,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=0,
+            signal_type="ofi_momentum",
+            meta_weight=meta_weight,
+            max_hold_seconds=max_hold_seconds,
+            entry_toxicity_index=round(toxicity_index, 6),
+            drawn_tp=target_price,
+            drawn_stop=stop_price,
+            drawn_time=max_hold_seconds,
+            drawn_tp_pct=drawn_bracket.take_profit_pct,
+            drawn_stop_pct=drawn_bracket.stop_loss_pct,
+        )
+        self._positions[pos.id] = pos
+
+        log.info(
+            "momentum_position_opened",
+            pos_id=pos.id,
+            market=signal.market_id,
+            entry=entry_price,
+            size=entry_size,
+            target=pos.target_price,
+            stop=pos.stop_price,
+            max_hold_seconds=max_hold_seconds,
+        )
+
+        if order.status == OrderStatus.FILLED:
+            await self.on_entry_filled(pos)
+
+        return pos
 
     async def _open_position_inner(
         self,
@@ -1676,6 +1938,18 @@ class PositionManager:
         """Called when the entry buy order is filled.  Places the exit sell."""
         pos.state = PositionState.ENTRY_FILLED
         pos.entry_price = pos.entry_order.filled_avg_price or pos.entry_price
+        pos.entry_toxicity_index = self._capture_fill_toxicity_index(pos, side="BUY")
+
+        if pos.signal_type == "ofi_momentum":
+            log.info(
+                "momentum_entry_fill_toxicity_snapshot",
+                pos_id=pos.id,
+                market=pos.market_id,
+                toxicity_index=round(pos.entry_toxicity_index, 4),
+            )
+
+        if pos.signal_type == "ofi_momentum":
+            self._refresh_ofi_drawn_bracket(pos)
 
         # Reconcile actual fill quantity.  The chaser or paper-fill may
         # have set filled_size already; if not, infer from the order.
@@ -1684,6 +1958,19 @@ class PositionManager:
                 pos.filled_size = pos.entry_order.filled_size
             else:
                 pos.filled_size = pos.entry_size
+
+        if pos.signal_type == "ofi_momentum":
+            pos.exit_order = None
+            pos.state = PositionState.EXIT_PENDING
+            log.info(
+                "momentum_local_exit_armed",
+                pos_id=pos.id,
+                target=pos.target_price,
+                stop=pos.stop_price,
+                max_hold_seconds=round(pos.max_hold_seconds, 2),
+                trade_side=pos.trade_side,
+            )
+            return
 
         # Use trade_asset_id for exit — supports both YES and NO side entries.
         # Fallback to no_asset_id preserves backward compatibility for
@@ -1710,6 +1997,23 @@ class PositionManager:
             trade_side=pos.trade_side,
         )
 
+    def _refresh_ofi_drawn_bracket(self, pos: Position) -> None:
+        take_profit_pct = pos.drawn_tp_pct or MomentumBracket().take_profit_pct
+        stop_loss_pct = pos.drawn_stop_pct or MomentumBracket().stop_loss_pct
+        max_hold_seconds = pos.drawn_time or pos.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+        drawn_bracket = DrawnMomentumBracket(
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            max_hold_seconds=max_hold_seconds,
+        )
+        pos.target_price = drawn_bracket.target_price(pos.entry_price)
+        pos.stop_price = drawn_bracket.stop_price(pos.entry_price)
+        pos.sl_trigger_cents = drawn_bracket.stop_loss_cents(pos.entry_price)
+        pos.max_hold_seconds = float(drawn_bracket.max_hold_seconds)
+        pos.drawn_tp = pos.target_price
+        pos.drawn_stop = pos.stop_price
+        pos.drawn_time = pos.max_hold_seconds
+
     # ── Handle exit fill ───────────────────────────────────────────────────
     def on_exit_filled(self, pos: Position, reason: str = "target") -> None:
         """Close the position after exit fill or forced liquidation."""
@@ -1717,12 +2021,25 @@ class PositionManager:
             log.warning("position_already_closed_ignore_fill", pos_id=pos.id, reason=reason)
             return
 
+        pos.exit_toxicity_index = self._capture_fill_toxicity_index(pos, side="SELL")
+
+        if (
+            pos.signal_type == "ofi_momentum"
+            and pos.exit_reason == "time_stop"
+            and pos.smart_passive_exit_deadline > 0
+            and pos.exit_order is not None
+            and pos.exit_order.post_only
+            and pos.exit_order.status == OrderStatus.FILLED
+        ):
+            self._smart_passive_maker_filled_count += 1
+
         pos.state = PositionState.CLOSED
         pos.exit_price = (
             pos.exit_order.filled_avg_price if pos.exit_order else pos.target_price
         )
         pos.exit_time = time.time()
-        pos.exit_reason = reason
+        pos.exit_reason = pos.exit_reason or reason
+        pos.smart_passive_exit_deadline = 0.0
 
         # Net-of-fee PnL using actual fill size
         pos.pnl_cents = compute_net_pnl_cents(
@@ -1754,7 +2071,7 @@ class PositionManager:
         # Includes preemptive_liquidity_drain which is a loss-exit that was
         # previously missing — its omission caused a loser-loop where the bot
         # re-entered immediately after a preemptive OBI exit.
-        if reason in ("stop_loss", "preemptive_liquidity_drain", "timeout"):
+        if reason in ("stop_loss", "preemptive_liquidity_drain", "timeout", "time_stop"):
             self._stop_loss_cooldowns[pos.market_id] = pos.exit_time
 
         log.info(
@@ -1767,6 +2084,7 @@ class PositionManager:
             hold_seconds=round(pos.exit_time - pos.entry_time, 1),
             daily_pnl=round(self._daily_pnl_cents, 2),
             drawdown=round(self._max_drawdown_cents, 2),
+            exit_toxicity_index=round(pos.exit_toxicity_index, 4),
         )
 
         # Auto-cleanup old closed/cancelled positions
@@ -1794,6 +2112,10 @@ class PositionManager:
 
             # Exit timeout or stop-loss
             elif pos.state == PositionState.EXIT_PENDING:
+                if pos.signal_type == "ofi_momentum":
+                    await self.evaluate_ofi_local_exit(pos, now=now)
+                    continue
+
                 elapsed = now - pos.entry_time
 
                 # Stop-loss: check if current NO price moved against us
@@ -1804,40 +2126,302 @@ class PositionManager:
                     # handle cases signalled by the bot via force_stop_loss()
                     pass
 
-                if elapsed > settings.strategy.exit_timeout_seconds:
-                    # Cancel chaser task if running
-                    if pos.exit_chaser_task and not pos.exit_chaser_task.done():
-                        pos.exit_chaser_task.cancel()
-                    # Cancel the existing limit sell
-                    if pos.exit_order:
-                        await self.executor.cancel_order(pos.exit_order)
-
-                    # Place a market sell (IOC at best bid — simulated by
-                    # placing at a very low price in paper mode)
-                    exit_asset = pos.trade_asset_id or pos.no_asset_id
-                    exit_order = await self.executor.place_limit_order(
-                        market_id=pos.market_id,
-                        asset_id=exit_asset,
-                        side=OrderSide.SELL,
-                        price=0.01,  # effectively market sell
-                        size=pos.effective_size,
-                    )
-                    pos.exit_order = exit_order
-                    # In paper mode, simulate a realistic fill at the
-                    # current best bid rather than the literal 0.01.
-                    if self.executor.paper_mode:
-                        fill_price = self._paper_market_sell_price(pos)
-                        exit_order.filled_avg_price = fill_price
-                        exit_order.filled_size = pos.effective_size
-                        exit_order.status = OrderStatus.FILLED
-                        self.on_exit_filled(pos, reason="timeout")
+                max_hold_seconds = (
+                    pos.max_hold_seconds
+                    if pos.max_hold_seconds > 0
+                    else settings.strategy.exit_timeout_seconds
+                )
+                if elapsed > max_hold_seconds:
+                    exit_reason = "time_stop" if pos.signal_type == "ofi_momentum" else "timeout"
+                    if pos.signal_type == "ofi_momentum":
+                        await self._start_smart_passive_time_stop(pos, now)
                     else:
-                        pos.exit_reason = "timeout"
-                        log.info(
-                            "timeout_exit_placed",
-                            pos_id=pos.id,
-                            note="awaiting CLOB fill confirmation",
-                        )
+                        await self._place_aggressive_timeout_exit(pos, reason=exit_reason)
+
+    def _is_smart_passive_time_stop_active(self, pos: Position) -> bool:
+        return (
+            pos.signal_type == "ofi_momentum"
+            and pos.exit_reason == "time_stop"
+            and pos.smart_passive_exit_deadline > 0
+            and pos.exit_order is not None
+            and pos.exit_order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        )
+
+    async def evaluate_ofi_local_exit(self, pos: Position, *, now: float | None = None) -> bool:
+        if pos.signal_type != "ofi_momentum" or pos.state != PositionState.EXIT_PENDING:
+            return False
+
+        now = now if now is not None else time.time()
+
+        if (
+            pos.exit_order is not None
+            and pos.exit_reason in ("target", "stop_loss")
+            and pos.exit_order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        ):
+            return True
+
+        if self._is_smart_passive_time_stop_active(pos):
+            if now >= pos.smart_passive_exit_deadline:
+                if self._should_suppress_ofi_time_stop_exit(pos):
+                    return True
+                await self._promote_smart_passive_to_taker(pos)
+            return True
+
+        best_bid = self._current_best_bid(pos)
+        if pos.target_price > 0 and best_bid > 0 and best_bid >= pos.target_price:
+            await self.force_target_exit(pos)
+            return True
+
+        if pos.stop_price > 0 and best_bid > 0 and best_bid <= pos.stop_price:
+            await self.force_stop_loss(pos, reason="stop_loss")
+            return True
+
+        max_hold_seconds = pos.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+        if now - pos.entry_time >= max_hold_seconds:
+            if self._should_suppress_ofi_time_stop_exit(pos):
+                return True
+            await self._start_smart_passive_time_stop(pos, now)
+        return True
+
+    def _should_suppress_ofi_time_stop_exit(self, pos: Position) -> bool:
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        tracker = self._book_trackers.get(exit_asset)
+        if tracker is None:
+            return False
+
+        try:
+            snap = tracker.snapshot()
+        except Exception:
+            return False
+
+        best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+        best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+        bid_depth = float(getattr(snap, "bid_depth_usd", 0.0) or 0.0)
+        ask_depth = float(getattr(snap, "ask_depth_usd", 0.0) or 0.0)
+        bid_baseline = self._top_depth_baseline(tracker, side="bid", current_depth=bid_depth)
+        ask_baseline = self._top_depth_baseline(tracker, side="ask", current_depth=ask_depth)
+        spread = max(0.0, best_ask - best_bid)
+        baseline_spread = max(0.01, pos.entry_price * pos.drawn_stop_pct)
+        bid_vacuum = bid_depth > 0 and bid_baseline > 0 and bid_depth < bid_baseline * OFI_TIME_STOP_VACUUM_RATIO
+        ask_vacuum = ask_depth > 0 and ask_baseline > 0 and ask_depth < ask_baseline * OFI_TIME_STOP_VACUUM_RATIO
+        spread_blown_out = spread >= baseline_spread * OFI_TIME_STOP_SPREAD_MULTIPLIER
+
+        if (bid_vacuum or ask_vacuum) and spread_blown_out:
+            log.info(
+                "ofi_time_stop_suppressed_liquidity_vacuum",
+                pos_id=pos.id,
+                bid_depth=round(bid_depth, 2),
+                bid_baseline=round(bid_baseline, 2),
+                ask_depth=round(ask_depth, 2),
+                ask_baseline=round(ask_baseline, 2),
+                spread=round(spread, 4),
+            )
+            return True
+
+        bid_recovered = bid_baseline <= 0 or bid_depth >= bid_baseline * OFI_TIME_STOP_RECOVERY_RATIO
+        ask_recovered = ask_baseline <= 0 or ask_depth >= ask_baseline * OFI_TIME_STOP_RECOVERY_RATIO
+        return not (bid_recovered and ask_recovered)
+
+    def _top_depth_baseline(self, tracker: Any, *, side: str, current_depth: float) -> float:
+        top_depth_ewma = getattr(tracker, "top_depth_ewma", None)
+        if callable(top_depth_ewma):
+            try:
+                baseline = float(top_depth_ewma(side) or 0.0)
+            except Exception:
+                baseline = 0.0
+            if baseline > 0:
+                return baseline
+        return max(0.0, current_depth)
+
+    def _capture_fill_toxicity_index(self, pos: Position, *, side: str) -> float:
+        asset_id = pos.trade_asset_id or pos.no_asset_id
+        book = self._book_trackers.get(asset_id)
+        toxicity_index = 0.0
+
+        if book is not None and hasattr(book, "toxicity_metrics"):
+            try:
+                metrics = book.toxicity_metrics(side)
+                toxicity_index = float(metrics.get("toxicity_index", 0.0) or 0.0)
+            except Exception:
+                log.warning(
+                    "fill_toxicity_snapshot_failed",
+                    pos_id=pos.id,
+                    asset_id=asset_id,
+                    side=side,
+                    exc_info=True,
+                )
+
+        if toxicity_index <= 0.0:
+            toxicity_index = (
+                pos.entry_toxicity_index if side.upper() == "BUY" else pos.exit_toxicity_index
+            )
+
+        if toxicity_index <= 0.0:
+            toxicity_index = float(getattr(pos.signal, "toxicity_index", 0.0) or 0.0)
+
+        return round(max(0.0, toxicity_index), 6)
+
+    async def _start_smart_passive_time_stop(self, pos: Position, now: float) -> None:
+        await self._cancel_exit_flow(pos)
+
+        passive_price = self._current_best_ask(pos)
+        if passive_price <= 0:
+            log.info(
+                "time_stop_smart_passive_skipped",
+                pos_id=pos.id,
+                reason="no_best_ask",
+            )
+            await self._place_aggressive_timeout_exit(pos, reason="time_stop")
+            return
+
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        exit_order = await self.executor.place_limit_order(
+            market_id=pos.market_id,
+            asset_id=exit_asset,
+            side=OrderSide.SELL,
+            price=passive_price,
+            size=pos.effective_size,
+            post_only=True,
+        )
+
+        if exit_order.status == OrderStatus.CANCELLED:
+            log.info(
+                "time_stop_smart_passive_rejected",
+                pos_id=pos.id,
+                price=passive_price,
+                rejection_reason=exit_order.rejection_reason,
+            )
+            await self._place_aggressive_timeout_exit(pos, reason="time_stop")
+            return
+
+        pos.exit_order = exit_order
+        pos.exit_reason = "time_stop"
+        pos.smart_passive_exit_deadline = now + OFI_SMART_PASSIVE_TIMEOUT_SECONDS
+        self._smart_passive_started_count += 1
+        log.info(
+            "time_stop_smart_passive_started",
+            pos_id=pos.id,
+            price=passive_price,
+            deadline_s=OFI_SMART_PASSIVE_TIMEOUT_SECONDS,
+        )
+
+    async def _promote_smart_passive_to_taker(self, pos: Position) -> None:
+        await self._cancel_exit_flow(pos)
+        self._smart_passive_fallback_triggered_count += 1
+        log.info(
+            "time_stop_smart_passive_expired",
+            pos_id=pos.id,
+            fallback="aggressive_taker_exit",
+        )
+        await self._place_aggressive_timeout_exit(pos, reason="time_stop")
+
+    async def _cancel_exit_flow(self, pos: Position) -> None:
+        if pos.exit_chaser_task and not pos.exit_chaser_task.done():
+            pos.exit_chaser_task.cancel()
+        if pos.exit_order:
+            await self.executor.cancel_order(pos.exit_order)
+
+    async def _place_aggressive_timeout_exit(self, pos: Position, *, reason: str) -> None:
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        pos.exit_reason = reason
+        pos.smart_passive_exit_deadline = 0.0
+        exit_order = await self.executor.place_limit_order(
+            market_id=pos.market_id,
+            asset_id=exit_asset,
+            side=OrderSide.SELL,
+            price=0.01,
+            size=pos.effective_size,
+        )
+        pos.exit_order = exit_order
+        if self.executor.paper_mode:
+            fill_price = self._paper_market_sell_price(pos)
+            exit_order.filled_avg_price = fill_price
+            exit_order.filled_size = pos.effective_size
+            exit_order.status = OrderStatus.FILLED
+            self.on_exit_filled(pos, reason=reason)
+        else:
+            log.info(
+                "time_stop_exit_placed" if reason == "time_stop" else "timeout_exit_placed",
+                pos_id=pos.id,
+                note="awaiting CLOB fill confirmation",
+            )
+
+    def _current_best_bid(self, pos: Position) -> float:
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        tracker = self._book_trackers.get(exit_asset)
+        if tracker is None:
+            return 0.0
+
+        best_bid = 0.0
+        try:
+            snap = tracker.snapshot()
+            best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+        except Exception:
+            best_bid = float(getattr(tracker, "best_bid", 0.0) or 0.0)
+
+        if best_bid <= 0:
+            best_bid = float(getattr(tracker, "best_bid", 0.0) or 0.0)
+
+        if best_bid <= 0:
+            return 0.0
+        return round(min(0.99, max(0.01, best_bid)), 4)
+
+    def _current_best_ask(self, pos: Position) -> float:
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        tracker = self._book_trackers.get(exit_asset)
+        if tracker is None:
+            return 0.0
+
+        best_ask = 0.0
+        try:
+            snap = tracker.snapshot()
+            best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+        except Exception:
+            best_ask = float(getattr(tracker, "best_ask", 0.0) or 0.0)
+
+        if best_ask <= 0:
+            best_ask = float(getattr(tracker, "best_ask", 0.0) or 0.0)
+
+        if best_ask <= 0:
+            return 0.0
+        return round(min(0.99, max(0.01, best_ask)), 4)
+
+    async def force_target_exit(self, pos: Position, *, reason: str = "target") -> None:
+        if pos.state != PositionState.EXIT_PENDING:
+            return
+
+        if pos.exit_chaser_task and not pos.exit_chaser_task.done():
+            pos.exit_chaser_task.cancel()
+
+        if pos.exit_order:
+            await self.executor.cancel_order(pos.exit_order)
+
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        exit_price = pos.target_price if pos.target_price > 0 else self._current_best_bid(pos)
+        exit_price = round(min(0.99, max(0.01, exit_price)), 4)
+        exit_order = await self.executor.place_limit_order(
+            market_id=pos.market_id,
+            asset_id=exit_asset,
+            side=OrderSide.SELL,
+            price=exit_price,
+            size=pos.effective_size,
+        )
+        pos.exit_order = exit_order
+        pos.exit_reason = reason
+        pos.smart_passive_exit_deadline = 0.0
+        if self.executor.paper_mode:
+            fill_price = self._current_best_bid(pos) or exit_price
+            exit_order.filled_avg_price = fill_price
+            exit_order.filled_size = pos.effective_size
+            exit_order.status = OrderStatus.FILLED
+            self.on_exit_filled(pos, reason=reason)
+        else:
+            log.info(
+                "target_exit_placed",
+                pos_id=pos.id,
+                price=exit_price,
+                note="awaiting CLOB fill confirmation",
+            )
 
     def _paper_market_sell_price(self, pos: Position) -> float:
         """Estimate a realistic fill price for paper-mode market sells.
@@ -1880,6 +2464,7 @@ class PositionManager:
             await self.executor.cancel_order(pos.exit_order)
 
         exit_asset = pos.trade_asset_id or pos.no_asset_id
+        pos.exit_reason = reason
         exit_order = await self.executor.place_limit_order(
             market_id=pos.market_id,
             asset_id=exit_asset,
@@ -1897,7 +2482,6 @@ class PositionManager:
             exit_order.status = OrderStatus.FILLED
             self.on_exit_filled(pos, reason=reason)
         else:
-            pos.exit_reason = reason
             log.info(
                 "stop_loss_exit_placed",
                 pos_id=pos.id,
@@ -2498,9 +3082,7 @@ class PositionManager:
         ComboPosition | None
             The created combo, or ``None`` if risk gates reject.
         """
-        from src.signals.combinatorial_arb import ComboArbSignal
-
-        if not isinstance(signal, ComboArbSignal):
+        if not self._is_combo_like_signal(signal):
             return None
 
         strat = settings.strategy
@@ -2563,9 +3145,11 @@ class PositionManager:
             uniform_shares = signal.target_shares
 
             maker_leg = signal.maker_leg
+            maker_asset_id = getattr(maker_leg, "asset_id", maker_leg.yes_token_id)
+            maker_trade_side = getattr(maker_leg, "trade_side", "YES")
             maker_order = await self.executor.place_limit_order(
                 market_id=maker_leg.market_id,
-                asset_id=maker_leg.yes_token_id,
+                asset_id=maker_asset_id,
                 side=OrderSide.BUY,
                 price=maker_leg.target_price,
                 size=uniform_shares,
@@ -2580,7 +3164,7 @@ class PositionManager:
                 if fallback_price > 0:
                     maker_order = await self.executor.place_limit_order(
                         market_id=maker_leg.market_id,
-                        asset_id=maker_leg.yes_token_id,
+                        asset_id=maker_asset_id,
                         side=OrderSide.BUY,
                         price=fallback_price,
                         size=uniform_shares,
@@ -2601,8 +3185,8 @@ class PositionManager:
                 entry_price=maker_order.price,
                 entry_size=uniform_shares,
                 entry_time=time.time(),
-                trade_asset_id=maker_leg.yes_token_id,
-                trade_side="YES",
+                trade_asset_id=maker_asset_id,
+                trade_side=maker_trade_side,
                 yes_asset_id=maker_leg.yes_token_id,
                 signal_type="combo_arb",
                 fee_enabled=False,
@@ -2611,6 +3195,8 @@ class PositionManager:
             legs[maker_pos.market_id] = maker_pos
 
             for idx, leg in enumerate(signal.taker_legs, start=1):
+                leg_asset_id = getattr(leg, "asset_id", leg.yes_token_id)
+                leg_trade_side = getattr(leg, "trade_side", "YES")
                 pos = Position(
                     id=f"{combo_id}-L{idx}",
                     market_id=leg.market_id,
@@ -2621,8 +3207,8 @@ class PositionManager:
                     entry_price=leg.target_price,
                     entry_size=uniform_shares,
                     entry_time=0.0,
-                    trade_asset_id=leg.yes_token_id,
-                    trade_side="YES",
+                    trade_asset_id=leg_asset_id,
+                    trade_side=leg_trade_side,
                     yes_asset_id=leg.yes_token_id,
                     signal_type="combo_arb",
                     fee_enabled=True,
@@ -2653,6 +3239,17 @@ class PositionManager:
                 shares=uniform_shares,
             )
             return combo
+
+    def _is_combo_like_signal(self, signal: Any) -> bool:
+        maker_leg = getattr(signal, "maker_leg", None)
+        taker_legs = getattr(signal, "taker_legs", None)
+        return (
+            maker_leg is not None
+            and isinstance(taker_legs, list)
+            and hasattr(signal, "cluster_event_id")
+            and hasattr(signal, "target_shares")
+            and hasattr(signal, "total_collateral")
+        )
 
     async def abandon_combo(
         self,
@@ -2741,13 +3338,13 @@ class PositionManager:
             maker_pos.filled_size = maker_pos.entry_order.filled_size
             maker_pos.state = PositionState.ENTRY_FILLED
 
-            book = self._book_trackers.get(maker_pos.yes_asset_id or maker_pos.trade_asset_id)
+            book = self._book_trackers.get(maker_pos.trade_asset_id or maker_pos.yes_asset_id)
             bid = book.best_bid if book is not None else 0.01
             bid = max(0.01, bid)
 
             exit_order = await self.executor.place_limit_order(
                 market_id=maker_pos.market_id,
-                asset_id=maker_pos.yes_asset_id or maker_pos.trade_asset_id,
+                asset_id=maker_pos.trade_asset_id or maker_pos.yes_asset_id,
                 side=OrderSide.SELL,
                 price=round(bid, 2),
                 size=maker_pos.filled_size,
@@ -2789,7 +3386,7 @@ class PositionManager:
         hedge_failures: list[Position] = []
 
         for pos in unfilled:
-            book = self._book_trackers.get(pos.yes_asset_id or pos.trade_asset_id)
+            book = self._book_trackers.get(pos.trade_asset_id or pos.yes_asset_id)
             best_ask = book.best_ask if book else 0.0
 
             if best_ask <= 0:
@@ -2814,7 +3411,7 @@ class PositionManager:
                 # We send post_only=False (taker) and accept the fee hit.
                 taker_order = await self.executor.place_limit_order(
                     market_id=pos.market_id,
-                    asset_id=pos.yes_asset_id or pos.trade_asset_id,
+                    asset_id=pos.trade_asset_id or pos.yes_asset_id,
                     side=OrderSide.BUY,
                     price=round(best_ask, 2),
                     size=pos.entry_size,
@@ -2880,7 +3477,7 @@ class PositionManager:
             if p.state == PositionState.ENTRY_FILLED
         ]
         for pos in all_filled_now:
-            book = self._book_trackers.get(pos.yes_asset_id or pos.trade_asset_id)
+            book = self._book_trackers.get(pos.trade_asset_id or pos.yes_asset_id)
             bid = book.best_bid if book else 0.01
             if bid <= 0:
                 bid = 0.01
@@ -2888,7 +3485,7 @@ class PositionManager:
             # Market-sell at bid (taker) to guarantee execution
             exit_order = await self.executor.place_limit_order(
                 market_id=pos.market_id,
-                asset_id=pos.yes_asset_id or pos.trade_asset_id,
+                asset_id=pos.trade_asset_id or pos.yes_asset_id,
                 side=OrderSide.SELL,
                 price=round(bid, 2),
                 size=pos.effective_size,

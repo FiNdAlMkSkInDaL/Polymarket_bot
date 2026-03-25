@@ -15,6 +15,7 @@ V2 — Institutional-grade lifecycle:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import queue as _queue_mod
 import signal
 import sys
@@ -41,6 +42,7 @@ from src.monitoring.telegram import TelegramAlerter
 from src.monitoring.trade_store import TradeStore
 from src.signals.adverse_selection_guard import AdverseSelectionGuard
 from src.signals.edge_filter import compute_edge_score
+from src.signals.ofi_momentum import OFIMomentumDetector, OFIMomentumSignal
 from src.signals.panic_detector import PanicDetector, PanicSignal
 from src.signals.resolution_probability import (
     CryptoPriceModel,
@@ -60,6 +62,7 @@ from src.signals.signal_framework import (
 from src.signals.whale_monitor import WhaleMonitor
 from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
+from src.trading.fee_cache import FeeCache
 from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
@@ -67,8 +70,10 @@ from src.trading.stealth_executor import StealthExecutor
 from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
+from src.signals.contagion_arb import ContagionArbDetector, ContagionArbSignal
 from src.signals.cross_market import CrossMarketSignalGenerator
 from src.signals.combinatorial_arb import ComboArbDetector, ComboArbSignal, ComboSizer
+from src.signals.bayesian_arb import BayesianArbDetector, BayesianArbRelationshipManager
 from src.data.arb_clusters import ArbitrageClusterManager
 from src.signals.drift_signal import DriftSignal, MeanReversionDrift
 from src.signals.oracle_signal import OracleSignalEngine
@@ -201,6 +206,7 @@ class TradingBot:
         self._taker_counts: dict[str, int] = {}    # asset_id → taker-initiated trades
         self._total_counts: dict[str, int] = {}    # asset_id → total classified trades
         self._recent_trade_volume: dict[str, list[tuple[float, float]]] = {}  # cond_id → [(ts, size)]
+        self._recent_contagion_matrix: deque[dict[str, Any]] = deque(maxlen=12)
 
         # Spread-based signal evaluators (Problem 3)
         self._spread_evaluators: dict[str, CompositeSignalEvaluator] = {}  # condition_id → evaluator
@@ -215,6 +221,7 @@ class TradingBot:
         # V3: Per-market drift signal detectors
         self._drift_detectors: dict[str, MeanReversionDrift] = {}  # condition_id → detector
         self._drift_cooldowns: dict[str, float] = {}  # condition_id → last fire timestamp
+        self._ofi_detectors: dict[str, OFIMomentumDetector] = {}  # condition_id → detector
 
         # Maker adverse-selection monitor (V1/V4 calibration)
         self._maker_monitor: AdverseSelectionMonitor | None = None
@@ -256,19 +263,20 @@ class TradingBot:
                 GenericBayesianModel(),
             ],
         )
-        # Crypto retrigger state (Fix 2): last evaluated spot price
-        self._rpe_last_spot: float | None = None
-
-        # Cached fee-category set (avoid re-parsing on every trade eval)
-        _fee_cats_raw = settings.strategy.fee_enabled_categories.lower().split(",")
-        self._fee_category_set: frozenset[str] = frozenset(
-            cat.strip() for cat in _fee_cats_raw if cat.strip()
+        self._contagion_arb: ContagionArbDetector | None = (
+            ContagionArbDetector(self.pce, self._rpe)
+            if settings.strategy.contagion_arb_enabled
+            else None
         )
+        self._rpe_last_spot: float | None = None
+        self._l2_active_set: set[str] = set()
+        self._fee_category_set: set[str] = {
+            part.strip().lower()
+            for part in (settings.strategy.fee_enabled_categories or "").split(",")
+            if part.strip()
+        }
+        self._fee_cache = FeeCache()
 
-        # RPE calibration tracker (Deliverable A)
-        self._rpe_calibration = RPECalibrationTracker()
-
-        # Exception circuit breakers for critical async loops
         self._trade_loop_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._stale_bar_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._retrigger_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
@@ -276,233 +284,56 @@ class TradingBot:
         self._ghost_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._timeout_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._oracle_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
-        self._combo_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
 
-        # SI-9: Combinatorial Arbitrage state
         self._cluster_mgr = ArbitrageClusterManager()
-        self._combo_detector: ComboArbDetector | None = None  # set in _run()
-        self._combo_positions: dict[str, ComboPosition] = {}
+        self._combo_detector: ComboArbDetector | None = None
+        self._bayesian_cluster_mgr = BayesianArbRelationshipManager()
+        self._bayesian_detector: BayesianArbDetector | None = None
 
-        # RPE per-market cooldown (Deliverable C)
-        self._rpe_last_signal: dict[str, float] = {}
-
-        # SI-8: Oracle Latency Arbitrage state
-        self._oracle_last_signal: dict[str, float] = {}
-        self._oracle_signal_engine = OracleSignalEngine()
         self._oracle_registry = OracleAdapterRegistry()
-        self._oracle_registry.register("ap_election", APElectionAdapter)
-        self._oracle_registry.register("sports", SportsAdapter)
+        self._oracle_signal_engine = OracleSignalEngine()
         self._oracle_adapter_tasks: list[asyncio.Task] = []
+        self._oracle_last_signal: dict[str, float] = {}
 
-        # Data recorder (enabled via RECORD_DATA=true, or forced on in PAPER)
-        self._recorder = None
-        if self.guard.enforce_data_recording() and MarketDataRecorder is not None:
-            self._recorder = MarketDataRecorder(data_dir=settings.record_data_dir)
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  Lifecycle
-    # ═══════════════════════════════════════════════════════════════════════
-    async def start(self) -> None:
-        """Discover markets, wire components, and enter the main loop."""
-        setup_logging(settings.log_dir)
-        mode_label = self.deployment_env.value
-        strat = settings.strategy
-        log.info(
-            "bot_starting",
-            mode=mode_label,
-            **self.guard.startup_summary(),
-            min_edge_score=strat.min_edge_score,
-            signal_cooldown_min=strat.signal_cooldown_minutes,
-            heartbeat_stale_ms=strat.heartbeat_stale_ms,
-            heartbeat_stale_count=strat.heartbeat_stale_count,
-            ws_silence_timeout=strat.ws_silence_timeout_s,
-            min_kelly_trades=strat.min_kelly_trades,
-            pure_mm_enabled=strat.pure_mm_enabled,
-            pure_mm_max_markets=strat.pure_mm_max_markets,
-            rpe_shadow_mode=strat.rpe_shadow_mode,
-            rpe_generic_enabled=strat.rpe_generic_enabled,
-            kelly_fraction=strat.kelly_fraction,
+        self._recorder = (
+            MarketDataRecorder(settings.record_data_dir)
+            if settings.record_data and MarketDataRecorder is not None
+            else None
         )
-
-        # Fail-fast if running with real capital without required credentials
-        if self.guard.is_live:
-            missing = settings.validate_credentials()
-            if missing:
-                for msg in missing:
-                    log.error("credential_missing", detail=msg)
-                raise SystemExit(
-                    f"Cannot start in {mode_label} mode — missing credentials: "
-                    f"{", ".join(missing)}"
-                )
-
-        await self.telegram.send(f"🤖 Bot starting in <b>{mode_label}</b> mode")
-
-        try:
-            await self._run(mode_label)
-        except Exception as exc:
-            log.exception("bot_crashed", error=str(exc))
-            await self.telegram.send(
-                f"💥 <b>Bot crashed unexpectedly</b>\n"
-                f"<code>{type(exc).__name__}: {exc}</code>\n"
-                "Please restart the bot."
-            )
-            raise
-
-    async def _run(self, mode_label: str) -> None:
-        """Internal: initialise and run after startup message is sent."""
-        self._start_time = time.monotonic()
-
-        # 1. Init trade store
-        await self.trade_store.init()
-
-        # 2. Discover eligible markets via lifecycle manager (with retry)
-        _INIT_RETRIES = 5
-        _INIT_DELAY = 15.0  # seconds between retries
-        for _disc_attempt in range(1, _INIT_RETRIES + 1):
-            self._markets = await self.lifecycle.initial_discovery()
-            if self._markets:
-                break
-            if _disc_attempt < _INIT_RETRIES:
-                log.warning(
-                    "initial_discovery_empty_retrying",
-                    attempt=_disc_attempt,
-                    max_attempts=_INIT_RETRIES,
-                    delay_s=_INIT_DELAY,
-                )
-                await asyncio.sleep(_INIT_DELAY)
-        if not self._markets:
-            log.error("no_eligible_markets")
-            await self.telegram.send(
-                "⚠️ <b>Bot stopped — no eligible markets found.</b>\n"
-                "No markets currently meet the configured criteria.\n"
-                "Restart the bot manually when conditions change."
-            )
-            return
-
-        tracked_limit = settings.strategy.max_active_l2_markets
-        self._markets.sort(key=lambda market: market.daily_volume_usd, reverse=True)
-        self._markets = self._markets[:tracked_limit]
-        log.info("markets_selected", count=len(self._markets))
-
-        # 3. Build per-market aggregators, detectors & book trackers
-        #    Load shedding: only the top MAX_ACTIVE_L2_MARKETS by 24h
-        #    volume get full L2 book reconstruction + SI-2 iceberg
-        #    detection.  The rest use lightweight price/trade-only
-        #    tracking to keep loop latency under 100ms.
-        all_asset_ids: list[str] = []
-        whale_map: dict[str, tuple[str, str]] = {}
-
-        l2_limit = settings.strategy.max_active_l2_markets
-        all_wirable = list(self._markets)
-        for om in self.lifecycle.observing.values():
-            if om.info not in all_wirable:
-                all_wirable.append(om.info)
-        # Sort descending by volume; top l2_limit get full L2
-        all_wirable.sort(key=lambda m: m.daily_volume_usd, reverse=True)
-        self._l2_active_set: set[str] = {
-            m.condition_id for m in all_wirable[:l2_limit]
-        }
-        log.info(
-            "load_shedding_applied",
-            total_markets=len(all_wirable),
-            l2_active=len(self._l2_active_set),
-            l2_limit=l2_limit,
-        )
-
-        for m in self._markets:
-            self._wire_market(m)
-            all_asset_ids.extend([m.yes_token_id, m.no_token_id])
-            whale_map[m.yes_token_id] = (m.condition_id, "yes")
-            whale_map[m.no_token_id] = (m.condition_id, "no")
-
-        # Also wire observing-tier markets (collect data, no trading)
-        for om in self.lifecycle.observing.values():
-            m = om.info
-            self._wire_market(m)
-            all_asset_ids.extend([m.yes_token_id, m.no_token_id])
-            whale_map[m.yes_token_id] = (m.condition_id, "yes")
-            whale_map[m.no_token_id] = (m.condition_id, "no")
-
-        # Register whale token→market mapping
-        self.whale_monitor.set_market_map(whale_map)
-
-        # 4. Set initial wallet balance
-        self.positions.set_wallet_balance(self.guard.get_wallet_balance())
-
-        # 4b. Validate fee model against CLOB REST endpoint (live only).
-        #     Sample up to 3 active markets to cross-check the local
-        #     parabolic formula against the exchange's actual fee curve.
-        if self.guard.is_live and self._markets:
-            from src.trading.fee_cache import validate_fee_model
-            probe_markets = self._markets[:3]
-            probe_tokens = [m.no_token_id for m in probe_markets]
-            # Use 0.50 mid-price as the worst-case probe (peak fee)
-            probe_prices = [0.50] * len(probe_tokens)
-            fee_ok = await validate_fee_model(probe_tokens, probe_prices)
-            if not fee_ok:
-                await self.telegram.send(
-                    "⚠️ <b>Fee model divergence detected</b>\n"
-                    "Local fee formula disagrees with CLOB endpoint.\n"
-                    "Review logs — bot continues with local model."
-                )
-
-        # 5. Launch concurrent tasks
-        self._running = True
         self._ws = MarketWebSocketPool(
-            all_asset_ids, self._trade_queue, book_queue=self._book_queue,
+            [],
+            self._trade_queue,
+            book_queue=self._book_queue,
             recorder=self._recorder,
         )
+        self._l2_ws = (
+            L2WebSocket(self._l2_books, recorder=self._recorder)
+            if settings.strategy.l2_enabled
+            else None
+        )
 
-        # L2 WebSocket (Pillar 11) — dedicated connection for L2 book data
-        # In multi-core mode, L2 processing is offloaded to worker processes
-        # managed by the ProcessManager.  In single-process fallback, the
-        # original L2WebSocket runs inside the main asyncio loop.
-        if self._multicore_enabled and self._l2_books:
-            self._process_manager = ProcessManager(
-                on_emergency_stop=self._schedule_stop,
-            )
-            l2_asset_ids = list(self._l2_books.keys())
-            self._process_manager.start_l2_workers(l2_asset_ids)
-            # Replace in-process L2 book trackers with shared-memory readers
-            for aid in l2_asset_ids:
-                reader = self._process_manager.get_reader(aid)
-                if reader is not None:
-                    self._book_trackers[aid] = SharedBookReaderAdapter(reader)
-            # Start PCE worker
-            self._process_manager.start_pce_worker(
-                data_dir=settings.record_data_dir,
-            )
-            # Wire VaR gate queues to position manager for remote PCE checks
-            self.positions.set_var_gate_queues(
-                self._process_manager.pce_var_request_queue,
-                self._process_manager.pce_var_response_queue,
-            )
-            self._l2_ws = None
-            log.info(
-                "multicore_enabled",
-                l2_workers=self._process_manager.n_l2_workers,
-                l2_assets=len(l2_asset_ids),
-            )
-        elif settings.strategy.l2_enabled and self._l2_books:
-            # Fallback: single-process L2 (original path)
-            for l2_book in self._l2_books.values():
-                l2_book._on_desync = self._on_l2_desync
-            self._l2_ws = L2WebSocket(self._l2_books, recorder=self._recorder)
-        else:
-            self._l2_ws = None
-
-        # Adverse-selection guard (Pillar 5)
         self._adverse_guard = AdverseSelectionGuard(
-            executor=self.executor,
-            book_trackers=self._book_trackers,
-            fast_kill_event=self._fast_kill_event,
+            self.executor,
+            self._book_trackers,
+            self._fast_kill_event,
             taker_counts=self._taker_counts,
             total_counts=self._total_counts,
             trade_counts=self._trade_counts,
             get_position_assets=self._positioned_asset_ids,
             telegram=self.telegram,
-            on_shutdown=self.stop,
+            on_shutdown=self._schedule_stop,
         )
+
+        self._heartbeat: BookHeartbeat | None = None
+        self._order_poller: OrderStatusPoller | None = None
+        self._stop_loss_monitor: StopLossMonitor | None = None
+        self._pure_mm: PureMarketMaker | None = None
+
+    async def start(self) -> None:
+        """Start background tasks and live runtime services for the trading bot."""
+        self._running = True
+        self._start_time = time.time()
+        mode_label = self.deployment_env.value
 
         # Polygon head-lag checker (moved from adverse-selection guard)
         polygon_checker = (
@@ -636,9 +467,24 @@ class TradingBot:
             for tid in self._cluster_mgr.all_cluster_yes_token_ids():
                 if tid not in self._book_trackers:
                     self._book_trackers[tid] = OrderbookTracker(tid)
-            self._combo_detector = ComboArbDetector(self._book_trackers)
+            self._combo_detector = ComboArbDetector(self._book_trackers, aggregators=self._yes_aggs)
             self._tasks.append(
                 asyncio.create_task(self._combo_arbitrage_loop(), name="combo_arb")
+            )
+
+        if settings.strategy.si10_bayesian_arb_enabled:
+            self._bayesian_cluster_mgr.scan_clusters(self._markets)
+            for tid in self._bayesian_cluster_mgr.all_cluster_asset_ids():
+                if tid not in self._book_trackers:
+                    self._book_trackers[tid] = OrderbookTracker(tid)
+            await self._fee_cache.prefetch(sorted(self._bayesian_cluster_mgr.all_cluster_asset_ids()))
+            self._bayesian_detector = BayesianArbDetector(
+                self._book_trackers,
+                fee_enabled_resolver=self._is_fee_enabled,
+                fee_rate_bps_lookup=self._fee_cache.get_fee_rate_sync,
+            )
+            self._tasks.append(
+                asyncio.create_task(self._bayesian_arb_loop(), name="bayesian_arb")
             )
 
         # Multi-core mode: add worker consumer tasks, skip in-process PCE loop
@@ -745,6 +591,16 @@ class TradingBot:
         if settings.strategy.regime_enabled:
             self._regime_detectors[m.condition_id] = RegimeDetector(m.condition_id)
 
+        self._ofi_detectors[m.condition_id] = OFIMomentumDetector(
+            market_id=m.condition_id,
+            no_asset_id=m.no_token_id,
+            window_ms=settings.strategy.window_ms,
+            threshold=settings.strategy.ofi_threshold,
+            tvi_kappa=settings.strategy.ofi_tvi_kappa,
+        )
+        if self._contagion_arb is not None:
+            self._contagion_arb.register_market(m)
+
         # PCE: register market for correlation tracking (Pillar 15)
         self.pce.register_market(
             m.condition_id, m.event_id, getattr(m, 'tags', '') or '',
@@ -797,6 +653,9 @@ class TradingBot:
         self._regime_detectors.pop(m.condition_id, None)
         self._drift_detectors.pop(m.condition_id, None)
         self._drift_cooldowns.pop(m.condition_id, None)
+        self._ofi_detectors.pop(m.condition_id, None)
+        if self._contagion_arb is not None:
+            self._contagion_arb.unregister_market(m.condition_id)
         self._rpe.clear_market(m.condition_id)
         self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
@@ -1049,9 +908,20 @@ class TradingBot:
             await self._pure_mm.stop()
 
         try:
-            stats = await asyncio.wait_for(self.trade_store.get_stats(), timeout=5)
+            stats = self._augment_trade_stats(
+                await asyncio.wait_for(self.trade_store.get_stats(), timeout=5)
+            )
             log.info("final_stats", **stats)
             await asyncio.wait_for(self.telegram.notify_stats(stats), timeout=5)
+            await asyncio.wait_for(
+                self.telegram.send(
+                    f"🛑 <b>Bot stopped</b>\n"
+                    f"Trades: {int(stats.get('total_trades', 0) or 0)}\n"
+                    f"Expectancy: {float(stats.get('expectancy_cents', 0.0) or 0.0):+.2f}¢/trade"
+                    f"{self._smart_passive_operator_block()}"
+                ),
+                timeout=5,
+            )
         except Exception:
             log.warning("final_stats_skipped")
         try:
@@ -1059,6 +929,10 @@ class TradingBot:
             await asyncio.wait_for(self.trade_store.close(), timeout=5)
         except Exception:
             log.warning("trade_store_close_error", exc_info=True)
+        try:
+            await asyncio.wait_for(self._fee_cache.close(), timeout=5)
+        except Exception:
+            log.warning("fee_cache_close_error", exc_info=True)
 
         log.info("bot_stopped")
 
@@ -1417,6 +1291,9 @@ class TradingBot:
         if self._maker_monitor is not None:
             await self._maker_monitor.tick()
 
+        await self._evaluate_ofi_momentum(asset_id)
+        await self._evaluate_contagion_arb(asset_id)
+
     def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
         """Callback from basic OrderbookTracker when the BBO changes.
 
@@ -1426,6 +1303,142 @@ class TradingBot:
             self._stop_loss_monitor.on_bbo_update(asset_id),
             name=f"stop_loss_bbo_{asset_id[:12]}",
         )
+        _safe_fire_and_forget(
+            self._evaluate_ofi_momentum(asset_id),
+            name=f"ofi_bbo_{asset_id[:12]}",
+        )
+        _safe_fire_and_forget(
+            self._evaluate_contagion_arb(asset_id),
+            name=f"contagion_bbo_{asset_id[:12]}",
+        )
+
+    async def _evaluate_ofi_momentum(self, asset_id: str) -> None:
+        """Evaluate OFI momentum on book updates and route BUY signals."""
+        market_info = self._market_map.get(asset_id)
+        if market_info is None or asset_id != market_info.no_token_id:
+            return
+
+        if not self.lifecycle.is_tradeable(market_info.condition_id):
+            return
+        if not market_info.accepting_orders:
+            return
+        if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            return
+
+        detector = self._ofi_detectors.get(market_info.condition_id)
+        no_book = self._book_trackers.get(market_info.no_token_id)
+        no_agg = self._no_aggs.get(market_info.no_token_id)
+        if detector is None or no_book is None or no_agg is None or not no_book.has_data:
+            return
+
+        l2_no = self._l2_books.get(market_info.no_token_id)
+        if l2_no is not None and not l2_no.is_reliable:
+            return
+
+        sig = detector.generate_signal(no_book=no_book, trade_aggregator=no_agg)
+        if sig is None:
+            return
+
+        regime_det = self._regime_detectors.get(market_info.condition_id)
+        regime_score = regime_det.regime_score if regime_det else 0.5
+        meta_decision = self._meta_controller.evaluate("ofi_momentum", regime_score)
+        if meta_decision.vetoed:
+            log.info(
+                "meta_controller_veto",
+                market_id=market_info.condition_id[:16],
+                signal_type="ofi_momentum",
+                regime_score=round(regime_score, 3),
+                reason=meta_decision.veto_reason,
+            )
+            return
+
+        if sig.direction != "BUY":
+            log.debug(
+                "ofi_momentum_sell_observed",
+                market_id=market_info.condition_id,
+                ofi=round(sig.ofi, 4),
+            )
+            return
+
+        if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+            log.info(
+                "stop_loss_cooldown_suppressed_ofi",
+                market_id=market_info.condition_id[:16],
+            )
+            return
+
+        self.lifecycle.record_signal(market_info.condition_id)
+        await self._on_panic_signal(
+            sig,
+            no_agg,
+            market_info,
+            signal_metadata={
+                "signal_source": "ofi_momentum",
+                "direction": sig.direction,
+                "rolling_vi": sig.rolling_vi,
+                "current_vi": sig.current_vi,
+                "toxicity_index": sig.toxicity_index,
+                "toxicity_depth_evaporation": sig.toxicity_depth_evaporation,
+                "toxicity_sweep_ratio": sig.toxicity_sweep_ratio,
+                "meta_weight": meta_decision.weight,
+                "regime_score": regime_score,
+            },
+        )
+
+    async def _evaluate_contagion_arb(self, asset_id: str) -> None:
+        """Evaluate the toxicity contagion detector on every BBO update."""
+        if self._contagion_arb is None:
+            return
+
+        market_info = self._market_map.get(asset_id)
+        if market_info is None:
+            return
+        if not self.lifecycle.is_tradeable(market_info.condition_id):
+            return
+        if not market_info.accepting_orders:
+            return
+
+        yes_book = self._book_trackers.get(market_info.yes_token_id)
+        no_book = self._book_trackers.get(market_info.no_token_id)
+        if yes_book is None or no_book is None:
+            return
+        if not getattr(yes_book, "has_data", False) or not getattr(no_book, "has_data", False):
+            return
+
+        l2_yes = self._l2_books.get(market_info.yes_token_id)
+        l2_no = self._l2_books.get(market_info.no_token_id)
+        if l2_yes is not None and not l2_yes.is_reliable:
+            return
+        if l2_no is not None and not l2_no.is_reliable:
+            return
+
+        yes_snapshot = yes_book.snapshot()
+        yes_price = 0.0
+        if yes_snapshot.best_bid > 0 and yes_snapshot.best_ask > 0:
+            yes_price = round((yes_snapshot.best_bid + yes_snapshot.best_ask) / 2.0, 4)
+        elif yes_snapshot.best_ask > 0:
+            yes_price = round(yes_snapshot.best_ask, 4)
+        else:
+            yes_agg = self._yes_aggs.get(market_info.yes_token_id)
+            yes_price = round(yes_agg.current_price, 4) if yes_agg else 0.0
+
+        if yes_price <= 0 or yes_price >= 1:
+            return
+
+        yes_buy_toxicity = float(yes_book.toxicity_index("BUY"))
+        no_buy_toxicity = float(no_book.toxicity_index("BUY"))
+        signals = self._contagion_arb.evaluate_market(
+            market=market_info,
+            yes_price=yes_price,
+            yes_buy_toxicity=yes_buy_toxicity,
+            no_buy_toxicity=no_buy_toxicity,
+            universe=self._tracked_l2_markets(),
+        )
+        for signal in signals:
+            lagging_market = self._find_market(signal.lagging_market_id)
+            if lagging_market is None:
+                continue
+            await self._on_contagion_signal(signal, lagging_market)
 
     async def _on_l2_desync(self, asset_id: str) -> None:
         """Callback from L2OrderBook on sequence gap detection.
@@ -1694,11 +1707,18 @@ class TradingBot:
         self, sig: BaseSignal, no_agg: OHLCVAggregator, market: MarketInfo,
         signal_metadata: dict | None = None,
     ) -> None:
-        """Handle a confirmed entry signal (PanicSignal or DriftSignal)."""
+        """Handle a confirmed entry signal routed into PositionManager."""
         # Fire-and-forget — Telegram notification must NOT block the
         # alpha-critical execution path (saves 50-500ms per trade).
-        _notify_zscore = sig.zscore if isinstance(sig, PanicSignal) else abs(getattr(sig, "displacement", 0.0))
-        _notify_vratio = sig.volume_ratio if isinstance(sig, PanicSignal) else 1.0
+        if isinstance(sig, PanicSignal):
+            _notify_zscore = sig.zscore
+            _notify_vratio = sig.volume_ratio
+        elif isinstance(sig, OFIMomentumSignal):
+            _notify_zscore = abs(sig.rolling_vi or sig.current_vi)
+            _notify_vratio = 1.0
+        else:
+            _notify_zscore = abs(getattr(sig, "displacement", 0.0))
+            _notify_vratio = 1.0
         asyncio.ensure_future(self.telegram.notify_signal(
             sig.market_id, _notify_zscore, _notify_vratio
         ))
@@ -1741,6 +1761,18 @@ class TradingBot:
             signal_metadata=signal_metadata,
         )
         if pos:
+            if pos.signal_type == "ofi_momentum":
+                log.info(
+                    "momentum_signal_routed_taker",
+                    pos_id=pos.id,
+                    market=market.condition_id,
+                    entry=pos.entry_price,
+                    target=pos.target_price,
+                    stop=pos.stop_price,
+                    max_hold_seconds=pos.max_hold_seconds,
+                )
+                return
+
             # Launch entry chaser as a child task (Pillar 1)
             # Panic signals use urgent=True to escalate immediately
             # and capture the edge before it decays.
@@ -2430,6 +2462,246 @@ class TradingBot:
                 return m
         return None
 
+    def _build_contagion_matrix_entry(
+        self,
+        signal: ContagionArbSignal,
+        market: MarketInfo,
+        *,
+        book: OrderbookTracker | None,
+        agg: OHLCVAggregator | None,
+        suppressed: bool = False,
+        suppression_reason: str | None = None,
+    ) -> dict[str, Any]:
+        fair_value = signal.implied_probability
+        market_price = signal.lagging_market_price
+        best_bid = 0.0
+        best_ask = 0.0
+        last_trade_age_s = -1.0
+
+        if signal.direction == "buy_no":
+            fair_value = max(0.01, min(0.99, 1.0 - signal.implied_probability))
+            market_price = max(0.01, min(0.99, 1.0 - signal.lagging_market_price))
+
+        if book is not None and getattr(book, "has_data", False):
+            snap = book.snapshot()
+            best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+            best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+            if signal.direction == "buy_no" and best_bid > 0 and best_ask > 0:
+                best_bid = max(0.01, min(0.99, 1.0 - float(getattr(snap, "best_ask", 0.0) or 0.0)))
+                best_ask = max(0.01, min(0.99, 1.0 - float(getattr(snap, "best_bid", 0.0) or 0.0)))
+
+        if agg is not None and getattr(agg, "last_trade_time", 0.0) > 0:
+            last_trade_age_s = max(0.0, time.time() - float(agg.last_trade_time))
+
+        mid_price = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else market_price
+        cross_spread_slip_cents = max(0.0, (best_ask - mid_price) * 100.0) if best_ask > 0 else 0.0
+        edge_cents = (fair_value - (best_ask or market_price)) * 100.0
+        leader_market = self._find_market(signal.leading_market_id)
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "shadow": signal.is_shadow,
+            "suppressed": suppressed,
+            "suppression_reason": suppression_reason or "",
+            "leader_market_id": signal.leading_market_id,
+            "lagging_market_id": signal.lagging_market_id,
+            "leader_question": getattr(leader_market, "question", "") if leader_market else "",
+            "lagging_question": getattr(market, "question", ""),
+            "leader_direction": signal.direction,
+            "leader_toxicity_excess": round(signal.leader_toxicity - signal.toxicity_percentile, 6),
+            "leader_price_shift_cents": round(signal.leader_price_shift * 100.0, 3),
+            "expected_shift_cents": round(signal.expected_probability_shift * 100.0, 3),
+            "correlation": round(signal.correlation, 6),
+            "thematic_group": signal.thematic_group,
+            "fair_value": round(fair_value, 6),
+            "market_price": round(market_price, 6),
+            "edge_cents": round(edge_cents, 3),
+            "cross_spread_slip_cents": round(cross_spread_slip_cents, 3),
+            "last_trade_age_s": round(last_trade_age_s, 3),
+        }
+
+    async def _record_contagion_matrix(
+        self,
+        signal: ContagionArbSignal,
+        market: MarketInfo,
+        *,
+        book: OrderbookTracker | None,
+        agg: OHLCVAggregator | None,
+        suppressed: bool = False,
+        suppression_reason: str | None = None,
+    ) -> None:
+        entry = self._build_contagion_matrix_entry(
+            signal,
+            market,
+            book=book,
+            agg=agg,
+            suppressed=suppressed,
+            suppression_reason=suppression_reason,
+        )
+        self._recent_contagion_matrix.appendleft(entry)
+        await self.telegram.notify_contagion_matrix(entry)
+
+    async def _on_contagion_signal(
+        self,
+        signal: ContagionArbSignal,
+        market: MarketInfo,
+    ) -> None:
+        """Route a contagion arb signal into the RPE fast-strike entry path."""
+        if signal.is_shadow:
+            log.info(
+                "contagion_signal_shadow",
+                leading_market=signal.leading_market_id,
+                lagging_market=signal.lagging_market_id,
+                direction=signal.direction,
+                implied_probability=round(signal.implied_probability, 4),
+                correlation=round(signal.correlation, 4),
+                thematic_group=signal.thematic_group,
+            )
+            return
+
+        if not self.lifecycle.is_tradeable(market.condition_id):
+            return
+        if not market.accepting_orders:
+            return
+        if not self.lifecycle.is_cooled_down(market.condition_id):
+            return
+        if not self.positions.is_stop_loss_cooled_down(market.condition_id):
+            log.info(
+                "stop_loss_cooldown_suppressed_contagion",
+                market_id=market.condition_id[:16],
+            )
+            return
+
+        positioned = self._positioned_asset_ids()
+        if market.yes_token_id in positioned or market.no_token_id in positioned:
+            log.info("contagion_already_positioned", market=market.condition_id)
+            return
+
+        if signal.direction == "buy_no":
+            book = self._book_trackers.get(market.no_token_id)
+            agg = self._no_aggs.get(market.no_token_id)
+        else:
+            book = self._book_trackers.get(market.yes_token_id)
+            agg = self._yes_aggs.get(market.yes_token_id)
+
+        if book is not None or agg is not None:
+            await self._record_contagion_matrix(signal, market, book=book, agg=agg)
+
+        if book and book.has_data:
+            snap = book.snapshot()
+            if snap.best_bid > 0 and snap.best_ask > 0:
+                spread_pct = ((snap.best_ask - snap.best_bid) / snap.best_ask) * 100.0
+                if spread_pct > settings.strategy.contagion_arb_max_lagging_spread_pct:
+                    log.info(
+                        "contagion_suppressed_wide_lagger",
+                        market=market.condition_id,
+                        spread_pct=round(spread_pct, 3),
+                        limit=settings.strategy.contagion_arb_max_lagging_spread_pct,
+                    )
+                    await self._record_contagion_matrix(
+                        signal,
+                        market,
+                        book=book,
+                        agg=agg,
+                        suppressed=True,
+                        suppression_reason="lagger_spread_wide",
+                    )
+                    return
+            entry_price = round(snap.best_ask - 0.01, 2) if snap.best_ask > 0 else 0.0
+            min_depth = settings.strategy.min_ask_depth_usd
+            if snap.ask_depth_usd < min_depth:
+                log.info(
+                    "contagion_rejected_thin_asks",
+                    market=market.condition_id,
+                    ask_depth_usd=round(snap.ask_depth_usd, 2),
+                    min_required=min_depth,
+                    direction=signal.direction,
+                )
+                return
+        else:
+            entry_price = round(agg.current_price, 2) if agg else 0.0
+
+        if agg is None or agg.last_trade_time <= 0:
+            log.info("contagion_suppressed_stale_lagger", market=market.condition_id, reason="no_last_trade")
+            await self._record_contagion_matrix(
+                signal,
+                market,
+                book=book,
+                agg=agg,
+                suppressed=True,
+                suppression_reason="lagger_no_trade_timestamp",
+            )
+            return
+
+        last_trade_age_s = time.time() - agg.last_trade_time
+        if last_trade_age_s > settings.strategy.contagion_arb_max_last_trade_age_s:
+            log.info(
+                "contagion_suppressed_stale_lagger",
+                market=market.condition_id,
+                last_trade_age_s=round(last_trade_age_s, 2),
+                limit=settings.strategy.contagion_arb_max_last_trade_age_s,
+            )
+            await self._record_contagion_matrix(
+                signal,
+                market,
+                book=book,
+                agg=agg,
+                suppressed=True,
+                suppression_reason="lagger_trade_stale",
+            )
+            return
+
+        if entry_price <= 0:
+            return
+
+        fee_enabled = self._is_fee_enabled(market)
+        days_to_resolution = 1
+        if market.end_date:
+            delta = market.end_date - datetime.now(tz=timezone.utc)
+            days_to_resolution = max(1, delta.days)
+
+        contagion_meta = dict(signal.metadata)
+        contagion_meta.update({
+            "signal_source": signal.signal_source,
+            "leading_market_id": signal.leading_market_id,
+            "thematic_group": signal.thematic_group,
+            "leader_toxicity": signal.leader_toxicity,
+            "toxicity_percentile": signal.toxicity_percentile,
+            "correlation": signal.correlation,
+        })
+
+        pos = await self.positions.open_rpe_position(
+            market_id=market.condition_id,
+            yes_asset_id=market.yes_token_id,
+            no_asset_id=market.no_token_id,
+            direction=signal.direction,
+            model_probability=signal.implied_probability,
+            confidence=signal.confidence,
+            entry_price=entry_price,
+            event_id=market.event_id,
+            days_to_resolution=days_to_resolution,
+            fee_enabled=fee_enabled,
+            book=book,
+            signal_metadata=contagion_meta,
+            latency_healthy=True,
+        )
+        if pos:
+            self.lifecycle.record_signal(market.condition_id)
+            if getattr(pos, "fast_strike", False):
+                log.info(
+                    "contagion_fast_strike_no_chaser",
+                    pos_id=pos.id,
+                    market=market.condition_id,
+                    leader_market=signal.leading_market_id,
+                )
+            elif book and book.has_data:
+                chaser_task = asyncio.create_task(
+                    self._entry_chaser_flow(pos, book),
+                    name=f"chaser_entry_contagion_{pos.id}",
+                )
+                chaser_task.add_done_callback(_safe_task_done_callback)
+                pos.entry_chaser_task = chaser_task
+
     async def _on_oracle_signal(
         self,
         signal: SignalResult,
@@ -2649,6 +2921,9 @@ class TradingBot:
                 pos.entry_size,
                 pos.target_price,
             )
+            if pos.signal_type == "ofi_momentum":
+                return
+
             # Launch exit chaser (Pillar 1)
             # Use trade_asset_id to route to the correct book —
             # panic positions trade NO, RPE positions may trade YES or NO.
@@ -2676,7 +2951,7 @@ class TradingBot:
             )
             return
 
-        self.positions.on_exit_filled(pos, reason="target")
+        self.positions.on_exit_filled(pos, reason=pos.exit_reason or "target")
         # Refresh lifecycle cooldown from close time (not signal fire time)
         self.lifecycle.record_signal(pos.market_id)
         _safe_fire_and_forget(
@@ -2687,9 +2962,15 @@ class TradingBot:
     async def _record_and_notify_exit(self, pos: Any) -> None:
         try:
             await self.trade_store.record(pos)
+            setattr(pos, "_recorded", True)
             self.positions._invalidate_stats_cache()
             await self.telegram.notify_exit(
-                pos.id, pos.entry_price, pos.exit_price, pos.pnl_cents, pos.exit_reason
+                pos.id,
+                pos.entry_price,
+                pos.exit_price,
+                pos.pnl_cents,
+                pos.exit_reason,
+                self.positions.smart_passive_counters,
             )
         except asyncio.CancelledError:
             raise
@@ -2821,6 +3102,8 @@ class TradingBot:
                     if pos.state != PositionState.EXIT_PENDING:
                         continue
                     if not pos.exit_order:
+                        continue
+                    if pos.signal_type == "ofi_momentum":
                         continue
 
                     asset_id = pos.trade_asset_id or pos.no_asset_id
@@ -3159,10 +3442,14 @@ class TradingBot:
                 for pos in self.positions.get_all_positions():
                     if (
                         pos.state == PositionState.CLOSED
-                        and pos.exit_reason == "timeout"
+                        and (
+                            pos.exit_reason in ("timeout", "time_stop")
+                            or pos.signal_type == "ofi_momentum"
+                        )
                         and not getattr(pos, "_recorded", False)
                     ):
                         await self.trade_store.record(pos)
+                        setattr(pos, "_recorded", True)
                         self.positions._invalidate_stats_cache()
                         await self.telegram.notify_exit(
                             pos.id, pos.entry_price, pos.exit_price,
@@ -3260,9 +3547,29 @@ class TradingBot:
         while self._running:
             await asyncio.sleep(900)
             try:
-                stats = await self.trade_store.get_stats()
+                stats = self._augment_trade_stats(await self.trade_store.get_stats())
                 log.info("periodic_stats", **stats)
                 await self.telegram.notify_stats(stats)
+
+                if self._combo_detector is not None:
+                    paused = self._combo_detector.active_deferrals()
+                    log.info(
+                        "combo_arb_ofi_status",
+                        paused_clusters=len(paused),
+                        paused_event_ids=[state.event_id for state in paused],
+                        si9_ofi_window_ms=settings.strategy.si9_ofi_window_ms,
+                        si9_toxic_ofi_threshold=settings.strategy.si9_toxic_ofi_threshold,
+                    )
+
+                all_rankings = self._top_toxicity_rankings(limit=None)
+                top_rankings = all_rankings[:5]
+                if top_rankings:
+                    log.info(
+                        "top_market_toxicity_rankings",
+                        tracked_markets=len(all_rankings),
+                        l2_active=len(getattr(self, "_l2_active_set", set())),
+                        top_markets=top_rankings,
+                    )
 
                 # Log market scores
                 for am in self.lifecycle.active.values():
@@ -3307,6 +3614,90 @@ class TradingBot:
             except Exception as exc:
                 log.error("stats_loop_error", error=str(exc))
 
+    def _tracked_l2_markets(self) -> list[MarketInfo]:
+        condition_ids = getattr(self, "_l2_active_set", set())
+        if not condition_ids:
+            return []
+
+        tracked: dict[str, MarketInfo] = {}
+        for market in self._markets:
+            if market.condition_id in condition_ids:
+                tracked[market.condition_id] = market
+        for active_market in self.lifecycle.active.values():
+            market = active_market.info
+            if market.condition_id in condition_ids:
+                tracked[market.condition_id] = market
+        for observing_market in self.lifecycle.observing.values():
+            market = observing_market.info
+            if market.condition_id in condition_ids:
+                tracked[market.condition_id] = market
+        return list(tracked.values())
+
+    def _top_toxicity_rankings(self, limit: int | None = 5) -> list[dict[str, Any]]:
+        rankings: list[dict[str, Any]] = []
+        for market in self._tracked_l2_markets():
+            book = self._book_trackers.get(market.no_token_id)
+            if book is None:
+                book = self._book_trackers.get(market.yes_token_id)
+            if book is None or not getattr(book, "has_data", True):
+                continue
+
+            buy_metrics = book.toxicity_metrics("BUY")
+            sell_metrics = book.toxicity_metrics("SELL")
+            dominant_side = "BUY"
+            dominant_metrics = buy_metrics
+            if sell_metrics["toxicity_index"] > buy_metrics["toxicity_index"]:
+                dominant_side = "SELL"
+                dominant_metrics = sell_metrics
+
+            toxicity_index = float(dominant_metrics.get("toxicity_index", 0.0))
+            if toxicity_index <= 0:
+                continue
+
+            rankings.append(
+                {
+                    "condition_id": market.condition_id,
+                    "question": getattr(market, "question", "")[:60],
+                    "asset_id": market.no_token_id,
+                    "dominant_side": dominant_side,
+                    "toxicity_index": round(toxicity_index, 4),
+                    "depth_evaporation": round(
+                        float(dominant_metrics.get("toxicity_depth_evaporation", 0.0)),
+                        4,
+                    ),
+                    "sweep_ratio": round(
+                        float(dominant_metrics.get("toxicity_sweep_ratio", 0.0)),
+                        4,
+                    ),
+                }
+            )
+
+        rankings.sort(
+            key=lambda row: (
+                -row["toxicity_index"],
+                -row["depth_evaporation"],
+                -row["sweep_ratio"],
+                row["condition_id"],
+            )
+        )
+        if limit is None:
+            return rankings
+        return rankings[:limit]
+
+    def _augment_trade_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(stats)
+        enriched["smart_passive_counters"] = self.positions.smart_passive_counters
+        return enriched
+
+    def _smart_passive_operator_block(self) -> str:
+        counters = self.positions.smart_passive_counters
+        return (
+            "\n"
+            f"Smart-passive: {int(counters.get('smart_passive_started', 0) or 0)} started  |  "
+            f"{int(counters.get('maker_filled', 0) or 0)} maker-filled  |  "
+            f"{int(counters.get('fallback_triggered', 0) or 0)} fallback"
+        )
+
     async def _paper_summary_loop(self) -> None:
         """Every 30 minutes, send a formatted paper trade summary to Telegram.
 
@@ -3317,9 +3708,13 @@ class TradingBot:
         while self._running:
             await asyncio.sleep(interval)
             try:
-                stats = await self.trade_store.get_stats()
+                stats = self._augment_trade_stats(await self.trade_store.get_stats())
                 uptime_h = (time.monotonic() - self._start_time) / 3600.0
-                await self.telegram.notify_paper_summary(stats, uptime_h)
+                await self.telegram.notify_paper_summary(
+                    stats,
+                    uptime_h,
+                    toxicity_rankings=self._top_toxicity_rankings(limit=5),
+                )
                 log.info(
                     "paper_summary_sent",
                     total_trades=stats.get("total_trades", 0),
@@ -3452,6 +3847,8 @@ class TradingBot:
                     l2_total_desyncs / max(1, l2_total_deltas), 6
                 )
                 health["l2_unreliable_books"] = l2_unreliable_count
+                health["smart_passive_counters"] = self.positions.smart_passive_counters
+                health["contagion_matrix"] = list(self._recent_contagion_matrix)
 
                 # Atomic write: offload blocking file I/O to a thread
                 await asyncio.to_thread(
@@ -3698,20 +4095,7 @@ class TradingBot:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _combo_arbitrage_loop(self) -> None:
-        """Scan negRisk clusters for mis-priced arb, place multi-leg orders.
-
-        Runs every ``si9_scan_interval_ms``.  For each active cluster:
-          1. Evaluate via ``ComboArbDetector.evaluate_cluster()``.
-             Passes wallet_balance so ComboSizer can enforce share-count
-             pegging (NOT Kelly USD sizing).
-          2. If signal emitted, place combo via ``open_combo_position()``.
-          3. Monitor existing combos for fill status and leg timeout.
-          4. On timeout → ``abandon_combo()`` runs the Hanging Leg State
-             Machine (State 1: clean cancel / State 2: emergency hedge
-             or dump).
-
-        Circuit breaker: ``self._combo_breaker`` (threshold=5, window=60s).
-        """
+        """Scan negRisk clusters for mis-priced arb and place multi-leg orders."""
         strat = settings.strategy
         interval = strat.si9_scan_interval_ms / 1000.0
         max_leg_delay_s = strat.si9_max_leg_delay_ms / 1000.0
@@ -3722,17 +4106,12 @@ class TradingBot:
             try:
                 await asyncio.sleep(interval)
 
-                # Skip if no detector wired (safety)
                 if self._combo_detector is None:
                     continue
 
-                # ── 1. Scan clusters for new arb signals ──────────────
-                # Pass wallet_balance so ComboSizer can compute uniform
-                # share counts constrained by available capital.
                 wallet_bal = self.positions._wallet_balance_usd
 
                 for cluster in self._cluster_mgr.active_clusters:
-                    # Skip if we already have a combo for this event
                     existing = self._combo_positions.get(cluster.event_id)
                     if existing and existing.state in (
                         ComboState.ENTRY_PENDING,
@@ -3744,7 +4123,48 @@ class TradingBot:
                     signal = self._combo_detector.evaluate_cluster(
                         cluster, wallet_balance=wallet_bal,
                     )
+                    resumed = self._combo_detector.pop_recent_resume(cluster.event_id)
+                    if resumed is not None:
+                        self._combo_ofi_alerted.discard(cluster.event_id)
+                        log.info(
+                            "combo_arb_resumed_notification",
+                            event_id=cluster.event_id,
+                            maker_leg=resumed.maker_leg,
+                            market_id=resumed.market_id,
+                            defer_count=resumed.defer_count,
+                        )
+                        await self.telegram.notify_combo_arb_resumed(
+                            cluster.event_id,
+                            resumed.maker_leg,
+                            resumed.defer_count,
+                            question=resumed.question,
+                        )
                     if signal is None:
+                        deferred = self._combo_detector.get_active_deferral(cluster.event_id)
+                        if (
+                            deferred is not None
+                            and cluster.event_id not in self._combo_ofi_alerted
+                        ):
+                            self._combo_ofi_alerted.add(cluster.event_id)
+                            log.info(
+                                "combo_arb_deferred",
+                                event_id=cluster.event_id,
+                                reason=deferred.reason,
+                                maker_leg=deferred.maker_leg,
+                                market_id=deferred.market_id,
+                                rolling_vi=round(deferred.rolling_vi, 6),
+                                current_vi=round(deferred.current_vi, 6),
+                                threshold=round(deferred.threshold, 6),
+                                defer_count=deferred.defer_count,
+                            )
+                            await self.telegram.notify_combo_arb_deferred(
+                                cluster.event_id,
+                                deferred.maker_leg,
+                                deferred.rolling_vi,
+                                deferred.threshold,
+                                current_vi=deferred.current_vi,
+                                question=deferred.question,
+                            )
                         continue
 
                     combo = await self.positions.open_combo_position(
@@ -3762,13 +4182,11 @@ class TradingBot:
                             f"Collateral: ${signal.total_collateral:.2f}"
                         )
 
-                # ── 2. Monitor existing combos ────────────────────────
                 now = time.time()
                 for event_id, combo in list(self._combo_positions.items()):
                     if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
                         continue
 
-                    # Update combo state
                     if combo.all_filled:
                         if combo.state != ComboState.ALL_FILLED:
                             combo.state = ComboState.ALL_FILLED
@@ -3786,11 +4204,6 @@ class TradingBot:
                     elif len(combo.filled_legs) > 0 and combo.state == ComboState.ENTRY_PENDING:
                         combo.state = ComboState.PARTIAL_FILL
 
-                    # ── Leg timeout → Hanging Leg State Machine ────────
-                    # abandon_combo() handles the two states:
-                    #   State 1 (0 fills): safe cancel of all resting orders
-                    #   State 2 (partial fills): emergency taker hedge or
-                    #     dump of filled legs to eliminate directional risk
                     elapsed = now - combo.created_at
                     if (
                         elapsed > max_leg_delay_s
@@ -3824,3 +4237,141 @@ class TradingBot:
                     )
                     await self._suspend_and_reset()
                     break
+
+    async def _bayesian_arb_loop(self) -> None:
+        """Scan configured SI-10 relationships for Bayesian Dutch-book arb."""
+        strat = settings.strategy
+        interval = strat.si10_scan_interval_ms / 1000.0
+        max_leg_delay_s = strat.si9_max_leg_delay_ms / 1000.0
+
+        log.info("bayesian_arb_loop_started", scan_interval_ms=strat.si10_scan_interval_ms)
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+
+                if self._bayesian_detector is None:
+                    continue
+
+                self._bayesian_cluster_mgr.scan_clusters(self._markets)
+                await self._fee_cache.prefetch(
+                    sorted(self._bayesian_cluster_mgr.all_cluster_asset_ids())
+                )
+                active_ids = {
+                    cluster.relationship_id
+                    for cluster in self._bayesian_cluster_mgr.active_clusters
+                }
+                wallet_bal = self.positions._wallet_balance_usd
+
+                for cluster in self._bayesian_cluster_mgr.active_clusters:
+                    existing = self._combo_positions.get(cluster.relationship_id)
+                    if existing and existing.state in (
+                        ComboState.ENTRY_PENDING,
+                        ComboState.PARTIAL_FILL,
+                        ComboState.ALL_FILLED,
+                    ):
+                        continue
+
+                    signal = self._bayesian_detector.evaluate_cluster(
+                        cluster, wallet_balance=wallet_bal,
+                    )
+                    resumed = self._bayesian_detector.pop_recent_resume(
+                        cluster.relationship_id
+                    )
+                    if resumed is not None:
+                        self._bayesian_ofi_alerted.discard(cluster.relationship_id)
+                        log.info(
+                            "bayesian_arb_resumed_notification",
+                            relationship_id=cluster.relationship_id,
+                            maker_leg=resumed.maker_leg,
+                            market_id=resumed.market_id,
+                            defer_count=resumed.defer_count,
+                        )
+
+                    if signal is None:
+                        deferred = self._bayesian_detector.get_active_deferral(
+                            cluster.relationship_id
+                        )
+                        if (
+                            deferred is not None
+                            and cluster.relationship_id not in self._bayesian_ofi_alerted
+                        ):
+                            self._bayesian_ofi_alerted.add(cluster.relationship_id)
+                            log.info(
+                                "bayesian_arb_deferred",
+                                relationship_id=cluster.relationship_id,
+                                reason=deferred.reason,
+                                maker_leg=deferred.maker_leg,
+                                market_id=deferred.market_id,
+                                rolling_vi=round(deferred.rolling_vi, 6),
+                                current_vi=round(deferred.current_vi, 6),
+                                threshold=round(deferred.threshold, 6),
+                                defer_count=deferred.defer_count,
+                            )
+                        continue
+
+                    combo = await self.positions.open_combo_position(
+                        signal, self._combo_positions,
+                    )
+                    if combo is not None:
+                        self._combo_positions[cluster.relationship_id] = combo
+                        log.info(
+                            "bayesian_arb_signal_notification",
+                            relationship_id=cluster.relationship_id,
+                            bound_title=signal.bound_title,
+                            bound_expression=signal.bound_expression,
+                            observed_yes_prices=signal.observed_yes_prices,
+                            traded_leg_prices=signal.traded_leg_prices,
+                            shares=signal.target_shares,
+                            edge_cents=signal.edge_cents,
+                            gross_edge_cents=signal.gross_edge_cents,
+                            spread_cost_cents=signal.spread_cost_cents,
+                            taker_fee_cents=signal.taker_fee_cents,
+                            net_ev_usd=signal.net_ev_usd,
+                            annualized_yield=signal.annualized_yield,
+                            days_to_resolution=signal.days_to_resolution,
+                            collateral=signal.total_collateral,
+                        )
+                        await self.telegram.notify_bayesian_arb_signal(
+                            cluster.relationship_id,
+                            label=signal.relationship_label,
+                            bound_title=signal.bound_title,
+                            bound_expression=signal.bound_expression,
+                            observed_yes_prices=signal.observed_yes_prices,
+                            traded_leg_prices=signal.traded_leg_prices,
+                            shares=signal.target_shares,
+                            edge_cents=signal.edge_cents,
+                            gross_edge_cents=signal.gross_edge_cents,
+                            spread_cost_cents=signal.spread_cost_cents,
+                            taker_fee_cents=signal.taker_fee_cents,
+                            net_ev_usd=signal.net_ev_usd,
+                            annualized_yield=signal.annualized_yield,
+                            days_to_resolution=signal.days_to_resolution,
+                            collateral_usd=signal.total_collateral,
+                        )
+
+                now = time.time()
+                for relationship_id, combo in list(self._combo_positions.items()):
+                    if combo.state in (ComboState.ABANDONED, ComboState.CLOSED):
+                        continue
+                    if relationship_id not in active_ids:
+                        continue
+                    elapsed = now - combo.created_at
+                    if (
+                        elapsed > max_leg_delay_s
+                        and combo.state in (ComboState.ENTRY_PENDING, ComboState.PARTIAL_FILL)
+                        and not combo.all_filled
+                    ):
+                        log.warning(
+                            "bayesian_arb_leg_timeout",
+                            combo_id=combo.combo_id,
+                            relationship_id=relationship_id,
+                            elapsed_s=round(elapsed, 1),
+                            filled=len(combo.filled_legs),
+                            pending=len(combo.pending_legs),
+                        )
+                        await self.positions.abandon_combo(combo, reason="leg_timeout")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("bayesian_arb_loop_error", error=str(exc), exc_info=True)

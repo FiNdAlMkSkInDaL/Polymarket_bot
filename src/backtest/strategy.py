@@ -20,14 +20,34 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, fields
+from datetime import datetime, timezone
+import random
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from src.core.config import EXCHANGE_MIN_SHARES, EXCHANGE_MIN_USD, StrategyParams
+from src.core.config import EXCHANGE_MIN_SHARES, EXCHANGE_MIN_USD, StrategyParams, settings
 from src.core.logger import get_logger
+from src.backtest.matching_engine import Fill
+from src.data.market_discovery import MarketInfo
 from src.data.ohlcv import OHLCVAggregator, OHLCVBar
 from src.data.websocket_client import TradeEvent
+from src.signals.bayesian_arb import (
+    BayesianArbDetector,
+    BayesianArbRelationshipManager,
+    BayesianRelationship,
+)
+from src.signals.contagion_arb import ContagionArbDetector, ContagionArbSignal
 from src.signals.edge_filter import compute_edge_score
+from src.signals.ofi_momentum import OFIMomentumDetector, compute_toxicity_size_multiplier
 from src.signals.panic_detector import PanicDetector
+from src.signals.resolution_probability import (
+    CryptoPriceModel,
+    GenericBayesianModel,
+    ResolutionProbabilityEngine,
+)
+from src.signals.signal_framework import MetaStrategyController
+from src.execution.momentum_taker import MomentumBracket
+from src.execution.momentum_taker import draw_stochastic_momentum_bracket
 from src.trading.executor import OrderSide, OrderStatus
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 
@@ -36,6 +56,11 @@ if TYPE_CHECKING:
     from src.backtest.matching_engine import Fill, SimOrder
 
 log = get_logger(__name__)
+OFI_REPLAY_SMART_PASSIVE_TIMEOUT_SECONDS = 15.0
+OFI_REPLAY_TIME_STOP_VACUUM_RATIO = 0.35
+OFI_REPLAY_TIME_STOP_RECOVERY_RATIO = 0.60
+OFI_REPLAY_TIME_STOP_SPREAD_MULTIPLIER = 1.75
+_REPLAY_TOP_DEPTH_EWMA_ALPHA = 0.2
 
 LEGACY_BACKTEST_SIGNAL_DEFAULTS: dict[str, float | int] = {
     "zscore_threshold": 0.20,
@@ -60,6 +85,31 @@ def split_strategy_and_legacy_params(
         if name in LEGACY_BACKTEST_SIGNAL_DEFAULTS
     }
     return strategy_params, legacy_params
+
+
+def _parse_market_end_date(raw: Any) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None:
+            return raw.replace(tzinfo=timezone.utc)
+        return raw
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,6 +217,8 @@ class BotReplayAdapter(StrategyABC):
         used, preserving full backward-compatibility.
     """
 
+    self_aggregates_trades = True
+
     def __init__(
         self,
         market_id: str,
@@ -177,6 +229,7 @@ class BotReplayAdapter(StrategyABC):
         initial_bankroll: float = 1000.0,
         params: StrategyParams | None = None,
         legacy_signal_params: dict[str, float | int] | None = None,
+        stochastic_seed: int | None = None,
     ) -> None:
         self._market_id = market_id
         self._yes_asset_id = yes_asset_id
@@ -187,11 +240,16 @@ class BotReplayAdapter(StrategyABC):
         self._legacy_signal_params = dict(LEGACY_BACKTEST_SIGNAL_DEFAULTS)
         if legacy_signal_params:
             self._legacy_signal_params.update(legacy_signal_params)
+        self._stochastic_seed = stochastic_seed
+        self._rng = random.Random(stochastic_seed)
 
         # Aggregators and detector (created on init)
         self._yes_agg: OHLCVAggregator | None = None
         self._no_agg: OHLCVAggregator | None = None
         self._detector: PanicDetector | None = None
+        self._ofi_detector: OFIMomentumDetector | None = None
+        self._book: _ReplayOrderBook | None = None
+        self._meta_controller = MetaStrategyController()
 
         # Signal cooldown tracking
         self._last_signal_time: float = 0.0
@@ -204,6 +262,9 @@ class BotReplayAdapter(StrategyABC):
         # Position tracking (simplified for backtest)
         self._positions: list[dict] = []   # all opened positions
         self._open_positions: dict[str, dict] = {}  # order_id → position context
+        self._smart_passive_started: int = 0
+        self._smart_passive_maker_filled: int = 0
+        self._smart_passive_fallbacks: int = 0
 
         # External price history for RPE crypto model replay
         self._external_prices: list[tuple[float, float]] = []  # (ts, price)
@@ -227,6 +288,7 @@ class BotReplayAdapter(StrategyABC):
         """Initialise aggregators and detectors."""
         self._yes_agg = OHLCVAggregator(self._yes_asset_id)
         self._no_agg = OHLCVAggregator(self._no_asset_id)
+        self._book = _ReplayOrderBook(self._no_asset_id)
 
         # Use the real PanicDetector — same gates as live bot
         self._detector = PanicDetector(
@@ -239,6 +301,13 @@ class BotReplayAdapter(StrategyABC):
             volume_ratio_threshold=float(self._legacy_signal_params["volume_ratio_threshold"]),
             trend_guard_pct=float(self._legacy_signal_params["trend_guard_pct"]),
             trend_guard_bars=int(self._legacy_signal_params["trend_guard_bars"]),
+        )
+        self._ofi_detector = OFIMomentumDetector(
+            market_id=self._market_id,
+            no_asset_id=self._no_asset_id,
+            window_ms=self._params.window_ms,
+            threshold=self._params.ofi_threshold,
+            tvi_kappa=self._params.ofi_tvi_kappa,
         )
 
         # Register market with PCE if enabled
@@ -256,6 +325,7 @@ class BotReplayAdapter(StrategyABC):
             yes=self._yes_asset_id,
             no=self._no_asset_id,
             pce_enabled=self._pce is not None,
+            stochastic_seed=self._stochastic_seed,
         )
 
     def on_book_update(self, asset_id: str, snapshot: dict) -> None:
@@ -265,14 +335,117 @@ class BotReplayAdapter(StrategyABC):
         liquidity detection, and TP rescaling. The adapter stores the
         latest snapshot for use in signal evaluation and sizing.
         """
-        # Store latest book state for sizing / signal decisions
-        pass  # The matching engine maintains the authoritative book
+        if asset_id != self._no_asset_id or self._ofi_detector is None or self.engine is None:
+            return
+
+        self._check_momentum_brackets(snapshot)
+
+        bid_levels = snapshot.get("bid_levels") or []
+        ask_levels = snapshot.get("ask_levels") or []
+        if not bid_levels or not ask_levels:
+            return
+
+        best_bid = float(snapshot.get("best_bid", 0.0) or 0.0)
+        best_ask = float(snapshot.get("best_ask", 0.0) or 0.0)
+        if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+            return
+
+        timestamp = float(snapshot.get("timestamp", 0.0) or 0.0)
+        if self._book is not None and timestamp > 0:
+            self._book.apply_event(
+                {
+                    "event_type": "l2_snapshot",
+                    "bids": [
+                        {"price": str(price), "size": str(size)}
+                        for price, size in bid_levels
+                    ],
+                    "asks": [
+                        {"price": str(price), "size": str(size)}
+                        for price, size in ask_levels
+                    ],
+                },
+                timestamp,
+            )
+        if timestamp - self._last_signal_time < self._cooldown_seconds:
+            return
+        if len(self._open_positions) >= self._params.max_open_positions:
+            return
+
+        sig = self._ofi_detector.generate_signal(
+            no_book=self._book,
+            trade_aggregator=self._no_agg,
+            timestamp_ms=int(timestamp * 1000),
+        )
+        if sig is None or sig.direction != "BUY":
+            return
+
+        meta_decision = self._meta_controller.evaluate("ofi_momentum", 0.5)
+        if meta_decision.vetoed:
+            return
+
+        trade_usd = min(
+            self._initial_bankroll * self._params.kelly_fraction,
+            self._params.max_trade_size_usd,
+        )
+        size = (trade_usd / best_ask) * meta_decision.weight if best_ask > 0 else 0.0
+        toxicity_mult = compute_toxicity_size_multiplier(
+            getattr(sig, "toxicity_index", 0.0),
+            elevated_threshold=self._params.ofi_toxicity_scale_threshold,
+            max_multiplier=self._params.ofi_toxicity_size_boost_max,
+        )
+        if toxicity_mult > 1.0:
+            size *= toxicity_mult
+        if size < 1:
+            return
+
+        order = self.engine.submit_order(
+            side=OrderSide.BUY,
+            price=best_ask,
+            size=size,
+            order_type="limit",
+            post_only=False,
+        )
+        drawn_bracket = draw_stochastic_momentum_bracket(
+            mean_max_hold_seconds=MomentumBracket().max_hold_seconds,
+            rng=self._rng,
+        )
+        target_price = drawn_bracket.target_price(best_ask)
+
+        self._last_signal_time = timestamp
+        self._pending_entries[order.order_id] = {
+            "order": order,
+            "entry_price": best_ask,
+            "target_price": target_price,
+            "stop_price": drawn_bracket.stop_price(best_ask),
+            "max_hold_seconds": drawn_bracket.max_hold_seconds,
+            "drawn_tp": target_price,
+            "drawn_stop": drawn_bracket.stop_price(best_ask),
+            "drawn_time": drawn_bracket.max_hold_seconds,
+            "drawn_tp_pct": drawn_bracket.take_profit_pct,
+            "drawn_stop_pct": drawn_bracket.stop_loss_pct,
+            "ofi": sig.ofi,
+            "signal_source": "ofi_momentum",
+        }
+
+        log.debug(
+            "adapter_ofi_entry_signal",
+            order_id=order.order_id,
+            ofi=round(sig.ofi, 4),
+            entry_price=best_ask,
+            target_price=target_price,
+        )
 
     def on_trade(self, asset_id: str, trade: TradeEvent) -> None:
         """Feed trades into OHLCV aggregators.
 
         When a bar closes, evaluate the strategy's signal logic.
         """
+        if asset_id == self._no_asset_id and self.engine is not None:
+            self._check_momentum_brackets({
+                "best_bid": self.engine.get_asset_best_bid(self._no_asset_id),
+                "timestamp": trade.timestamp,
+            })
+
         if asset_id == self._yes_asset_id and self._yes_agg:
             bar = self._yes_agg.on_trade(trade)
             if bar is not None:
@@ -513,30 +686,45 @@ class BotReplayAdapter(StrategyABC):
                     self._pending_entries[oid] = ctx
                 return
 
-            # Fully filled — place exit order at target
-            target = ctx["target_price"]
-            exit_order = self.engine.submit_order(
-                side=OrderSide.SELL,
-                price=target,
-                size=fill.size,
-                order_type="limit",
-                post_only=True,
-            )
             pos = {
                 "entry_fill": fill,
                 "entry_ctx": ctx,
-                "exit_order_id": exit_order.order_id,
+                "exit_order_id": None,
                 "entry_time": fill.timestamp,
+                "target_price": float(ctx.get("target_price", 0.0) or 0.0),
+                "stop_price": float(ctx.get("stop_price", 0.0) or 0.0),
+                "max_hold_seconds": float(ctx.get("max_hold_seconds", 0.0) or 0.0),
+                "drawn_tp": float(ctx.get("drawn_tp", 0.0) or 0.0),
+                "drawn_stop": float(ctx.get("drawn_stop", 0.0) or 0.0),
+                "drawn_time": float(ctx.get("drawn_time", 0.0) or 0.0),
+                "drawn_tp_pct": float(ctx.get("drawn_tp_pct", 0.0) or 0.0),
+                "drawn_stop_pct": float(ctx.get("drawn_stop_pct", 0.0) or 0.0),
+                "signal_source": ctx.get("signal_source", ""),
+                "exit_reason": "take_profit",
             }
-            self._pending_exits[exit_order.order_id] = pos
-            self._open_positions[exit_order.order_id] = pos
+
+            if ctx.get("signal_source") == "ofi_momentum":
+                tracking_id = f"OFI-LOCAL-{oid}"
+                self._open_positions[tracking_id] = pos
+            else:
+                target = ctx["target_price"]
+                exit_order = self.engine.submit_order(
+                    side=OrderSide.SELL,
+                    price=target,
+                    size=fill.size,
+                    order_type="limit",
+                    post_only=True,
+                )
+                pos["exit_order_id"] = exit_order.order_id
+                self._pending_exits[exit_order.order_id] = pos
+                self._open_positions[exit_order.order_id] = pos
 
             log.debug(
                 "adapter_entry_filled",
                 order_id=oid,
                 entry_price=fill.price,
-                target=target,
-                exit_order=exit_order.order_id,
+                target=pos.get("target_price", 0.0),
+                exit_order=pos.get("exit_order_id"),
             )
             return
 
@@ -544,6 +732,14 @@ class BotReplayAdapter(StrategyABC):
         if oid in self._pending_exits:
             pos = self._pending_exits.pop(oid)
             self._open_positions.pop(oid, None)
+
+            if (
+                pos.get("signal_source") == "ofi_momentum"
+                and pos.get("exit_reason") == "time_stop"
+                and pos.get("smart_passive_deadline", 0.0) > 0
+                and fill.is_maker
+            ):
+                self._smart_passive_maker_filled += 1
 
             entry_fill = pos["entry_fill"]
             pnl = (fill.price - entry_fill.price) * fill.size
@@ -559,6 +755,11 @@ class BotReplayAdapter(StrategyABC):
                 "exit_time": fill.timestamp,
                 "entry_fee": entry_fill.fee,
                 "exit_fee": fill.fee,
+                "exit_reason": pos.get("exit_reason", "take_profit"),
+                "smart_passive_started_at": pos.get("smart_passive_started_at", 0.0),
+                "drawn_tp": pos.get("drawn_tp", 0.0),
+                "drawn_stop": pos.get("drawn_stop", 0.0),
+                "drawn_time": pos.get("drawn_time", 0.0),
             })
 
             log.debug(
@@ -567,6 +768,186 @@ class BotReplayAdapter(StrategyABC):
                 exit=fill.price,
                 pnl_net=round(pnl_net, 4),
             )
+
+    def _check_momentum_brackets(self, snapshot: dict[str, Any]) -> None:
+        """Force-close OFI momentum positions on stop-loss or time-stop."""
+        if self.engine is None or not self._open_positions:
+            return
+
+        best_bid = float(
+            snapshot.get("best_bid", 0.0) or self.engine.get_asset_best_bid(self._no_asset_id) or 0.0
+        )
+        best_ask = float(
+            snapshot.get("best_ask", 0.0) or self.engine.get_asset_best_ask(self._no_asset_id) or 0.0
+        )
+        timestamp = float(snapshot.get("timestamp", 0.0) or 0.0)
+        if timestamp <= 0 or (best_bid <= 0 and best_ask <= 0):
+            return
+
+        for exit_order_id, pos in list(self._open_positions.items()):
+            if pos.get("signal_source") != "ofi_momentum":
+                continue
+
+            smart_passive_deadline = float(pos.get("smart_passive_deadline", 0.0) or 0.0)
+            if smart_passive_deadline > 0:
+                if timestamp >= smart_passive_deadline and best_bid > 0:
+                    if self._should_suppress_replay_time_stop(best_bid, best_ask, pos):
+                        continue
+                    self._trigger_smart_passive_fallback(exit_order_id, pos, best_bid)
+                continue
+
+            target_price = float(pos.get("target_price", 0.0) or 0.0)
+            if target_price > 0 and best_bid >= target_price:
+                self._trigger_local_replay_exit(
+                    tracking_id=exit_order_id,
+                    pos=pos,
+                    best_bid=best_bid,
+                    reason="target",
+                )
+                continue
+
+            stop_price = float(pos.get("stop_price", 0.0) or 0.0)
+            max_hold_seconds = float(pos.get("max_hold_seconds", 0.0) or 0.0)
+            entry_time = float(pos.get("entry_time", 0.0) or 0.0)
+
+            if stop_price > 0 and best_bid <= stop_price:
+                self._trigger_local_replay_exit(
+                    tracking_id=exit_order_id,
+                    pos=pos,
+                    best_bid=best_bid,
+                    reason="stop_loss",
+                )
+                continue
+
+            if max_hold_seconds > 0 and timestamp - entry_time >= max_hold_seconds and best_ask > 0:
+                if self._should_suppress_replay_time_stop(best_bid, best_ask, pos):
+                    continue
+                self._start_smart_passive_time_stop(exit_order_id, pos, best_ask, timestamp)
+
+    def _should_suppress_replay_time_stop(
+        self,
+        best_bid: float,
+        best_ask: float,
+        pos: dict[str, Any],
+    ) -> bool:
+        if self._book is None:
+            return False
+
+        bid_depth, ask_depth = self._book.top_depths_usd()
+        bid_baseline = self._book.top_depth_ewma("bid")
+        ask_baseline = self._book.top_depth_ewma("ask")
+        spread = max(0.0, best_ask - best_bid)
+        baseline_spread = max(
+            0.01,
+            float(pos.get("entry_fill").price if pos.get("entry_fill") else 0.5)
+            * float(pos.get("drawn_stop_pct", 0.0) or MomentumBracket().stop_loss_pct),
+        )
+        bid_vacuum = bid_depth > 0 and bid_baseline > 0 and bid_depth < bid_baseline * OFI_REPLAY_TIME_STOP_VACUUM_RATIO
+        ask_vacuum = ask_depth > 0 and ask_baseline > 0 and ask_depth < ask_baseline * OFI_REPLAY_TIME_STOP_VACUUM_RATIO
+        spread_blown_out = spread >= baseline_spread * OFI_REPLAY_TIME_STOP_SPREAD_MULTIPLIER
+
+        if (bid_vacuum or ask_vacuum) and spread_blown_out:
+            return True
+
+        bid_recovered = bid_baseline <= 0 or bid_depth >= bid_baseline * OFI_REPLAY_TIME_STOP_RECOVERY_RATIO
+        ask_recovered = ask_baseline <= 0 or ask_depth >= ask_baseline * OFI_REPLAY_TIME_STOP_RECOVERY_RATIO
+        return not (bid_recovered and ask_recovered)
+
+    def _trigger_local_replay_exit(
+        self,
+        *,
+        tracking_id: str,
+        pos: dict[str, Any],
+        best_bid: float,
+        reason: str,
+    ) -> None:
+        if self.engine is None:
+            return
+
+        self._open_positions.pop(tracking_id, None)
+        taker_exit_order = self.engine.submit_order(
+            side=OrderSide.SELL,
+            price=best_bid,
+            size=pos["entry_fill"].size,
+            order_type="limit",
+            post_only=False,
+        )
+        pos["exit_order_id"] = taker_exit_order.order_id
+        pos["exit_reason"] = reason
+        pos["smart_passive_deadline"] = 0.0
+        self._pending_exits[taker_exit_order.order_id] = pos
+        self._open_positions[taker_exit_order.order_id] = pos
+        self.engine.simulate_fill(
+            taker_exit_order.order_id,
+            pos["entry_fill"].size,
+            price=best_bid,
+            is_maker=False,
+        )
+
+    def _start_smart_passive_time_stop(
+        self,
+        exit_order_id: str,
+        pos: dict[str, Any],
+        best_ask: float,
+        timestamp: float,
+    ) -> None:
+        if self.engine is None:
+            return
+
+        if pos.get("exit_order_id"):
+            self.engine.cancel_order(exit_order_id)
+        self._pending_exits.pop(exit_order_id, None)
+        self._open_positions.pop(exit_order_id, None)
+
+        passive_exit_order = self.engine.submit_order(
+            side=OrderSide.SELL,
+            price=best_ask,
+            size=pos["entry_fill"].size,
+            order_type="limit",
+            post_only=True,
+        )
+
+        pos["exit_order_id"] = passive_exit_order.order_id
+        pos["exit_reason"] = "time_stop"
+        pos["smart_passive_started_at"] = timestamp
+        pos["smart_passive_deadline"] = timestamp + OFI_REPLAY_SMART_PASSIVE_TIMEOUT_SECONDS
+        self._pending_exits[passive_exit_order.order_id] = pos
+        self._open_positions[passive_exit_order.order_id] = pos
+        self._smart_passive_started += 1
+
+    def _trigger_smart_passive_fallback(
+        self,
+        exit_order_id: str,
+        pos: dict[str, Any],
+        best_bid: float,
+    ) -> None:
+        if self.engine is None:
+            return
+
+        if pos.get("exit_order_id"):
+            self.engine.cancel_order(exit_order_id)
+        self._pending_exits.pop(exit_order_id, None)
+        self._open_positions.pop(exit_order_id, None)
+
+        taker_exit_order = self.engine.submit_order(
+            side=OrderSide.SELL,
+            price=best_bid,
+            size=pos["entry_fill"].size,
+            order_type="limit",
+            post_only=False,
+        )
+        pos["exit_order_id"] = taker_exit_order.order_id
+        pos["exit_reason"] = "time_stop"
+        pos["smart_passive_deadline"] = 0.0
+        self._pending_exits[taker_exit_order.order_id] = pos
+        self._open_positions[taker_exit_order.order_id] = pos
+        self._smart_passive_fallbacks += 1
+        self.engine.simulate_fill(
+            taker_exit_order.order_id,
+            pos["entry_fill"].size,
+            price=best_bid,
+            is_maker=False,
+        )
 
     def on_external_price(
         self, asset_id: str, price: float, timestamp: float
@@ -588,6 +969,12 @@ class BotReplayAdapter(StrategyABC):
         # Push PCE rejection count to telemetry
         if self._pce is not None and self.engine is not None and hasattr(self.engine, 'telemetry'):
             self.engine.telemetry.set_pce_rejections(self._pce_rejections)
+        if self.engine is not None and hasattr(self.engine, 'telemetry'):
+            self.engine.telemetry.set_smart_passive_counters(
+                started=self._smart_passive_started,
+                maker_filled=self._smart_passive_maker_filled,
+                fallback_triggered=self._smart_passive_fallbacks,
+            )
 
         # Unregister from PCE
         if self._pce is not None:
@@ -600,7 +987,644 @@ class BotReplayAdapter(StrategyABC):
             open_remaining=len(self._open_positions),
             total_pnl_net=round(total_pnl, 4),
             pce_enabled=self._pce is not None,
+            smart_passive_started=self._smart_passive_started,
+            smart_passive_maker_filled=self._smart_passive_maker_filled,
+            smart_passive_fallbacks=self._smart_passive_fallbacks,
         )
+
+
+class ContagionReplayAdapter(StrategyABC):
+    """Shared-market replay adapter for the Domino contagion arb.
+
+    Reuses the production contagion detector, shared PCE correlations, and
+    the RPE dislocation math inside a single replay strategy that sees the
+    whole market universe at once.
+    """
+
+    self_aggregates_trades = True
+
+    def __init__(
+        self,
+        market_configs: list[dict[str, Any]],
+        *,
+        fee_enabled: bool = True,
+        initial_bankroll: float = 1000.0,
+        params: StrategyParams | None = None,
+    ) -> None:
+        self._market_configs = [dict(config) for config in market_configs]
+        self._fee_enabled = fee_enabled
+        self._initial_bankroll = initial_bankroll
+        self._params = params or StrategyParams()
+
+        self._markets: dict[str, MarketInfo] = {}
+        self._market_by_asset: dict[str, MarketInfo] = {}
+        self._asset_role: dict[str, str] = {}
+        self._yes_aggs: dict[str, OHLCVAggregator] = {}
+        self._no_aggs: dict[str, OHLCVAggregator] = {}
+        self._books: dict[str, _ReplayOrderBook] = {}
+        self._external_prices: list[tuple[float, float]] = []
+
+        self._pending_entries: dict[str, dict[str, Any]] = {}
+        self._pending_exits: dict[str, dict[str, Any]] = {}
+        self._open_positions: dict[str, dict[str, Any]] = {}
+        self._positions: list[dict[str, Any]] = []
+
+        self._pce = PortfolioCorrelationEngine(
+            shadow_mode=True,
+            max_portfolio_var_usd=self._params.pce_max_portfolio_var_usd,
+            haircut_threshold=self._params.pce_correlation_haircut_threshold,
+            structural_prior_weight=self._params.pce_structural_prior_weight,
+            min_overlap_bars=self._params.pce_min_overlap_bars,
+            holding_period_minutes=self._params.pce_holding_period_minutes,
+            var_soft_cap=self._params.pce_var_soft_cap,
+            var_bisect_iterations=self._params.pce_var_bisect_iterations,
+        )
+        self._rpe = ResolutionProbabilityEngine(
+            models=[
+                CryptoPriceModel(price_fn=self._latest_external_price),
+                GenericBayesianModel(),
+            ],
+            shadow_mode=False,
+        )
+        self._contagion = ContagionArbDetector(
+            self._pce,
+            self._rpe,
+            shadow_mode=False,
+        )
+
+    def on_init(self) -> None:
+        for index, config in enumerate(self._market_configs):
+            market_id = str(config.get("market_id") or f"CONTAGION_{index}").strip()
+            yes_asset_id = str(config.get("yes_asset_id") or config.get("yes_id") or "").strip()
+            no_asset_id = str(config.get("no_asset_id") or config.get("no_id") or "").strip()
+            if not market_id or not yes_asset_id or not no_asset_id:
+                continue
+
+            market = MarketInfo(
+                condition_id=market_id,
+                question=str(config.get("question") or market_id),
+                yes_token_id=yes_asset_id,
+                no_token_id=no_asset_id,
+                daily_volume_usd=float(config.get("daily_volume_usd", 0.0) or 0.0),
+                end_date=None,
+                active=bool(config.get("active", True)),
+                event_id=str(config.get("event_id") or config.get("group") or ""),
+                liquidity_usd=float(config.get("liquidity_usd", 0.0) or 0.0),
+                score=float(config.get("score", 0.0) or 0.0),
+                accepting_orders=bool(config.get("accepting_orders", True)),
+                tags=str(config.get("tags") or config.get("theme") or ""),
+                neg_risk=bool(config.get("neg_risk", False)),
+            )
+            self._markets[market_id] = market
+            self._market_by_asset[yes_asset_id] = market
+            self._market_by_asset[no_asset_id] = market
+            self._asset_role[yes_asset_id] = "yes"
+            self._asset_role[no_asset_id] = "no"
+            self._yes_aggs[yes_asset_id] = OHLCVAggregator(yes_asset_id)
+            self._no_aggs[no_asset_id] = OHLCVAggregator(no_asset_id)
+            self._books[yes_asset_id] = _ReplayOrderBook(yes_asset_id)
+            self._books[no_asset_id] = _ReplayOrderBook(no_asset_id)
+
+            self._pce.register_market(
+                market_id=market.condition_id,
+                event_id=market.event_id or market.condition_id,
+                tags=market.tags or "replay",
+                aggregator=self._yes_aggs[yes_asset_id],
+            )
+            self._contagion.register_market(market)
+
+        log.info("contagion_replay_adapter_init", markets=len(self._markets))
+
+    def on_book_update(self, asset_id: str, snapshot: dict) -> None:
+        market = self._market_by_asset.get(asset_id)
+        book = self._books.get(asset_id)
+        if market is None or book is None:
+            return
+
+        bid_levels = snapshot.get("bid_levels") or []
+        ask_levels = snapshot.get("ask_levels") or []
+        timestamp = float(snapshot.get("timestamp", 0.0) or 0.0)
+        if timestamp <= 0 or not bid_levels or not ask_levels:
+            return
+
+        book.apply_event(
+            {
+                "event_type": "l2_snapshot",
+                "bids": [{"price": str(price), "size": str(size)} for price, size in bid_levels],
+                "asks": [{"price": str(price), "size": str(size)} for price, size in ask_levels],
+            },
+            timestamp,
+        )
+
+        self._check_contagion_exits(asset_id, timestamp)
+        self._evaluate_contagion_market(market.condition_id, timestamp)
+
+    def on_trade(self, asset_id: str, trade: TradeEvent) -> None:
+        role = self._asset_role.get(asset_id)
+        if role == "yes":
+            self._yes_aggs[asset_id].on_trade(trade)
+        elif role == "no":
+            self._no_aggs[asset_id].on_trade(trade)
+
+    def on_fill(self, fill: "Fill") -> None:
+        order_id = fill.order_id
+
+        if order_id in self._pending_entries:
+            ctx = self._pending_entries.pop(order_id)
+            order = self.engine.matching_engine.get_order(order_id) if self.engine is not None else None
+            if order is not None and order.remaining > 1e-9:
+                self._pending_entries[order_id] = ctx
+                return
+
+            self._open_positions[order_id] = {
+                "entry_fill": fill,
+                "entry_time": fill.timestamp,
+                "asset_id": ctx["asset_id"],
+                "market_id": ctx["market_id"],
+                "target_price": ctx["target_price"],
+                "stop_price": ctx["stop_price"],
+                "max_hold_seconds": ctx["max_hold_seconds"],
+                "signal_source": ctx["signal_source"],
+                "exit_reason": "take_profit",
+            }
+            return
+
+        if order_id in self._pending_exits:
+            pos = self._pending_exits.pop(order_id)
+            entry_fill = pos["entry_fill"]
+            pnl = (fill.price - entry_fill.price) * fill.size
+            pnl_net = pnl - fill.fee - entry_fill.fee
+            self._positions.append(
+                {
+                    "entry_price": entry_fill.price,
+                    "exit_price": fill.price,
+                    "size": fill.size,
+                    "pnl_gross": pnl,
+                    "pnl_net": pnl_net,
+                    "entry_time": pos["entry_time"],
+                    "exit_time": fill.timestamp,
+                    "entry_fee": entry_fill.fee,
+                    "exit_fee": fill.fee,
+                    "exit_reason": pos.get("exit_reason", "take_profit"),
+                    "signal_source": pos.get("signal_source", "contagion_arb"),
+                }
+            )
+
+    def on_external_price(self, asset_id: str, price: float, timestamp: float) -> None:
+        del asset_id
+        if price > 0:
+            self._external_prices.append((timestamp, price))
+            if len(self._external_prices) > 500:
+                self._external_prices = self._external_prices[-500:]
+
+    def on_end(self) -> None:
+        if self.engine is not None:
+            for entry_order_id, pos in list(self._open_positions.items()):
+                asset_id = str(pos.get("asset_id", ""))
+                book = self._books.get(asset_id)
+                if book is None or not book.has_data:
+                    continue
+                best_bid = book.best_bid
+                if best_bid <= 0:
+                    continue
+                pos["exit_reason"] = "end_of_replay"
+                exit_order = self.engine.submit_order(
+                    side=OrderSide.SELL,
+                    price=best_bid,
+                    size=pos["entry_fill"].size,
+                    order_type="limit",
+                    post_only=False,
+                    asset_id=asset_id,
+                )
+                self._pending_exits[exit_order.order_id] = pos
+                self._open_positions.pop(entry_order_id, None)
+                self._flush_pending_orders(asset_id, self.engine.clock.now())
+
+        for market_id in list(self._markets):
+            self._pce.unregister_market(market_id)
+
+        total_pnl = sum(pos.get("pnl_net", 0.0) for pos in self._positions)
+        log.info(
+            "contagion_replay_adapter_summary",
+            positions=len(self._positions),
+            open_remaining=len(self._open_positions),
+            total_pnl_net=round(total_pnl, 4),
+        )
+
+    def _latest_external_price(self) -> float | None:
+        if not self._external_prices:
+            return None
+        return float(self._external_prices[-1][1])
+
+    def _evaluate_contagion_market(self, market_id: str, timestamp: float) -> None:
+        market = self._markets.get(market_id)
+        if market is None or self.engine is None:
+            return
+
+        yes_book = self._books.get(market.yes_token_id)
+        no_book = self._books.get(market.no_token_id)
+        if yes_book is None or no_book is None or not yes_book.has_data or not no_book.has_data:
+            return
+
+        yes_bid = yes_book.best_bid
+        yes_ask = yes_book.best_ask
+        if yes_bid <= 0 or yes_ask <= 0 or yes_ask <= yes_bid:
+            return
+
+        self._pce.refresh_correlations()
+        signals = self._contagion.evaluate_market(
+            market=market,
+            yes_price=(yes_bid + yes_ask) / 2.0,
+            yes_buy_toxicity=yes_book.toxicity_index("BUY"),
+            no_buy_toxicity=no_book.toxicity_index("BUY"),
+            timestamp=timestamp,
+            universe=list(self._markets.values()),
+        )
+        for signal in signals:
+            self._open_contagion_position(signal, timestamp)
+
+    def _open_contagion_position(
+        self,
+        signal: ContagionArbSignal,
+        timestamp: float,
+    ) -> None:
+        if self.engine is None:
+            return
+
+        market = self._markets.get(signal.lagging_market_id)
+        if market is None or not market.accepting_orders:
+            return
+        if any(pos.get("market_id") == market.condition_id for pos in self._open_positions.values()):
+            return
+
+        asset_id = signal.lagging_asset_id
+        book = self._books.get(asset_id)
+        if book is None or not book.has_data or book.best_bid <= 0 or book.best_ask <= 0:
+            return
+
+        agg = self._yes_aggs.get(asset_id) or self._no_aggs.get(asset_id)
+        if agg is None or agg.last_trade_time <= 0:
+            return
+        if (timestamp - agg.last_trade_time) > self._params.contagion_arb_max_last_trade_age_s:
+            return
+
+        spread_pct = ((book.best_ask - book.best_bid) / book.best_ask) * 100.0
+        if spread_pct > self._params.contagion_arb_max_lagging_spread_pct:
+            return
+
+        entry_price = round(book.best_ask, 2)
+        if entry_price <= 0:
+            return
+
+        trade_usd = min(
+            self._initial_bankroll * self._params.kelly_fraction,
+            self._params.max_trade_size_usd,
+        )
+        size = trade_usd / entry_price if entry_price > 0 else 0.0
+        if size < 1:
+            return
+
+        fair_value = signal.implied_probability
+        if signal.direction == "buy_no":
+            fair_value = max(0.01, min(0.99, 1.0 - signal.implied_probability))
+        target_price = round(max(entry_price + 0.01, min(0.99, fair_value)), 2)
+        stop_price = round(max(0.01, entry_price * (1.0 - self._params.stop_loss_pct)), 2)
+
+        order = self.engine.submit_order(
+            side=OrderSide.BUY,
+            price=entry_price,
+            size=size,
+            order_type="limit",
+            post_only=False,
+            asset_id=asset_id,
+        )
+        self._pending_entries[order.order_id] = {
+            "asset_id": asset_id,
+            "market_id": market.condition_id,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "max_hold_seconds": max(60.0, self._params.contagion_arb_cooldown_seconds),
+            "signal_source": signal.signal_source,
+        }
+        self._flush_pending_orders(asset_id, timestamp)
+
+    def _check_contagion_exits(self, asset_id: str, timestamp: float) -> None:
+        if self.engine is None:
+            return
+
+        book = self._books.get(asset_id)
+        if book is None or not book.has_data or book.best_bid <= 0:
+            return
+
+        for entry_order_id, pos in list(self._open_positions.items()):
+            if pos.get("asset_id") != asset_id:
+                continue
+
+            best_bid = round(book.best_bid, 2)
+            exit_reason = ""
+            if best_bid >= float(pos.get("target_price", 0.0) or 0.0):
+                exit_reason = "take_profit"
+            elif best_bid <= float(pos.get("stop_price", 0.0) or 0.0):
+                exit_reason = "stop_loss"
+            elif timestamp - float(pos.get("entry_time", 0.0) or 0.0) >= float(pos.get("max_hold_seconds", 0.0) or 0.0):
+                exit_reason = "time_stop"
+
+            if not exit_reason:
+                continue
+
+            exit_order = self.engine.submit_order(
+                side=OrderSide.SELL,
+                price=best_bid,
+                size=pos["entry_fill"].size,
+                order_type="limit",
+                post_only=False,
+                asset_id=asset_id,
+            )
+            pos["exit_reason"] = exit_reason
+            self._pending_exits[exit_order.order_id] = pos
+            self._open_positions.pop(entry_order_id, None)
+            self._flush_pending_orders(asset_id, timestamp)
+
+    def _flush_pending_orders(self, asset_id: str, timestamp: float) -> None:
+        if self.engine is None:
+            return
+
+        self._sync_matching_engine_book(asset_id)
+        current_time = timestamp + (self.engine.config.latency_ms / 1000.0) + 1e-6
+        fills = self.engine.matching_engine.activate_pending_orders(current_time)
+        if fills:
+            self.engine._process_fills(fills)
+
+    def _sync_matching_engine_book(self, asset_id: str) -> None:
+        if self.engine is None:
+            return
+
+        book = self._books.get(asset_id)
+        if book is None or not book.has_data:
+            return
+
+        self.engine.matching_engine.on_book_update(
+            {
+                "event_type": "book_snapshot",
+                "bids": [{"price": level.price, "size": level.size} for level in book.levels("bid")],
+                "asks": [{"price": level.price, "size": level.size} for level in book.levels("ask")],
+            },
+            current_time=self.engine.clock.now(),
+        )
+
+
+class BayesianReplayAdapter(StrategyABC):
+    """Shared-market replay adapter for SI-10 Bayesian joint-probability arb.
+
+    The replay books the detector's deterministic Dutch-book payout immediately
+    after a signal so WFO optimises the live economic gates rather than a
+    separate liquidation model.
+    """
+
+    self_aggregates_trades = True
+
+    def __init__(
+        self,
+        market_configs: list[dict[str, Any]],
+        relationships: list[dict[str, Any]],
+        *,
+        fee_enabled: bool = True,
+        initial_bankroll: float = 1000.0,
+        params: StrategyParams | None = None,
+    ) -> None:
+        self._market_configs = [dict(config) for config in market_configs]
+        self._relationship_configs = [dict(item) for item in relationships]
+        self._fee_enabled = fee_enabled
+        self._initial_bankroll = initial_bankroll
+        self._params = params or StrategyParams()
+
+        self._markets: dict[str, MarketInfo] = {}
+        self._books: dict[str, _ReplayOrderBook] = {}
+        self._cluster_mgr = BayesianArbRelationshipManager(
+            relationships=self._build_relationships(self._relationship_configs)
+        )
+        self._detector: BayesianArbDetector | None = None
+        self._cluster_by_asset: dict[str, set[str]] = {}
+        self._cluster_lookup: dict[str, Any] = {}
+        self._last_signature: dict[str, tuple[Any, ...]] = {}
+        self._last_signal_ts: dict[str, float] = {}
+        self._trade_counter: int = 0
+
+    def on_init(self) -> None:
+        for index, config in enumerate(self._market_configs):
+            market_id = str(config.get("market_id") or f"SI10_{index}").strip()
+            yes_asset_id = str(config.get("yes_asset_id") or config.get("yes_id") or "").strip()
+            no_asset_id = str(config.get("no_asset_id") or config.get("no_id") or "").strip()
+            if not market_id or not yes_asset_id or not no_asset_id:
+                continue
+
+            market = MarketInfo(
+                condition_id=market_id,
+                question=str(config.get("question") or market_id),
+                yes_token_id=yes_asset_id,
+                no_token_id=no_asset_id,
+                daily_volume_usd=float(config.get("daily_volume_usd", 0.0) or 0.0),
+                end_date=_parse_market_end_date(
+                    config.get("end_date")
+                    or config.get("end_date_iso")
+                    or config.get("end_time")
+                ),
+                active=bool(config.get("active", True)),
+                event_id=str(config.get("event_id") or config.get("group") or ""),
+                liquidity_usd=float(config.get("liquidity_usd", 0.0) or 0.0),
+                score=float(config.get("score", 0.0) or 0.0),
+                accepting_orders=bool(config.get("accepting_orders", True)),
+                tags=str(config.get("tags") or config.get("theme") or ""),
+                neg_risk=bool(config.get("neg_risk", False)),
+            )
+            self._markets[market_id] = market
+            self._books[yes_asset_id] = _ReplayOrderBook(yes_asset_id)
+            self._books[no_asset_id] = _ReplayOrderBook(no_asset_id)
+
+        self._cluster_mgr.scan_clusters(list(self._markets.values()))
+        self._cluster_lookup = {
+            cluster.relationship_id: cluster for cluster in self._cluster_mgr.active_clusters
+        }
+        for cluster in self._cluster_mgr.active_clusters:
+            for asset_id in (
+                cluster.base_a.yes_token_id,
+                cluster.base_a.no_token_id,
+                cluster.base_b.yes_token_id,
+                cluster.base_b.no_token_id,
+                cluster.joint.yes_token_id,
+                cluster.joint.no_token_id,
+            ):
+                self._cluster_by_asset.setdefault(asset_id, set()).add(cluster.relationship_id)
+
+        self._detector = BayesianArbDetector(
+            self._books,
+            fee_enabled_resolver=self._is_fee_enabled,
+            now_provider=self._now,
+        )
+        log.info(
+            "bayesian_replay_adapter_init",
+            markets=len(self._markets),
+            relationships=len(self._cluster_lookup),
+        )
+
+    def on_book_update(self, asset_id: str, snapshot: dict) -> None:
+        book = self._books.get(asset_id)
+        if book is None:
+            return
+
+        bid_levels = snapshot.get("bid_levels") or []
+        ask_levels = snapshot.get("ask_levels") or []
+        timestamp = float(snapshot.get("timestamp", 0.0) or 0.0)
+        if timestamp <= 0 or not bid_levels or not ask_levels:
+            return
+
+        book.apply_event(
+            {
+                "event_type": "l2_snapshot",
+                "bids": [{"price": str(price), "size": str(size)} for price, size in bid_levels],
+                "asks": [{"price": str(price), "size": str(size)} for price, size in ask_levels],
+            },
+            timestamp,
+        )
+
+        for relationship_id in self._cluster_by_asset.get(asset_id, ()):
+            cluster = self._cluster_lookup.get(relationship_id)
+            if cluster is None:
+                continue
+            self._evaluate_cluster(cluster, timestamp)
+
+    def on_trade(self, asset_id: str, trade: TradeEvent) -> None:
+        del asset_id
+        del trade
+
+    def on_fill(self, fill: "Fill") -> None:
+        del fill
+
+    def _evaluate_cluster(self, cluster: Any, timestamp: float) -> None:
+        if self.engine is None or self._detector is None:
+            return
+
+        signal = self._detector.evaluate_cluster(cluster, wallet_balance=self.engine.cash)
+        if signal is None:
+            return
+
+        signature = (
+            signal.violation_type,
+            tuple(
+                sorted(
+                    (
+                        asset_id,
+                        round(float(details.get("target_price", 0.0) or 0.0), 4),
+                    )
+                    for asset_id, details in signal.traded_leg_prices.items()
+                )
+            ),
+            round(signal.net_edge_cents, 2),
+        )
+        last_signature = self._last_signature.get(cluster.relationship_id)
+        last_ts = self._last_signal_ts.get(cluster.relationship_id, 0.0)
+        if signature == last_signature and (timestamp - last_ts) < 60.0:
+            return
+
+        total_payout = signal.target_shares * signal.guaranteed_payout
+        total_fee_usd = max(0.0, total_payout - signal.total_collateral - signal.net_ev_usd)
+        total_entry_cost = signal.total_collateral + total_fee_usd
+        if total_entry_cost > self.engine.cash + 1e-9:
+            return
+
+        self._trade_counter += 1
+        avg_entry_price = total_entry_cost / max(signal.target_shares, 1e-9)
+        exit_time = timestamp + (signal.days_to_resolution * 86_400.0)
+
+        self.engine._cash -= total_entry_cost
+        self.engine._cash += total_payout
+        self.engine.telemetry.record_fill(
+            Fill(
+                order_id=f"SI10-{self._trade_counter}-ENTRY",
+                price=avg_entry_price,
+                size=signal.target_shares,
+                fee=total_fee_usd,
+                timestamp=timestamp,
+                is_maker=False,
+                side=OrderSide.BUY,
+            ),
+            mid_at_submission=avg_entry_price,
+        )
+        self.engine.telemetry.record_fill(
+            Fill(
+                order_id=f"SI10-{self._trade_counter}-EXIT",
+                price=signal.guaranteed_payout,
+                size=signal.target_shares,
+                fee=0.0,
+                timestamp=timestamp + 1e-6,
+                is_maker=False,
+                side=OrderSide.SELL,
+            ),
+            mid_at_submission=signal.guaranteed_payout,
+        )
+        self.engine.telemetry.record_round_trip(
+            entry_price=avg_entry_price,
+            exit_price=signal.guaranteed_payout,
+            size=signal.target_shares,
+            entry_fee=total_fee_usd,
+            exit_fee=0.0,
+            entry_time=timestamp,
+            exit_time=exit_time,
+        )
+        self.engine.telemetry.record_equity(timestamp, self.engine.cash)
+
+        self._last_signature[cluster.relationship_id] = signature
+        self._last_signal_ts[cluster.relationship_id] = timestamp
+
+        log.info(
+            "bayesian_replay_trade",
+            relationship_id=cluster.relationship_id,
+            net_ev_usd=round(signal.net_ev_usd, 4),
+            annualized_yield=round(signal.annualized_yield, 6),
+            shares=signal.target_shares,
+        )
+
+    def _is_fee_enabled(self, market: MarketInfo) -> bool:
+        if not self._fee_enabled:
+            return False
+        market_tags = (getattr(market, "tags", "") or "").lower()
+        if not market_tags:
+            return False
+        fee_categories = {
+            part.strip().lower()
+            for part in (settings.strategy.fee_enabled_categories or "").split(",")
+            if part.strip()
+        }
+        return any(category in market_tags for category in fee_categories)
+
+    def _now(self) -> datetime:
+        current_ts = self.engine.clock.now() if self.engine is not None else 0.0
+        return datetime.fromtimestamp(current_ts, tz=timezone.utc)
+
+    @staticmethod
+    def _build_relationships(raw: list[dict[str, Any]]) -> list[BayesianRelationship]:
+        relationships: list[BayesianRelationship] = []
+        for index, item in enumerate(raw):
+            base_a = str(item.get("base_a_condition_id") or item.get("base_a") or "").strip()
+            base_b = str(item.get("base_b_condition_id") or item.get("base_b") or "").strip()
+            joint = str(item.get("joint_condition_id") or item.get("joint") or "").strip()
+            if not base_a or not base_b or not joint:
+                continue
+            relationship_id = str(
+                item.get("relationship_id")
+                or item.get("id")
+                or f"SI10_REL_{index}"
+            )
+            relationships.append(
+                BayesianRelationship(
+                    relationship_id=relationship_id,
+                    base_a_condition_id=base_a,
+                    base_b_condition_id=base_b,
+                    joint_condition_id=joint,
+                    label=str(item.get("label") or item.get("name") or relationship_id),
+                )
+            )
+        return relationships
 
 
 @dataclass(slots=True)
@@ -632,8 +1656,25 @@ class _ReplayOrderBook:
         self._bids: dict[float, float] = {}
         self._asks: dict[float, float] = {}
         self._depth_history: deque[tuple[float, float]] = deque(maxlen=40)
+        self._bid_depth_ewma: float = 0.0
+        self._ask_depth_ewma: float = 0.0
         self._ofi_window: deque[tuple[float, float, float]] = deque(maxlen=500)
         self._ofi_price_window: deque[tuple[float, str, float, float]] = deque(maxlen=1000)
+        self._toxicity_window_s: float = max(
+            0.25,
+            settings.strategy.toxicity_window_ms / 1000.0,
+        )
+        self._toxicity_window: deque[tuple[float, float, float, float, float]] = deque(maxlen=1000)
+        self._rolling_bid_sweep_usd: float = 0.0
+        self._rolling_ask_sweep_usd: float = 0.0
+        self._toxicity_depth_norm: float = max(
+            1e-6,
+            settings.strategy.toxicity_depth_evaporation_pct,
+        )
+        self._toxicity_sweep_norm: float = max(
+            1e-6,
+            settings.strategy.toxicity_sweep_depth_ratio,
+        )
         self._last_update: float = 0.0
 
     @property
@@ -656,6 +1697,20 @@ class _ReplayOrderBook:
             return 1.0
         return round(bid_depth / ask_depth, 2)
 
+    def levels(self, side: str, n: int = 5):
+        if side.lower() in ("bid", "buy"):
+            levels = sorted(self._bids.items(), reverse=True)[:n]
+        else:
+            levels = sorted(self._asks.items())[:n]
+        return [SimpleNamespace(price=price, size=size) for price, size in levels]
+
+    def snapshot(self):
+        return SimpleNamespace(
+            best_bid=self.best_bid,
+            best_ask=self.best_ask,
+            timestamp=self._last_update,
+        )
+
     def apply_event(self, event_data: dict[str, Any], timestamp: float) -> None:
         event_type = str(event_data.get("event_type", "")).lower()
         if event_type in ("book", "snapshot", "book_snapshot", "l2_snapshot"):
@@ -666,9 +1721,19 @@ class _ReplayOrderBook:
         self._record_depth(timestamp)
 
     def current_total_depth(self) -> float:
+        bid_depth, ask_depth = self.top_depths_usd()
+        return round(bid_depth + ask_depth, 2)
+
+    def top_depths_usd(self) -> tuple[float, float]:
         bid_depth = sum(price * size for price, size in sorted(self._bids.items(), reverse=True)[:5])
         ask_depth = sum(price * size for price, size in sorted(self._asks.items())[:5])
-        return round(bid_depth + ask_depth, 2)
+        return round(bid_depth, 2), round(ask_depth, 2)
+
+    def top_depth_ewma(self, side: str) -> float:
+        bid_depth, ask_depth = self.top_depths_usd()
+        if side.lower() in ("bid", "buy"):
+            return round(self._bid_depth_ewma or bid_depth, 2)
+        return round(self._ask_depth_ewma or ask_depth, 2)
 
     def depth_velocity(self, window_s: float) -> float | None:
         if len(self._depth_history) < 2:
@@ -693,28 +1758,75 @@ class _ReplayOrderBook:
                 consumed += abs(delta)
         return consumed
 
+    def toxicity_index(self, side: str = "BUY") -> float:
+        return self.toxicity_metrics(side)["toxicity_index"]
+
+    def toxicity_metrics(self, side: str = "BUY") -> dict[str, float]:
+        self._prune_toxicity(self._last_update)
+        if len(self._toxicity_window) < 2:
+            return {
+                "toxicity_index": 0.0,
+                "toxicity_depth_evaporation": 0.0,
+                "toxicity_sweep_ratio": 0.0,
+            }
+
+        baseline = self._toxicity_window[0]
+        current = self._toxicity_window[-1]
+        direction = side.upper()
+        if direction == "SELL":
+            baseline_depth = baseline[1]
+            current_depth = current[1]
+            sweep_ratio = self._rolling_bid_sweep_usd / max(1e-9, baseline_depth)
+        else:
+            baseline_depth = baseline[2]
+            current_depth = current[2]
+            sweep_ratio = self._rolling_ask_sweep_usd / max(1e-9, baseline_depth)
+
+        if baseline_depth <= 0:
+            return {
+                "toxicity_index": 0.0,
+                "toxicity_depth_evaporation": 0.0,
+                "toxicity_sweep_ratio": 0.0,
+            }
+
+        depth_evaporation = max(0.0, (baseline_depth - current_depth) / baseline_depth)
+        evap_score = min(1.0, depth_evaporation / self._toxicity_depth_norm)
+        sweep_score = min(1.0, sweep_ratio / self._toxicity_sweep_norm)
+        return {
+            "toxicity_index": round(min(1.0, 0.5 * evap_score + 0.5 * sweep_score), 6),
+            "toxicity_depth_evaporation": round(depth_evaporation, 6),
+            "toxicity_sweep_ratio": round(sweep_ratio, 6),
+        }
+
     def _apply_snapshot(self, data: dict[str, Any], timestamp: float) -> None:
         new_bids = self._parse_levels(data.get("bids") or [])
         new_asks = self._parse_levels(data.get("asks") or [])
 
         delta_bid_qty = 0.0
         delta_ask_qty = 0.0
+        bid_sweep_usd = 0.0
+        ask_sweep_usd = 0.0
 
         for price in set(self._bids) | set(new_bids):
             level_delta = new_bids.get(price, 0.0) - self._bids.get(price, 0.0)
             if level_delta != 0.0:
                 self._ofi_price_window.append((timestamp, "BUY", price, level_delta))
                 delta_bid_qty += level_delta
+            if level_delta < 0.0:
+                bid_sweep_usd += price * abs(level_delta)
 
         for price in set(self._asks) | set(new_asks):
             level_delta = new_asks.get(price, 0.0) - self._asks.get(price, 0.0)
             if level_delta != 0.0:
                 self._ofi_price_window.append((timestamp, "SELL", price, level_delta))
                 delta_ask_qty += level_delta
+            if level_delta < 0.0:
+                ask_sweep_usd += price * abs(level_delta)
 
         self._bids = new_bids
         self._asks = new_asks
         self._record_ofi(delta_bid_qty, delta_ask_qty, timestamp)
+        self._record_toxicity(timestamp, bid_sweep_usd, ask_sweep_usd)
 
     def _apply_delta(self, data: dict[str, Any], timestamp: float) -> None:
         changes = data.get("changes") or data.get("price_changes") or data.get("data") or []
@@ -725,6 +1837,8 @@ class _ReplayOrderBook:
 
         delta_bid_qty = 0.0
         delta_ask_qty = 0.0
+        bid_sweep_usd = 0.0
+        ask_sweep_usd = 0.0
         for change in changes:
             try:
                 price = float(change.get("price", 0.0))
@@ -745,6 +1859,8 @@ class _ReplayOrderBook:
                 if level_delta != 0.0:
                     self._ofi_price_window.append((timestamp, "BUY", price, level_delta))
                     delta_bid_qty += level_delta
+                if level_delta < 0.0:
+                    bid_sweep_usd += price * abs(level_delta)
             elif side in ("SELL", "ASK"):
                 old_size = self._asks.get(price, 0.0)
                 if size <= 0:
@@ -755,8 +1871,11 @@ class _ReplayOrderBook:
                 if level_delta != 0.0:
                     self._ofi_price_window.append((timestamp, "SELL", price, level_delta))
                     delta_ask_qty += level_delta
+                if level_delta < 0.0:
+                    ask_sweep_usd += price * abs(level_delta)
 
         self._record_ofi(delta_bid_qty, delta_ask_qty, timestamp)
+        self._record_toxicity(timestamp, bid_sweep_usd, ask_sweep_usd)
 
     @staticmethod
     def _parse_levels(levels: list[dict[str, Any]]) -> dict[float, float]:
@@ -772,7 +1891,22 @@ class _ReplayOrderBook:
         return parsed
 
     def _record_depth(self, timestamp: float) -> None:
-        self._depth_history.append((timestamp, self.current_total_depth()))
+        bid_depth, ask_depth = self.top_depths_usd()
+        if self._bid_depth_ewma <= 0:
+            self._bid_depth_ewma = bid_depth
+        else:
+            self._bid_depth_ewma = (
+                _REPLAY_TOP_DEPTH_EWMA_ALPHA * bid_depth
+                + (1.0 - _REPLAY_TOP_DEPTH_EWMA_ALPHA) * self._bid_depth_ewma
+            )
+        if self._ask_depth_ewma <= 0:
+            self._ask_depth_ewma = ask_depth
+        else:
+            self._ask_depth_ewma = (
+                _REPLAY_TOP_DEPTH_EWMA_ALPHA * ask_depth
+                + (1.0 - _REPLAY_TOP_DEPTH_EWMA_ALPHA) * self._ask_depth_ewma
+            )
+        self._depth_history.append((timestamp, round(bid_depth + ask_depth, 2)))
 
     def _record_ofi(self, delta_bid_qty: float, delta_ask_qty: float, timestamp: float) -> None:
         if delta_bid_qty != 0.0 or delta_ask_qty != 0.0:
@@ -785,6 +1919,25 @@ class _ReplayOrderBook:
             self._ofi_window.popleft()
         while self._ofi_price_window and self._ofi_price_window[0][0] < cutoff:
             self._ofi_price_window.popleft()
+
+    def _top_depths_usd(self) -> tuple[float, float]:
+        return self.top_depths_usd()
+
+    def _record_toxicity(self, timestamp: float, bid_sweep_usd: float, ask_sweep_usd: float) -> None:
+        bid_depth, ask_depth = self._top_depths_usd()
+        self._toxicity_window.append((timestamp, bid_depth, ask_depth, bid_sweep_usd, ask_sweep_usd))
+        self._rolling_bid_sweep_usd += bid_sweep_usd
+        self._rolling_ask_sweep_usd += ask_sweep_usd
+        self._prune_toxicity(timestamp)
+
+    def _prune_toxicity(self, timestamp: float) -> None:
+        cutoff = timestamp - self._toxicity_window_s
+        while self._toxicity_window and self._toxicity_window[0][0] < cutoff:
+            _, _bid_depth, _ask_depth, bid_sweep_usd, ask_sweep_usd = self._toxicity_window.popleft()
+            self._rolling_bid_sweep_usd -= bid_sweep_usd
+            self._rolling_ask_sweep_usd -= ask_sweep_usd
+        self._rolling_bid_sweep_usd = max(0.0, self._rolling_bid_sweep_usd)
+        self._rolling_ask_sweep_usd = max(0.0, self._rolling_ask_sweep_usd)
 
 
 class PureMarketMakerReplayAdapter(StrategyABC):

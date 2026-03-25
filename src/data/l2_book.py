@@ -155,6 +155,21 @@ class L2OrderBook:
         # ``opposing_ofi_at_price`` can measure consumption at a specific
         # wall price.
         self._ofi_price_window: deque[tuple[float, str, float, float]] = deque(maxlen=1000)
+        self._toxicity_window_sec: float = max(
+            0.25,
+            settings.strategy.toxicity_window_ms / 1000.0,
+        )
+        self._toxicity_window: deque[tuple[float, float, float, float, float]] = deque(maxlen=1000)
+        self._rolling_bid_sweep_usd: float = 0.0
+        self._rolling_ask_sweep_usd: float = 0.0
+        self._toxicity_depth_norm: float = max(
+            1e-6,
+            settings.strategy.toxicity_depth_evaporation_pct,
+        )
+        self._toxicity_sweep_norm: float = max(
+            1e-6,
+            settings.strategy.toxicity_sweep_depth_ratio,
+        )
         # ── Snapshot fetch lock (prevents concurrent fetches) ─────────
         self._snapshot_lock = asyncio.Lock()
 
@@ -367,6 +382,7 @@ class L2OrderBook:
         # Clear depth history so a resync doesn't produce an artificial
         # depth-change spike that triggers false ghost-liquidity alerts.
         self._depth_history.clear()
+        self._reset_toxicity_state(self._last_update)
 
         # Update BBO + spread score (also records depth if BBO changed)
         self._update_bbo_and_score()
@@ -476,6 +492,9 @@ class L2OrderBook:
 
         delta_bid_qty = 0.0
         delta_ask_qty = 0.0
+        bid_sweep_usd = 0.0
+        ask_sweep_usd = 0.0
+        now = time.time()
 
         for ch in changes:
             try:
@@ -500,8 +519,10 @@ class L2OrderBook:
                 # SI-5: per-price OFI for wall pressure monitoring
                 if level_delta != 0.0:
                     self._ofi_price_window.append(
-                        (time.time(), "BUY", price, level_delta)
+                        (now, "BUY", price, level_delta)
                     )
+                if level_delta < 0.0:
+                    bid_sweep_usd += price * abs(level_delta)
                 # SI-2: Fire level-change callback for iceberg detection
                 if self._on_level_change is not None and old_size != size:
                     self._on_level_change("BUY", price, old_size, size)
@@ -516,19 +537,22 @@ class L2OrderBook:
                 # SI-5: per-price OFI for wall pressure monitoring
                 if level_delta != 0.0:
                     self._ofi_price_window.append(
-                        (time.time(), "SELL", price, level_delta)
+                        (now, "SELL", price, level_delta)
                     )
+                if level_delta < 0.0:
+                    ask_sweep_usd += price * abs(level_delta)
                 # SI-2: Fire level-change callback for iceberg detection
                 if self._on_level_change is not None and old_size != size:
                     self._on_level_change("SELL", price, old_size, size)
 
         # SI-5: record OFI deltas
         if delta_bid_qty != 0.0 or delta_ask_qty != 0.0:
-            self._ofi_window.append((time.time(), delta_bid_qty, delta_ask_qty))
+            self._ofi_window.append((now, delta_bid_qty, delta_ask_qty))
 
         # Trim if over max levels
         self._trim_side(self._bids)
         self._trim_side(self._asks)
+        self._record_toxicity_sample(now, bid_sweep_usd=bid_sweep_usd, ask_sweep_usd=ask_sweep_usd)
 
     def _trigger_desync(self) -> None:
         """Move to DESYNCED state, wipe the book, signal for re-snapshot."""
@@ -814,6 +838,54 @@ class L2OrderBook:
         current_depth = self.current_total_depth()
         return (current_depth - past_depth) / past_depth
 
+    def toxicity_index(self, side: str = "BUY") -> float:
+        return self.toxicity_metrics(side)["toxicity_index"]
+
+    def toxicity_metrics(self, side: str = "BUY") -> dict[str, float]:
+        if self._state != BookState.SYNCED:
+            return {
+                "toxicity_index": 0.0,
+                "toxicity_depth_evaporation": 0.0,
+                "toxicity_sweep_ratio": 0.0,
+            }
+
+        now = time.time()
+        self._prune_toxicity(now)
+        if len(self._toxicity_window) < 2:
+            return {
+                "toxicity_index": 0.0,
+                "toxicity_depth_evaporation": 0.0,
+                "toxicity_sweep_ratio": 0.0,
+            }
+
+        baseline = self._toxicity_window[0]
+        current = self._toxicity_window[-1]
+        direction = side.upper()
+        if direction == "SELL":
+            baseline_depth = baseline[1]
+            current_depth = current[1]
+            sweep_ratio = self._rolling_bid_sweep_usd / max(1e-9, baseline_depth)
+        else:
+            baseline_depth = baseline[2]
+            current_depth = current[2]
+            sweep_ratio = self._rolling_ask_sweep_usd / max(1e-9, baseline_depth)
+
+        if baseline_depth <= 0:
+            return {
+                "toxicity_index": 0.0,
+                "toxicity_depth_evaporation": 0.0,
+                "toxicity_sweep_ratio": 0.0,
+            }
+
+        depth_evaporation = max(0.0, (baseline_depth - current_depth) / baseline_depth)
+        evap_score = min(1.0, depth_evaporation / self._toxicity_depth_norm)
+        sweep_score = min(1.0, sweep_ratio / self._toxicity_sweep_norm)
+        return {
+            "toxicity_index": round(min(1.0, 0.5 * evap_score + 0.5 * sweep_score), 6),
+            "toxicity_depth_evaporation": round(depth_evaporation, 6),
+            "toxicity_sweep_ratio": round(sweep_ratio, 6),
+        }
+
     # ── Liquidity gap detection ─────────────────────────────────────────
     def find_liquidity_gaps(self, min_depth_usd: float = 0.0) -> list[_Level]:
         """Find ask-side price levels where cumulative depth is thin.
@@ -856,6 +928,46 @@ class L2OrderBook:
                 gaps.append(_Level(price, round(cumulative, 4)))
 
         return gaps
+
+    def _top_depths_usd(self) -> tuple[float, float]:
+        bid_depth = sum(
+            (-neg_p) * self._bids[neg_p]
+            for neg_p in self._bids.islice(stop=5)
+        )
+        ask_depth = sum(
+            p * self._asks[p]
+            for p in self._asks.islice(stop=5)
+        )
+        return round(bid_depth, 2), round(ask_depth, 2)
+
+    def _record_toxicity_sample(
+        self,
+        now: float,
+        *,
+        bid_sweep_usd: float,
+        ask_sweep_usd: float,
+    ) -> None:
+        bid_depth, ask_depth = self._top_depths_usd()
+        self._toxicity_window.append((now, bid_depth, ask_depth, bid_sweep_usd, ask_sweep_usd))
+        self._rolling_bid_sweep_usd += bid_sweep_usd
+        self._rolling_ask_sweep_usd += ask_sweep_usd
+        self._prune_toxicity(now)
+
+    def _prune_toxicity(self, now: float) -> None:
+        cutoff = now - self._toxicity_window_sec
+        while self._toxicity_window and self._toxicity_window[0][0] < cutoff:
+            _, _bid_depth, _ask_depth, bid_sweep_usd, ask_sweep_usd = self._toxicity_window.popleft()
+            self._rolling_bid_sweep_usd -= bid_sweep_usd
+            self._rolling_ask_sweep_usd -= ask_sweep_usd
+        self._rolling_bid_sweep_usd = max(0.0, self._rolling_bid_sweep_usd)
+        self._rolling_ask_sweep_usd = max(0.0, self._rolling_ask_sweep_usd)
+
+    def _reset_toxicity_state(self, now: float) -> None:
+        self._toxicity_window.clear()
+        self._rolling_bid_sweep_usd = 0.0
+        self._rolling_ask_sweep_usd = 0.0
+        if now > 0:
+            self._record_toxicity_sample(now, bid_sweep_usd=0.0, ask_sweep_usd=0.0)
 
     # ── Internal helpers ───────────────────────────────────────────────
     def _trim_side(self, side: SortedDict) -> None:

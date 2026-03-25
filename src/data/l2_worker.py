@@ -126,6 +126,8 @@ async def _l2_worker_async(
 
         # Pre-compute depth near mid for AdverseSelectionGuard fast-path
         depth_near_mid = book.depth_near_mid_usd(1.0, 50)
+        buy_toxicity = book.toxicity_index("BUY")
+        sell_toxicity = book.toxicity_index("SELL")
 
         writer.write(
             seq=book.seq,
@@ -137,6 +139,8 @@ async def _l2_worker_async(
             ask_depth_usd=sum(p * s for p, s in ask_levels_raw[:5]),
             spread_score=book.spread_score_value,
             depth_near_mid=depth_near_mid,
+            buy_toxicity=buy_toxicity,
+            sell_toxicity=sell_toxicity,
             state=_STATE_MAP.get(book.state.value, 0),
             latency_state=LATENCY_HEALTHY,
             is_reliable=book.is_reliable,
