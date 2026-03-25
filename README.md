@@ -1,262 +1,188 @@
 # Polymarket Bot
 
-Institutional documentation for the current checked-in trading stack.
+Institutional trading stack for Polymarket microstructure, combinatorial, and
+joint-probability execution.
 
-This repository is no longer documented as a generic mean-reversion market
-maker. The repo now contains multiple strategy families, but the approved
-live posture is intentionally narrow:
+This repository is not a single-strategy market maker. The checked-in runtime,
+replay, and optimization layers support multiple alpha streams, a shared risk
+and execution substrate, and an Optuna-to-production parameter deployment path.
 
-- LIVE OPS: SI-9 combinatorial arbitrage only
-- DEPLOYMENT MODE: PAPER
-- RETIRED LIVE STRATEGY: PURE_MM passive market making
-- NEW DIRECTIONAL RESEARCH STACK: OFI momentum taker built on the refactored
-   O(1) OHLCV engine
-
-Use this file as the operator-facing source of truth. Use ARCHITECTURE.md for
-the full component-level explanation.
+Use this file as the operator-facing overview. Use ARCHITECTURE.md for the
+technical source of truth.
 
 ## Current State
 
-### Live Ops
+- Deployment mode defaults to PAPER via DEPLOYMENT_ENV.
+- The runtime wires multiple alpha streams into one bot and one shared risk
+  surface.
+- Research and deployment now share a formal parameter handoff via
+  champion_params.json and live_hyperparameters.json.
+- PURE_MM remains in the repository for legacy replay and regression, but it is
+  no longer the right mental model for the system.
 
-- SI-9 combinatorial arbitrage is the only strategy that should be treated as
-   active live deployment.
-- The checked-in service and environment are configured for PAPER mode.
-- The live posture is intentionally separated from research and backtest-only
-   capabilities.
+## Feature Set
 
-### Backtest Ops
+### Alpha Streams
 
-- The replay stack supports both the legacy passive maker path and the newer
-   OFI momentum taker path.
-- Walk-forward optimization now assumes the OHLCV engine is incremental and
-   must be run with file logging disabled to avoid I/O bottlenecks.
+- OFI Momentum with TVI-sensitive confirmation and toxicity-aware sizing.
+- Contagion Arb, a Domino-style cross-market toxicity propagation strategy.
+- SI-9 combinatorial arbitrage for mutually exclusive negRisk clusters.
+- SI-10 Bayesian joint-probability arbitrage across configured base/base/joint
+  triplets.
+- Legacy panic, drift, RPE, oracle, and passive-maker paths that remain in the
+  codebase for compatibility, research, and selective deployment.
 
-## The Pivot
+### Shared Infrastructure
 
-PURE_MM is deprecated as a live strategy.
+- Event-driven order-book tracking with O(1) top-of-book metrics and top-depth
+  EWMA baselines.
+- Hidden stochastic OFI exit management monitored locally instead of posting a
+  deterministic take-profit order to the book.
+- O(1) ensemble exposure gating to prevent multi-strategy directional stacking
+  on the same market.
+- Cross-book synchronization gating for multi-leg and multi-market signals.
+- Replay adapters for OFI, contagion, Bayesian, and legacy strategies.
+- Optuna walk-forward optimization with child-process timeouts and SQLite study
+  storage.
+- Boot-time live hyperparameter override loading with strict validation.
 
-The retirement reason is not cosmetic. The market split into two losing
-regimes for passive quoting:
+## Strategy Matrix
 
-- Long-tail markets produced too few passive fills to justify capital or
-   operational complexity. In practice, they behaved like zero-fill books.
-- Top 25 / high-volume markets did fill, but those fills were dominated by
-   toxic flow and adverse selection.
-
-The repo still contains the PURE_MM implementation and replay adapter because
-they remain useful for research, regression testing, and historical analysis.
-That should not be confused with approval for live deployment.
-
-For the current high-volume universe, recent out-of-sample WFO artifacts are
-treated as disqualifying evidence for passive deployment. Operationally,
-PURE_MM stays retired until the quoting model changes materially.
-
-## Strategy Status Matrix
-
-| Strategy | Status | Operational Meaning |
+| Strategy | Runtime Status | Notes |
 | --- | --- | --- |
-| PURE_MM passive maker | Retired from live ops | Kept in code for replay, research, and historical comparison |
-| SI-9 combinatorial arbitrage | Active live strategy | Approved live paper strategy on VPS |
-| OFI momentum taker | Research / replay / rollout candidate | Implemented, wired, and documented, but not the primary live engine |
-| Legacy panic / drift directional paths | Legacy compatibility | Still present in the repo, not the strategic center of live ops |
+| OFI Momentum | Implemented in live/replay | Uses aggressive entry and hidden local exits |
+| Contagion Arb | Implemented in live/replay | Enabled by config, shadow mode on by default |
+| SI-9 Combinatorial Arb | Implemented in live/replay | Runtime-wired, explicitly gated by config |
+| SI-10 Bayesian Arb | Implemented in live/replay | Runtime-wired, explicitly gated by config |
+| PURE_MM | Legacy | Kept for replay, comparative study, and regression |
 
-## Live Ops
+"Implemented" means the code path is merged and wired into the bot or replay
+stack. It does not imply that every strategy is enabled in the same deployment.
 
-### Approved Production Posture
+## Alpha Summaries
 
-The live VPS posture is:
+### OFI Momentum With TVI
 
-- PAPER mode
-- SI-9 enabled when running the combinatorial arb deployment
-- PURE_MM disabled on the current Top 25 / high-volume target map
+OFI Momentum trades fast queue-pressure dislocations using aggressive entry.
+The detector measures rolling order-flow imbalance and uses TVI sensitivity via
+the ofi_tvi_kappa parameter. Once a position is filled, the strategy does not
+leave a visible deterministic take-profit order resting on the book. Instead,
+the runtime draws a private bracket and monitors hidden target, stop, and hold
+time locally.
 
-This distinction matters. The repo is a transitional system and still carries
-legacy and optional code paths. Live approval is narrower than code presence.
+Operational consequences:
 
-### SI-9 Overview
+- entry is taker-style and latency-sensitive
+- exits are monitored from BBO changes and timeout backstops
+- replay and WFO reuse the same bracket draw logic for parity
 
-SI-9 trades mutually exclusive negRisk event clusters.
+### Contagion Arb
 
-Core idea:
+Contagion Arb groups markets by thematic tags, watches leader-book toxicity,
+and projects that impulse into lagging books through correlation and residual
+filters. The signal is suppressed when the relevant books are not synchronized
+within the configured cross-book desync budget.
 
-- If the sum of YES best bids across all legs is below $1.00$ by enough
-   margin, the event cluster can be bought as a Dutch-book style arb.
+### SI-9 Combinatorial Arb
 
-Operational guardrails:
+SI-9 scans mutually exclusive event clusters and looks for the Dutch-book case
+where the sum of YES best bids drops sufficiently below $1.00$. It keeps share
+counts equal across legs, works the bottleneck leg passively first, and uses a
+hanging-leg unwind path to avoid naked partial exposure.
 
-- Ghost-town filter: reject clusters when $\sum bids < 0.85$
-- Reject implausible edge prints when edge exceeds $\$0.15$
-- Require minimum leg depth before sizing
-- Enforce max concurrent combos, max total combo exposure, and per-combo
-   collateral caps
-- Use maker-first routing for the bottleneck leg, then sweep taker legs only
-   after the maker leg fills
-- If a combo partially fills, the hanging-leg state machine either emergency
-   hedges the missing leg or dumps filled legs to eliminate naked exposure
+### SI-10 Bayesian Joint-Probability Arb
 
-Institutional interpretation:
+SI-10 evaluates configured base/base/joint triplets in O(1) time using live
+YES-book snapshots, fee-aware edge math, depth constraints, and the same
+cross-book synchronization gate used by the other coordinated strategies.
 
-- SI-9 is a tightly scoped execution strategy, not a generic market-making
-   engine.
-- Its risk control surface is explicit and leg-aware.
+## MLOps Pipeline
 
-## Momentum Architecture
+The repository now has a formal research-to-runtime handoff.
 
-The repository now includes a new OFIMomentumSignal pipeline designed around
-aggressive taker entry rather than passive quote capture.
+### Research Side
 
-### What It Does
+- WFO runs through src/backtest/wfo_optimizer.py using Optuna studies backed by
+  SQLite.
+- Each study exports a report and a champion_params.json artifact.
+- champion_params.json contains a params object plus metadata such as fold,
+  degradation, trade counts, and generation time.
 
-- Tracks rolling top-of-book volume imbalance over a millisecond window
-- Emits a directional momentum signal when rolling VI crosses a configured
-   threshold
-- Routes execution through an aggressive taker entry path instead of waiting
-   for maker fills
+### Deployment Side
 
-### Why It Exists
+- scripts/inject_wfo_champions.py accepts one or more WFO output directories or
+  champion_params.json files.
+- The injector resolves each artifact, validates parameter names and values,
+  merges them in input order, and writes live_hyperparameters.json atomically.
+- Existing live_hyperparameters.json values are loaded first, then overlaid by
+  the supplied champion artifacts.
 
-The strategy is built for the regime where waiting passively is the problem.
-If the signal is about fleeting order-flow imbalance, execution must cross the
-spread immediately or the edge disappears.
+### Boot-Time Loading
 
-### Hard Brackets
+- src/core/config.py loads live_hyperparameters.json during settings bootstrap.
+- src/core/live_hyperparameters.py validates overrides before they touch the
+  frozen StrategyParams dataclass.
+- Invalid live hyperparameters fail the boot with a hard error instead of
+  silently degrading into stale defaults.
+- LIVE_HYPERPARAMETERS_PATH can override the default file location.
 
-OFI momentum uses hard post-entry bracket logic:
+### Validation Rules
 
-- Take profit: 3.0%
-- Stop-loss: 1.5%
-- Time-stop: 300 seconds
+- unknown strategy parameter names are rejected
+- None, NaN, and infinite values are rejected
+- edge thresholds ending in _usd or _cents must stay strictly positive
+- percentile and correlation-style fields must remain inside [0, 1]
+- max_cross_book_desync_ms must be strictly positive
 
-Those brackets are deliberate guardrails, not optional tuning ideas. The time
-stop exists because momentum that does not resolve quickly usually decays into
-inventory risk rather than edge.
+## WFO Usage Notes
 
-## Engine Optimization
-
-The OHLCV stack was refactored to remove repeated full-window recomputation.
-
-Current design:
-
-- OHLCV bars update incrementally on each trade
-- Rolling VWAP and rolling volatility maintain O(1) state updates
-- Return sums, squared-return sums, and rolling volume sums are updated as bars
-   enter and leave the window
-- The backtest engine skips duplicate aggregation when the strategy manages
-   its own trade aggregation
-
-This is the key March 24 engineering change that made momentum WFO practical.
-The prior model rebuilt rolling state too often and burned CPU on every tick.
-
-Important replay rule:
-
-- BotReplayAdapter aggregates its own trade stream
-- The backtest engine detects that via `self_aggregates_trades = True`
-- Engine-side duplicate OHLCV work is skipped
-
-That separation prevents the replay stack from paying for the same bar work
-twice.
-
-## Walk-Forward Optimization
-
-This repo now draws a hard operational line between LIVE OPS and BACKTEST OPS.
-Do not mix their assumptions.
-
-### Required Operator Rule
-
-Before running WFO, disable file logging:
+Before heavy optimization runs, disable file logging:
 
 ```powershell
 $env:BOT_DISABLE_FILE_LOGGING='1'
 ```
 
-Reason:
+Why:
 
-- WFO runs many short child-process backtests
-- Structured file logging creates avoidable disk contention
-- The repo explicitly supports disabling rotating file output while preserving
-   stdout/stderr logging
+- Optuna launches many child-process backtests
+- rotating file logging adds avoidable disk contention
+- the optimizer already has checkpoint and artifact outputs
 
-### Trial Timeout Wrapper
-
-Each trial is wrapped in a hard 60-second wall-clock timeout.
-
-Operational meaning:
-
-- A slow trial is not allowed to stall the study indefinitely
-- The optimizer runs each trial in a child process
-- If the child does not finish within 60 seconds, it is terminated and the
-   trial is marked as timed out
-
-This is a control mechanism, not just a convenience feature.
-
-### Generic WFO Command
+Representative entry points:
 
 ```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
-python -m src.cli wfo `
-   --data-dir data/vps_march2026 `
-   --train-days 35 `
-   --test-days 7 `
-   --step-days 7 `
-   --anchored `
-   --embargo-days 1 `
-   --n-trials 500 `
-   --max-workers -1 `
-   --strategy-adapter bot_replay
+python wfo_ofi_momentum.py
+python wfo_contagion_arb.py
+python wfo_bayesian_arb.py
 ```
-
-### Top 25 OFI Momentum Wrapper
-
-```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
-python wfo_ofi_momentum.py `
-   --train-days 35 `
-   --test-days 7 `
-   --step-days 7 `
-   --embargo-days 1 `
-   --n-trials 500 `
-   --max-workers -1 `
-   --trial-timeout-s 60
-```
-
-### WFO Interpretation Rules
-
-- Treat LIVE OPS and BACKTEST OPS as separate operating domains
-- PURE_MM backtests require L2 snapshots and deltas; trade-only data is not a
-   valid passive-maker evaluation dataset
-- OFI momentum WFO is only useful if logging overhead is controlled and the
-   OHLCV path stays incremental
 
 ## Repository Layout
 
 ```text
 src/
-├── backtest/      Replay engine, matching engine, WFO optimizer
-├── core/          Config, logger, guards, process management
-├── data/          Discovery, OHLCV, L2 books, adapters
-├── execution/     Aggressive execution helpers such as momentum taker brackets
+├── backtest/      Replay engine, matching engine, WFO optimizer, telemetry
+├── core/          Config, guards, process management, live hyperparameter loader
+├── data/          Market discovery, OHLCV, L2 books, adapters
+├── execution/     Execution helpers including OFI bracket drawing
 ├── monitoring/    Trade store, health reporting, Telegram notifications
-├── signals/       SI-9 detector, OFI momentum detector, legacy signal stack
-├── strategies/    PURE_MM live strategy implementation
-├── trading/       Position manager, stop-loss engine, combo lifecycle
+├── signals/       OFI, contagion, SI-9, SI-10, and legacy detectors
+├── strategies/    Legacy live strategy implementations such as PURE_MM
+├── trading/       Position manager, stop-loss engine, combo lifecycle, risk
 ├── bot.py         Runtime orchestrator
 └── cli.py         Operator CLI
 ```
 
-## Checked-In Code Versus Deployment Truth
+## Documentation Rules
 
-This repo has experienced runtime-versus-source drift before. Documentation now
-separates:
+Keep these distinctions explicit when updating docs:
 
-- checked-in architecture
-- approved live deployment posture
-- historical artifacts and saved runtime observations
+- code present in the repository
+- code wired into the runtime
+- code enabled by default
+- code approved for a specific deployment
 
-If a piece of code still exists, that does not automatically mean it is part of
-the approved live deployment.
-
-That distinction is especially important for:
+This repo supports more than one thing at once. The docs should reflect the
+actual wiring without collapsing everything into a single live posture claim.
 
 - PURE_MM defaults that still exist in config
 - legacy directional code paths still present for compatibility

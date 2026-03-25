@@ -1,458 +1,375 @@
 # Architecture
 
-This document explains the current checked-in architecture as of March 24,
-2026, with an explicit separation between live deployment posture and research
-or replay-only capabilities.
+This document describes the checked-in trading architecture as it exists in the
+repository today. It is written for quantitative engineers who need exact
+runtime and replay behavior, not a simplified product summary.
 
-## Architectural Position
+## System Shape
 
-The repository is a hybrid trading system, but it is no longer correct to
-describe it as a passive market-making repo with a few optional side modules.
+The repository is a multi-strategy event-driven trading system built around a
+shared runtime substrate:
 
-The current strategic center is:
+- src/bot.py orchestrates books, trades, detectors, and background control
+  loops.
+- src/trading/position_manager.py owns position lifecycle, local exits, and
+  shared execution-time risk checks.
+- src/trading/stop_loss.py converts BBO changes into immediate exit evaluation.
+- src/data/orderbook.py maintains live top-of-book state and O(1) depth
+  baselines.
+- src/backtest/strategy.py mirrors live behavior in deterministic replay
+  adapters.
+- src/backtest/wfo_optimizer.py drives Optuna walk-forward studies and artifact
+  export.
+- src/core/live_hyperparameters.py and scripts/inject_wfo_champions.py bridge
+  optimization outputs into production configuration.
 
-1. SI-9 combinatorial arbitrage for live paper deployment
-2. OFI momentum taker architecture for directional microstructure replay and
-   optimization
-3. An optimized O(1) OHLCV engine that makes the replay path operationally
-   viable
+The codebase contains multiple alpha families. The runtime does not assume a
+single flagship strategy.
 
-The PURE_MM passive maker stack still exists in source, but it is now a legacy
-research and replay path rather than the approved live strategy.
+## Alpha Portfolio
 
-## Architecture Separation
+### OFI Momentum
 
-### Live Ops
+Primary modules:
 
-Live Ops should be read as the approved deployed posture.
+- src/signals/ofi_momentum.py
+- src/execution/momentum_taker.py
+- src/trading/position_manager.py
+- src/trading/stop_loss.py
+- src/backtest/strategy.py
 
-Current posture:
+OFI Momentum is a taker-style microstructure strategy built around rolling
+top-of-book imbalance and TVI-sensitive confirmation. The signal is short-hold,
+latency-sensitive, and explicitly designed to monetize queue-pressure rather
+than passive spread capture.
 
-- Deployment environment is PAPER
-- SI-9 is the only active live strategy
-- PURE_MM remains disabled on the high-volume target map
+### Contagion Arb
 
-### Backtest Ops
+Primary modules:
 
-Backtest Ops should be read as the research and optimization plane.
+- src/signals/contagion_arb.py
+- src/signals/microstructure_utils.py
+- src/backtest/strategy.py
+- src/backtest/wfo_optimizer.py
 
-Current posture:
+Contagion Arb monitors thematic groups of markets, detects toxicity spikes on a
+leader book, and propagates that shock into lagging books subject to
+correlation, residual, spread, and synchronization gates.
 
-- OFI momentum is fully represented in replay
-- PURE_MM is still available for replay and comparative study
-- WFO uses child-process isolation and hard trial timeouts
-- Logging must be throttled operationally to avoid I/O choking
+### SI-9 Combinatorial Arb
 
-This separation is intentional and should survive future refactors.
+Primary modules:
 
-## The Strategic Pivot
+- src/signals/combinatorial_arb.py
+- src/data/arb_clusters.py
+- src/trading/position_manager.py
+- src/bot.py
 
-### PURE_MM Is Retired Operationally
+SI-9 looks for mutually exclusive clusters whose YES best bids imply a
+sub-$1.00$ Dutch-book. It is structurally multi-leg and therefore uses a
+different execution model from the directional strategies.
 
-PURE_MM failed in two different ways:
+### SI-10 Bayesian Joint-Probability Arb
 
-1. Long-tail markets produced too few passive fills
-2. Top 25 markets produced fills in the wrong regime: toxic, informed, or
-   adverse-selection-dominated flow
+Primary modules:
 
-The high-volume universe failure is reflected in the current repo narrative and
-recent OOS WFO conclusions. The long-tail failure is an execution-reality
-problem: passive quoting without enough organic taker flow creates operational
-motion with little or no actual business throughput.
+- src/signals/bayesian_arb.py
+- src/backtest/strategy.py
+- src/backtest/wfo_optimizer.py
+- src/bot.py
 
-The result is a clear desk-level conclusion:
+SI-10 evaluates configured base/base/joint relationships directly from live
+YES-book snapshots and fee-aware edge math. It uses the same synchronization
+gate as the other coordinated strategies.
 
-- PURE_MM remains in source
-- PURE_MM may still be replayed
-- PURE_MM should not be treated as the approved live strategy
+### Legacy Paths
 
-### Why The New Direction Looks Different
+PURE_MM, panic, drift, RPE, oracle, and related support code remain in the
+repository. They are relevant for replay, regression, and selective deployment,
+but they are not the correct umbrella description of the architecture.
 
-The replacement architecture does not try to force one execution style onto all
-books.
+## Execution Layer
 
-- SI-9 targets explicit structural mispricings in mutually exclusive clusters
-- OFI momentum accepts that some edges are only monetizable with taker speed
+### Event-Driven Runtime
 
-That is the deeper reason the repo now contains both a combinatorial arb engine
-and an aggressive momentum path.
+The live runtime is built around market-data events rather than polling loops.
 
-## Strategy Portfolio
+- OrderbookTracker updates top-of-book state from price_change and book events.
+- BBO changes invoke stop-loss and local-exit evaluation.
+- PositionManager owns entry state, exit state, fill reconciliation, and exit
+  routing.
+- The timeout loop exists as a backstop, not as the primary execution trigger.
 
-### PURE_MM Passive Maker
+This matters because the high-conviction paths are latency-sensitive and should
+not wait for coarse periodic polling to react to market state.
 
-Primary code locations:
+### Stochastic Hazard-Rate Exits For OFI
 
-- `src/strategies/pure_market_maker.py`
-- `src/backtest/strategy.py` via `PureMarketMakerReplayAdapter`
-- `src/core/config.py` pure maker parameters
+The OFI execution layer no longer posts a deterministic visible take-profit
+order after entry fill.
 
-Status:
+Instead:
 
-- Present in code
-- Configurable
-- Still instantiated by the bot when enabled
-- Not approved as the current live production path
+1. src/execution/momentum_taker.py draws a private DrawnMomentumBracket via
+   draw_stochastic_momentum_bracket().
+2. The draw uses bounded exponential hazard-style sampling around the configured
+   means for take-profit percentage, stop-loss percentage, and max hold time.
+3. src/trading/position_manager.py stores the sampled target, stop, and hold
+   horizon on the position as drawn_tp, drawn_stop, drawn_time,
+   drawn_tp_pct, and drawn_stop_pct.
+4. on_entry_filled() arms the position for local monitoring and deliberately
+   leaves pos.exit_order unset.
 
-Operational interpretation:
+Why this design exists:
 
-- Keep it for research and historical regression
-- Do not write new documentation that frames it as the flagship live strategy
+- a posted deterministic TP advertises the strategy footprint to the market
+- the signal is short-lived and does not benefit from revealing its full exit
+  geometry
+- replay parity is still preserved because the same bracket sampler is reused
+  there with deterministic seeding
 
-### SI-9 Combinatorial Arbitrage
+This is not a cosmetic randomization layer. It is a change in execution model:
+the exit is now hidden and strategy-owned.
 
-Primary code locations:
+### Local Exit Monitoring
 
-- `src/signals/combinatorial_arb.py`
-- `src/trading/position_manager.py`
-- `src/bot.py`
-- `src/data/arb_clusters.py`
+The local OFI exit path is centered in PositionManager.evaluate_ofi_local_exit().
+That function is triggered from two places:
 
-Status:
+- src/trading/stop_loss.py when a BBO update arrives for the traded asset
+- PositionManager.check_timeouts() as a periodic backstop
 
-- Approved live strategy
-- Deployed in PAPER mode
-- Structured around explicit multi-leg safety constraints
+Exit logic is evaluated in this order:
 
-### OFI Momentum Taker
+1. if a local target exit is already working, avoid duplicate submissions
+2. if smart-passive time-stop mode is active, either continue waiting or
+   promote to taker
+3. if current best bid reaches the hidden target, call force_target_exit()
+4. if current best bid breaches the hidden stop, call force_stop_loss()
+5. if the stochastic hold horizon expires, begin time-stop handling
 
-Primary code locations:
+The important architectural point is that OFI exits are no longer generic sell
+orders sitting in the book. They are stateful local decisions tied to the live
+book.
 
-- `src/signals/ofi_momentum.py`
-- `src/execution/momentum_taker.py`
-- `src/trading/position_manager.py`
-- `src/backtest/strategy.py`
+### Liquidity-Vacuum Suppression
 
-Status:
+Time-stop exits are not fired blindly. The runtime suppresses OFI time-stop
+exits during transient order-book vacuums.
 
-- Implemented and wired
-- Part of the replay and optimization stack
-- Important for forward strategy development
-- Not documented here as the sole live strategy
+Mechanics:
 
-## SI-9 Architecture
+- OrderbookTracker maintains O(1) EWMA baselines for top bid and ask depth.
+- PositionManager._should_suppress_ofi_time_stop_exit() compares current depth
+  against those EWMAs.
+- The exit is suppressed when depth collapses below the configured vacuum ratio
+  and spread simultaneously blows out beyond the configured multiple of the
+  baseline spread.
+- The exit becomes eligible again only after recovery relative to the EWMA
+  baselines.
 
-### Signal Detection
+This prevents the bot from converting a stale momentum exit into a worst-quote
+liquidity donation during a temporary microstructure vacuum.
 
-SI-9 scans mutually exclusive event clusters and evaluates whether the sum of
-YES best bids implies a structural arbitrage.
+### Smart-Passive Time-Stop Fallback
 
-Detection logic:
+When the hold horizon expires without target or stop being hit, the OFI path
+can enter smart-passive exit mode before promoting to taker. This preserves the
+existing maker-fallback logic while keeping the exit locally owned.
 
-- Read the YES-side best bid and ask across all legs of a cluster
-- Compute $\sum bids$
-- Require the cluster to clear the configured margin threshold
-- Size all legs to the same share count to preserve the hedge invariant
+### Replay Parity
 
-This is not Kelly sizing. It is share-count pegging. That distinction is
-critical. Unequal leg sizes would destroy the Dutch-book structure.
+Replay mirrors the same OFI model.
 
-### Guardrails
+- src/backtest/strategy.py uses draw_stochastic_momentum_bracket() when opening
+  OFI positions.
+- Replay positions carry the same drawn fields as live positions.
+- Replay exit checks mirror local target, local stop, and time-stop handling.
+- WFO injects stochastic_seed values so each Optuna trial is deterministic even
+  though brackets are stochastic.
 
-SI-9 contains explicit guardrails that should remain documented because they
-encode hard-won market structure lessons.
+The result is parity without reintroducing visible deterministic brackets.
 
-#### Ghost-Town Filter
+## Risk Layer
 
-The cluster is rejected when:
+### EnsembleRiskManager
 
-- $\sum bids < 0.85$
-- edge exceeds $\$0.15$
+src/trading/ensemble_risk.py implements an O(1) directional exposure gate
+across strategies.
 
-This prevents the detector from confusing dead books with genuine liquid arb.
+The core problem is that scalar net exposure is insufficient once multiple
+strategies can hold YES and NO inventory on the same market. The manager
+therefore maintains:
 
-#### Liquidity Gate
+- one hash map keyed by market_id for directional ownership counts
+- one position index keyed by position_id for exact release bookkeeping
 
-Each leg must clear a minimum bid-depth threshold before the cluster is even
-considered viable.
+Per market, exposure is split into:
 
-#### Exposure Limits
+- yes_by_strategy
+- no_by_strategy
 
-SI-9 enforces:
+The operational rule is simple: a strategy may not open new exposure in a
+direction if another strategy already owns that same directional slot on the
+market.
 
-- max concurrent combos
-- max total combo exposure
-- max collateral per combo
-- wallet-risk budget checks
+This prevents gross risk stacking such as:
 
-These checks live in the execution path, not just the detector, which is the
-correct architecture. Signal validity and executable safety are not the same
-thing.
+- OFI Momentum opening NO
+- RPE opening more NO on the same market
+- SI-10 opening another NO expression on the same book
 
-### Maker-First Execution
+All of can_enter(), register_position(), and release_position() are O(1) in the
+size of the tracked state.
 
-SI-9 is deliberately maker-first.
+### CrossBookSyncGate
 
-Execution sequence:
+src/signals/microstructure_utils.py implements CrossBookSyncGate, another O(1)
+primitive.
 
-1. Rank legs by bottleneck characteristics
-2. Work the hardest leg passively first
-3. Hold the remaining legs as pending taker legs
-4. Sweep the takers only after the maker leg fills
+It performs a max-minus-min timestamp divergence check across a small set of
+related book snapshots and returns a CrossBookSyncAssessment containing:
 
-The point is to avoid crossing the full combo before the hard leg proves the
-arb is actually executable.
+- is_synchronized
+- latest_timestamp
+- delta_ms
+- book_count
 
-### Hanging-Leg State Machine
-
-This is the most important SI-9 safety component.
-
-If the combo partially fills:
-
-1. Re-evaluate missing legs using current best ask and spread
-2. If emergency taker completion is still affordable, cross and finish the arb
-3. Otherwise dump the already filled legs and flatten the book
-
-The invariant is simple:
-
-- never leave partial combo exposure sitting in the portfolio as naked
-  directional risk
-
-That guardrail exists because multi-leg risk is qualitatively different from a
-single-position timeout.
-
-## OFI Momentum Architecture
-
-### Detector
-
-The OFI detector tracks rolling top-of-book volume imbalance:
+If any snapshot is missing a valid timestamp, synchronization fails
+immediately. Otherwise:
 
 $$
-VI = \frac{Q_{bid} - Q_{ask}}{Q_{bid} + Q_{ask}}
+\Delta_{ms} = (\max t_i - \min t_i) \times 1000
 $$
 
-It maintains a rolling millisecond window and triggers when the rolling VI
-crosses a configurable threshold.
+Signals are suppressed when:
 
-Core properties:
+$$
+\Delta_{ms} > \text{MAX\_CROSS\_BOOK\_DESYNC\_MS}
+$$
 
-- window-based, not bar-close-based
-- built from top-of-book queue pressure
-- directional output: BUY or SELL
-- intended for fast microstructure momentum, not slow mean reversion
+This gate is instantiated in:
 
-### Execution Philosophy
+- ComboArbDetector for SI-9 cluster evaluation
+- ContagionArbDetector for leader/lagger synchronization
+- BayesianArbDetector for base/base/joint triplets
 
-OFI momentum uses aggressive taker entry.
+The purpose is not cosmetic data hygiene. It is a hard defense against trading
+one leg of a relationship on stale or asynchronously updated books.
 
-That is deliberate. If the edge comes from short-lived order-flow imbalance,
-waiting passively is usually equivalent to declining the trade.
+### Additional Shared Risk Controls
 
-The execution helper places a spread-crossing buy at the current best ask and,
-in PAPER mode, simulates the fill immediately for deterministic testing.
+Other live risk components remain layered around the two primitives above:
 
-### Hard Brackets
+- DeploymentGuard caps size by deployment phase
+- PortfolioCorrelationEngine applies concentration haircuts and VaR-based size
+  control
+- LatencyGuard and heartbeat infrastructure mark stale books and throttle
+  execution
+- hanging-leg logic in SI-9 flattens partial fills that can no longer be
+  completed safely
 
-OFI momentum positions use fixed post-entry brackets:
+Those are important, but EnsembleRiskManager and CrossBookSyncGate are the key
+new architectural primitives that changed how gross risk is controlled.
 
-- take profit: 3.0%
-- stop-loss: 1.5%
-- time-stop: 300 seconds
+## Replay And Research Layer
 
-The 1.5% stop-loss is not a soft suggestion. It is a hard bailout bracket.
-The 300-second time-stop exists because stale momentum is inventory, not edge.
+### O(1) Aggregation
 
-### Timeout Integration
+The replay plane relies on incremental OHLCV and depth state rather than full
+window recomputation.
 
-The position manager treats OFI momentum differently from generic exits.
+- rolling VWAP, volatility, and related moments are updated incrementally
+- replay order books keep OFI windows and top-depth EWMAs in O(1) state
+- BotReplayAdapter advertises self_aggregates_trades = True so the engine does
+  not duplicate bar work
 
-- When an OFI momentum position exceeds its hold window, the exit reason is
-  `time_stop`
-- Non-OFI positions use the generic timeout path
+This optimization is operationally significant because WFO trial throughput
+depends on it.
 
-This distinction should remain in the docs because the desk needs to know that
-momentum decays are handled as strategy-specific bracket exits, not generic
-housekeeping.
+### WFO Model
 
-## OHLCV And Replay Engine Optimization
+src/backtest/wfo_optimizer.py runs walk-forward studies with these properties:
 
-### Why The Refactor Was Necessary
+- rolling or anchored fold generation
+- Optuna study storage in SQLite
+- per-trial child-process isolation
+- hard wall-clock timeout enforcement
+- champion report export with per-fold and aggregate metrics
 
-Momentum WFO was previously bottlenecked by OHLCV recomputation cost.
+Champion parameters are exported by _export_champion_params() as:
 
-The fix was architectural, not cosmetic:
-
-- stop rebuilding rolling arrays on every tick
-- maintain rolling statistics incrementally
-- avoid duplicate aggregation inside the replay loop
-
-### O(1) Incremental State
-
-The current OHLCV aggregator maintains rolling state explicitly:
-
-- rolling volume sum
-- rolling VWAP volume sum
-- rolling VWAP sum
-- rolling return sum
-- rolling squared-return sum
-- short-window return moments
-- EWMA volatility state
-- downside EWMA volatility state
-
-When a bar enters or expires, the aggregator updates those moments directly.
-That turns the hot path from repeated window recomputation into O(1) state
-maintenance.
-
-### BotReplayAdapter Owns Its Aggregation
-
-BotReplayAdapter now declares:
-
-- `self_aggregates_trades = True`
-
-That declaration matters because the backtest engine checks it and skips its own
-duplicate OHLCV pass when the strategy already manages aggregation internally.
-
-Architectural consequence:
-
-- live-like strategy replay remains faithful
-- the backtest engine avoids paying for the same bar work twice
-
-### Why This Must Stay Documented
-
-Three months from now, this will otherwise look like an arbitrary optimization.
-It is not. It is the reason momentum WFO can finish within the operational
-timeout budget.
-
-## Backtest Engine
-
-The replay engine is synchronous and event-driven.
-
-Core behavior:
-
-1. replay events in timestamp order
-2. activate orders after simulated latency
-3. process real L2 book events when available
-4. synthesize a BBO in trade-only mode when necessary
-5. pass trade and book events into the strategy
-6. record fills and equity telemetry
-
-This design is simpler than an async backtest loop and is easier to reason
-about deterministically.
-
-## WFO Architecture
-
-### Study Model
-
-WFO uses:
-
-- rolling or anchored windows
-- Optuna-based parameter search
-- child-process backtest execution
-- hard timeout enforcement per trial
-
-### Timeout Wrapper
-
-Every trial is executed in a spawned child process. The parent waits up to
-60 seconds. If the child is still alive, the process is terminated and the
-trial is marked as a timeout.
-
-This is critical operational hygiene. A single pathological trial must not
-freeze a large study.
-
-### Logging Rule
-
-Before any serious WFO run, set:
-
-```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
+```json
+{
+  "params": {"param_name": 1.23},
+  "meta": {
+    "champion_fold": 3,
+    "oos_sharpe": 1.11,
+    "generated_at": "..."
+  }
+}
 ```
 
-Reason:
+OFI studies additionally thread stochastic_seed through replay so the sampled
+hidden brackets remain deterministic within each trial and champion replay.
 
-- rotating JSONL file output is unnecessary during dense optimization runs
-- child-process studies amplify I/O contention
-- the logger already supports stdout-only operation when this flag is set
+## Deployment Parameter Plane
 
-### Generic WFO Workflow
+### Artifact Handoff
 
-```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
-python -m src.cli wfo `
-  --data-dir data/vps_march2026 `
-  --train-days 35 `
-  --test-days 7 `
-  --step-days 7 `
-  --anchored `
-  --embargo-days 1 `
-  --n-trials 500 `
-  --max-workers -1 `
-  --strategy-adapter bot_replay
-```
+The research-to-production bridge is explicit.
 
-### OFI Momentum Top 25 Workflow
+1. A WFO run emits champion_params.json.
+2. scripts/inject_wfo_champions.py loads one or more champion artifacts.
+3. The injector validates all overrides against StrategyParams.
+4. The injector merges the params in input order and writes
+   live_hyperparameters.json atomically.
+5. src/core/config.py applies those overrides during bootstrap.
 
-```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
-python wfo_ofi_momentum.py `
-  --train-days 35 `
-  --test-days 7 `
-  --step-days 7 `
-  --embargo-days 1 `
-  --n-trials 500 `
-  --max-workers -1 `
-  --trial-timeout-s 60
-```
+### Validation Model
 
-## Deployment State
+src/core/live_hyperparameters.py is the sole validation authority for this
+handoff.
 
-### What Is Checked In
+It enforces at minimum:
 
-The checked-in service configuration launches the bot in PAPER mode.
+- payload must be a JSON object
+- params must resolve to known StrategyParams fields
+- None, NaN, and infinite values are invalid
+- strictly positive edge thresholds remain strictly positive
+- percentile and correlation-style fields remain in [0, 1]
+- max_cross_book_desync_ms remains strictly positive
 
-### What Should Be Documented Carefully
+If live_hyperparameters.json exists but is invalid, config bootstrap raises a
+hard error. The architecture chooses deterministic failure over silent drift.
 
-This repository has already produced runtime-versus-source mismatches in prior
-analysis. For that reason, architecture docs should not casually merge:
+### File Locations
 
-- code that exists
-- code that is enabled by default
-- code that is approved for live use
-- code that was observed in a historical runtime artifact
+- default live override path: repository-root live_hyperparameters.json
+- override env var: LIVE_HYPERPARAMETERS_PATH
 
-The approved documentation rule is:
+## Operational Distinctions That Must Stay Explicit
 
-- state what the code supports
-- state what the live desk is actually running
-- do not assume those are identical unless there is direct evidence
+When documenting or extending the system, keep these categories separate:
 
-## Guardrails Worth Keeping In The Docs
+- code present in source
+- code wired into the runtime
+- code enabled by default
+- code approved for a given desk deployment
 
-These are precisely the kinds of details future readers will otherwise rip out
-without understanding why they exist.
-
-### PURE_MM Retirement Guardrail
-
-- PURE_MM remains in source for research only until the quoting model proves it
-  can survive both long-tail starvation and Top 25 toxic flow
-
-### SI-9 Ghost-Town Guardrail
-
-- reject low-$\sum bids$ and absurd-edge clusters because dead books masquerade
-  as fake arb
-
-### OFI Bracket Guardrail
-
-- 1.5% stop-loss and 300-second time-stop are structural constraints, not mere
-  optimization parameters
-
-### WFO Throughput Guardrail
-
-- disable file logging during WFO and keep the 60-second timeout wrapper, or
-  optimization throughput collapses under avoidable overhead
-
-### Replay Fidelity Guardrail
-
-- preserve `self_aggregates_trades = True` behavior for BotReplayAdapter so the
-  engine does not double-charge OHLCV work
+This repository has enough optionality that collapsing those categories will
+produce incorrect operational guidance.
 
 ## Bottom Line
 
-The repository is now built around a clear division of labor:
+The current architecture is best understood as four cooperating layers:
 
-- SI-9 for live paper deployment
-- OFI momentum for aggressive directional microstructure execution and replay
-- O(1) OHLCV state as the enabling infrastructure
-- WFO as a controlled, timeout-bounded research process
+1. multiple alpha generators, including OFI, contagion, SI-9, and SI-10
+2. an execution layer that now hides OFI exit geometry with stochastic local
+   brackets
+3. a risk layer built around O(1) exposure and synchronization gates
+4. a research-to-production parameter plane driven by WFO artifacts and strict
+   boot-time validation
 
-If future documentation collapses this back into "a Polymarket market maker,"
-it will be wrong.
+Describing the repository as a generic market maker would now be materially
+wrong.
