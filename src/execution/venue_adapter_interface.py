@@ -49,6 +49,13 @@ class VenueAdapter(ABC):
     ) -> "VenueOrderStatus":
         ...
 
+    @abstractmethod
+    def get_wallet_balance(
+        self,
+        asset_symbol: str,
+    ) -> Decimal:
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class VenueOrderResponse:

@@ -4,13 +4,18 @@ import json
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.dispatch_guard import DispatchGuard
 from src.execution.mev_router import MevExecutionBatch
 from src.execution.mev_serializer import deserialize_envelope, serialize_mev_execution_batch
 from src.execution.priority_context import PriorityOrderContext
-from src.execution.venue_adapter_interface import VenueAdapter
+
+if TYPE_CHECKING:
+    from src.execution.venue_adapter_interface import VenueAdapter
+else:
+    VenueAdapter = Any
 
 
 _logger = logging.getLogger(__name__)
@@ -114,16 +119,20 @@ class PriorityDispatcher:
         guard: DispatchGuard | None = None,
         guard_enabled: bool = True,
         venue_adapter: VenueAdapter | None = None,
+        client_order_id_generator: ClientOrderIdGenerator | None = None,
     ):
         if mode not in {"paper", "dry_run", "live"}:
             raise ValueError(f"Unsupported priority dispatch mode: {mode!r}")
         if mode == "live" and venue_adapter is None:
             raise ValueError("live mode requires venue_adapter")
+        if mode == "live" and client_order_id_generator is None:
+            raise ValueError("live mode requires client_order_id_generator")
         self._router = router
         self._mode = mode
         self._guard = guard
         self._guard_enabled = bool(guard_enabled)
         self._venue_adapter = venue_adapter
+        self._client_order_id_generator = client_order_id_generator
 
     @property
     def guard(self) -> DispatchGuard | None:
@@ -211,10 +220,19 @@ class PriorityDispatcher:
     ) -> DispatchReceipt:
         if self._venue_adapter is None:
             raise ValueError("live mode requires venue_adapter")
+        if self._client_order_id_generator is None:
+            raise ValueError("live mode requires client_order_id_generator")
 
-        route_id = str(first_payload["route_id"]).strip()
-        sequence = int(first_payload["sequence"])
-        client_order_id = f"{route_id}-{sequence}"
+        signal_source = context.signal_source
+        generator = self._client_order_id_generator
+        if signal_source in {"OFI", "SI9", "CTF", "CONTAGION", "MANUAL"}:
+            generator = generator.for_signal_source(signal_source)
+
+        client_order_id = generator.generate(
+            market_id=context.market_id,
+            side=context.side,
+            timestamp_ms=dispatch_timestamp_ms,
+        )
         order_price = Decimal(first_payload["price"])
         effective_size = Decimal(first_payload["metadata"]["effective_size"])
 
@@ -241,7 +259,7 @@ class PriorityDispatcher:
                 partial_fill_size=None,
                 partial_fill_price=None,
                 fill_status="NONE",
-                order_id=submit_response.venue_order_id,
+                order_id=submit_response.client_order_id,
                 execution_id=submit_response.client_order_id,
                 remaining_size=order_status.remaining_size,
                 venue_timestamp_ms=submit_response.venue_timestamp_ms,
@@ -260,7 +278,7 @@ class PriorityDispatcher:
                 partial_fill_size=None,
                 partial_fill_price=None,
                 fill_status="FULL",
-                order_id=submit_response.venue_order_id,
+                order_id=submit_response.client_order_id,
                 execution_id=submit_response.client_order_id,
                 remaining_size=order_status.remaining_size,
                 venue_timestamp_ms=submit_response.venue_timestamp_ms,
@@ -279,7 +297,7 @@ class PriorityDispatcher:
                 partial_fill_size=order_status.filled_size,
                 partial_fill_price=order_status.average_fill_price,
                 fill_status="PARTIAL",
-                order_id=submit_response.venue_order_id,
+                order_id=submit_response.client_order_id,
                 execution_id=submit_response.client_order_id,
                 remaining_size=order_status.remaining_size,
                 venue_timestamp_ms=submit_response.venue_timestamp_ms,
@@ -297,7 +315,7 @@ class PriorityDispatcher:
             partial_fill_size=None,
             partial_fill_price=None,
             fill_status="NONE",
-            order_id=submit_response.venue_order_id,
+            order_id=submit_response.client_order_id,
             execution_id=submit_response.client_order_id,
             remaining_size=order_status.remaining_size,
             venue_timestamp_ms=submit_response.venue_timestamp_ms,

@@ -14,6 +14,7 @@ from src.execution.dispatch_guard import DispatchGuard
 from src.execution.escalation_policy_interface import EscalationPolicyInterface
 from src.execution.guard_observability import GuardObservabilityPanel, ObservabilitySnapshot
 from src.execution.live_book_interface import LiveBestBidProvider
+from src.execution.orchestrator_load_shedder import OrchestratorLoadShedder
 from src.execution.ofi_paper_ledger import OfiLedgerSnapshot
 from src.execution.ofi_signal_bridge import OfiEntrySignal, OfiSignalBridge
 from src.execution.position_lifecycle_interface import PositionLifecycleInterface
@@ -102,6 +103,7 @@ class MultiSignalOrchestrator:
         position_lifecycle: PositionLifecycleInterface,
         escalation_policy: EscalationPolicyInterface,
         config: OrchestratorConfig,
+        load_shedder: OrchestratorLoadShedder | None = None,
     ):
         self._bus = bus
         self._guard = guard
@@ -114,6 +116,7 @@ class MultiSignalOrchestrator:
         self._position_lifecycle = position_lifecycle
         self._escalation_policy = escalation_policy
         self._config = config
+        self._load_shedder = load_shedder
         self._observability_panel = GuardObservabilityPanel({"SYSTEM": guard}, bus)
         self._pending_unwinds: dict[str, Si9UnwindManifest] = {}
         self._active_cluster_ids: set[str] = set()
@@ -170,6 +173,10 @@ class MultiSignalOrchestrator:
     def si9_cluster_config(self) -> Si9ClusterConfig | None:
         return self._si9_cluster_config
 
+    @property
+    def load_shedder(self) -> OrchestratorLoadShedder | None:
+        return self._load_shedder
+
     def bind_detector_context(
         self,
         *,
@@ -181,12 +188,33 @@ class MultiSignalOrchestrator:
         self._si9_detector = si9_detector
         self._si9_cluster_config = si9_cluster_config
 
+    def on_best_yes_ask_update(
+        self,
+        market_id: str,
+        ask_price: Decimal,
+        ask_size: Decimal,
+        timestamp_ms: int,
+    ) -> bool:
+        if not self._market_allowed(market_id):
+            return False
+        if self._si9_detector is None:
+            return False
+        self._si9_detector.update_best_yes_ask(market_id, ask_price, ask_size, int(timestamp_ms))
+        return True
+
     def on_ctf_signal(
         self,
         signal: CtfMergeSignal,
         timestamp_ms: int,
     ) -> OrchestratorEvent:
         event_timestamp_ms = int(timestamp_ms)
+        if not self._market_allowed(signal.market_id):
+            return self._event(
+                event_type="CTF_REJECTED",
+                timestamp_ms=event_timestamp_ms,
+                source="CTF",
+                payload={"reason": "MARKET_NOT_ALLOWED", "market_id": signal.market_id},
+            )
         if "CTF" not in self._config.signal_sources_enabled:
             return self._event(
                 event_type="CTF_REJECTED",
@@ -226,6 +254,13 @@ class MultiSignalOrchestrator:
         timestamp_ms: int,
     ) -> OrchestratorEvent:
         event_timestamp_ms = int(timestamp_ms)
+        if not self._market_allowed(signal.market_id):
+            return self._event(
+                event_type="OFI_REJECTED",
+                timestamp_ms=event_timestamp_ms,
+                source="OFI",
+                payload={"reason": "MARKET_NOT_ALLOWED", "market_id": signal.market_id, "side": signal.side},
+            )
         if "OFI" not in self._config.signal_sources_enabled:
             return self._event(
                 event_type="OFI_REJECTED",
@@ -275,6 +310,18 @@ class MultiSignalOrchestrator:
         timestamp_ms: int,
     ) -> OrchestratorEvent:
         event_timestamp_ms = int(timestamp_ms)
+        blocked_market_ids = [market_id for market_id in signal.market_ids if not self._market_allowed(market_id)]
+        if blocked_market_ids:
+            return self._event(
+                event_type="SI9_REJECTED",
+                timestamp_ms=event_timestamp_ms,
+                source="SI9",
+                payload={
+                    "reason": "MARKET_NOT_ALLOWED",
+                    "cluster_id": signal.cluster_id,
+                    "blocked_market_ids": blocked_market_ids,
+                },
+            )
         if "SI9" not in self._config.signal_sources_enabled:
             return self._event(
                 event_type="SI9_REJECTED",
@@ -544,3 +591,8 @@ class MultiSignalOrchestrator:
         if hasattr(value, "__dataclass_fields__"):
             return self._json_safe_value(asdict(value))
         return str(value)
+
+    def _market_allowed(self, market_id: str) -> bool:
+        if self._load_shedder is None:
+            return True
+        return self._load_shedder.is_market_allowed(market_id)

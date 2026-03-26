@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from src.execution.alpha_adapters import ofi_to_context
+from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.dispatch_guard import DispatchGuard
 from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.mev_router import MevExecutionRouter
@@ -53,6 +54,29 @@ def _make_guard() -> DispatchGuard:
     )
 
 
+def _make_client_order_id_generator(session_id: str = "a3f9b2c1-session") -> ClientOrderIdGenerator:
+    return ClientOrderIdGenerator("OFI", session_id)
+
+
+def _expected_client_order_id(timestamp_ms: int, market_id: str = "MKT_PRIORITY", session_id: str = "a3f9b2c1-session") -> str:
+    return f"OFI-{session_id[:8]}-{market_id[:8]}-Y-{timestamp_ms}"
+
+
+def _make_live_dispatcher(
+    adapter: MockVenueAdapter,
+    *,
+    guard: DispatchGuard | None = None,
+    session_id: str = "a3f9b2c1-session",
+) -> PriorityDispatcher:
+    return PriorityDispatcher(
+        _make_router(),
+        "live",
+        guard=guard,
+        venue_adapter=adapter,
+        client_order_id_generator=_make_client_order_id_generator(session_id),
+    )
+
+
 class MockVenueAdapter(VenueAdapter):
     def __init__(
         self,
@@ -60,6 +84,7 @@ class MockVenueAdapter(VenueAdapter):
         submit_response: VenueOrderResponse | None = None,
         status_response: VenueOrderStatus | None = None,
         cancel_response: VenueCancelResponse | None = None,
+        wallet_balance: Decimal = Decimal("100.000000"),
     ) -> None:
         self._submit_response = submit_response or VenueOrderResponse(
             client_order_id="ROUTE-1-1",
@@ -86,6 +111,8 @@ class MockVenueAdapter(VenueAdapter):
         self.submit_calls: list[dict[str, object]] = []
         self.cancel_calls: list[dict[str, object]] = []
         self.status_calls: list[str] = []
+        self.balance_calls: list[str] = []
+        self.wallet_balance = wallet_balance
 
     def submit_order(
         self,
@@ -116,9 +143,22 @@ class MockVenueAdapter(VenueAdapter):
         self.status_calls.append(client_order_id)
         return replace(self._status_response, client_order_id=client_order_id)
 
+    def get_wallet_balance(self, asset_symbol: str) -> Decimal:
+        self.balance_calls.append(asset_symbol)
+        return self.wallet_balance
+
 
 def test_mock_venue_adapter_satisfies_abc() -> None:
     assert isinstance(MockVenueAdapter(), VenueAdapter)
+
+
+def test_mock_venue_adapter_returns_configured_wallet_balance() -> None:
+    adapter = MockVenueAdapter(wallet_balance=Decimal("42.500000"))
+
+    balance = adapter.get_wallet_balance("USDC")
+
+    assert balance == Decimal("42.500000")
+    assert adapter.balance_calls == ["USDC"]
 
 
 def test_venue_order_response_is_frozen() -> None:
@@ -232,7 +272,7 @@ def test_dry_run_receipt_live_fields_are_none() -> None:
 
 def test_live_dispatcher_submits_limit_order_with_router_price_and_effective_size() -> None:
     adapter = MockVenueAdapter()
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     dispatcher.dispatch(_make_context(), 10)
 
@@ -243,19 +283,19 @@ def test_live_dispatcher_submits_limit_order_with_router_price_and_effective_siz
             "price": Decimal("0.640001"),
             "size": Decimal("42.500000"),
             "order_type": "LIMIT",
-            "client_order_id": "PRIORITY-000001-1",
+            "client_order_id": _expected_client_order_id(10),
         }
     ]
 
 
 def test_live_dispatcher_uses_deterministic_client_order_id() -> None:
     adapter = MockVenueAdapter()
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
-    assert receipt.execution_id == "PRIORITY-000001-1"
-    assert adapter.status_calls == ["PRIORITY-000001-1"]
+    assert receipt.execution_id == _expected_client_order_id(10)
+    assert adapter.status_calls == [_expected_client_order_id(10)]
 
 
 def test_live_dispatcher_populates_open_receipt_fields_from_venue() -> None:
@@ -277,14 +317,14 @@ def test_live_dispatcher_populates_open_receipt_fields_from_venue() -> None:
             average_fill_price=None,
         ),
     )
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
     assert receipt.executed is True
     assert receipt.fill_status == "NONE"
-    assert receipt.order_id == "VENUE-OPEN"
-    assert receipt.execution_id == "PRIORITY-000001-1"
+    assert receipt.order_id == _expected_client_order_id(10)
+    assert receipt.execution_id == _expected_client_order_id(10)
     assert receipt.remaining_size == Decimal("42.500000")
     assert receipt.venue_timestamp_ms == 2222
     assert receipt.latency_ms == 17
@@ -301,7 +341,7 @@ def test_live_dispatcher_populates_full_fill_receipt_fields_from_status() -> Non
             average_fill_price=Decimal("0.640001"),
         )
     )
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
@@ -323,7 +363,7 @@ def test_live_dispatcher_maps_partial_fill_to_partial_receipt_shape() -> None:
             average_fill_price=Decimal("0.630000"),
         )
     )
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
@@ -346,13 +386,13 @@ def test_live_dispatcher_maps_pending_submission_to_executed_open_receipt() -> N
             latency_ms=21,
         )
     )
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
     assert receipt.executed is True
     assert receipt.fill_status == "NONE"
-    assert receipt.order_id == "VENUE-PENDING"
+    assert receipt.order_id == _expected_client_order_id(10)
     assert receipt.latency_ms == 21
 
 
@@ -375,20 +415,20 @@ def test_live_dispatcher_maps_rejection_reason_into_unexecuted_receipt() -> None
             average_fill_price=None,
         ),
     )
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     receipt = dispatcher.dispatch(_make_context(), 10)
 
     assert receipt.executed is False
     assert receipt.fill_status == "NONE"
     assert receipt.guard_reason == "PRICE_OUT_OF_BOUNDS"
-    assert receipt.order_id is None
+    assert receipt.order_id == _expected_client_order_id(10)
     assert receipt.remaining_size == Decimal("42.500000")
 
 
 def test_live_dispatcher_guard_rejection_skips_submit() -> None:
     adapter = MockVenueAdapter()
-    dispatcher = PriorityDispatcher(_make_router(), "live", guard=_make_guard(), venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter, guard=_make_guard())
     context = _make_context()
 
     dispatcher.dispatch(context, 10)
@@ -403,14 +443,14 @@ def test_live_dispatcher_guard_rejection_skips_submit() -> None:
             "price": Decimal("0.640001"),
             "size": Decimal("42.500000"),
             "order_type": "LIMIT",
-            "client_order_id": "PRIORITY-000001-1",
+            "client_order_id": _expected_client_order_id(10),
         }
     ]
 
 
 def test_live_dispatcher_uses_router_effective_size_not_anchor_volume() -> None:
     adapter = MockVenueAdapter()
-    dispatcher = PriorityDispatcher(_make_router(), "live", venue_adapter=adapter)
+    dispatcher = _make_live_dispatcher(adapter)
 
     dispatcher.dispatch(_make_context(), 10)
 

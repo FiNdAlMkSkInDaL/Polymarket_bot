@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Literal
 
 from src.execution.si9_execution_manifest import Si9ExecutionManifest
+from src.execution.unwind_manifest import RecommendedAction
 
 
 UnwindReason = Literal[
@@ -14,8 +15,6 @@ UnwindReason = Literal[
     "GUARD_CIRCUIT_OPEN",
     "MANUAL_ABORT",
 ]
-
-RecommendedAction = Literal["MARKET_SELL", "PASSIVE_UNWIND", "HOLD_FOR_RECOVERY"]
 
 
 @dataclass(frozen=True, slots=True)

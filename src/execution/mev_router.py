@@ -329,8 +329,10 @@ class MevExecutionRouter:
         self,
         context: PriorityOrderContext,
     ) -> MevExecutionBatch:
-        # Dry-run planning still advances the route-id counter; leave that intact for now
-        # and revisit explicit route-id injection when live execution mode is introduced.
+        # Dry-run planning intentionally still advances the route-id counter.
+        # Live client_order_id generation no longer depends on this counter;
+        # PriorityDispatcher uses ClientOrderIdGenerator for live submissions,
+        # while route_id remains a deterministic planning/debug envelope field.
         route_id = self._next_route_id("PRIORITY")
         payloads = self._build_priority_sequence_payloads(route_id, context)
         return MevExecutionBatch(

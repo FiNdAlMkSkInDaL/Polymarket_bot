@@ -13,14 +13,18 @@ from src.execution.ctf_execution_manifest import (
     CtfLegManifest,
     CtfLegReceipt,
 )
+from src.execution.ctf_live_executor import CtfLiveExecutionResult, CtfLiveExecutor
 from src.execution.ctf_paper_adapter import CtfPaperAdapter, CtfPaperAdapterConfig
 from src.execution.ctf_paper_ledger import CtfLedgerSnapshot, CtfPaperLedger
+from src.execution.ctf_unwind_manifest import CtfUnwindLeg, CtfUnwindManifest
 from src.execution.guard_observability import (
     GuardObservabilityPanel,
     ObservabilitySnapshot,
     SuppressionEntry,
 )
 from src.execution.live_book_interface import LiveBestBidProvider, PaperBestBidProvider
+from src.execution.ofi_exit_router import OfiExitRouter
+from src.execution.ofi_local_exit_monitor import OfiExitDecision, OfiLocalExitMonitor
 from src.execution.ofi_paper_ledger import OfiLedgerSnapshot, OfiPaperLedger
 from src.execution.ofi_signal_bridge import OfiBridgeReceipt, OfiEntrySignal, OfiSignalBridge, OfiSignalBridgeConfig
 from src.execution.mempool_monitor import (
@@ -36,6 +40,29 @@ from src.execution.mempool_monitor import (
 from src.execution.mev_dispatcher import MevDispatcher
 from src.execution.mev_paper_adapter import MevPaperAdapter
 from src.execution.alpha_adapters import ctf_to_context, ofi_to_context, si9_to_context
+from src.execution.client_order_id import ClientOrderIdGenerator
+from src.execution.clob_signer import ClobSigner
+from src.execution.clob_transport import (
+    AiohttpClobTransport,
+    ClobTransportCircuitOpenError,
+    ClobTransportError,
+    ClobTransportHttpError,
+    ClobTransportRateLimitError,
+    ClobTransportTimeoutError,
+)
+from src.execution.live_escalation_policy import LiveEscalationPolicy
+from src.execution.live_wallet_balance import LiveWalletBalanceProvider
+from src.execution.live_unwind_cost_estimator import LiveUnwindCostEstimator
+from src.execution.nonce_manager import ClobNonceManager
+from src.execution.polymarket_clob_adapter import PolymarketClobAdapter
+from src.execution.polymarket_clob_translator import (
+    ClobApiOrderType,
+    ClobOrderIntent,
+    ClobPayloadBuilder,
+    ClobReceiptParser,
+    ClobTimeInForce,
+    VenueRejectionReason,
+)
 from src.execution.priority_dispatcher import DispatchReceipt, PriorityDispatcher
 from src.execution.priority_context import PriorityOrderContext
 from src.execution.multi_signal_orchestrator import (
@@ -49,10 +76,13 @@ from src.execution.position_lifecycle_interface import PaperPositionLifecycle, P
 from src.execution.si9_execution_manifest import Si9ExecutionManifest, Si9LegManifest
 from src.execution.si9_paper_adapter import Si9PaperAdapter, Si9PaperAdapterConfig, Si9PaperAdapterReceipt
 from src.execution.si9_paper_ledger import Si9LedgerSnapshot, Si9PaperLedger
+from src.execution.live_unwind_executor import LiveUnwindExecutor
+from src.execution.orphaned_leg_scanner import OrphanedLegRecoveryScanner, RecoveryOpenPosition
 from src.execution.unwind_executor_interface import PaperUnwindExecutor, UnwindExecutionReceipt, UnwindExecutor
 from src.execution.escalation_policy_interface import EscalationPolicyInterface, PaperEscalationPolicy
 from src.execution.si9_unwind_evaluator import Si9UnwindEvaluator
 from src.execution.si9_unwind_manifest import Si9UnwindConfig, Si9UnwindLeg, Si9UnwindManifest
+from src.execution.unwind_manifest import RecommendedAction, UnwindActionTaken, UnwindManifest
 from src.execution.signal_coordination_bus import (
     CoordinationBusConfig,
     CoordinationBusSnapshot,
@@ -79,6 +109,8 @@ __all__ = [
     "DEFAULT_MOMENTUM_TP_PCT",
     "CoordinationBusConfig",
     "CoordinationBusSnapshot",
+    "CtfLiveExecutionResult",
+    "CtfLiveExecutor",
     "CtfExecutionManifest",
     "CtfExecutionReceipt",
     "CtfLedgerSnapshot",
@@ -86,15 +118,38 @@ __all__ = [
     "CtfLegReceipt",
     "CtfPaperAdapter",
     "CtfPaperAdapterConfig",
+    "ClientOrderIdGenerator",
+    "AiohttpClobTransport",
+    "ClobNonceManager",
+    "ClobApiOrderType",
+    "ClobOrderIntent",
+    "ClobPayloadBuilder",
+    "ClobReceiptParser",
+    "ClobSigner",
+    "ClobTransportCircuitOpenError",
+    "ClobTransportError",
+    "ClobTransportHttpError",
+    "ClobTransportRateLimitError",
+    "ClobTransportTimeoutError",
+    "ClobTimeInForce",
     "CtfPaperLedger",
+    "CtfUnwindLeg",
+    "CtfUnwindManifest",
     "DispatchGuard",
     "DispatchGuardConfig",
     "DispatchReceipt",
     "GuardDecision",
     "GuardObservabilityPanel",
     "LiveBestBidProvider",
+    "LiveEscalationPolicy",
+    "LiveWalletBalanceProvider",
+    "LiveUnwindCostEstimator",
+    "LiveUnwindExecutor",
     "OfiBridgeReceipt",
+    "OfiExitDecision",
+    "OfiExitRouter",
     "OfiEntrySignal",
+    "OfiLocalExitMonitor",
     "OfiLedgerSnapshot",
     "OfiPaperLedger",
     "OfiSignalBridge",
@@ -109,6 +164,7 @@ __all__ = [
     "MevOrderPayload",
     "MevPaperAdapter",
     "ObservabilitySnapshot",
+    "OrphanedLegRecoveryScanner",
     "PendingTransactionMatch",
     "PendingVolumeStateMachine",
     "PaperBestBidProvider",
@@ -117,6 +173,7 @@ __all__ = [
     "PaperUnwindExecutor",
     "POLYMARKET_CTF_CONTRACT",
     "POLYGON_USDC_CONTRACTS",
+    "PolymarketClobAdapter",
     "PriorityDispatcher",
     "PriorityOrderContext",
     "MultiSignalOrchestrator",
@@ -125,6 +182,8 @@ __all__ = [
     "OrchestratorSnapshot",
     "build_paper_orchestrator",
     "PositionLifecycleInterface",
+    "RecommendedAction",
+    "RecoveryOpenPosition",
     "Si9ExecutionManifest",
     "Si9LegManifest",
     "Si9LedgerSnapshot",
@@ -140,8 +199,11 @@ __all__ = [
     "SignalCoordinationBus",
     "SlotDecision",
     "SuppressionEntry",
+    "UnwindActionTaken",
     "UnwindExecutionReceipt",
     "UnwindExecutor",
+    "UnwindManifest",
+    "VenueRejectionReason",
     "WebSocketPendingTxRpcClient",
     "ctf_to_context",
     "deserialize_conviction_scalar",

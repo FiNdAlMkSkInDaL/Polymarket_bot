@@ -4,13 +4,14 @@ from abc import ABC, abstractmethod
 
 from src.execution.si9_unwind_evaluator import Si9UnwindEvaluator
 from src.execution.si9_unwind_manifest import Si9UnwindManifest
+from src.execution.unwind_manifest import UnwindManifest
 
 
 class EscalationPolicyInterface(ABC):
     @abstractmethod
     def should_escalate(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> bool:
         ...
@@ -18,7 +19,7 @@ class EscalationPolicyInterface(ABC):
     @abstractmethod
     def should_surrender(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> bool:
         """
@@ -47,14 +48,16 @@ class PaperEscalationPolicy(EscalationPolicyInterface):
 
     def should_escalate(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> bool:
+        if not isinstance(manifest, Si9UnwindManifest):
+            return False
         return self._evaluator.escalate(manifest, int(current_timestamp_ms)) is not manifest
 
     def should_surrender(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> bool:
         _ = manifest
@@ -63,7 +66,9 @@ class PaperEscalationPolicy(EscalationPolicyInterface):
 
     def escalate_manifest(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
-    ) -> Si9UnwindManifest:
+    ) -> UnwindManifest:
+        if not isinstance(manifest, Si9UnwindManifest):
+            return manifest
         return self._evaluator.escalate(manifest, int(current_timestamp_ms))

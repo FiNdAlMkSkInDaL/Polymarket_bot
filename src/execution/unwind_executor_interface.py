@@ -3,16 +3,17 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
 
+from src.execution.priority_dispatcher import DispatchReceipt
 from src.execution.si9_unwind_manifest import Si9UnwindConfig, Si9UnwindManifest
+from src.execution.unwind_manifest import UnwindActionTaken, UnwindManifest
 
 
 class UnwindExecutor(ABC):
     @abstractmethod
     def execute_unwind(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> "UnwindExecutionReceipt":
         ...
@@ -20,12 +21,13 @@ class UnwindExecutor(ABC):
 
 @dataclass(frozen=True, slots=True)
 class UnwindExecutionReceipt:
-    manifest: Si9UnwindManifest
-    action_taken: Literal["MARKET_SELL", "PASSIVE_UNWIND", "HOLD", "SKIPPED"]
+    manifest: UnwindManifest
+    action_taken: UnwindActionTaken
     legs_acted_on: tuple[str, ...]
     estimated_cost: Decimal
     execution_timestamp_ms: int
     notes: str | None
+    per_leg_receipts: tuple[DispatchReceipt, ...] = tuple()
 
 
 class PaperUnwindExecutor(UnwindExecutor):
@@ -41,7 +43,7 @@ class PaperUnwindExecutor(UnwindExecutor):
 
     def execute_unwind(
         self,
-        manifest: Si9UnwindManifest,
+        manifest: UnwindManifest,
         current_timestamp_ms: int,
     ) -> UnwindExecutionReceipt:
         timestamp_ms = int(current_timestamp_ms)
@@ -49,7 +51,7 @@ class PaperUnwindExecutor(UnwindExecutor):
         market_ids = tuple(leg.market_id for leg in manifest.hanging_legs)
 
         if manifest.recommended_action == "MARKET_SELL":
-            action_taken: Literal["MARKET_SELL", "PASSIVE_UNWIND", "HOLD", "SKIPPED"] = "MARKET_SELL"
+            action_taken: UnwindActionTaken = "MARKET_SELL"
             notes = "Paper unwind mirrors urgent market-sell recommendation"
         elif manifest.recommended_action == "PASSIVE_UNWIND":
             action_taken = "PASSIVE_UNWIND"
@@ -69,4 +71,5 @@ class PaperUnwindExecutor(UnwindExecutor):
             estimated_cost=manifest.total_estimated_unwind_cost,
             execution_timestamp_ms=timestamp_ms,
             notes=notes,
+            per_leg_receipts=tuple(),
         )

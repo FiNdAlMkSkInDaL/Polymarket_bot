@@ -22,6 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -37,6 +38,8 @@ from src.execution.momentum_taker import (
     MomentumTakerExecutor,
     draw_stochastic_momentum_bracket,
 )
+from src.execution.ofi_local_exit_monitor import OfiExitDecision, OfiLocalExitMonitor
+from src.execution.orderbook_best_bid_provider import OrderbookBestBidProvider
 from src.signals.edge_filter import ConfluenceContext, compute_confluence_discount, compute_edge_score
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.ofi_momentum import OFIMomentumSignal, compute_toxicity_size_multiplier
@@ -305,6 +308,7 @@ class PositionManager:
         self._smart_passive_started_count: int = 0
         self._smart_passive_maker_filled_count: int = 0
         self._smart_passive_fallback_triggered_count: int = 0
+        self._ofi_exit_monitors: dict[str, OfiLocalExitMonitor] = {}
 
     @property
     def ensemble_risk(self) -> EnsembleRiskManager:
@@ -2293,76 +2297,78 @@ class PositionManager:
 
         if self._is_smart_passive_time_stop_active(pos):
             if now >= pos.smart_passive_exit_deadline:
-                if self._should_suppress_ofi_time_stop_exit(pos):
+                decision = self._evaluate_ofi_exit_decision(pos, current_timestamp_ms=int(now * 1000))
+                if decision.action == "SUPPRESSED_BY_VACUUM":
                     return True
                 await self._promote_smart_passive_to_taker(pos)
             return True
 
-        best_bid = self._current_best_bid(pos)
-        if pos.target_price > 0 and best_bid > 0 and best_bid >= pos.target_price:
+        decision = self._evaluate_ofi_exit_decision(pos, current_timestamp_ms=int(now * 1000))
+        if decision.action == "TARGET_HIT":
             await self.force_target_exit(pos)
             return True
 
-        if pos.stop_price > 0 and best_bid > 0 and best_bid <= pos.stop_price:
+        if decision.action == "STOP_HIT":
             await self.force_stop_loss(pos, reason="stop_loss")
             return True
 
-        max_hold_seconds = pos.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
-        if now - pos.entry_time >= max_hold_seconds:
-            if self._should_suppress_ofi_time_stop_exit(pos):
-                return True
+        if decision.action == "SUPPRESSED_BY_VACUUM":
+            return True
+
+        if decision.action == "TIME_STOP_TRIGGERED":
             await self._start_smart_passive_time_stop(pos, now)
         return True
 
-    def _should_suppress_ofi_time_stop_exit(self, pos: Position) -> bool:
+    def _evaluate_ofi_exit_decision(self, pos: Position, *, current_timestamp_ms: int) -> OfiExitDecision:
         exit_asset = pos.trade_asset_id or pos.no_asset_id
-        tracker = self._book_trackers.get(exit_asset)
-        if tracker is None:
-            return False
-
-        try:
-            snap = tracker.snapshot()
-        except Exception:
-            return False
-
-        best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
-        best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
-        bid_depth = float(getattr(snap, "bid_depth_usd", 0.0) or 0.0)
-        ask_depth = float(getattr(snap, "ask_depth_usd", 0.0) or 0.0)
-        bid_baseline = self._top_depth_baseline(tracker, side="bid", current_depth=bid_depth)
-        ask_baseline = self._top_depth_baseline(tracker, side="ask", current_depth=ask_depth)
-        spread = max(0.0, best_ask - best_bid)
-        baseline_spread = max(0.01, pos.entry_price * pos.drawn_stop_pct)
-        bid_vacuum = bid_depth > 0 and bid_baseline > 0 and bid_depth < bid_baseline * OFI_TIME_STOP_VACUUM_RATIO
-        ask_vacuum = ask_depth > 0 and ask_baseline > 0 and ask_depth < ask_baseline * OFI_TIME_STOP_VACUUM_RATIO
-        spread_blown_out = spread >= baseline_spread * OFI_TIME_STOP_SPREAD_MULTIPLIER
-
-        if (bid_vacuum or ask_vacuum) and spread_blown_out:
+        max_hold_seconds = pos.drawn_time or pos.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+        drawn_tp = pos.drawn_tp if pos.drawn_tp > 0 else pos.target_price
+        drawn_stop = pos.drawn_stop if pos.drawn_stop > 0 else pos.stop_price
+        baseline_spread = max(0.01, pos.entry_price * pos.drawn_stop_pct) if pos.drawn_stop_pct > 0 else 0.01
+        position_state = {
+            "market_id": exit_asset,
+            "drawn_tp": Decimal(str(max(0.0, drawn_tp))),
+            "drawn_stop": Decimal(str(max(0.0, drawn_stop))),
+            "drawn_time_ms": int((pos.entry_time + max_hold_seconds) * 1000),
+            "baseline_spread": Decimal(str(baseline_spread)),
+        }
+        monitor = self._ofi_exit_monitor(exit_asset)
+        if monitor is None:
+            current_best_bid = Decimal(str(max(0.0, self._current_best_bid(pos))))
+            if position_state["drawn_tp"] > Decimal("0") and current_best_bid >= position_state["drawn_tp"]:
+                return OfiExitDecision(action="TARGET_HIT", trigger_price=position_state["drawn_tp"])
+            if position_state["drawn_stop"] > Decimal("0") and current_best_bid > Decimal("0") and current_best_bid <= position_state["drawn_stop"]:
+                return OfiExitDecision(action="STOP_HIT", trigger_price=position_state["drawn_stop"])
+            if current_timestamp_ms > position_state["drawn_time_ms"]:
+                return OfiExitDecision(action="TIME_STOP_TRIGGERED", trigger_price=current_best_bid)
+            return OfiExitDecision(action="HOLD", trigger_price=current_best_bid)
+        decision = monitor.evaluate_exit(position_state, current_timestamp_ms)
+        if decision.action == "SUPPRESSED_BY_VACUUM":
             log.info(
                 "ofi_time_stop_suppressed_liquidity_vacuum",
                 pos_id=pos.id,
-                bid_depth=round(bid_depth, 2),
-                bid_baseline=round(bid_baseline, 2),
-                ask_depth=round(ask_depth, 2),
-                ask_baseline=round(ask_baseline, 2),
-                spread=round(spread, 4),
+                asset_id=exit_asset,
+                trigger_price=float(decision.trigger_price),
             )
-            return True
+        return decision
 
-        bid_recovered = bid_baseline <= 0 or bid_depth >= bid_baseline * OFI_TIME_STOP_RECOVERY_RATIO
-        ask_recovered = ask_baseline <= 0 or ask_depth >= ask_baseline * OFI_TIME_STOP_RECOVERY_RATIO
-        return not (bid_recovered and ask_recovered)
-
-    def _top_depth_baseline(self, tracker: Any, *, side: str, current_depth: float) -> float:
-        top_depth_ewma = getattr(tracker, "top_depth_ewma", None)
-        if callable(top_depth_ewma):
-            try:
-                baseline = float(top_depth_ewma(side) or 0.0)
-            except Exception:
-                baseline = 0.0
-            if baseline > 0:
-                return baseline
-        return max(0.0, current_depth)
+    def _ofi_exit_monitor(self, asset_id: str) -> OfiLocalExitMonitor | None:
+        asset_key = str(asset_id or "").strip()
+        if not asset_key:
+            return None
+        monitor = self._ofi_exit_monitors.get(asset_key)
+        if monitor is not None:
+            return monitor
+        tracker = self._book_trackers.get(asset_key)
+        if tracker is None:
+            return None
+        monitor = OfiLocalExitMonitor(
+            OrderbookBestBidProvider(tracker),
+            vacuum_ratio=Decimal(str(OFI_TIME_STOP_VACUUM_RATIO)),
+            spread_multiple=Decimal(str(OFI_TIME_STOP_SPREAD_MULTIPLIER)),
+        )
+        self._ofi_exit_monitors[asset_key] = monitor
+        return monitor
 
     def _capture_fill_toxicity_index(self, pos: Position, *, side: str) -> float:
         asset_id = pos.trade_asset_id or pos.no_asset_id
