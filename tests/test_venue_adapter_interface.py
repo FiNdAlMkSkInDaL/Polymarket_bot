@@ -9,6 +9,7 @@ from src.execution.alpha_adapters import ofi_to_context
 from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.dispatch_guard import DispatchGuard
 from src.execution.dispatch_guard_config import DispatchGuardConfig
+from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.mev_router import MevExecutionRouter
 from src.execution.priority_dispatcher import PriorityDispatcher
 from src.execution.venue_adapter_interface import (
@@ -74,6 +75,11 @@ def _make_live_dispatcher(
         guard=guard,
         venue_adapter=adapter,
         client_order_id_generator=_make_client_order_id_generator(session_id),
+        wallet_balance_provider=LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        ),
     )
 
 

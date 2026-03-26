@@ -342,6 +342,17 @@ class OrderExecutor:
         self._open_count += 1  # Track new live order
         return order
 
+    def register_external_order(self, order: Order) -> Order:
+        existing = self._orders.get(order.order_id)
+        was_open = existing is not None and existing.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        is_open = order.status in (OrderStatus.LIVE, OrderStatus.PARTIALLY_FILLED)
+        self._orders[order.order_id] = order
+        if not was_open and is_open:
+            self._open_count += 1
+        elif was_open and not is_open:
+            self._open_count = max(0, self._open_count - 1)
+        return order
+
     # ── Order cancellation ──────────────────────────────────────────────────────────
     async def cancel_order(self, order: Order) -> None:
         """Cancel a live order."""

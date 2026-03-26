@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from src.execution.escalation_policy_interface import EscalationPolicyInterface
+from src.execution.live_execution_boundary import LiveExecutionBoundary
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
 from src.detectors.ctf_peg_config import CtfPegConfig
 from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
@@ -213,7 +214,11 @@ def _build_live_factory_orchestrator() -> MultiSignalOrchestrator:
         ),
         orderbook_tracker=_StubOrderbookTracker(),
         position_manager=_StubPositionManager(),
-        venue_adapter=_StubVenueAdapter(),
+        execution_boundary=LiveExecutionBoundary(
+            venue_adapter=_StubVenueAdapter(),
+            wallet_balance_provider=None,
+            ofi_exit_router=None,
+        ),
         unwind_executor=PaperUnwindExecutor(_si9_adapter_config().unwind_config),
         escalation_policy=_StubEscalationPolicy(),
     )

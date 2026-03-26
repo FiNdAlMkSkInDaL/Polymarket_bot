@@ -6,7 +6,7 @@ import pytest
 
 from src.detectors import CtfPegConfig
 from src.events.mev_events import CtfMergeSignal
-from src.detectors.ctf_peg_detector import CtfPegDetector
+from src.signals.ctf_peg_detector import CtfPegDetector
 
 
 def _config(**overrides) -> CtfPegConfig:

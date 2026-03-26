@@ -191,24 +191,6 @@ class CtfPaperAdapter:
                 self._ledger.record(receipt, conviction_scalar)
                 return receipt
 
-            second_guard_decision = self._guard.check(second_context, timestamp_ms)
-            if not second_guard_decision.allowed:
-                self._guard.record_suppression(second_context.signal_source)
-                second_leg_receipt = self._rejected_leg_receipt(
-                    second_leg,
-                    second_context,
-                    reason=second_guard_decision.reason,
-                    timestamp_ms=timestamp_ms,
-                )
-                receipt = self._build_second_leg_rejected_receipt(
-                    manifest=manifest,
-                    anchor_leg_receipt=anchor_leg_receipt,
-                    second_leg_receipt=second_leg_receipt,
-                    timestamp_ms=timestamp_ms,
-                )
-                self._ledger.record(receipt, conviction_scalar)
-                return receipt
-
             second_dispatch = self._dispatcher.dispatch(second_context, timestamp_ms)
             second_leg_receipt = self._leg_receipt(second_leg, second_dispatch, timestamp_ms)
             if not second_dispatch.executed:

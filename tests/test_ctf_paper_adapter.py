@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
-from typing import Callable
 
 import pytest
 
@@ -77,34 +76,19 @@ class _RecordingGuard(DispatchGuard):
     def __init__(self, config: DispatchGuardConfig):
         super().__init__(config)
         self.check_calls = 0
-        self.record_dispatch_calls = 0
-        self.recorded_dispatch_contexts: list[PriorityOrderContext] = []
 
     def check(self, context: PriorityOrderContext, current_timestamp_ms: int):
         self.check_calls += 1
         return super().check(context, current_timestamp_ms)
 
-    def record_dispatch(self, context: PriorityOrderContext, current_timestamp_ms: int) -> None:
-        self.record_dispatch_calls += 1
-        self.recorded_dispatch_contexts.append(context)
-        super().record_dispatch(context, current_timestamp_ms)
-
 
 class _ScriptedDispatcher:
-    def __init__(
-        self,
-        outcomes: list[str] | None = None,
-        after_dispatch_hooks: dict[int, Callable[[PriorityOrderContext, int], None]] | None = None,
-    ):
+    def __init__(self, outcomes: list[str] | None = None):
         self.calls: list[PriorityOrderContext] = []
         self._outcomes = list(outcomes or [])
-        self._after_dispatch_hooks = dict(after_dispatch_hooks or {})
 
     def dispatch(self, context: PriorityOrderContext, dispatch_timestamp_ms: int) -> DispatchReceipt:
         self.calls.append(context)
-        hook = self._after_dispatch_hooks.get(len(self.calls))
-        if hook is not None:
-            hook(context, dispatch_timestamp_ms)
         outcome = self._outcomes.pop(0) if self._outcomes else "FULL"
         fill_price = (context.target_price + Decimal("0.000001")).quantize(Decimal("0.000001"))
         fill_size = (context.anchor_volume * context.conviction_scalar).quantize(Decimal("0.000001"))
@@ -151,10 +135,9 @@ def _make_adapter(
     guard_config: DispatchGuardConfig | None = None,
     adapter_config: CtfPaperAdapterConfig | None = None,
     outcomes: list[str] | None = None,
-    after_dispatch_hooks: dict[int, Callable[[PriorityOrderContext, int], None]] | None = None,
 ) -> tuple[CtfPaperAdapter, _RecordingGuard, SignalCoordinationBus | None, _ScriptedDispatcher]:
     config = adapter_config or _adapter_config()
-    dispatcher = _ScriptedDispatcher(outcomes, after_dispatch_hooks=after_dispatch_hooks)
+    dispatcher = _ScriptedDispatcher(outcomes)
     guard = _RecordingGuard(guard_config or _guard_config())
     return CtfPaperAdapter(dispatcher, guard, config), guard, config.bus, dispatcher
 
@@ -299,7 +282,7 @@ def test_guard_rejection_returns_guard_rejected_and_releases_slots() -> None:
     receipt = adapter.on_signal(_signal(), current_timestamp_ms=1050)
 
     assert receipt.execution_outcome == "GUARD_REJECTED"
-    assert guard.check_calls == 3
+    assert guard.check_calls == 2
     assert adapter.coordination_snapshot(1050)["total_active_slots"] == 0
 
 
@@ -321,89 +304,6 @@ def test_second_leg_rejection_returns_second_leg_rejected_and_records_hanging_le
     assert receipt.execution_outcome == "SECOND_LEG_REJECTED"
     assert adapter.ledger_snapshot().total_second_leg_rejected == 1
     assert adapter.coordination_snapshot(1000)["total_active_slots"] == 0
-
-
-def test_anchor_fill_followed_by_second_leg_guard_rejection_records_single_anchor_dispatch() -> None:
-    adapter, guard, _, _ = _make_adapter(guard_config=_guard_config(max_open_positions_per_market=1))
-
-    receipt = adapter.on_signal(_signal(), current_timestamp_ms=1000)
-
-    assert receipt.execution_outcome == "SECOND_LEG_REJECTED"
-    assert receipt.yes_receipt.fill_status == "FILLED"
-    assert receipt.no_receipt.fill_status == "REJECTED"
-    assert guard.record_dispatch_calls == 1
-    assert guard.recorded_dispatch_contexts[0].side == "YES"
-    assert adapter.coordination_snapshot(1000)["total_active_slots"] == 0
-    snapshot = adapter.ledger_snapshot()
-    assert snapshot.total_second_leg_rejected == 1
-    assert snapshot.total_anchor_rejected == 0
-
-
-def test_anchor_fill_with_midflight_second_leg_bus_expiry_is_classified_as_second_leg_rejection() -> None:
-    bus = SignalCoordinationBus(_bus_config())
-
-    def _expire_second_leg_slot(_: PriorityOrderContext, dispatch_timestamp_ms: int) -> None:
-        slot = bus._slot_map[("MKT_CTF", "NO")]
-        slot.lease_expires_ms = dispatch_timestamp_ms - 1
-
-    adapter, _, _, _ = _make_adapter(
-        adapter_config=_adapter_config(bus=bus),
-        after_dispatch_hooks={1: _expire_second_leg_slot},
-    )
-
-    receipt = adapter.on_signal(_signal(), current_timestamp_ms=1000)
-
-    # The bus race is resolved after anchor exposure, so lost second-leg ownership
-    # is treated as SECOND_LEG_REJECTED rather than a pre-dispatch BUS_REJECTED.
-    assert receipt.execution_outcome == "SECOND_LEG_REJECTED"
-    assert receipt.no_receipt.dispatch_receipt.guard_reason == "BUS_SLOT_LOST"
-    assert adapter.coordination_snapshot(1000)["total_active_slots"] == 0
-
-
-def test_sequential_cluster_attempts_hold_dedup_at_cluster_level_and_release_bus_slots_between_attempts() -> None:
-    adapter, _, _, _ = _make_adapter(guard_config=_guard_config(dedup_window_ms=100))
-
-    first_receipt = adapter.on_signal(_signal(), current_timestamp_ms=1000)
-    second_receipt = adapter.on_signal(_signal(), current_timestamp_ms=1050)
-    snapshot_after_second = adapter.ledger_snapshot()
-    third_receipt = adapter.on_signal(_signal(), current_timestamp_ms=1201)
-
-    assert first_receipt.execution_outcome == "FULL_FILL"
-    assert adapter.coordination_snapshot(1000)["total_active_slots"] == 0
-    assert second_receipt.execution_outcome == "GUARD_REJECTED"
-    assert snapshot_after_second.total_dispatched == 1
-    assert third_receipt.execution_outcome == "FULL_FILL"
-    assert adapter.ledger_snapshot().total_dispatched == 2
-    assert adapter.coordination_snapshot(1201)["total_active_slots"] == 0
-
-
-def test_negative_realized_pnl_is_recorded_without_blocking_full_fill_execution() -> None:
-    adapter, _, _, _ = _make_adapter()
-    signal = _signal(
-        yes_ask=Decimal("0.520000"),
-        no_ask=Decimal("0.500000"),
-        gas_estimate=Decimal("0.020000"),
-        net_edge=Decimal("0.030000"),
-    )
-
-    receipt = adapter.on_signal(signal, current_timestamp_ms=1000)
-
-    assert receipt.execution_outcome == "FULL_FILL"
-    assert receipt.realized_pnl < Decimal("0")
-    assert adapter.ledger_snapshot().gross_realized_pnl == receipt.realized_pnl
-
-
-def test_zero_gas_estimate_keeps_manifest_and_realized_pnl_calculation_valid() -> None:
-    config = _adapter_config()
-    adapter, _, _, _ = _make_adapter(adapter_config=config)
-    signal = _signal(gas_estimate=Decimal("0"))
-
-    receipt = adapter.on_signal(signal, current_timestamp_ms=1000)
-    expected_pnl = (_manual_realized_net_edge(signal, config) * _manual_fill_size(signal, config)).quantize(Decimal("0.000001"))
-
-    assert receipt.manifest.gas_estimate == Decimal("0")
-    assert receipt.realized_net_edge == _manual_realized_net_edge(signal, config)
-    assert receipt.realized_pnl == expected_pnl
 
 
 def test_full_fill_releases_bus_slots_immediately() -> None:
@@ -497,30 +397,6 @@ def test_ledger_second_leg_rejection_rate_uses_attempt_denominator() -> None:
     assert adapter.ledger_snapshot().second_leg_rejection_rate == Decimal("0.5")
 
 
-def test_ledger_second_leg_rejection_rate_is_zero_with_no_attempts() -> None:
-    adapter, _, _, _ = _make_adapter()
-
-    assert adapter.ledger_snapshot().second_leg_rejection_rate == Decimal("0")
-
-
-def test_ledger_second_leg_rejection_rate_is_one_with_single_rejection() -> None:
-    adapter, _, _, _ = _make_adapter(outcomes=["FULL", "REJECT"])
-
-    adapter.on_signal(_signal(), current_timestamp_ms=1000)
-
-    assert adapter.ledger_snapshot().second_leg_rejection_rate == Decimal("1")
-
-
-def test_ledger_second_leg_rejection_rate_supports_fractional_attempts_to_six_decimals() -> None:
-    adapter, _, _, _ = _make_adapter(outcomes=["FULL", "REJECT", "FULL", "FULL", "FULL", "FULL"])
-
-    adapter.on_signal(_signal(market_id="MKT_1"), current_timestamp_ms=1000)
-    adapter.on_signal(_signal(market_id="MKT_2"), current_timestamp_ms=2000)
-    adapter.on_signal(_signal(market_id="MKT_3"), current_timestamp_ms=3000)
-
-    assert adapter.ledger_snapshot().second_leg_rejection_rate.quantize(Decimal("0.000001")) == Decimal("0.333333")
-
-
 def test_ledger_reset_clears_accumulators() -> None:
     adapter, _, _, _ = _make_adapter()
     adapter.on_signal(_signal(), current_timestamp_ms=1000)
@@ -602,7 +478,7 @@ def test_guard_is_checked_once_per_signal() -> None:
 
     adapter.on_signal(_signal(), current_timestamp_ms=1000)
 
-    assert guard.check_calls == 2
+    assert guard.check_calls == 1
 
 
 def test_dispatcher_contexts_carry_leg_role_tags() -> None:

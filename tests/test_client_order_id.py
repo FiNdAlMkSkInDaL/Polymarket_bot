@@ -8,6 +8,7 @@ import pytest
 
 from src.execution.alpha_adapters import ofi_to_context
 from src.execution.client_order_id import ClientOrderIdGenerator
+from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.mev_router import MevExecutionRouter
 from src.execution.priority_dispatcher import PriorityDispatcher
 from src.execution.venue_adapter_interface import VenueAdapter, VenueOrderResponse, VenueOrderStatus
@@ -144,7 +145,16 @@ def test_session_id_longer_than_eight_chars_uses_first_eight() -> None:
 
 def test_live_dispatcher_without_client_order_id_generator_raises_value_error() -> None:
     with pytest.raises(ValueError, match="client_order_id_generator"):
-        PriorityDispatcher(_make_router(), "live", venue_adapter=RecordingVenueAdapter())
+        PriorityDispatcher(
+            _make_router(),
+            "live",
+            venue_adapter=RecordingVenueAdapter(),
+            wallet_balance_provider=LiveWalletBalanceProvider(
+                RecordingVenueAdapter(),
+                tracked_assets=["USDC"],
+                initial_balances={"USDC": Decimal("100.000000")},
+            ),
+        )
 
 
 def test_live_dispatcher_with_generator_produces_receipt_with_non_none_order_id() -> None:
@@ -154,6 +164,11 @@ def test_live_dispatcher_with_generator_produces_receipt_with_non_none_order_id(
         "live",
         venue_adapter=adapter,
         client_order_id_generator=ClientOrderIdGenerator("OFI", "a3f9b2c1-session"),
+        wallet_balance_provider=LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        ),
     )
 
     receipt = dispatcher.dispatch(_make_context(), 10)
@@ -169,6 +184,11 @@ def test_live_dispatcher_order_id_matches_generated_client_order_id_format() -> 
         "live",
         venue_adapter=adapter,
         client_order_id_generator=ClientOrderIdGenerator("OFI", "a3f9b2c1-session"),
+        wallet_balance_provider=LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        ),
     )
 
     receipt = dispatcher.dispatch(_make_context(), 10)
@@ -185,6 +205,11 @@ def test_dispatcher_prefers_context_signal_source_when_generator_session_is_reus
         "live",
         venue_adapter=adapter,
         client_order_id_generator=ClientOrderIdGenerator("MANUAL", "a3f9b2c1-session"),
+        wallet_balance_provider=LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        ),
     )
 
     receipt = dispatcher.dispatch(_make_context(), 10)

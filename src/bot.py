@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from decimal import Decimal
+import os
 import queue as _queue_mod
 import signal
 import sys
@@ -87,6 +89,22 @@ from src.data.oracle_adapter import (
 )
 from src.data.adapters.ap_election_adapter import APElectionAdapter
 from src.data.adapters.sports_adapter import SportsAdapter
+from src.detectors.ctf_peg_config import CtfPegConfig
+from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
+from src.execution.dispatch_guard_config import DispatchGuardConfig
+from src.execution.live_execution_boundary import LiveExecutionBoundary, build_live_execution_boundary
+from src.execution.live_escalation_policy import LiveEscalationPolicy
+from src.execution.live_orchestrator_config import LiveOrchestratorConfig
+from src.execution.live_unwind_cost_estimator import LiveUnwindCostEstimator
+from src.execution.live_unwind_executor import LiveUnwindExecutor
+from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator, OrchestratorConfig
+from src.execution.ofi_signal_bridge import OfiEntrySignal, OfiSignalBridgeConfig
+from src.execution.orchestrator_factory import build_live_orchestrator
+from src.execution.orchestrator_health_monitor import HealthMonitorConfig, OrchestratorHealthMonitor
+from src.execution.si9_paper_adapter import Si9PaperAdapterConfig
+from src.execution.si9_unwind_manifest import Si9UnwindConfig
+from src.execution.signal_coordination_bus import CoordinationBusConfig
+from src.execution.ofi_local_exit_monitor import OfiExitDecision
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 from src.strategies.pure_market_maker import PureMarketMaker
 
@@ -97,6 +115,10 @@ except ImportError:
     MarketDataRecorder = None  # type: ignore[misc,assignment]
 
 log = get_logger(__name__)
+
+
+def _decimal_from_number(value: Any) -> Decimal:
+    return Decimal(str(value))
 
 
 def _safe_task_done_callback(task: asyncio.Task) -> None:
@@ -139,6 +161,7 @@ class TradingBot:
         paper_mode: bool | None = None,
         *,
         deployment_env: DeploymentEnv | None = None,
+        session_id: str | None = None,
         confirmed_production: bool = False,
     ):
         # Deployment env is the canonical source of truth.
@@ -156,6 +179,10 @@ class TradingBot:
             self.deployment_env,
             confirmed_production=confirmed_production,
         )
+        injected_session_id = str(session_id or os.getenv("POLYBOT_SESSION_ID", "") or "").strip()
+        if not injected_session_id and self.deployment_env == DeploymentEnv.PAPER:
+            injected_session_id = "paper-session"
+        self._session_id = injected_session_id
         self.paper_mode = self.guard.is_paper
 
         # Components (initialised in start())
@@ -337,6 +364,10 @@ class TradingBot:
         self._order_poller: OrderStatusPoller | None = None
         self._stop_loss_monitor: StopLossMonitor | None = None
         self._pure_mm: PureMarketMaker | None = None
+        self._live_orchestrator: MultiSignalOrchestrator | None = None
+        self._live_execution_boundary: LiveExecutionBoundary | None = None
+        self._orchestrator_health_monitor: OrchestratorHealthMonitor | None = None
+        self._orchestrator_tick_interval_ms: int = settings.strategy.heartbeat_check_ms
 
     async def start(self) -> None:
         """Start background tasks and live runtime services for the trading bot."""
@@ -372,6 +403,23 @@ class TradingBot:
             self.executor,
             on_fill=self._on_clob_fill,
         )
+
+        self._live_execution_boundary = self._build_live_execution_boundary_runtime()
+        self._live_orchestrator = self._build_live_orchestrator_runtime(self._live_execution_boundary)
+        self._orchestrator_health_monitor = OrchestratorHealthMonitor(
+            self._live_orchestrator,
+            HealthMonitorConfig(
+                max_release_failures_before_halt=max(1, self._live_orchestrator_config().max_position_release_failures),
+                stale_snapshot_threshold_ms=max(self._orchestrator_tick_interval_ms * 3, 1),
+                min_heartbeat_interval_ms=self._orchestrator_tick_interval_ms,
+            ),
+        )
+        if self._live_orchestrator.wallet_balance_provider is not None:
+            self._live_orchestrator.wallet_balance_provider.set_balance_update_callback(self._on_wallet_balance_update)
+            self.positions.set_wallet_balance(
+                self._live_orchestrator.wallet_balance_provider.get_available_margin("USDC")
+            )
+        self._apply_live_market_target_map()
 
         # Event-driven stop-loss monitor (Pillar 11) — no polling task
         # V4: on_probe_breakeven wires back to PositionManager.scale_probe_to_full
@@ -449,6 +497,7 @@ class TradingBot:
             asyncio.create_task(self._tp_rescale_loop(), name="tp_rescale"),
             asyncio.create_task(self._adverse_guard.start(), name="adverse_sel"),
             asyncio.create_task(self._heartbeat.run(), name="heartbeat"),
+            asyncio.create_task(self._orchestrator_tick_loop(), name="orchestrator_tick"),
             asyncio.create_task(self._ghost_liquidity_loop(), name="ghost_liquidity"),
             asyncio.create_task(self._order_poller.run(), name="order_status_poller"),
             asyncio.create_task(self._health_reporter(), name="health_reporter"),
@@ -456,6 +505,11 @@ class TradingBot:
             asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
+
+        if self._live_orchestrator is not None and self._live_orchestrator.wallet_balance_provider is not None:
+            self._tasks.append(
+                asyncio.create_task(self._wallet_balance_poll_loop(), name="wallet_balance_poll")
+            )
 
         if settings.strategy.pure_mm_enabled:
             self._tasks.append(
@@ -476,6 +530,8 @@ class TradingBot:
             for tid in self._cluster_mgr.all_cluster_yes_token_ids():
                 if tid not in self._book_trackers:
                     self._book_trackers[tid] = OrderbookTracker(tid)
+            self._sync_live_orchestrator_clusters()
+            self._apply_live_market_target_map()
             self._combo_detector = ComboArbDetector(
                 self._book_trackers,
                 aggregators=self._yes_aggs,
@@ -722,6 +778,8 @@ class TradingBot:
             await self._l2_ws.add_assets(new_l2_books)
 
         self._markets = list(target_markets)
+        self._sync_live_orchestrator_clusters()
+        self._apply_live_market_target_map()
 
     def _positioned_asset_ids(self) -> set[str]:
         """Return asset IDs that currently have open positions.
@@ -735,6 +793,385 @@ class TradingBot:
             ids.add(pos.trade_asset_id or pos.no_asset_id)
             ids.add(pos.no_asset_id)
         return ids
+
+    def _deployment_phase_for_orchestrator(self) -> str:
+        if self.deployment_env == DeploymentEnv.PAPER:
+            return "PAPER"
+        return "LIVE"
+
+    def _require_orchestrator_session_id(self) -> str:
+        if self._session_id:
+            return self._session_id
+        raise RuntimeError("POLYBOT_SESSION_ID is required for live orchestrator startup")
+
+    def _si9_cluster_configs(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        self._cluster_mgr.scan_clusters(self._markets)
+        return tuple(
+            (cluster.event_id, tuple(leg.condition_id for leg in cluster.legs))
+            for cluster in self._cluster_mgr.active_clusters
+        )
+
+    def _orchestrator_market_books(self) -> dict[str, tuple[OrderbookTracker, OrderbookTracker]]:
+        market_books: dict[str, tuple[OrderbookTracker, OrderbookTracker]] = {}
+        for market in self._markets:
+            yes_tracker = self._book_trackers.get(market.yes_token_id)
+            no_tracker = self._book_trackers.get(market.no_token_id)
+            if yes_tracker is None or no_tracker is None:
+                continue
+            market_books[market.condition_id] = (yes_tracker, no_tracker)
+        return market_books
+
+    def _si9_unwind_config(self) -> Si9UnwindConfig:
+        return Si9UnwindConfig(
+            market_sell_threshold=(
+                _decimal_from_number(settings.strategy.si9_emergency_taker_max_cents) / Decimal("100")
+            ),
+            passive_unwind_threshold=Decimal("0.010000"),
+            max_hold_recovery_ms=max(int(settings.strategy.si9_max_leg_delay_ms), 1),
+            min_best_bid=Decimal("0.010000"),
+        )
+
+    def _live_orchestrator_config(self) -> LiveOrchestratorConfig:
+        heartbeat_interval_ms = max(int(settings.strategy.heartbeat_check_ms), 1)
+        self._orchestrator_tick_interval_ms = heartbeat_interval_ms
+        max_concurrent_clusters = max(int(settings.strategy.si9_max_concurrent_combos), 1)
+        max_slots = max(int(settings.strategy.max_active_l2_markets), 1)
+        max_slots_per_source = max(1, min(max_slots, 10))
+        return LiveOrchestratorConfig(
+            orchestrator_config=OrchestratorConfig(
+                tick_interval_ms=heartbeat_interval_ms,
+                max_pending_unwinds=max_concurrent_clusters,
+                max_concurrent_clusters=max_concurrent_clusters,
+                signal_sources_enabled=frozenset({"CTF", "SI9", "OFI"}),
+            ),
+            bus_config=CoordinationBusConfig(
+                slot_lease_ms=heartbeat_interval_ms,
+                max_slots_per_source=max_slots_per_source,
+                max_total_slots=max_slots,
+                allow_same_source_reentry=False,
+            ),
+            guard_config=DispatchGuardConfig(
+                dedup_window_ms=heartbeat_interval_ms,
+                max_dispatches_per_source_per_window=max_slots_per_source,
+                rate_window_ms=max(heartbeat_interval_ms * 2, 1),
+                circuit_breaker_threshold=2,
+                circuit_breaker_reset_ms=max(heartbeat_interval_ms * 6, 1),
+                max_open_positions_per_market=max(int(getattr(self.positions, "max_open", 1)), 1),
+            ),
+            ctf_adapter_config=CtfPaperAdapterConfig(
+                max_expected_net_edge=Decimal("0.250000"),
+                max_capital_per_signal=_decimal_from_number(settings.strategy.max_trade_size_usd),
+                default_anchor_volume=Decimal("10.000000"),
+                taker_fee_yes=Decimal("0.010000"),
+                taker_fee_no=Decimal("0.010000"),
+                cancel_on_stale_ms=heartbeat_interval_ms,
+                max_size_per_leg=Decimal("8.000000"),
+                mode="paper",
+                bus=None,
+            ),
+            si9_adapter_config=Si9PaperAdapterConfig(
+                max_expected_net_edge=Decimal("0.050000"),
+                max_capital_per_cluster=_decimal_from_number(settings.strategy.si9_max_per_combo_usd),
+                max_leg_fill_wait_ms=max(int(settings.strategy.si9_max_leg_delay_ms), 1),
+                cancel_on_stale_ms=heartbeat_interval_ms,
+                mode="paper",
+                unwind_config=self._si9_unwind_config(),
+                bus=None,
+            ),
+            ofi_bridge_config=OfiSignalBridgeConfig(
+                max_capital_per_signal=_decimal_from_number(settings.strategy.max_trade_size_usd),
+                mode="paper",
+                slot_side_lock=True,
+                source_enabled=True,
+            ),
+            ctf_peg_config=CtfPegConfig(
+                min_yield=Decimal("0.050000"),
+                taker_fee_yes=Decimal("0.010000"),
+                taker_fee_no=Decimal("0.010000"),
+                slippage_budget=Decimal("0.005000"),
+                gas_ewma_alpha=Decimal("0.500000"),
+                max_desync_ms=400,
+            ),
+            si9_cluster_configs=self._si9_cluster_configs(),
+            unwind_config=self._si9_unwind_config(),
+            deployment_phase=self._deployment_phase_for_orchestrator(),
+            session_id=self._require_orchestrator_session_id(),
+            max_position_release_failures=2,
+            heartbeat_interval_ms=heartbeat_interval_ms,
+        )
+
+    def _build_live_execution_boundary_runtime(self) -> LiveExecutionBoundary:
+        return build_live_execution_boundary(
+            deployment_phase=self._deployment_phase_for_orchestrator(),
+            session_id=self._require_orchestrator_session_id(),
+            market_by_condition={market.condition_id: market for market in self._markets},
+            now_ms=self._current_timestamp_ms,
+            clob_client=None if self.deployment_env == DeploymentEnv.PAPER else self.executor._get_clob_client(),
+        )
+
+    def _build_live_orchestrator_runtime(self, execution_boundary: LiveExecutionBoundary) -> MultiSignalOrchestrator:
+        config = self._live_orchestrator_config()
+        market_books = self._orchestrator_market_books()
+        if self.deployment_env == DeploymentEnv.PAPER:
+            from src.execution.escalation_policy_interface import PaperEscalationPolicy
+            from src.execution.si9_unwind_evaluator import Si9UnwindEvaluator
+            from src.execution.unwind_executor_interface import PaperUnwindExecutor
+
+            unwind_executor = PaperUnwindExecutor(config.unwind_config)
+            escalation_policy = PaperEscalationPolicy(
+                Si9UnwindEvaluator(config.unwind_config),
+                surrender_after_ms=max(config.unwind_config.max_hold_recovery_ms, 1),
+            )
+        else:
+            from src.execution.client_order_id import ClientOrderIdGenerator
+            from src.execution.orderbook_best_bid_provider import OrderbookBestBidProvider
+
+            provider = OrderbookBestBidProvider(market_books)
+            cost_estimator = LiveUnwindCostEstimator(
+                {market_id: provider for market_id in market_books}
+            )
+            escalation_policy = LiveEscalationPolicy(cost_estimator, config.unwind_config)
+            unwind_executor = LiveUnwindExecutor(
+                execution_boundary.venue_adapter,
+                ClientOrderIdGenerator("UNWIND", config.session_id),
+            )
+
+        return build_live_orchestrator(
+            config=config,
+            orderbook_tracker=market_books,
+            position_manager=self.positions,
+            execution_boundary=execution_boundary,
+            unwind_executor=unwind_executor,
+            escalation_policy=escalation_policy,
+            ofi_exit_trackers=self._book_trackers,
+        )
+
+    def _ranked_live_market_ids(self) -> list[str]:
+        return [market.condition_id for market in sorted(self._markets, key=lambda row: row.daily_volume_usd, reverse=True)]
+
+    def _apply_live_market_target_map(self) -> None:
+        if self._live_orchestrator is None or self._live_orchestrator.load_shedder is None:
+            return
+        self._live_orchestrator.load_shedder.update_target_map(self._ranked_live_market_ids())
+
+    def _sync_live_orchestrator_clusters(self) -> None:
+        if self._live_orchestrator is None or self._live_orchestrator.si9_detector is None:
+            return
+        detector = self._live_orchestrator.si9_detector
+        detector.cluster_members.clear()
+        for cluster_id, market_ids in self._si9_cluster_configs():
+            detector.register_cluster(cluster_id, market_ids)
+
+    def _current_timestamp_ms(self) -> int:
+        return time.time_ns() // 1_000_000
+
+    def _on_wallet_balance_update(self, asset_symbol: str, balance: Decimal) -> None:
+        if str(asset_symbol or "").strip().upper() != "USDC":
+            return
+        self.positions.set_wallet_balance(balance)
+
+    async def _wallet_balance_poll_loop(self) -> None:
+        if self._live_orchestrator is None or self._live_orchestrator.wallet_balance_provider is None:
+            return
+        await self._live_orchestrator.wallet_balance_provider.poll_balance_loop(self._orchestrator_tick_interval_ms)
+
+    async def _orchestrator_tick_loop(self) -> None:
+        interval_s = self._orchestrator_tick_interval_ms / 1000.0
+        while self._running:
+            await asyncio.sleep(interval_s)
+            if self._live_orchestrator is None or self._orchestrator_health_monitor is None:
+                continue
+            current_timestamp_ms = self._current_timestamp_ms()
+            try:
+                if self.deployment_env == DeploymentEnv.PAPER:
+                    events = self._live_orchestrator.on_tick(current_timestamp_ms)
+                else:
+                    events = await asyncio.to_thread(self._live_orchestrator.on_tick, current_timestamp_ms)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._orchestrator_health_monitor.record_position_release_failure()
+                log.error("orchestrator_tick_error", exc_info=True)
+                continue
+            if any(event.event_type == "UNWIND_COMPLETE" for event in events):
+                self._orchestrator_health_monitor.reset_release_failure_count()
+            self._orchestrator_health_monitor.check(current_timestamp_ms)
+
+    def _fan_out_live_best_yes_ask(self, asset_id: str) -> None:
+        if self._live_orchestrator is None:
+            return
+        market_info = self._market_map.get(asset_id)
+        if market_info is None or asset_id != market_info.yes_token_id:
+            return
+        tracker = self._book_trackers.get(asset_id)
+        if tracker is None or not getattr(tracker, "has_data", False):
+            return
+        snapshot = tracker.snapshot()
+        best_ask = getattr(snapshot, "best_ask", 0.0)
+        if best_ask <= 0.0:
+            return
+        levels = tracker.levels("ask", 1)
+        if not levels:
+            return
+        ask_size = getattr(levels[0], "size", 0.0)
+        if ask_size <= 0.0:
+            return
+        self._live_orchestrator.on_best_yes_ask_update(
+            market_info.condition_id,
+            _decimal_from_number(best_ask),
+            _decimal_from_number(ask_size),
+            self._current_timestamp_ms(),
+        )
+
+    def _has_live_ofi_exit_runtime(self) -> bool:
+        return (
+            self.deployment_env != DeploymentEnv.PAPER
+            and self._live_orchestrator is not None
+            and self._live_orchestrator.ofi_exit_router is not None
+        )
+
+    def _ofi_exit_positions_for_asset(self, asset_id: str) -> list[PositionState]:
+        return [
+            pos
+            for pos in self.positions.get_open_positions()
+            if getattr(pos, "signal_type", "") == "ofi_momentum"
+            and pos.state == PositionState.EXIT_PENDING
+            and ((pos.trade_asset_id or pos.no_asset_id) == asset_id or pos.no_asset_id == asset_id)
+        ]
+
+    def _current_decimal_bbo(self, asset_id: str) -> dict[str, Decimal]:
+        tracker = self._book_trackers.get(asset_id)
+        if tracker is None:
+            return {"best_bid": Decimal("0"), "best_ask": Decimal("0")}
+        try:
+            snapshot = tracker.snapshot()
+            best_bid = getattr(snapshot, "best_bid", 0.0)
+            best_ask = getattr(snapshot, "best_ask", 0.0)
+        except Exception:
+            best_bid = getattr(tracker, "best_bid", 0.0)
+            best_ask = getattr(tracker, "best_ask", 0.0)
+        return {
+            "best_bid": _decimal_from_number(max(0.0, best_bid)),
+            "best_ask": _decimal_from_number(max(0.0, best_ask)),
+        }
+
+    def _build_live_ofi_exit_position_state(self, pos: Any, current_timestamp_ms: int) -> dict[str, Any]:
+        exit_asset = pos.trade_asset_id or pos.no_asset_id
+        max_hold_seconds = pos.drawn_time or pos.max_hold_seconds or 0.0
+        baseline_spread = max(0.01, pos.entry_price * pos.drawn_stop_pct) if pos.drawn_stop_pct > 0 else 0.01
+        current_bbo = self._current_decimal_bbo(exit_asset)
+        return {
+            "position_id": pos.id,
+            "market_id": pos.market_id,
+            "side": pos.trade_side or "NO",
+            "size": _decimal_from_number(pos.effective_size),
+            "drawn_tp": _decimal_from_number(max(0.0, pos.drawn_tp if pos.drawn_tp > 0 else pos.target_price)),
+            "drawn_stop": _decimal_from_number(max(0.0, pos.drawn_stop if pos.drawn_stop > 0 else pos.stop_price)),
+            "drawn_time_ms": int((pos.entry_time + max(max_hold_seconds, 0.0)) * 1000),
+            "baseline_spread": _decimal_from_number(baseline_spread),
+            "current_timestamp_ms": int(current_timestamp_ms),
+            "current_best_bid": current_bbo["best_bid"],
+            "current_best_ask": current_bbo["best_ask"],
+        }
+
+    async def _apply_live_ofi_exit_receipt(
+        self,
+        pos: Any,
+        receipt: Any,
+        *,
+        fallback_price: Decimal,
+        reason: str,
+        post_only: bool,
+    ) -> None:
+        from src.trading.executor import Order, OrderSide, OrderStatus
+
+        if not receipt.executed:
+            if self._live_orchestrator is not None:
+                self._live_orchestrator.clear_ofi_exit(pos.id)
+            return
+
+        prior_order = getattr(pos, "exit_order", None)
+        if prior_order is not None and prior_order.order_id != (receipt.order_id or ""):
+            prior_order.status = OrderStatus.CANCELLED
+            self.executor.register_external_order(prior_order)
+
+        order_status = OrderStatus.LIVE
+        filled_size = Decimal("0")
+        filled_avg_price = Decimal("0")
+        if receipt.fill_status == "FULL":
+            order_status = OrderStatus.FILLED
+            filled_size = receipt.fill_size or Decimal("0")
+            filled_avg_price = receipt.fill_price or Decimal("0")
+        elif receipt.fill_status == "PARTIAL":
+            order_status = OrderStatus.PARTIALLY_FILLED
+            filled_size = receipt.partial_fill_size or Decimal("0")
+            filled_avg_price = receipt.partial_fill_price or Decimal("0")
+
+        exit_order = Order(
+            order_id=receipt.order_id or f"OFI-EXIT-{pos.id}",
+            market_id=pos.market_id,
+            asset_id=pos.trade_asset_id or pos.no_asset_id,
+            side=OrderSide.SELL,
+            price=receipt.fill_price or fallback_price or Decimal("0.01"),
+            size=_decimal_from_number(pos.effective_size),
+            status=order_status,
+            filled_size=filled_size,
+            filled_avg_price=filled_avg_price,
+            clob_order_id=str(receipt.execution_id or receipt.order_id or ""),
+            post_only=post_only,
+        )
+        self.executor.register_external_order(exit_order)
+        pos.exit_order = exit_order
+        pos.exit_reason = reason
+        if exit_order.status == OrderStatus.FILLED:
+            self._handle_exit_fill(pos)
+
+    async def _evaluate_live_ofi_exit_path(self, asset_id: str) -> None:
+        if not self._has_live_ofi_exit_runtime() or self._live_orchestrator is None:
+            return
+
+        current_timestamp_ms = self._current_timestamp_ms()
+        for pos in self._ofi_exit_positions_for_asset(asset_id):
+            position_state = self._build_live_ofi_exit_position_state(pos, current_timestamp_ms)
+            current_bbo = {
+                "best_bid": position_state["current_best_bid"],
+                "best_ask": position_state["current_best_ask"],
+            }
+
+            if pos.exit_order is not None and pos.exit_reason == "time_stop":
+                receipt = self._live_orchestrator.evaluate_ofi_exit_promotion(
+                    position_id=pos.id,
+                    current_timestamp_ms=current_timestamp_ms,
+                    current_bbo=current_bbo,
+                )
+                if receipt is not None:
+                    await self._apply_live_ofi_exit_receipt(
+                        pos,
+                        receipt,
+                        fallback_price=current_bbo["best_bid"],
+                        reason="time_stop",
+                        post_only=False,
+                    )
+                continue
+
+            decision = self._live_orchestrator.evaluate_ofi_exit(
+                asset_id=asset_id,
+                position_state=position_state,
+                current_timestamp_ms=current_timestamp_ms,
+            )
+            if decision.action in {"HOLD", "SUPPRESSED_BY_VACUUM"}:
+                continue
+
+            receipt = self._live_orchestrator.route_ofi_exit(position_state, decision)
+            if receipt is None:
+                continue
+            await self._apply_live_ofi_exit_receipt(
+                pos,
+                receipt,
+                fallback_price=current_bbo["best_ask"] if decision.action == "TIME_STOP_TRIGGERED" else decision.trigger_price,
+                reason="target" if decision.action == "TARGET_HIT" else "stop_loss" if decision.action == "STOP_HIT" else "time_stop",
+                post_only=decision.action == "TIME_STOP_TRIGGERED",
+            )
 
     def _ensemble_allows_entry(
         self,
@@ -999,6 +1436,13 @@ class TradingBot:
             await asyncio.wait_for(self._fee_cache.close(), timeout=5)
         except Exception:
             log.warning("fee_cache_close_error", exc_info=True)
+        if self._live_execution_boundary is not None:
+            try:
+                await asyncio.wait_for(self._live_execution_boundary.close(), timeout=5)
+            except Exception:
+                log.warning("orchestrator_transport_close_error", exc_info=True)
+            finally:
+                self._live_execution_boundary = None
 
         log.info("bot_stopped")
 
@@ -1045,7 +1489,7 @@ class TradingBot:
 
         for pos in self.positions.get_open_positions():
             if pos.entry_order and pos.entry_order.order_id == order.order_id:
-                if pos.state == PositionState.ENTRY_PENDING:
+                if pos.state == PositionState.ENTRY_PENDING and order.status == OrderStatus.FILLED:
                     await self._handle_entry_fill(pos)
                     # V1 Adverse-selection monitor: record POST_ONLY entry fills
                     if (
@@ -1064,7 +1508,7 @@ class TradingBot:
                         self._maker_monitor.record_maker_fill(fill_rec)
                 return
             if pos.exit_order and pos.exit_order.order_id == order.order_id:
-                if pos.state == PositionState.EXIT_PENDING:
+                if pos.state == PositionState.EXIT_PENDING and order.status == OrderStatus.FILLED:
                     self._handle_exit_fill(pos)
                 return
 
@@ -1344,14 +1788,19 @@ class TradingBot:
 
     async def _on_l2_bbo_change_inner(self, asset_id: str, score: Any) -> None:
         """Inner implementation — called by the guarded wrapper."""
+        self._fan_out_live_best_yes_ask(asset_id)
         log.debug(
             "l2_bbo_update",
             asset_id=asset_id,
             spread_score=round(score.score, 1),
             raw_spread_cents=round(score.raw_spread_cents, 2),
         )
+        await self._evaluate_live_ofi_exit_path(asset_id)
         # Drive event-driven stop-loss evaluation
-        await self._stop_loss_monitor.on_bbo_update(asset_id)
+        await self._stop_loss_monitor.on_bbo_update(
+            asset_id,
+            exclude_signal_types={"ofi_momentum"} if self._has_live_ofi_exit_runtime() else None,
+        )
 
         # Tick the maker adverse-selection monitor (schedules T+5/15/60 marks)
         if self._maker_monitor is not None:
@@ -1365,8 +1814,17 @@ class TradingBot:
 
         Schedules an async stop-loss evaluation for this asset.
         """
+        del snapshot
+        self._fan_out_live_best_yes_ask(asset_id)
         _safe_fire_and_forget(
-            self._stop_loss_monitor.on_bbo_update(asset_id),
+            self._evaluate_live_ofi_exit_path(asset_id),
+            name=f"ofi_exit_bbo_{asset_id[:12]}",
+        )
+        _safe_fire_and_forget(
+            self._stop_loss_monitor.on_bbo_update(
+                asset_id,
+                exclude_signal_types={"ofi_momentum"} if self._has_live_ofi_exit_runtime() else None,
+            ),
             name=f"stop_loss_bbo_{asset_id[:12]}",
         )
         _safe_fire_and_forget(
@@ -1389,6 +1847,15 @@ class TradingBot:
         if not market_info.accepting_orders:
             return
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            return
+
+        current_timestamp_ms = self._current_timestamp_ms()
+        is_live_ofi_runtime = (
+            self.deployment_env != DeploymentEnv.PAPER
+            and self._live_orchestrator is not None
+            and self._orchestrator_health_monitor is not None
+        )
+        if is_live_ofi_runtime and not self._orchestrator_health_monitor.is_safe_to_trade(current_timestamp_ms):
             return
 
         detector = self._ofi_detectors.get(market_info.condition_id)
@@ -1433,6 +1900,25 @@ class TradingBot:
             )
             return
 
+        if is_live_ofi_runtime:
+            live_signal = OfiEntrySignal(
+                market_id=market_info.condition_id,
+                side="NO",
+                target_price=_decimal_from_number(sig.no_best_ask),
+                anchor_volume=_decimal_from_number(sig.top_ask_size),
+                conviction_scalar=_decimal_from_number(min(max(abs(sig.rolling_vi), 0.0), 1.0)),
+                signal_timestamp_ms=int(sig.timestamp_ms),
+                tvi_kappa=_decimal_from_number(max(sig.tvi_multiplier - 1.0, 0.0)),
+                ofi_window_ms=max(int(sig.window_ms), 1),
+            )
+            self._live_orchestrator.on_ofi_signal(
+                live_signal,
+                _decimal_from_number(settings.strategy.max_trade_size_usd),
+                int(sig.timestamp_ms),
+            )
+            self.lifecycle.record_signal(market_info.condition_id)
+            return
+
         self.lifecycle.record_signal(market_info.condition_id)
         await self._on_panic_signal(
             sig,
@@ -1454,6 +1940,13 @@ class TradingBot:
     async def _evaluate_contagion_arb(self, asset_id: str) -> None:
         """Evaluate the toxicity contagion detector on every BBO update."""
         if self._contagion_arb is None:
+            return
+
+        if (
+            self.deployment_env != DeploymentEnv.PAPER
+            and self._orchestrator_health_monitor is not None
+            and not self._orchestrator_health_monitor.is_safe_to_trade(self._current_timestamp_ms())
+        ):
             return
 
         market_info = self._market_map.get(asset_id)
@@ -3038,6 +3531,8 @@ class TradingBot:
             )
             return
 
+        if pos.signal_type == "ofi_momentum" and self._live_orchestrator is not None:
+            self._live_orchestrator.clear_ofi_exit(pos.id)
         self.positions.on_exit_filled(pos, reason=pos.exit_reason or "target")
         # Refresh lifecycle cooldown from close time (not signal fire time)
         self.lifecycle.record_signal(pos.market_id)
@@ -3236,9 +3731,13 @@ class TradingBot:
                         dynamic_spread < settings.strategy.min_spread_cents
                         and current_best_bid > pos.entry_price
                     ):
+                        scalp_floor = (
+                            _decimal_from_number(pos.entry_price)
+                            + (_decimal_from_number(dynamic_spread) / Decimal("100"))
+                        )
                         scalp_target = max(
                             current_best_bid - 0.01,
-                            pos.entry_price + dynamic_spread / 100.0,
+                            scalp_floor,
                         )
                         new_target = min(new_target, scalp_target)
 
@@ -3523,7 +4022,7 @@ class TradingBot:
         """
         while self._running:
             try:
-                await self.positions.check_timeouts()
+                await self.positions.check_timeouts(exclude_signal_types={"ofi_momentum"})
 
                 # Record timeouts (only once — mark as recorded)
                 for pos in self.positions.get_all_positions():
@@ -4162,7 +4661,15 @@ class TradingBot:
         while self._running:
             await asyncio.sleep(300)
             try:
-                removed_pos = self.positions.cleanup_closed()
+                try:
+                    removed_pos = self.positions.cleanup_closed()
+                except Exception:
+                    if self._orchestrator_health_monitor is not None:
+                        self._orchestrator_health_monitor.record_position_release_failure()
+                    raise
+                else:
+                    if self._orchestrator_health_monitor is not None:
+                        self._orchestrator_health_monitor.reset_release_failure_count()
                 if removed_pos:
                     log.info("positions_cleaned", count=len(removed_pos))
 
@@ -4209,6 +4716,12 @@ class TradingBot:
                 await asyncio.sleep(interval)
 
                 if self._combo_detector is None:
+                    continue
+                if (
+                    self.deployment_env != DeploymentEnv.PAPER
+                    and self._orchestrator_health_monitor is not None
+                    and not self._orchestrator_health_monitor.is_safe_to_trade(self._current_timestamp_ms())
+                ):
                     continue
 
                 wallet_bal = self.positions._wallet_balance_usd

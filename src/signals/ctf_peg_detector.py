@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from src.detectors.ctf_peg_config import CtfPegConfig
+from src.detectors import CtfPegConfig
 from src.events.mev_events import CtfMergeSignal
 
 

@@ -13,9 +13,11 @@ Covers:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 from pathlib import Path
+import sys
 from unittest.mock import MagicMock, patch
 
 from src.backtest.strategy import (
@@ -28,6 +30,7 @@ from src.backtest.wfo_optimizer import (
     FoldResult,
     WfoConfig,
     WfoReport,
+    _objective,
     _export_champion_params,
     _suggest_params,
     _compute_stitched_metrics,
@@ -1289,3 +1292,242 @@ class TestRunWfoReplayTimeouts:
         assert report.folds[0].best_trial_score != float("-inf")
         assert report.folds[0].is_total_pnl == 0.0
         assert report.folds[0].oos_total_pnl == 0.0
+
+
+class TestObjectiveTelemetry:
+    @staticmethod
+    def _cfg() -> WfoConfig:
+        return WfoConfig(
+            data_dir="data",
+            market_id="market",
+            yes_asset_id="yes",
+            no_asset_id="no",
+            trial_timeout_s=1.0,
+            search_space_params=("ofi_threshold",),
+        )
+
+    @staticmethod
+    def _params() -> dict[str, float]:
+        return {"ofi_threshold": 0.8}
+
+    @staticmethod
+    def _attr_map(trial: MagicMock) -> dict[str, object]:
+        attrs: dict[str, object] = {}
+        for call in trial.set_user_attr.call_args_list:
+            attrs[call.args[0]] = call.args[1]
+        return attrs
+
+    def test_objective_timeout_records_no_metrics_attrs(self):
+        trial = MagicMock()
+        trial.number = 17
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("timeout", None)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == -9999.0
+        assert attrs["total_fills"] == 0
+        assert attrs["rejection_reason"] == "no_metrics"
+        assert attrs["timed_out"] is True
+        assert attrs["timed_out_params"] == self._params()
+
+    def test_objective_interrupted_records_no_metrics_attrs(self):
+        trial = MagicMock()
+        trial.number = 18
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("interrupted", None)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == -9999.0
+        assert attrs["total_fills"] == 0
+        assert attrs["rejection_reason"] == "no_metrics"
+        assert attrs["interrupted"] is True
+        assert attrs["interrupted_params"] == self._params()
+
+    def test_objective_worker_error_records_no_metrics_attrs(self):
+        trial = MagicMock()
+        trial.number = 19
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("error", "boom")):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == float("-inf")
+        assert attrs["total_fills"] == 0
+        assert attrs["rejection_reason"] == "no_metrics"
+
+    def test_objective_missing_metrics_records_no_metrics_attrs(self):
+        trial = MagicMock()
+        trial.number = 20
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("ok", None)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == float("-inf")
+        assert attrs["total_fills"] == 0
+        assert attrs["rejection_reason"] == "no_metrics"
+
+    def test_objective_below_min_trades_records_rejection_reason(self):
+        trial = MagicMock()
+        trial.number = 21
+        metrics = {
+            "sharpe_ratio": 1.2,
+            "sortino_ratio": 1.4,
+            "max_drawdown": 0.02,
+            "profit_factor": 1.1,
+            "total_fills": 3,
+        }
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("ok", metrics)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == float("-inf")
+        assert attrs["total_fills"] == 3
+        assert attrs["rejection_reason"] == "below_min_trades"
+
+    def test_objective_drawdown_collapse_records_raw_metrics(self):
+        trial = MagicMock()
+        trial.number = 22
+        metrics = {
+            "sharpe_ratio": 2.5,
+            "sortino_ratio": 2.0,
+            "max_drawdown": 0.15,
+            "profit_factor": 1.8,
+            "total_fills": 12,
+        }
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("ok", metrics)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score == 0.0
+        assert attrs["total_fills"] == 12
+        assert attrs["rejection_reason"] == "drawdown_collapse"
+        assert attrs["raw_sharpe"] == 2.5
+        assert attrs["max_drawdown"] == 0.15
+        assert attrs["profit_factor"] == 1.8
+
+    def test_objective_valid_score_records_valid_reason(self):
+        trial = MagicMock()
+        trial.number = 23
+        metrics = {
+            "sharpe_ratio": 2.5,
+            "sortino_ratio": 2.0,
+            "max_drawdown": 0.05,
+            "profit_factor": 1.8,
+            "total_fills": 12,
+        }
+
+        with patch("src.backtest.wfo_optimizer._suggest_params", return_value=self._params()), \
+             patch("src.backtest.wfo_optimizer._run_backtest_with_timeout", return_value=("ok", metrics)):
+            score = _objective(trial, ["2026-01-01"], self._cfg())
+
+        attrs = self._attr_map(trial)
+        assert score > 0.0
+        assert attrs["total_fills"] == 12
+        assert attrs["rejection_reason"] == "valid"
+        assert "raw_sharpe" not in attrs
+
+
+class TestOfiFoldTracer:
+    def test_trace_ofi_fold_smoke(self, tmp_path: Path):
+        script_path = Path(__file__).resolve().parents[2] / "scripts" / "trace_ofi_fold.py"
+        spec = importlib.util.spec_from_file_location("trace_ofi_fold", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        market_map = tmp_path / "market_map.json"
+        market_map.write_text(
+            json.dumps([
+                {
+                    "market_id": "mkt-1",
+                    "yes_id": "YES-1",
+                    "no_id": "NO-1",
+                }
+            ]),
+            encoding="utf-8",
+        )
+
+        for day in range(1, 5):
+            date_str = f"2026-01-0{day}"
+            tick_file = tmp_path / "raw_ticks" / date_str / "NO-1.jsonl"
+            _write_events(
+                tick_file,
+                [
+                    {
+                        "local_ts": 1.0,
+                        "source": "l2",
+                        "asset_id": "NO-1",
+                        "payload": {
+                            "event_type": "l2_snapshot",
+                            "asset_id": "NO-1",
+                            "bids": [{"price": "0.45", "size": "8"}],
+                            "asks": [{"price": "0.55", "size": "2"}],
+                        },
+                    },
+                    {
+                        "local_ts": 1.1,
+                        "source": "trade",
+                        "asset_id": "NO-1",
+                        "payload": {
+                            "event_type": "last_trade_price",
+                            "asset_id": "NO-1",
+                            "market_id": "mkt-1",
+                            "price": "0.55",
+                            "size": "10",
+                            "side": "buy",
+                        },
+                    },
+                    {
+                        "local_ts": 1.2,
+                        "source": "l2",
+                        "asset_id": "NO-1",
+                        "payload": {
+                            "event_type": "price_change",
+                            "asset_id": "NO-1",
+                            "changes": [
+                                {"asset_id": "NO-1", "side": "BUY", "price": "0.46", "size": "10"},
+                                {"asset_id": "NO-1", "side": "SELL", "price": "0.55", "size": "1"},
+                            ],
+                        },
+                    },
+                ],
+            )
+
+        report = module.trace_ofi_fold(
+            data_dir=str(tmp_path),
+            market_configs_path=str(market_map),
+            fold_index=0,
+            train_days=2,
+            test_days=1,
+            step_days=1,
+            embargo_days=0,
+            max_markets=1,
+            ofi_threshold=module._decimal("0.5"),
+            window_ms=2000,
+            ofi_tvi_kappa=module._decimal("0.0"),
+            ofi_toxicity_scale_threshold=module._decimal("0.6"),
+            ofi_toxicity_size_boost_max=module._decimal("2.0"),
+            take_profit_pct=module._decimal("0.02"),
+            stop_loss_pct=module._decimal("0.02"),
+            kelly_fraction=module._decimal("0.25"),
+            max_trade_size_usd=module._decimal("15.0"),
+            initial_cash=module._decimal("1000.0"),
+            signal_cooldown_minutes=module._decimal("0.0"),
+        )
+
+        assert report.target_market_count == 1
+        assert report.window.fold_index == 0
+        assert report.funnel.total_book_updates >= 2
+        assert report.funnel.total_ofi_threshold_breaches >= report.funnel.final_valid_signals

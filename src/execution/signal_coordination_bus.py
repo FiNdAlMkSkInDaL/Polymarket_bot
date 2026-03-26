@@ -1,5 +1,3 @@
-"""Sole authorized coordination bus implementation for execution adapters."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

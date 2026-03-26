@@ -9,7 +9,7 @@ from src.execution.dispatch_guard import DispatchGuard
 from src.execution.priority_dispatcher import DispatchReceipt, PriorityDispatcher
 from src.execution.signal_coordination_bus import SignalCoordinationBus, SlotDecision
 from src.execution.si9_execution_manifest import Si9ExecutionManifest, Si9LegManifest
-from src.execution.si9_paper_ledger import Si9PaperLedger
+from src.execution.si9_paper_ledger import Si9LedgerSnapshot, Si9PaperLedger
 from src.execution.si9_unwind_evaluator import Si9UnwindEvaluator
 from src.execution.si9_unwind_manifest import Si9UnwindConfig, Si9UnwindManifest, UnwindReason
 from src.signals.si9_matrix_detector import Si9MatrixSignal
@@ -73,18 +73,10 @@ class Si9PaperAdapter:
         self._unwind_evaluator = Si9UnwindEvaluator(config.unwind_config)
 
     @property
-    def dispatcher(self) -> PriorityDispatcher:
-        return self._dispatcher
-
-    @property
-    def guard(self) -> DispatchGuard:
-        return self._guard
-
-    @property
     def bus(self) -> SignalCoordinationBus | None:
         return self._bus
 
-    def ledger_snapshot(self):
+    def ledger_snapshot(self) -> Si9LedgerSnapshot:
         return self._ledger.snapshot()
 
     def on_signal(
@@ -107,8 +99,8 @@ class Si9PaperAdapter:
         acquired_contexts: list[tuple[str, str, str]] = []
         for leg in manifest.legs:
             context = self._context_for_leg(leg, conviction_scalar)
-            if self._bus is not None:
-                slot_decision = self._bus.request_slot(
+            if self._config.bus is not None:
+                slot_decision = self._config.bus.request_slot(
                     context.market_id,
                     context.side,
                     context.signal_source,
@@ -272,10 +264,10 @@ class Si9PaperAdapter:
         acquired_contexts: list[tuple[str, str, str]],
         current_timestamp_ms: int,
     ) -> None:
-        if self._bus is None:
+        if self._config.bus is None:
             return
         for market_id, side, signal_source in acquired_contexts:
-            self._bus.release_slot(market_id, side, signal_source, int(current_timestamp_ms))
+            self._config.bus.release_slot(market_id, side, signal_source, int(current_timestamp_ms))
 
     def _build_unwind_manifest(
         self,

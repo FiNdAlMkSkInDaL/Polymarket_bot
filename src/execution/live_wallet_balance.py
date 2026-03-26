@@ -27,6 +27,7 @@ class LiveWalletBalanceProvider:
         initial_balances: dict[str, Decimal] | None = None,
         now_ms: Callable[[], int] | None = None,
         sleep_fn: Callable[[float], asyncio.Future[object] | object] | None = None,
+        on_balance_update: Callable[[str, Decimal], None] | None = None,
         logger: _BalanceLogger | None = None,
     ) -> None:
         self._venue_adapter = venue_adapter
@@ -35,6 +36,7 @@ class LiveWalletBalanceProvider:
         self._last_updated_ms: dict[str, int] = {}
         self._now_ms = now_ms
         self._sleep_fn = sleep_fn or asyncio.sleep
+        self._on_balance_update = on_balance_update
         self._logger = logger or get_logger(__name__)
 
         if initial_balances:
@@ -46,6 +48,9 @@ class LiveWalletBalanceProvider:
 
     def get_last_updated_ms(self, asset_symbol: str) -> int | None:
         return self._last_updated_ms.get(self._normalize_asset_symbol(asset_symbol))
+
+    def set_balance_update_callback(self, callback: Callable[[str, Decimal], None] | None) -> None:
+        self._on_balance_update = callback
 
     async def poll_balance_loop(self, interval_ms: int) -> None:
         if not isinstance(interval_ms, int) or interval_ms <= 0:
@@ -79,6 +84,8 @@ class LiveWalletBalanceProvider:
         self._balances[asset_symbol] = balance
         if updated_ms is not None:
             self._last_updated_ms[asset_symbol] = updated_ms
+        if self._on_balance_update is not None:
+            self._on_balance_update(asset_symbol, balance)
 
     def _current_timestamp_ms(self) -> int | None:
         if self._now_ms is None:

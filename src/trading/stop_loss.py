@@ -104,7 +104,7 @@ class StopLossMonitor:
     # ═══════════════════════════════════════════════════════════════════════
     #  Event entry-point — called by BBO-change callbacks
     # ═══════════════════════════════════════════════════════════════════════
-    async def on_bbo_update(self, asset_id: str) -> None:
+    async def on_bbo_update(self, asset_id: str, *, exclude_signal_types: set[str] | None = None) -> None:
         """Called when the BBO changes for *asset_id*.
 
         Only evaluates positions whose ``no_asset_id`` matches the
@@ -120,6 +120,7 @@ class StopLossMonitor:
             p for p in self._pm.get_open_positions()
             if ((p.trade_asset_id or p.no_asset_id) == asset_id or p.no_asset_id == asset_id)
             and p.state == PositionState.EXIT_PENDING
+            and getattr(p, "signal_type", "") not in (exclude_signal_types or set())
         ]
         if not positions_for_asset:
             return

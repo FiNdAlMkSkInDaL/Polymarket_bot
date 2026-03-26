@@ -8,14 +8,18 @@ from types import SimpleNamespace
 import pytest
 
 from src.detectors.ctf_peg_config import CtfPegConfig
+from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
 from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.escalation_policy_interface import EscalationPolicyInterface
+from src.execution.live_execution_boundary import LiveExecutionBoundary
+from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator, OrchestratorConfig
 from src.execution.orchestrator_factory import build_live_orchestrator
 from src.execution.orchestrator_health_monitor import HealthMonitorConfig, HealthReport, OrchestratorHealthMonitor
 from src.execution.ofi_signal_bridge import OfiSignalBridgeConfig
+from src.execution.ofi_exit_router import OfiExitRouter
 from src.execution.si9_paper_adapter import Si9PaperAdapterConfig
 from src.execution.si9_unwind_manifest import Si9UnwindConfig, Si9UnwindManifest
 from src.execution.signal_coordination_bus import CoordinationBusConfig
@@ -242,9 +246,27 @@ def _build_live_factory_orchestrator(*, deployment_phase: str = "PAPER") -> Mult
         config=_live_config(deployment_phase=deployment_phase),
         orderbook_tracker=_StubOrderbookTracker(),
         position_manager=_StubPositionManager(),
-        venue_adapter=_StubVenueAdapter(),
+        execution_boundary=_execution_boundary(deployment_phase=deployment_phase),
         unwind_executor=PaperUnwindExecutor(_unwind_config()),
         escalation_policy=_StubEscalationPolicy(),
+    )
+
+
+def _execution_boundary(*, deployment_phase: str = "PAPER") -> LiveExecutionBoundary:
+    adapter = _StubVenueAdapter()
+    wallet_provider = None
+    ofi_exit_router = None
+    if deployment_phase == "LIVE":
+        wallet_provider = LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        )
+        ofi_exit_router = OfiExitRouter(adapter, ClientOrderIdGenerator("OFI", "session-graph"))
+    return LiveExecutionBoundary(
+        venue_adapter=adapter,
+        wallet_balance_provider=wallet_provider,
+        ofi_exit_router=ofi_exit_router,
     )
 
 
@@ -295,34 +317,37 @@ def test_live_orchestrator_config_rejects_non_positive_heartbeat_interval() -> N
         _live_config(heartbeat_interval_ms=0)
 
 
-def test_build_live_orchestrator_raises_runtime_error_when_venue_adapter_interface_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    original_import = builtins.__import__
-
-    def _raising_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "src.execution.venue_adapter_interface":
-            raise ImportError("forced missing interface")
-        return original_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", _raising_import)
-
-    with pytest.raises(RuntimeError, match="VenueAdapter interface not yet available"):
+def test_build_live_orchestrator_live_requires_wallet_balance_provider() -> None:
+    with pytest.raises(ValueError, match="wallet balance provider"):
         build_live_orchestrator(
-            config=_live_config(),
+            config=_live_config(deployment_phase="LIVE"),
             orderbook_tracker=_StubOrderbookTracker(),
             position_manager=_StubPositionManager(),
-            venue_adapter=_StubVenueAdapter(),
+            execution_boundary=LiveExecutionBoundary(
+                venue_adapter=_StubVenueAdapter(),
+                wallet_balance_provider=None,
+                ofi_exit_router=None,
+            ),
             unwind_executor=PaperUnwindExecutor(_unwind_config()),
             escalation_policy=_StubEscalationPolicy(),
         )
 
 
-def test_build_live_orchestrator_raises_type_error_for_wrong_venue_adapter_type() -> None:
-    with pytest.raises(TypeError, match="venue_adapter must implement VenueAdapter"):
+def test_build_live_orchestrator_live_requires_venue_adapter() -> None:
+    with pytest.raises(ValueError, match="venue adapter"):
         build_live_orchestrator(
-            config=_live_config(),
+            config=_live_config(deployment_phase="LIVE"),
             orderbook_tracker=_StubOrderbookTracker(),
             position_manager=_StubPositionManager(),
-            venue_adapter=object(),
+            execution_boundary=LiveExecutionBoundary(
+                venue_adapter=None,
+                wallet_balance_provider=LiveWalletBalanceProvider(
+                    _StubVenueAdapter(),
+                    tracked_assets=["USDC"],
+                    initial_balances={"USDC": Decimal("100.000000")},
+                ),
+                ofi_exit_router=None,
+            ),
             unwind_executor=PaperUnwindExecutor(_unwind_config()),
             escalation_policy=_StubEscalationPolicy(),
         )
@@ -339,6 +364,13 @@ def test_build_live_orchestrator_live_phase_constructs_dispatcher_with_client_or
 
     assert isinstance(orchestrator, MultiSignalOrchestrator)
     assert orchestrator.dispatcher._client_order_id_generator is not None
+
+
+def test_live_factory_threads_wallet_provider_and_ofi_exit_router_into_graph() -> None:
+    orchestrator = _build_live_factory_orchestrator(deployment_phase="LIVE")
+
+    assert orchestrator.wallet_balance_provider is not None
+    assert orchestrator.ofi_exit_router is not None
 
 
 def test_two_live_factory_calls_produce_independent_instances_without_shared_state() -> None:
@@ -391,7 +423,7 @@ def test_live_factory_registers_all_si9_clusters() -> None:
         config=config,
         orderbook_tracker=_StubOrderbookTracker(),
         position_manager=_StubPositionManager(),
-        venue_adapter=_StubVenueAdapter(),
+        execution_boundary=_execution_boundary(),
         unwind_executor=PaperUnwindExecutor(_unwind_config()),
         escalation_policy=_StubEscalationPolicy(),
     )

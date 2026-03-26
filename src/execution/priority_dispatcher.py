@@ -13,8 +13,10 @@ from src.execution.mev_serializer import deserialize_envelope, serialize_mev_exe
 from src.execution.priority_context import PriorityOrderContext
 
 if TYPE_CHECKING:
+    from src.execution.live_wallet_balance import LiveWalletBalanceProvider
     from src.execution.venue_adapter_interface import VenueAdapter
 else:
+    LiveWalletBalanceProvider = Any
     VenueAdapter = Any
 
 
@@ -120,19 +122,23 @@ class PriorityDispatcher:
         guard_enabled: bool = True,
         venue_adapter: VenueAdapter | None = None,
         client_order_id_generator: ClientOrderIdGenerator | None = None,
+        wallet_balance_provider: LiveWalletBalanceProvider | None = None,
     ):
         if mode not in {"paper", "dry_run", "live"}:
             raise ValueError(f"Unsupported priority dispatch mode: {mode!r}")
         if mode == "live" and venue_adapter is None:
-            raise ValueError("live mode requires venue_adapter")
+            raise ValueError("Unsupported priority dispatch mode: 'live'; live mode requires venue_adapter")
         if mode == "live" and client_order_id_generator is None:
             raise ValueError("live mode requires client_order_id_generator")
+        if mode == "live" and wallet_balance_provider is None:
+            raise ValueError("live mode requires wallet_balance_provider")
         self._router = router
         self._mode = mode
         self._guard = guard
         self._guard_enabled = bool(guard_enabled)
         self._venue_adapter = venue_adapter
         self._client_order_id_generator = client_order_id_generator
+        self._wallet_balance_provider = wallet_balance_provider
 
     @property
     def guard(self) -> DispatchGuard | None:
@@ -235,6 +241,25 @@ class PriorityDispatcher:
         )
         order_price = Decimal(first_payload["price"])
         effective_size = Decimal(first_payload["metadata"]["effective_size"])
+        required_margin = order_price * effective_size
+
+        if self._wallet_balance_provider is None:
+            raise ValueError("live mode requires wallet_balance_provider")
+        available_margin = self._wallet_balance_provider.get_available_margin("USDC")
+        if available_margin < required_margin:
+            return DispatchReceipt(
+                context=context,
+                mode="live",
+                executed=False,
+                fill_price=None,
+                fill_size=None,
+                serialized_envelope=serialized_envelope,
+                dispatch_timestamp_ms=dispatch_timestamp_ms,
+                guard_reason="INSUFFICIENT_MARGIN",
+                partial_fill_size=None,
+                partial_fill_price=None,
+                fill_status="NONE",
+            )
 
         submit_response = self._venue_adapter.submit_order(
             market_id=context.market_id,

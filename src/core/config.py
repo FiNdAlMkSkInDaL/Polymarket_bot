@@ -623,9 +623,9 @@ class StrategyParams:
     contagion_arb_max_pairs_per_leader: int = _env_int("CONTAGION_ARB_MAX_PAIRS_PER_LEADER", 3)
     contagion_arb_max_lagging_spread_pct: float = _env_float("CONTAGION_ARB_MAX_LAGGING_SPREAD_PCT", 3.0)
     contagion_arb_max_last_trade_age_s: float = _env_float("CONTAGION_ARB_MAX_LAST_TRADE_AGE_S", 300.0)
-    contagion_arb_max_leader_age_ms: float = _env_float("CONTAGION_ARB_MAX_LEADER_AGE_MS", 5000.0)
-    contagion_arb_max_lagger_age_ms: float = _env_float("CONTAGION_ARB_MAX_LAGGER_AGE_MS", 30000.0)
-    contagion_arb_max_causal_lag_ms: float = _env_float("CONTAGION_ARB_MAX_CAUSAL_LAG_MS", 600000.0)
+    contagion_arb_max_leader_age_ms: float = _env_float("CONTAGION_ARB_MAX_LEADER_AGE_MS", 1500.0)
+    contagion_arb_max_lagger_age_ms: float = _env_float("CONTAGION_ARB_MAX_LAGGER_AGE_MS", 1500.0)
+    contagion_arb_max_causal_lag_ms: float = _env_float("CONTAGION_ARB_MAX_CAUSAL_LAG_MS", 400.0)
     contagion_arb_allow_negative_lag: bool = _env_bool("CONTAGION_ARB_ALLOW_NEGATIVE_LAG", False)
     debug_force_contagion_signal: bool = _env_bool("DEBUG_FORCE_CONTAGION_SIGNAL", False)
     max_cross_book_desync_ms: float = _env_float(

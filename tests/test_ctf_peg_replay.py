@@ -10,7 +10,7 @@ from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.priority_dispatcher import DispatchReceipt
 from src.execution.priority_context import PriorityOrderContext
 from src.execution.signal_coordination_bus import CoordinationBusConfig, SignalCoordinationBus
-from src.detectors.ctf_peg_detector import CtfPegDetector
+from src.signals.ctf_peg_detector import CtfPegDetector
 
 
 def _config() -> CtfPegConfig:

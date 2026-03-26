@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from src.detectors.ctf_peg_config import CtfPegConfig
 from src.detectors.ctf_peg_detector import CtfPegDetector
@@ -14,9 +15,13 @@ from src.execution.dispatch_guard import DispatchGuard
 from src.execution.escalation_policy_interface import EscalationPolicyInterface
 from src.execution.guard_observability import GuardObservabilityPanel, ObservabilitySnapshot
 from src.execution.live_book_interface import LiveBestBidProvider
+from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.orchestrator_load_shedder import OrchestratorLoadShedder
+from src.execution.ofi_exit_router import OfiExitRouter
+from src.execution.ofi_local_exit_monitor import OfiExitDecision, OfiLocalExitMonitor
 from src.execution.ofi_paper_ledger import OfiLedgerSnapshot
 from src.execution.ofi_signal_bridge import OfiEntrySignal, OfiSignalBridge
+from src.execution.orderbook_best_bid_provider import OrderbookBestBidProvider
 from src.execution.position_lifecycle_interface import PositionLifecycleInterface
 from src.execution.priority_dispatcher import PriorityDispatcher
 from src.execution.si9_execution_manifest import Si9ExecutionManifest, Si9LegManifest
@@ -26,6 +31,9 @@ from src.execution.si9_unwind_manifest import Si9UnwindManifest
 from src.execution.signal_coordination_bus import CoordinationBusSnapshot, SignalCoordinationBus
 from src.execution.unwind_executor_interface import UnwindExecutionReceipt, UnwindExecutor
 from src.signals.si9_matrix_detector import Si9MatrixDetector, Si9MatrixSignal
+
+if TYPE_CHECKING:
+    from src.data.orderbook import OrderbookTracker
 
 
 SignalSource = Literal["CTF", "SI9", "OFI", "SYSTEM"]
@@ -104,6 +112,9 @@ class MultiSignalOrchestrator:
         escalation_policy: EscalationPolicyInterface,
         config: OrchestratorConfig,
         load_shedder: OrchestratorLoadShedder | None = None,
+        wallet_balance_provider: LiveWalletBalanceProvider | None = None,
+        ofi_exit_router: OfiExitRouter | None = None,
+        ofi_exit_trackers: Mapping[str, OrderbookTracker] | None = None,
     ):
         self._bus = bus
         self._guard = guard
@@ -117,6 +128,10 @@ class MultiSignalOrchestrator:
         self._escalation_policy = escalation_policy
         self._config = config
         self._load_shedder = load_shedder
+        self._wallet_balance_provider = wallet_balance_provider
+        self._ofi_exit_router = ofi_exit_router
+        self._ofi_exit_trackers = dict(ofi_exit_trackers or {})
+        self._ofi_exit_monitors: dict[str, OfiLocalExitMonitor] = {}
         self._observability_panel = GuardObservabilityPanel({"SYSTEM": guard}, bus)
         self._pending_unwinds: dict[str, Si9UnwindManifest] = {}
         self._active_cluster_ids: set[str] = set()
@@ -176,6 +191,14 @@ class MultiSignalOrchestrator:
     @property
     def load_shedder(self) -> OrchestratorLoadShedder | None:
         return self._load_shedder
+
+    @property
+    def wallet_balance_provider(self) -> LiveWalletBalanceProvider | None:
+        return self._wallet_balance_provider
+
+    @property
+    def ofi_exit_router(self) -> OfiExitRouter | None:
+        return self._ofi_exit_router
 
     def bind_detector_context(
         self,
@@ -460,6 +483,47 @@ class MultiSignalOrchestrator:
             self._pending_unwinds.pop(cluster_id, None)
         return events
 
+    def evaluate_ofi_exit(
+        self,
+        *,
+        asset_id: str,
+        position_state: dict,
+        current_timestamp_ms: int,
+    ) -> OfiExitDecision:
+        monitor = self._ofi_exit_monitor(asset_id)
+        if monitor is None:
+            return self._fallback_ofi_exit_decision(position_state, current_timestamp_ms)
+        return monitor.evaluate_exit(position_state, current_timestamp_ms)
+
+    def route_ofi_exit(
+        self,
+        position_state: dict,
+        decision: OfiExitDecision,
+    ):
+        if self._ofi_exit_router is None:
+            return None
+        return self._ofi_exit_router.route_exit(position_state, decision)
+
+    def evaluate_ofi_exit_promotion(
+        self,
+        *,
+        position_id: str,
+        current_timestamp_ms: int,
+        current_bbo: dict,
+    ):
+        if self._ofi_exit_router is None:
+            return None
+        return self._ofi_exit_router.evaluate_passive_promotion(
+            position_id,
+            current_timestamp_ms,
+            current_bbo,
+        )
+
+    def clear_ofi_exit(self, position_id: str) -> None:
+        if self._ofi_exit_router is None:
+            return
+        self._ofi_exit_router.clear_exit(position_id)
+
     def orchestrator_snapshot(
         self,
         timestamp_ms: int,
@@ -596,3 +660,38 @@ class MultiSignalOrchestrator:
         if self._load_shedder is None:
             return True
         return self._load_shedder.is_market_allowed(market_id)
+
+    def _ofi_exit_monitor(self, asset_id: str) -> OfiLocalExitMonitor | None:
+        asset_key = str(asset_id or "").strip()
+        if not asset_key:
+            return None
+        monitor = self._ofi_exit_monitors.get(asset_key)
+        if monitor is not None:
+            return monitor
+        tracker = self._ofi_exit_trackers.get(asset_key)
+        if tracker is None:
+            return None
+        monitor = OfiLocalExitMonitor(OrderbookBestBidProvider(tracker))
+        self._ofi_exit_monitors[asset_key] = monitor
+        return monitor
+
+    @staticmethod
+    def _fallback_ofi_exit_decision(position_state: dict, current_timestamp_ms: int) -> OfiExitDecision:
+        current_best_bid = MultiSignalOrchestrator._decimal_field(position_state, "current_best_bid")
+        drawn_tp = MultiSignalOrchestrator._decimal_field(position_state, "drawn_tp")
+        if drawn_tp > Decimal("0") and current_best_bid >= drawn_tp:
+            return OfiExitDecision(action="TARGET_HIT", trigger_price=drawn_tp)
+        drawn_stop = MultiSignalOrchestrator._decimal_field(position_state, "drawn_stop")
+        if drawn_stop > Decimal("0") and current_best_bid > Decimal("0") and current_best_bid <= drawn_stop:
+            return OfiExitDecision(action="STOP_HIT", trigger_price=drawn_stop)
+        drawn_time_ms = int(position_state.get("drawn_time_ms", 0) or 0)
+        if drawn_time_ms > 0 and int(current_timestamp_ms) > drawn_time_ms:
+            return OfiExitDecision(action="TIME_STOP_TRIGGERED", trigger_price=current_best_bid)
+        return OfiExitDecision(action="HOLD", trigger_price=current_best_bid)
+
+    @staticmethod
+    def _decimal_field(position_state: dict, field_name: str) -> Decimal:
+        value = position_state.get(field_name, Decimal("0"))
+        if isinstance(value, Decimal) and value.is_finite() and value >= Decimal("0"):
+            return value
+        return Decimal("0")

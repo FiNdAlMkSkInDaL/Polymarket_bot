@@ -10,6 +10,7 @@ from src.detectors.ctf_peg_config import CtfPegConfig
 from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
 from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.escalation_policy_interface import EscalationPolicyInterface
+from src.execution.live_execution_boundary import LiveExecutionBoundary
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
 from src.execution.orchestrator_factory import build_live_orchestrator
 from src.execution.orchestrator_health_monitor import HealthMonitorConfig, OrchestratorHealthMonitor
@@ -167,7 +168,11 @@ def _build_adapter() -> tuple[OrchestratorTelemetryAdapter, OrchestratorHealthMo
         config=_config(),
         orderbook_tracker=_StubTracker(),
         position_manager=_StubPositionManager(),
-        venue_adapter=_StubVenueAdapter(),
+        execution_boundary=LiveExecutionBoundary(
+            venue_adapter=_StubVenueAdapter(),
+            wallet_balance_provider=None,
+            ofi_exit_router=None,
+        ),
         unwind_executor=PaperUnwindExecutor(_unwind_config()),
         escalation_policy=_StubEscalationPolicy(),
     )

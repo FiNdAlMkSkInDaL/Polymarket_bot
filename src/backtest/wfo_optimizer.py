@@ -44,7 +44,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 
@@ -1205,6 +1205,31 @@ def compute_wfo_score(
     return composite * dd_penalty
 
 
+ObjectiveRejectionReason = Literal[
+    "below_min_trades",
+    "no_metrics",
+    "drawdown_collapse",
+    "valid",
+]
+
+
+def _record_objective_trial_attrs(
+    trial: Any,
+    *,
+    total_fills: int,
+    rejection_reason: ObjectiveRejectionReason,
+    raw_sharpe: float | None = None,
+    max_drawdown: float | None = None,
+    profit_factor: float | None = None,
+) -> None:
+    trial.set_user_attr("total_fills", int(total_fills))
+    trial.set_user_attr("rejection_reason", rejection_reason)
+    if rejection_reason == "drawdown_collapse":
+        trial.set_user_attr("raw_sharpe", float(raw_sharpe or 0.0))
+        trial.set_user_attr("max_drawdown", float(max_drawdown or 0.0))
+        trial.set_user_attr("profit_factor", float(profit_factor or 0.0))
+
+
 def _objective(
     trial: Any,
     train_dates: list[str],
@@ -1253,6 +1278,11 @@ def _objective(
         )
 
     if run_status == "timeout":
+        _record_objective_trial_attrs(
+            trial,
+            total_fills=0,
+            rejection_reason="no_metrics",
+        )
         trial.set_user_attr("timed_out", True)
         trial.set_user_attr("timed_out_params", suggested)
         log.warning(
@@ -1265,6 +1295,11 @@ def _objective(
         return -9999.0
 
     if run_status == "interrupted":
+        _record_objective_trial_attrs(
+            trial,
+            total_fills=0,
+            rejection_reason="no_metrics",
+        )
         trial.set_user_attr("interrupted", True)
         trial.set_user_attr("interrupted_params", suggested)
         log.warning(
@@ -1277,6 +1312,11 @@ def _objective(
         return -9999.0
 
     if run_status == "error":
+        _record_objective_trial_attrs(
+            trial,
+            total_fills=0,
+            rejection_reason="no_metrics",
+        )
         log.warning(
             "wfo_trial_worker_error",
             trial=trial.number,
@@ -1289,6 +1329,11 @@ def _objective(
     metrics = payload
 
     if metrics is None:
+        _record_objective_trial_attrs(
+            trial,
+            total_fills=0,
+            rejection_reason="no_metrics",
+        )
         return float("-inf")
 
     sharpe = metrics.get("sharpe_ratio", 0.0)
@@ -1296,6 +1341,14 @@ def _objective(
     mdd = metrics.get("max_drawdown", 0.0)
     pf = metrics.get("profit_factor", 0.0)
     fills = metrics.get("total_fills", 0)
+
+    rejection_reason: ObjectiveRejectionReason = "valid"
+    if fills < wfo_cfg.min_trades:
+        rejection_reason = "below_min_trades"
+    else:
+        dd_penalty = max(0.0, 1.0 - (mdd / wfo_cfg.max_acceptable_drawdown))
+        if dd_penalty == 0.0:
+            rejection_reason = "drawdown_collapse"
 
     score = compute_wfo_score(
         sharpe_ratio=sharpe,
@@ -1309,6 +1362,15 @@ def _objective(
         sortino_weight=wfo_cfg.sortino_weight,
         profit_factor_weight=wfo_cfg.profit_factor_weight,
         trade_bonus_weight=wfo_cfg.trade_bonus_weight,
+    )
+
+    _record_objective_trial_attrs(
+        trial,
+        total_fills=int(fills),
+        rejection_reason=rejection_reason,
+        raw_sharpe=sharpe,
+        max_drawdown=mdd,
+        profit_factor=pf,
     )
 
     # Log trial outcome

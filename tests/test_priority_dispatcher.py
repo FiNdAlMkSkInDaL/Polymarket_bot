@@ -94,7 +94,7 @@ def test_paper_fill_size_matches_effective_size_formula() -> None:
 
 def test_unknown_mode_raises_value_error() -> None:
     with pytest.raises(ValueError, match="Unsupported priority dispatch mode"):
-        PriorityDispatcher(_make_router(), "sandbox")  # type: ignore[arg-type]
+        PriorityDispatcher(_make_router(), "live")  # type: ignore[arg-type]
 
 
 def test_dispatch_receipt_is_immutable() -> None:

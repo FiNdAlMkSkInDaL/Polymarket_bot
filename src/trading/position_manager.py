@@ -278,7 +278,7 @@ class PositionManager:
         self._ohlcv_aggs: dict[str, OHLCVAggregator] | None = None  # asset_id → aggregator; injected by bot.py
         self._positions: dict[str, Position] = {}
         self._next_id = 1
-        self._wallet_balance_usd: float = 0.0
+        self._wallet_balance_usd: Decimal | float = 0.0
         self._daily_pnl_cents: float = 0.0
         self._momentum_taker = MomentumTakerExecutor(executor)
         self._ofi_rng = random.Random()
@@ -392,7 +392,7 @@ class PositionManager:
         self._ensemble_risk.release_position(pos.id)
 
     # ── Wallet balance ─────────────────────────────────────────────────────
-    def set_wallet_balance(self, usd: float) -> None:
+    def set_wallet_balance(self, usd: Decimal | float) -> None:
         self._wallet_balance_usd = usd
 
     @property
@@ -2226,12 +2226,15 @@ class PositionManager:
         self.cleanup_closed()
 
     # ── Timeout enforcement ────────────────────────────────────────────────
-    async def check_timeouts(self) -> None:
+    async def check_timeouts(self, *, exclude_signal_types: set[str] | None = None) -> None:
         """Cancel stale entry orders, check stop-losses, and force-exit stale positions."""
         now = time.time()
         stop_loss_cents = settings.strategy.stop_loss_cents
+        excluded_signal_types = exclude_signal_types or set()
 
         for pos in list(self._positions.values()):
+            if pos.state == PositionState.EXIT_PENDING and pos.signal_type in excluded_signal_types:
+                continue
             # Entry timeout
             if pos.state == PositionState.ENTRY_PENDING:
                 elapsed = now - pos.entry_time
