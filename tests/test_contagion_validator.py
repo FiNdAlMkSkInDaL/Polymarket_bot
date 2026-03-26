@@ -107,9 +107,9 @@ def _build_validator_fixture(tmp_path: Path) -> tuple[ContagionValidatorConfig, 
     leader_yes_records.append(_snapshot_record(asset_id="YES_LEADER", timestamp=70.0, bid=0.62, ask=0.64, ask_size=5.0))
     leader_no_records.append(_snapshot_record(asset_id="NO_LEADER", timestamp=70.0, bid=0.49, ask=0.51))
     leader_yes_records.append(_trade_record(asset_id="YES_LEADER", timestamp=70.5, price=0.63))
-    lagger_yes_records.append(_snapshot_record(asset_id="YES_LAGGER", timestamp=50.0, bid=0.50, ask=0.52))
-    lagger_no_records.append(_snapshot_record(asset_id="NO_LAGGER", timestamp=50.0, bid=0.49, ask=0.51))
-    lagger_yes_records.append(_trade_record(asset_id="YES_LAGGER", timestamp=55.0, price=0.51))
+    lagger_yes_records[-2] = _snapshot_record(asset_id="YES_LAGGER", timestamp=50.0, bid=0.50, ask=0.52)
+    lagger_no_records[-1] = _snapshot_record(asset_id="NO_LAGGER", timestamp=50.0, bid=0.49, ask=0.51)
+    lagger_yes_records[-1] = _trade_record(asset_id="YES_LAGGER", timestamp=50.5, price=0.51)
 
     _write_records(raw_day_dir / "YES_LEADER.jsonl", leader_yes_records)
     _write_records(raw_day_dir / "NO_LEADER.jsonl", leader_no_records)

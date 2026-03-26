@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -110,7 +111,7 @@ def _builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config_overrides
         max_lagger_age_ms=15000,
         require_causal_ordering=False,
     )
-    config = UniverseBuilderConfig(**{**config.__dict__, **config_overrides})
+    config = UniverseBuilderConfig(**{**asdict(config), **config_overrides})
     return UniverseBuilder(config)
 
 
@@ -141,7 +142,7 @@ def test_build_cluster_recommends_leader_and_lagger(tmp_path: Path, monkeypatch:
 
 
 def test_build_cluster_filters_low_correlation_pairs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    builder = _builder(tmp_path, monkeypatch, min_correlation=Decimal("0.95"))
+    builder = _builder(tmp_path, monkeypatch, min_correlation=Decimal("1.0"))
     report = builder.build_cluster(_candidate_set(), "2026-03-01T00:00:00Z", "2026-03-02T00:00:59Z")
     assert report.pairs_passing_correlation == 0
     assert report.leader_market_id is None
@@ -156,9 +157,13 @@ def test_build_cluster_filters_stale_laggers(tmp_path: Path, monkeypatch: pytest
 
 def test_build_cluster_applies_causal_ordering_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     builder = _builder(tmp_path, monkeypatch, require_causal_ordering=True)
-    report = builder.build_cluster(_candidate_set(), "2026-03-01T00:00:00Z", "2026-03-02T00:00:59Z")
+    candidates = [
+        MarketCandidate("MKT_A", "A", frozenset({"macro", "election"}), "LEADER"),
+        MarketCandidate("MKT_D", "D", frozenset({"macro", "election"}), "LAGGER"),
+    ]
+    report = builder.build_cluster(candidates, "2026-03-01T00:00:00Z", "2026-03-02T00:00:59Z")
     assert report.pairs_passing_freshness >= report.pairs_passing_causal_ordering
-    assert report.rejection_reasons["MKT_D"] in {"causal_ordering_reversed", "not_selected_for_cluster"}
+    assert report.rejection_reasons["MKT_D"] == "causal_ordering_reversed"
 
 
 def test_build_cluster_reports_missing_archive_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

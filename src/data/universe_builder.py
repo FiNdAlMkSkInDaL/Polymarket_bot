@@ -107,6 +107,9 @@ class UniverseBuilder:
                     continue
                 if lagger_candidate.expected_role == "LEADER":
                     continue
+                if not (leader_candidate.thematic_tags & lagger_candidate.thematic_tags):
+                    rejection_reasons.setdefault(lagger_id, "no_thematic_overlap")
+                    continue
                 metrics = compute_lagged_pair_metrics(
                     series_by_market[leader_id],
                     series_by_market[lagger_id],
@@ -198,11 +201,11 @@ def _choose_leader(
         key=lambda market_id: (
             len(adjacency.get(market_id, set())),
             events_per_day(series_by_market[market_id]) if market_id in series_by_market else 0.0,
-            eligible_markets[market_id].expected_role != "LEADER",
+            1 if eligible_markets[market_id].expected_role == "LEADER" else 0,
             market_id,
         ),
-        reverse=True,
     )
+    ranked.reverse()
     if not ranked:
         return None
     best = ranked[0]

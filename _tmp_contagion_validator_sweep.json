@@ -1,0 +1,330 @@
+[
+  {
+    "report": {
+      "replay_date": "2026-03-03",
+      "causal_lag_config": {
+        "max_leader_age_ms": 5000.0,
+        "max_lagger_age_ms": 10000.0,
+        "max_causal_lag_ms": 600000.0,
+        "allow_negative_lag": false
+      },
+      "leader_events_evaluated": 9,
+      "events_reaching_spike_check": 5,
+      "cross_market_pairs_evaluated": 2,
+      "causal_gate_pass_rate": 0.5,
+      "legacy_sync_pass_rate": 0.0,
+      "signals_fired": 0,
+      "fills_executed": 0,
+      "dominant_suppressor": "insufficient_leader_impulse",
+      "suppression_breakdown": {
+        "no_toxicity_spike": 4,
+        "insufficient_leader_impulse": 8,
+        "lagger_snapshot_stale": 1,
+        "causal_lag_too_large": 0,
+        "lagger_newer_than_leader": 0,
+        "leader_snapshot_stale": 0,
+        "correlation_too_low": 0,
+        "residual_shift_too_small": 0,
+        "missing_causal_timestamp": 0
+      },
+      "median_lagger_age_ms": 15000.0,
+      "p95_lagger_age_ms": 19500.0,
+      "generated_at": "2026-03-26T23:11:58.072490+00:00"
+    },
+    "diagnostics": {
+      "evaluations_total": 20,
+      "evaluations_with_previous_snapshot": 9,
+      "toxicity_spikes_detected": 5,
+      "reject_no_toxicity_spike": 4,
+      "reject_insufficient_leader_impulse": 8,
+      "reject_correlation_too_low": 0,
+      "reject_residual_shift_too_small": 0,
+      "cross_market_pairs_evaluated": 2,
+      "legacy_sync_pairs_passed": 0,
+      "accepted_causal_lag_count": 1,
+      "reject_leader_snapshot_stale": 0,
+      "reject_lagger_snapshot_stale": 1,
+      "reject_lagger_newer_than_leader": 0,
+      "reject_causal_lag_too_large": 0,
+      "reject_missing_causal_timestamp": 0,
+      "signals_emitted": 0,
+      "forced_signals_emitted": 0,
+      "debug_force_contagion_signal": false,
+      "debug_force_move_threshold": 0.01,
+      "causal_lag_config": {
+        "max_leader_age_ms": 5000.0,
+        "max_lagger_age_ms": 10000.0,
+        "max_causal_lag_ms": 600000.0,
+        "allow_negative_lag": false
+      },
+      "top_leader_shift_samples": [
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 70.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.125,
+          "directional_leader_shift": 0.125,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.125
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.016,
+          "directional_leader_shift": 0.016,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.016
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        }
+      ],
+      "top_toxicity_impulse_samples": [
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_no",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": -0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_no",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": -0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.016,
+          "directional_leader_shift": 0.016,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        }
+      ]
+    }
+  },
+  {
+    "report": {
+      "replay_date": "2026-03-03",
+      "causal_lag_config": {
+        "max_leader_age_ms": 5000.0,
+        "max_lagger_age_ms": 30000.0,
+        "max_causal_lag_ms": 600000.0,
+        "allow_negative_lag": false
+      },
+      "leader_events_evaluated": 9,
+      "events_reaching_spike_check": 5,
+      "cross_market_pairs_evaluated": 2,
+      "causal_gate_pass_rate": 1.0,
+      "legacy_sync_pass_rate": 0.0,
+      "signals_fired": 0,
+      "fills_executed": 0,
+      "dominant_suppressor": "insufficient_leader_impulse",
+      "suppression_breakdown": {
+        "no_toxicity_spike": 4,
+        "insufficient_leader_impulse": 8,
+        "lagger_snapshot_stale": 0,
+        "causal_lag_too_large": 0,
+        "lagger_newer_than_leader": 0,
+        "leader_snapshot_stale": 0,
+        "correlation_too_low": 0,
+        "residual_shift_too_small": 0,
+        "missing_causal_timestamp": 0
+      },
+      "median_lagger_age_ms": 15000.0,
+      "p95_lagger_age_ms": 19500.0,
+      "generated_at": "2026-03-26T23:11:58.089173+00:00"
+    },
+    "diagnostics": {
+      "evaluations_total": 20,
+      "evaluations_with_previous_snapshot": 9,
+      "toxicity_spikes_detected": 5,
+      "reject_no_toxicity_spike": 4,
+      "reject_insufficient_leader_impulse": 8,
+      "reject_correlation_too_low": 0,
+      "reject_residual_shift_too_small": 0,
+      "cross_market_pairs_evaluated": 2,
+      "legacy_sync_pairs_passed": 0,
+      "accepted_causal_lag_count": 2,
+      "reject_leader_snapshot_stale": 0,
+      "reject_lagger_snapshot_stale": 0,
+      "reject_lagger_newer_than_leader": 0,
+      "reject_causal_lag_too_large": 0,
+      "reject_missing_causal_timestamp": 0,
+      "signals_emitted": 0,
+      "forced_signals_emitted": 0,
+      "debug_force_contagion_signal": false,
+      "debug_force_move_threshold": 0.01,
+      "causal_lag_config": {
+        "max_leader_age_ms": 5000.0,
+        "max_lagger_age_ms": 30000.0,
+        "max_causal_lag_ms": 600000.0,
+        "allow_negative_lag": false
+      },
+      "top_leader_shift_samples": [
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 70.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.125,
+          "directional_leader_shift": 0.125,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.125
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.016,
+          "directional_leader_shift": 0.016,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.016
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.001
+        }
+      ],
+      "top_toxicity_impulse_samples": [
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 40.0,
+          "direction": "buy_no",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": -0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": 0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LEADER",
+          "timestamp": 40.0,
+          "direction": "buy_no",
+          "raw_leader_shift": 0.001,
+          "directional_leader_shift": -0.001,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        },
+        {
+          "market_id": "MKT_LAGGER",
+          "timestamp": 50.0,
+          "direction": "buy_yes",
+          "raw_leader_shift": 0.016,
+          "directional_leader_shift": 0.016,
+          "leader_toxicity": 0.0,
+          "toxicity_threshold": 0.0,
+          "observed_value": 0.0
+        }
+      ]
+    }
+  }
+]
