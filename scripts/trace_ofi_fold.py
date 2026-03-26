@@ -327,7 +327,9 @@ def trace_ofi_fold(
     no_asset_ids = tuple(config["no_asset_id"] for config in selected_configs)
 
     fold = folds[fold_index]
-    loader = _build_data_loader(data_dir, fold.train_dates, asset_ids=set(no_asset_ids))
+    loader = _build_data_loader(data_dir, fold.test_dates, asset_ids=set(no_asset_ids))
+    if loader is None:
+        loader = _build_data_loader(data_dir, fold.test_dates)
     if loader is None:
         raise FileNotFoundError("no replay data found for selected fold")
 
@@ -449,8 +451,8 @@ def trace_ofi_fold(
     return TraceReport(
         window=TraceWindow(
             fold_index=fold.index,
-            date_start=fold.train_dates[0],
-            date_end=fold.train_dates[-1],
+            date_start=fold.test_dates[0],
+            date_end=fold.test_dates[-1],
             event_start_iso=_iso(first_event_ts),
             event_end_iso=_iso(last_event_ts),
         ),
@@ -534,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{report.funnel.toxicity_suppressions} -> {report.funnel.depth_vacuum_suppressions} -> "
         f"{report.funnel.final_valid_signals}"
     )
-    print(json.dumps(asdict(report), indent=2))
+    print(json.dumps(asdict(report), indent=2, default=str))
     return 0
 
 

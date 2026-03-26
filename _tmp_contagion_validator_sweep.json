@@ -29,7 +29,7 @@
       },
       "median_lagger_age_ms": 15000.0,
       "p95_lagger_age_ms": 19500.0,
-      "generated_at": "2026-03-26T23:11:58.072490+00:00"
+      "generated_at": "2026-03-26T23:18:29.519546+00:00"
     },
     "diagnostics": {
       "evaluations_total": 20,
@@ -193,7 +193,7 @@
       },
       "median_lagger_age_ms": 15000.0,
       "p95_lagger_age_ms": 19500.0,
-      "generated_at": "2026-03-26T23:11:58.089173+00:00"
+      "generated_at": "2026-03-26T23:18:29.519546+00:00"
     },
     "diagnostics": {
       "evaluations_total": 20,

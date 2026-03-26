@@ -1,0 +1,64 @@
+{
+  "sweep": [
+    {
+      "max_lagger_age_ms": 30000,
+      "pairs_passing": 98,
+      "pass_rate_pct": 12.516,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 60000,
+      "pairs_passing": 174,
+      "pass_rate_pct": 22.2222,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 120000,
+      "pairs_passing": 245,
+      "pass_rate_pct": 31.2899,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 300000,
+      "pairs_passing": 332,
+      "pass_rate_pct": 42.401,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 600000,
+      "pairs_passing": 463,
+      "pass_rate_pct": 59.1315,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 900000,
+      "pairs_passing": 463,
+      "pass_rate_pct": 59.1315,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    },
+    {
+      "max_lagger_age_ms": 1800000,
+      "pairs_passing": 463,
+      "pass_rate_pct": 59.1315,
+      "signals_fired": 0,
+      "dominant_suppressor": "no_toxicity_spike",
+      "median_price_move_in_window": 0.0
+    }
+  ],
+  "recommendation": {
+    "suggested_max_lagger_age_ms": 600000,
+    "rationale": "Selected 600000 ms as the knee of the admissibility curve: 463 pairs pass with median archive price movement 0.0000%. No sweep value produced signals on this archive; recommendation maximizes admissibility while keeping median staleness risk at or below 0.5%."
+  }
+}
