@@ -196,6 +196,8 @@ class MarketWebSocket:
         seconds, forcing a reconnect via the outer backoff loop."""
         while self._running:
             await asyncio.sleep(1.0)
+            if not self.asset_ids:
+                continue
             elapsed = time.time() - self._last_message_time
             if elapsed > self._silence_timeout:
                 log.warning(

@@ -373,6 +373,121 @@ class TradingBot:
         self._orchestrator_health_monitor: OrchestratorHealthMonitor | None = None
         self._orchestrator_tick_interval_ms: int = settings.strategy.heartbeat_check_ms
 
+    async def _refresh_markets_once(self, *, decay_counters: bool) -> None:
+        """Refresh the tracked market universe once."""
+        if decay_counters:
+            decay_mins = settings.strategy.market_refresh_minutes
+            for aid in self._trade_counts:
+                self._trade_counts[aid] = self._trade_counts[aid] / max(decay_mins, 1)
+
+            for aid in list(self._taker_counts):
+                self._taker_counts[aid] = max(0, self._taker_counts[aid] // 2)
+            for aid in list(self._total_counts):
+                self._total_counts[aid] = max(0, self._total_counts[aid] // 2)
+
+        open_markets = self.positions.get_open_market_ids()
+        whale_tokens = self.whale_monitor.get_whale_tokens()
+
+        prev_active = len(self.lifecycle.active)
+        prev_observing = len(self.lifecycle.observing)
+        prev_draining = len(self.lifecycle.draining)
+
+        newly_added, evicted = await self.lifecycle.refresh(
+            orderbook_trackers=self._book_trackers,
+            trade_counts=self._trade_counts,
+            whale_tokens=whale_tokens,
+            open_position_markets=open_markets,
+            taker_counts=self._taker_counts,
+            total_counts=self._total_counts,
+        )
+
+        for cid in evicted:
+            self._l2_active_set.discard(cid)
+            for m in list(self._markets):
+                if m.condition_id == cid:
+                    if self._ws:
+                        await self._ws.remove_assets([m.yes_token_id, m.no_token_id])
+                    if self._l2_ws:
+                        await self._l2_ws.remove_assets([m.yes_token_id, m.no_token_id])
+                    self._unwire_market(m)
+                    break
+
+        l2_limit = settings.strategy.max_active_l2_markets
+        all_tracked = self.lifecycle.get_all_tracked()
+        all_tracked.sort(key=lambda m: m.daily_volume_usd, reverse=True)
+        self._l2_active_set = {
+            m.condition_id for m in all_tracked[:l2_limit]
+        }
+
+        tracked_markets = sorted(
+            (am.info for am in self.lifecycle.active.values()),
+            key=lambda market: market.daily_volume_usd,
+            reverse=True,
+        )[:l2_limit]
+        await self._reconcile_tracked_markets(tracked_markets)
+
+        stale_evicted = self.lifecycle.check_stale_markets(
+            yes_aggs=self._yes_aggs,
+            open_position_markets=open_markets,
+            stale_threshold_s=settings.strategy.stale_market_eviction_s,
+        )
+        for cid in stale_evicted:
+            for m in list(self._markets):
+                if m.condition_id == cid:
+                    if self._ws:
+                        await self._ws.remove_assets([m.yes_token_id, m.no_token_id])
+                    if self._l2_ws:
+                        await self._l2_ws.remove_assets([m.yes_token_id, m.no_token_id])
+                    self._unwire_market(m)
+                    break
+
+        for cid, am in self.lifecycle.active.items():
+            tid = am.info.yes_token_id
+            agg = self._yes_aggs.get(tid)
+            bt = self._book_trackers.get(tid)
+            tpm = self._trade_counts.get(tid, 0.0)
+            last_trade_age = (
+                round(time.time() - agg.last_trade_time, 1)
+                if agg and agg.last_trade_time > 0
+                else -1
+            )
+            bars = len(agg.bars) if agg else 0
+            spread = bt.spread_cents if bt and bt.has_data else -1
+            log.info(
+                "market_health",
+                condition_id=cid,
+                score=round(am.score.total, 1),
+                trades_per_min=round(tpm, 2),
+                last_trade_age_s=last_trade_age,
+                bars=bars,
+                spread_cents=spread,
+            )
+
+        total = len(self.lifecycle.active)
+        obs = len(self.lifecycle.observing)
+        drn = len(self.lifecycle.draining)
+        universe = total + obs + drn
+        discovered = len(newly_added)
+        dropped = len(evicted) + len(stale_evicted)
+
+        if newly_added or evicted or stale_evicted:
+            log.info(
+                "market_refresh_done",
+                discovered=discovered,
+                dropped=dropped,
+                active=total,
+                observing=obs,
+                draining=drn,
+            )
+            promoted = max(0, total - prev_active)
+            await self.telegram.send(
+                f"🔄 <b>Market refresh</b>\n"
+                f"Universe: {universe} tracked "
+                f"(+{discovered} discovered, -{dropped} dropped)\n"
+                f"Active: {total} (+{promoted} promoted)  |  "
+                f"Observing: {obs}  |  Draining: {drn}"
+            )
+
     async def start(self) -> None:
         """Start background tasks and live runtime services for the trading bot."""
         self._running = True
@@ -488,6 +603,8 @@ class TradingBot:
             self.positions._stealth = self._stealth
         # Wire OHLCV aggregators for POV volume lookups in scale_probe_to_full
         self.positions._ohlcv_aggs = self._no_aggs
+
+        await self._refresh_markets_once(decay_counters=False)
 
         self._tasks = [
             asyncio.create_task(self._ws.start(), name="ws"),
@@ -4490,141 +4607,14 @@ class TradingBot:
         """Periodically re-discover, re-score, promote/demote/evict."""
         interval = settings.strategy.market_refresh_minutes * 60
         while self._running:
-            await asyncio.sleep(interval)
             try:
-                # Decay trade frequency counts (approximate trades/min)
-                decay_mins = settings.strategy.market_refresh_minutes
-                for aid in self._trade_counts:
-                    self._trade_counts[aid] = self._trade_counts[aid] / max(decay_mins, 1)
-
-                # Decay taker/total counts (halve each refresh cycle)
-                for aid in list(self._taker_counts):
-                    self._taker_counts[aid] = max(0, self._taker_counts[aid] // 2)
-                for aid in list(self._total_counts):
-                    self._total_counts[aid] = max(0, self._total_counts[aid] // 2)
-
-                open_markets = self.positions.get_open_market_ids()
-                whale_tokens = self.whale_monitor.get_whale_tokens()
-
-                # Snapshot tier counts before refresh for delta tracking
-                prev_active = len(self.lifecycle.active)
-                prev_observing = len(self.lifecycle.observing)
-                prev_draining = len(self.lifecycle.draining)
-
-                newly_added, evicted = await self.lifecycle.refresh(
-                    orderbook_trackers=self._book_trackers,
-                    trade_counts=self._trade_counts,
-                    whale_tokens=whale_tokens,
-                    open_position_markets=open_markets,
-                    taker_counts=self._taker_counts,
-                    total_counts=self._total_counts,
-                )
-
-                # Evict markets
-                for cid in evicted:
-                    self._l2_active_set.discard(cid)
-                    for m in list(self._markets):
-                        if m.condition_id == cid:
-                            if self._ws:
-                                await self._ws.remove_assets(
-                                    [m.yes_token_id, m.no_token_id]
-                                )
-                            if self._l2_ws:
-                                await self._l2_ws.remove_assets(
-                                    [m.yes_token_id, m.no_token_id]
-                                )
-                            self._unwire_market(m)
-                            break
-
-                # Re-evaluate L2 active set before wiring new markets
-                # so _wire_market knows which markets get full L2
-                l2_limit = settings.strategy.max_active_l2_markets
-                all_tracked = self.lifecycle.get_all_tracked()
-                all_tracked.sort(key=lambda m: m.daily_volume_usd, reverse=True)
-                self._l2_active_set = {
-                    m.condition_id for m in all_tracked[:l2_limit]
-                }
-
-                tracked_markets = sorted(
-                    (am.info for am in self.lifecycle.active.values()),
-                    key=lambda market: market.daily_volume_usd,
-                    reverse=True,
-                )[:l2_limit]
-                await self._reconcile_tracked_markets(tracked_markets)
-
-                # ── Stale trade eviction ──────────────────────────────
-                stale_evicted = self.lifecycle.check_stale_markets(
-                    yes_aggs=self._yes_aggs,
-                    open_position_markets=open_markets,
-                    stale_threshold_s=settings.strategy.stale_market_eviction_s,
-                )
-                for cid in stale_evicted:
-                    for m in list(self._markets):
-                        if m.condition_id == cid:
-                            if self._ws:
-                                await self._ws.remove_assets(
-                                    [m.yes_token_id, m.no_token_id]
-                                )
-                            if self._l2_ws:
-                                await self._l2_ws.remove_assets(
-                                    [m.yes_token_id, m.no_token_id]
-                                )
-                            self._unwire_market(m)
-                            break
-
-                # ── Per-market health log ─────────────────────────────
-                for cid, am in self.lifecycle.active.items():
-                    tid = am.info.yes_token_id
-                    agg = self._yes_aggs.get(tid)
-                    bt = self._book_trackers.get(tid)
-                    tpm = self._trade_counts.get(tid, 0.0)
-                    last_trade_age = (
-                        round(time.time() - agg.last_trade_time, 1)
-                        if agg and agg.last_trade_time > 0
-                        else -1
-                    )
-                    bars = len(agg.bars) if agg else 0
-                    spread = bt.spread_cents if bt and bt.has_data else -1
-                    log.info(
-                        "market_health",
-                        condition_id=cid,
-                        score=round(am.score.total, 1),
-                        trades_per_min=round(tpm, 2),
-                        last_trade_age_s=last_trade_age,
-                        bars=bars,
-                        spread_cents=spread,
-                    )
-
-                total = len(self.lifecycle.active)
-                obs = len(self.lifecycle.observing)
-                drn = len(self.lifecycle.draining)
-                universe = total + obs + drn
-                discovered = len(newly_added)
-                dropped = len(evicted) + len(stale_evicted)
-
-                if newly_added or evicted or stale_evicted:
-                    log.info(
-                        "market_refresh_done",
-                        discovered=discovered,
-                        dropped=dropped,
-                        active=total,
-                        observing=obs,
-                        draining=drn,
-                    )
-                    # Separate universe-level deltas from tier breakdown
-                    promoted = max(0, total - prev_active)
-                    await self.telegram.send(
-                        f"🔄 <b>Market refresh</b>\n"
-                        f"Universe: {universe} tracked "
-                        f"(+{discovered} discovered, -{dropped} dropped)\n"
-                        f"Active: {total} (+{promoted} promoted)  |  "
-                        f"Observing: {obs}  |  Draining: {drn}"
-                    )
+                await self._refresh_markets_once(decay_counters=True)
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("market_refresh_error", error=str(exc), exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _pce_refresh_loop(self) -> None:
         """Periodically recompute correlations, persist, and send dashboard."""

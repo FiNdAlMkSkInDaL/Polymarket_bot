@@ -388,7 +388,7 @@ class StrategyParams:
     heartbeat_check_ms: int = _env_int("HEARTBEAT_CHECK_MS", 500)
     heartbeat_stale_ms: int = _env_int("HEARTBEAT_STALE_MS", 15000)
     heartbeat_stale_count: int = _env_int("HEARTBEAT_STALE_COUNT", 3)
-    ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 10.0)
+    ws_silence_timeout_s: float = _env_float("WS_SILENCE_TIMEOUT_S", 30.0)
     # L2 uses a separate, longer timeout because low-volume markets
     # can go minutes without book changes.  Ping/pong keeps the TCP
     # socket alive; application-level silence is expected.

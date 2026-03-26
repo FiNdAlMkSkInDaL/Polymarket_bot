@@ -258,6 +258,8 @@ class L2WebSocket:
         """Close the WS if no messages for ``_silence_timeout`` seconds."""
         while self._running:
             await asyncio.sleep(1.0)
+            if not self._books:
+                continue
             elapsed = time.time() - self._last_message_time
             if elapsed > self._silence_timeout:
                 log.warning(
