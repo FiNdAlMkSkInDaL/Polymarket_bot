@@ -317,13 +317,17 @@ class TradingBot:
         self._stale_bar_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._retrigger_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._tp_rescale_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
+        self._combo_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._ghost_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._timeout_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
         self._oracle_breaker = ExceptionCircuitBreaker(threshold=5, window_s=60.0)
 
         self._cluster_mgr = ArbitrageClusterManager()
+        self._combo_positions: dict[str, ComboPosition] = {}
+        self._combo_ofi_alerted: set[str] = set()
         self._combo_detector: ComboArbDetector | None = None
         self._bayesian_cluster_mgr = BayesianArbRelationshipManager()
+        self._bayesian_ofi_alerted: set[str] = set()
         self._bayesian_detector: BayesianArbDetector | None = None
 
         self._oracle_registry = OracleAdapterRegistry()
