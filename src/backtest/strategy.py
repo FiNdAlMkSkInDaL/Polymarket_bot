@@ -1060,6 +1060,10 @@ class ContagionReplayAdapter(StrategyABC):
             max_pairs_per_leader=self._params.contagion_arb_max_pairs_per_leader,
             shadow_mode=False,
             max_cross_book_desync_ms=self._params.max_cross_book_desync_ms,
+            max_leader_age_ms=self._params.contagion_arb_max_leader_age_ms,
+            max_lagger_age_ms=self._params.contagion_arb_max_lagger_age_ms,
+            max_causal_lag_ms=self._params.contagion_arb_max_causal_lag_ms,
+            allow_negative_lag=self._params.contagion_arb_allow_negative_lag,
         )
 
     def detector_diagnostics(self) -> dict[str, Any]:

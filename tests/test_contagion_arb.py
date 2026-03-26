@@ -170,7 +170,7 @@ def test_contagion_signal_requires_shared_theme() -> None:
     assert signals == []
 
 
-def test_contagion_signal_suppressed_when_leader_and_lagger_books_are_desynced() -> None:
+def test_contagion_signal_suppressed_when_lagger_snapshot_is_stale() -> None:
     sync_blocks: list[float] = []
     rpe = ResolutionProbabilityEngine(
         models=[],
@@ -225,8 +225,10 @@ def test_contagion_signal_suppressed_when_leader_and_lagger_books_are_desynced()
     )
 
     assert signals == []
-    assert len(sync_blocks) == 1
-    assert sync_blocks[0] > 400.0
+    diagnostics = detector.diagnostics_snapshot()
+    assert sync_blocks == []
+    assert diagnostics["reject_lagger_snapshot_stale"] >= 1
+    assert diagnostics["accepted_causal_lag_count"] == 0
 
 
 def test_contagion_diagnostics_capture_top_leader_shift_and_toxicity_impulse_samples() -> None:

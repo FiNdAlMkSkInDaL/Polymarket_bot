@@ -1,0 +1,1093 @@
+{
+  "replay_analysis": {
+    "champion_fold_dates": [
+      "2026-03-03"
+    ],
+    "backtest_metrics": {
+      "total_pnl": 0.0,
+      "total_pnl_pct": 0.0,
+      "total_fees_paid": 0,
+      "maker_fees": 0,
+      "taker_fees": 0,
+      "total_fills": 0,
+      "maker_fills": 0,
+      "taker_fills": 0,
+      "maker_taker_ratio": Infinity,
+      "total_volume": 0,
+      "maker_volume": 0,
+      "taker_volume": 0,
+      "total_slippage": 0.0,
+      "avg_slippage_bps": 0.0,
+      "slippage_count": 0,
+      "max_drawdown": 0.0,
+      "max_drawdown_usd": 0.0,
+      "sharpe_ratio": 0.0,
+      "sortino_ratio": 0.0,
+      "round_trips": 0,
+      "winners": 0,
+      "losers": 0,
+      "win_rate": 0.0,
+      "avg_win": 0.0,
+      "avg_loss": 0.0,
+      "profit_factor": 0.0,
+      "avg_hold_time_s": 0.0,
+      "equity_curve": [
+        [
+          1772500072.84,
+          1000.0
+        ],
+        [
+          1772502008.7,
+          1000.0
+        ],
+        [
+          1772503972.2,
+          1000.0
+        ],
+        [
+          1772505624.34,
+          1000.0
+        ],
+        [
+          1772507272.13,
+          1000.0
+        ],
+        [
+          1772509328.87,
+          1000.0
+        ],
+        [
+          1772512276.52,
+          1000.0
+        ],
+        [
+          1772512859.12,
+          1000.0
+        ],
+        [
+          1772515599.28,
+          1000.0
+        ],
+        [
+          1772517602.26,
+          1000.0
+        ],
+        [
+          1772520088.66,
+          1000.0
+        ],
+        [
+          1772520801.13,
+          1000.0
+        ],
+        [
+          1772522607.04,
+          1000.0
+        ],
+        [
+          1772525233.05,
+          1000.0
+        ],
+        [
+          1772528150.02,
+          1000.0
+        ],
+        [
+          1772529293.3,
+          1000.0
+        ],
+        [
+          1772531519.27,
+          1000.0
+        ],
+        [
+          1772534128.2,
+          1000.0
+        ],
+        [
+          1772535526.44,
+          1000.0
+        ],
+        [
+          1772537442.43,
+          1000.0
+        ],
+        [
+          1772539117.36,
+          1000.0
+        ],
+        [
+          1772539370.0,
+          1000.0
+        ],
+        [
+          1772541297.25,
+          1000.0
+        ],
+        [
+          1772543541.84,
+          1000.0
+        ],
+        [
+          1772546804.66,
+          1000.0
+        ],
+        [
+          1772548515.09,
+          1000.0
+        ],
+        [
+          1772552288.85,
+          1000.0
+        ],
+        [
+          1772553383.69,
+          1000.0
+        ],
+        [
+          1772555068.81,
+          1000.0
+        ],
+        [
+          1772556935.36,
+          1000.0
+        ],
+        [
+          1772557538.45,
+          1000.0
+        ],
+        [
+          1772558068.46,
+          1000.0
+        ],
+        [
+          1772558414.62,
+          1000.0
+        ],
+        [
+          1772559871.34,
+          1000.0
+        ],
+        [
+          1772563488.39,
+          1000.0
+        ],
+        [
+          1772564573.23,
+          1000.0
+        ],
+        [
+          1772565969.85,
+          1000.0
+        ],
+        [
+          1772567687.75,
+          1000.0
+        ],
+        [
+          1772568912.58,
+          1000.0
+        ],
+        [
+          1772569753.77,
+          1000.0
+        ],
+        [
+          1772570498.91,
+          1000.0
+        ],
+        [
+          1772571393.32,
+          1000.0
+        ],
+        [
+          1772571735.64,
+          1000.0
+        ],
+        [
+          1772572529.8,
+          1000.0
+        ],
+        [
+          1772573890.19,
+          1000.0
+        ],
+        [
+          1772574361.06,
+          1000.0
+        ],
+        [
+          1772574847.27,
+          1000.0
+        ],
+        [
+          1772576023.73,
+          1000.0
+        ],
+        [
+          1772576871.92,
+          1000.0
+        ],
+        [
+          1772577813.87,
+          1000.0
+        ],
+        [
+          1772578206.31,
+          1000.0
+        ],
+        [
+          1772578939.73,
+          1000.0
+        ],
+        [
+          1772579563.03,
+          1000.0
+        ],
+        [
+          1772579934.94,
+          1000.0
+        ],
+        [
+          1772580544.56,
+          1000.0
+        ],
+        [
+          1772580964.81,
+          1000.0
+        ],
+        [
+          1772581688.02,
+          1000.0
+        ],
+        [
+          1772582377.85,
+          1000.0
+        ]
+      ],
+      "avg_portfolio_correlation": 0.0,
+      "max_portfolio_var": 0.0,
+      "pce_rejections": 0,
+      "diversification_ratio": 0.0,
+      "smart_passive_counters": {
+        "smart_passive_started": 0,
+        "maker_filled": 0,
+        "fallback_triggered": 0
+      }
+    },
+    "detector_diagnostics": {
+      "evaluations_total": 4137,
+      "reject_no_toxicity_spike": 2415,
+      "reject_insufficient_leader_impulse": 552,
+      "reject_correlation_too_low": 0,
+      "reject_residual_shift_too_small": 0,
+      "signals_emitted": 0,
+      "forced_signals_emitted": 0,
+      "debug_force_contagion_signal": true,
+      "debug_force_move_threshold": 0.01,
+      "top_leader_shift_samples": [],
+      "top_toxicity_impulse_samples": []
+    },
+    "leader_counts": {
+      "evaluations_with_previous": 3034,
+      "events_with_spike": 619,
+      "events_with_impulse": 224
+    },
+    "sync_analysis": {
+      "leader_yes_no": {
+        "count": 4137,
+        "quantiles_ms": {
+          "p50": 1.2829303741455078,
+          "p90": 241998.3365535736,
+          "p95": 594642.9259777069,
+          "p99": 1789735.272884369,
+          "max": 4385571.976184845,
+          "mean": 91817.22124705777
+        },
+        "pass_rates": {
+          "1132": 0.73459,
+          "2000": 0.744259,
+          "5000": 0.751269
+        }
+      },
+      "leader_to_lagger": {
+        "count": 783,
+        "quantiles_ms": {
+          "p50": 443781.7018032074,
+          "p90": 1448271.3994979858,
+          "p95": 1715462.2914791107,
+          "p99": 2378188.7407302856,
+          "max": 2378197.6816654205,
+          "mean": 596654.336434519
+        },
+        "pass_rates": {
+          "1132": 0.103448,
+          "2000": 0.103448,
+          "5000": 0.111111
+        }
+      }
+    },
+    "pair_comovement": {
+      "runtime_corr_matrix": [
+        {
+          "pair": "0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "corr": 0.85
+        },
+        {
+          "pair": "0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "corr": 0.85
+        },
+        {
+          "pair": "0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846",
+          "corr": 0.85
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739",
+          "corr": 0.85
+        }
+      ],
+      "matched_return_pairs": [
+        {
+          "pair": "0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "matched_moves": 80,
+          "pearson_matched_returns": 0.4757667437358539,
+          "same_direction_rate": 1.0,
+          "mean_abs_delta_a": 0.00025,
+          "mean_abs_delta_b": 0.0002,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 289254.115
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "matched_moves": 214,
+          "pearson_matched_returns": 0.009433962264150936,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000327,
+          "mean_abs_delta_b": 9.3e-05,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 870651.388
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "matched_moves": 172,
+          "pearson_matched_returns": 0.0,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000349,
+          "mean_abs_delta_b": 5.8e-05,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 986269.784
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846",
+          "matched_moves": 186,
+          "pearson_matched_returns": -0.004397004914713558,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000296,
+          "mean_abs_delta_b": 0.000242,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 449465.38
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739",
+          "matched_moves": 126,
+          "pearson_matched_returns": -0.008717059147621331,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000794,
+          "mean_abs_delta_b": 0.000317,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 77496.882
+        },
+        {
+          "pair": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "matched_moves": 182,
+          "pearson_matched_returns": -0.017931713827583434,
+          "same_direction_rate": 0.0,
+          "mean_abs_delta_a": 0.00044,
+          "mean_abs_delta_b": 0.000157,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 448754.594
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739",
+          "matched_moves": 72,
+          "pearson_matched_returns": -0.027226638505866506,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000278,
+          "mean_abs_delta_b": 0.000417,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 161358.012
+        },
+        {
+          "pair": "0x48fbf70c1713e71a405052bc4641e26dbba435fa557672c4040763c901cbf606|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "matched_moves": 210,
+          "pearson_matched_returns": -0.050182433625483865,
+          "same_direction_rate": 0.333333,
+          "mean_abs_delta_a": 0.000333,
+          "mean_abs_delta_b": 0.000181,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 985927.927
+        },
+        {
+          "pair": "0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66|0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+          "matched_moves": 198,
+          "pearson_matched_returns": -0.2397717082274314,
+          "same_direction_rate": 0.0,
+          "mean_abs_delta_a": 7.6e-05,
+          "mean_abs_delta_b": 0.000129,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 489791.902
+        },
+        {
+          "pair": "0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739|0xb215decbedd846168842f6e207f09bd5f50ce51d2191f238887d976ec21b6f66",
+          "matched_moves": 68,
+          "pearson_matched_returns": null,
+          "same_direction_rate": null,
+          "mean_abs_delta_a": 0.000294,
+          "mean_abs_delta_b": 0.0,
+          "mean_runtime_corr": 0.85,
+          "sync_p50_ms": 396420.56
+        }
+      ]
+    }
+  },
+  "cluster_candidates": {
+    "top_candidates": [
+      {
+        "event_id": "75478",
+        "title": "Fed decision in April?",
+        "leg_count": 4,
+        "cluster_score": 1.083414985369949,
+        "total_volume_24h": 2833204.9502419997,
+        "total_liquidity": 2615069.00726,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0x0d14f5dc9fb3250ec888b1ac8d9fe9a0ce06f9d3ea60fdf138e8690622fea84c",
+            "question": "Will the Fed decrease interest rates by 25 bps after the April 2026 meeting?",
+            "group_item_title": "25 bps decrease",
+            "volume_24h": 464085.9285959999,
+            "liquidity": 689731.18811,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xd4d00e5bf8b960cc37c74c1ec19e41e00b0706add203ddcfbb65ad006c5c223a",
+            "question": "Will the Fed increase interest rates by 25+ bps after the April 2026 meeting?",
+            "group_item_title": "25+ bps increase",
+            "volume_24h": 796836.7551380002,
+            "liquidity": 310621.93516,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xd72622d154dfe65b9c019d6afcfe75a55717e5c502db611f555b101aafbf6ec5",
+            "question": "Will the Fed decrease interest rates by 50+ bps after the April 2026 meeting?",
+            "group_item_title": "50+ bps decrease",
+            "volume_24h": 1067611.3829799998,
+            "liquidity": 1090216.90361,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x36e8ca24d2a13435f519f15580d42b45cdbe3bc425fb39a7c2733260357af0fa",
+            "question": "Will there be no change in Fed interest rates after the April 2026 meeting?",
+            "group_item_title": "No change",
+            "volume_24h": 504670.88352800003,
+            "liquidity": 524498.98038,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "107420",
+        "title": "Slovenian Parliamentary Election Winner",
+        "leg_count": 2,
+        "cluster_score": 30.203497310448874,
+        "total_volume_24h": 2505984.7596080005,
+        "total_liquidity": 82970.01946,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xc28589f4effa41509c87c36535208481f7ab8878a4926a1014d6e525816df729",
+            "question": "Will the Freedom Movement (GS) win the most seats in the 2026 Slovenian parliamentary election?",
+            "group_item_title": "Freedom Movement (GS)",
+            "volume_24h": 1165524.9639650027,
+            "liquidity": 64630.20394,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x64d6a172e63a085198fcd8032da984cc42398e21d8984eaf4813ce6e3f0469a6",
+            "question": "Will the Slovenian Democratic Party (SDS) win the most seats in the 2026 Slovenian parliamentary election?",
+            "group_item_title": "Slovenian Democratic Party (SDS)",
+            "volume_24h": 1340459.795642998,
+            "liquidity": 18339.81552,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "33509",
+        "title": "La Liga Winner",
+        "leg_count": 4,
+        "cluster_score": 1.219446812369326,
+        "total_volume_24h": 1513092.8669909998,
+        "total_liquidity": 1240802.67515,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xad9cf9a89f41009718b3858c47ea30c88491dbf9f043b8fcd704c4ba65be8edf",
+            "question": "Will Atletico Madrid win the 2025\u201326 La Liga?",
+            "group_item_title": "Atletico Madrid",
+            "volume_24h": 344908.36999999994,
+            "liquidity": 428896.44624,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x069fef06f8b32dee6a22fab6189249dc83582f22cb737a85225b114770d7da05",
+            "question": "Will Barcelona win the 2025\u201326 La Liga?",
+            "group_item_title": "Barcelona",
+            "volume_24h": 17582.922005,
+            "liquidity": 94158.1265,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xa1f08ec3bcc1434cb0b695bd5ee9f81268ef45fb73f752b3a1c1fb1d35750866",
+            "question": "Will Real Madrid win the 2025\u201326 La Liga?",
+            "group_item_title": "Real Madrid",
+            "volume_24h": 14334.110798000002,
+            "liquidity": 155687.0877,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x683b0254bde8d1ef08206953015629f25b9869d9770807baab939f6aaba4ae5c",
+            "question": "Will Villarreal win the 2025\u201326 La Liga?",
+            "group_item_title": "Villarreal",
+            "volume_24h": 1136267.464188,
+            "liquidity": 562061.01471,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "33507",
+        "title": "English Premier League Winner",
+        "leg_count": 5,
+        "cluster_score": 0.3813677262015883,
+        "total_volume_24h": 1450299.147909337,
+        "total_liquidity": 3802889.04453,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xcba24842ceac7a40d2a8b9adde1f4407999b6505193b9fd68156ae76fbffa706",
+            "question": "Will Arsenal win the 2025\u201326 English Premier League?",
+            "group_item_title": "Arsenal",
+            "volume_24h": 58570.27571900003,
+            "liquidity": 486522.5233,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x2ca58175aa8080357d9706c535bb0be218ce7bb156dc48753e0d8b8ee6b56635",
+            "question": "Will Aston Villa win the 2025\u201326 English Premier League?",
+            "group_item_title": "Aston Villa",
+            "volume_24h": 538979.902,
+            "liquidity": 637121.10472,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x65a2dd0af5f4155915a701e8fdbcdb2f547fb5925d0bcef0b373a8c39a16613e",
+            "question": "Will Liverpool win the 2025\u201326 English Premier League?",
+            "group_item_title": "Liverpool",
+            "volume_24h": 7.31,
+            "liquidity": 1385936.64853,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xfb1835b887c33862f5749c619e612d1244ab6e66115f0ef43d373485dc3a1573",
+            "question": "Will Manchester City win the 2025\u201326 English Premier League?",
+            "group_item_title": "Man City",
+            "volume_24h": 824660.134190337,
+            "liquidity": 840690.9335,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x7cab9da787443beec1eb5e399afd46fffdc27b5f00e0293a1d6a9996c948ac52",
+            "question": "Will Manchester United win the 2025\u201326 English Premier League?",
+            "group_item_title": "Man United",
+            "volume_24h": 28081.525999999998,
+            "liquidity": 452617.83448,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "166459",
+        "title": "Next Prime Minister of Slovenia",
+        "leg_count": 4,
+        "cluster_score": 9.245219040869447,
+        "total_volume_24h": 316408.4580900001,
+        "total_liquidity": 34224.00883,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xdcdecdd86db43aa1d0c4ed4fc80142e86597c5383a22eccf006464c29099371c",
+            "question": "Will An\u017ee Logar be the next Prime Minister of Slovenia?",
+            "group_item_title": "An\u017ee Logar",
+            "volume_24h": 65174.219924000034,
+            "liquidity": 9533.8593,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xe94749bbf616139120735f9720de5b1a94b61cb7da0feb633f97f113d61a167b",
+            "question": "Will Janez Jan\u0161a be the next Prime Minister of Slovenia?",
+            "group_item_title": "Janez Jan\u0161a",
+            "volume_24h": 113473.27928799998,
+            "liquidity": 9397.1213,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x409836e4b9af0e8f7d1c2cc5f071d9ecb85efe706091323c4294c6859cc09ba0",
+            "question": "Will Robert Golob be the next Prime Minister of Slovenia?",
+            "group_item_title": "Robert Golob",
+            "volume_24h": 124989.60270300007,
+            "liquidity": 8850.8201,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x066ab5c23968b87e3dedae9843889eb60de22dfa07498d938bafee0b684439cb",
+            "question": "Will Vladimir Prebili\u010d be the next Prime Minister of Slovenia?",
+            "group_item_title": "Vladimir Prebili\u010d",
+            "volume_24h": 12771.356174999999,
+            "liquidity": 6442.20813,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "101772",
+        "title": "Fed Decision in June?",
+        "leg_count": 5,
+        "cluster_score": 0.4577712921617127,
+        "total_volume_24h": 293791.152183,
+        "total_liquidity": 641785.88132,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xdde06286a7b9464d344f410ab0b3d2ebc6469904e72c27fd982f65fdbf78768d",
+            "question": "Will the Fed decrease interest rates by 25 bps after the June 2026 meeting?",
+            "group_item_title": "25 bps decrease",
+            "volume_24h": 20912.924201000005,
+            "liquidity": 109321.9529,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xa7cb4135c6d9c36da0e343874dd5b455de739c6d1b9f9f5583dd9320aacf5db2",
+            "question": "Will the Fed increase interest rates by 25 bps after the June 2026 meeting?",
+            "group_item_title": "25 bps increase",
+            "volume_24h": 45871.494759,
+            "liquidity": 110092.85336,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x4e4a7df876b0c04f0b8b29b9073eddfbaf5c787192da825ae7ca1031bc8cfd15",
+            "question": "Will the Fed decrease interest rates by 50+ bps after the June 2026 meeting?",
+            "group_item_title": "50+ bps decrease",
+            "volume_24h": 29884.222030999998,
+            "liquidity": 204155.58414,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xb01e70a56199a6d5467f47a2b94e75e7c7218c128c8d0b8beb6dafed2f0d15c2",
+            "question": "Will the Fed increase interest rates by 50+ bps after the June 2026 meeting?",
+            "group_item_title": "50+ bps increase",
+            "volume_24h": 116561.64280599997,
+            "liquidity": 115706.04102,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xde04b189b3f19eaccda02529a3ea67abfc46bff5c0c8fc42d8a2d0ed7b8f0d41",
+            "question": "Will there be no change in Fed interest rates after the June 2026 meeting?",
+            "group_item_title": "No change",
+            "volume_24h": 80560.868386,
+            "liquidity": 102509.4499,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "80918",
+        "title": "Who will win the Lyon mayoral election?",
+        "leg_count": 4,
+        "cluster_score": 3.2732652558905455,
+        "total_volume_24h": 266627.07641900016,
+        "total_liquidity": 81455.99442,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0x17bcdc8803522b1014b6c8e7c5ddc3db18e9704c126d14d391e1e486970cce91",
+            "question": "Will Alexandre Dupalais win the 2026 Lyon mayoral election?",
+            "group_item_title": "Alexandre Dupalais",
+            "volume_24h": 2640.0,
+            "liquidity": 31830.6853,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x9c1cac166616ca0b8d6117223aa9b2fb6e60d9190cd5261245c329e471ef459b",
+            "question": "Will Gr\u00e9gory Doucet win the 2026 Lyon mayoral election?",
+            "group_item_title": "Gr\u00e9gory Doucet",
+            "volume_24h": 142801.66678200013,
+            "liquidity": 10784.56423,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x1bb43dc44799556ee98623b3ec98bdf0d094ba4bf2dfc73e7df32a4a9f75d737",
+            "question": "Will Jean-Michel Aulas win the 2026 Lyon mayoral election?",
+            "group_item_title": "Jean-Michel Aulas",
+            "volume_24h": 120185.40963700003,
+            "liquidity": 12554.17043,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x379914c8e1309261364e9a8f7888e99004ca398a9db6737fe821505cdb153bf5",
+            "question": "Will Nathalie Perrin-Gilbert win the 2026 Lyon mayoral election?",
+            "group_item_title": "Nathalie Perrin-Gilbert",
+            "volume_24h": 1000.0,
+            "liquidity": 26286.57446,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "32224",
+        "title": "Which party will win the Senate in 2026?",
+        "leg_count": 2,
+        "cluster_score": 0.266132147908344,
+        "total_volume_24h": 93355.30360000001,
+        "total_liquidity": 350785.5189,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0x307a1ed89d60b61002dd5bbf00e1408c5ed2ab3fcdb056191ca7ef9bc34d38f3",
+            "question": "Will the Democratic Party control the Senate after the 2026 Midterm elections?",
+            "group_item_title": "Democratic Party",
+            "volume_24h": 51102.388523,
+            "liquidity": 193007.0969,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x86bfb53af7250a40928975c551d12c185b762fa4ce0b40c6a64a50c946d72587",
+            "question": "Will the Republican Party control the Senate after the 2026 Midterm elections?",
+            "group_item_title": "Republican Party",
+            "volume_24h": 42252.91507700001,
+            "liquidity": 157778.422,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "80911",
+        "title": "Who will win the Nice mayoral election?",
+        "leg_count": 4,
+        "cluster_score": 1.0606608633712347,
+        "total_volume_24h": 75664.01073600001,
+        "total_liquidity": 71336.66693,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xc5b07cdec6c7ff66113ce4160ecb2ca148df06b72c170cfa0ec8d4a52309c7fa",
+            "question": "Will Christian Estrosi win the 2026 Nice mayoral election?",
+            "group_item_title": "Christian Estrosi",
+            "volume_24h": 42375.25680600001,
+            "liquidity": 14673.6345,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xd90a30a612b04f2aab7f8d8c67d3696d6aceafa8446ae4e0548e0e4492d7b14f",
+            "question": "Will Eric Ciotti win the 2026 Nice mayoral election?",
+            "group_item_title": "Eric Ciotti",
+            "volume_24h": 33288.75393,
+            "liquidity": 5453.85355,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xa50a1b10bec49d2ab35197289678fdbed917a5111d5b629ae47753fc14d3eb93",
+            "question": "Will Juliette Chesnel-Leroux win the 2026 Nice mayoral election?",
+            "group_item_title": "Juliette Chesnel-Leroux",
+            "volume_24h": 0.0,
+            "liquidity": 25271.82657,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x92aa5a508a571ba5be623c7595b5c24968ace5bbbc637314384ee076f83f6dae",
+            "question": "Will Mireille Damiano win the 2026 Nice mayoral election?",
+            "group_item_title": "Mireille Damiano",
+            "volume_24h": 0.0,
+            "liquidity": 25937.35231,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      },
+      {
+        "event_id": "95203",
+        "title": "Quebec General Election Winner",
+        "leg_count": 6,
+        "cluster_score": 0.44269870965495134,
+        "total_volume_24h": 33239.541666,
+        "total_liquidity": 75083.89100999999,
+        "available_legs": 0,
+        "coverage_ratio": 0.0,
+        "markets": [
+          {
+            "condition_id": "0xc7bc5d759ecbd05cfbf3b41ec98f1cd7ab306234bf76fd6c1768d3be1d6b9e76",
+            "question": "Will Coalition Avenir Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "CAQ",
+            "volume_24h": 5.0,
+            "liquidity": 13055.2746,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0xb79b3e4a9eca37f56dbd00bb495be37079050b1bea9759e0281fe8fe475dc5aa",
+            "question": "Will Parti conservateur du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "PCQ",
+            "volume_24h": 33074.691666,
+            "liquidity": 12019.58615,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x9b609d94cd0e303bf36f68a422a93f7dad9f58a2f8e4212eef51eed93480f323",
+            "question": "Will Parti lib\u00e9ral du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "PLQ",
+            "volume_24h": 8.0,
+            "liquidity": 9520.3126,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x30d4a64f70d80faee66508a797b347ef65e63913e4200bca954718fc824ea10e",
+            "question": "Will Parti Qu\u00e9b\u00e9cois win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "PQ",
+            "volume_24h": 151.85,
+            "liquidity": 12361.3628,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x72a433f7e229db037d504dbbed5c93bfcaccf9c641521be7290db4b357eb3352",
+            "question": "Will Parti vert du Qu\u00e9bec win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "PVQ",
+            "volume_24h": 0.0,
+            "liquidity": 13243.64833,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          },
+          {
+            "condition_id": "0x4c7d3102ab3408414937b8ed71a34914c117650bfa484069534761babec02560",
+            "question": "Will Qu\u00e9bec solidaire win the most seats in the 2026 Quebec general election?",
+            "group_item_title": "QS",
+            "volume_24h": 0.0,
+            "liquidity": 14883.70653,
+            "archive_coverage": {
+              "2026-03-02": false,
+              "2026-03-03": false,
+              "2026-03-04": false
+            }
+          }
+        ],
+        "selection_score": 0.0
+      }
+    ],
+    "recommended_expansion": [],
+    "recommended_market_total": 0
+  }
+}

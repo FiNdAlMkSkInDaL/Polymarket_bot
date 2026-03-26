@@ -272,6 +272,133 @@ Other live risk components remain layered around the two primitives above:
 Those are important, but EnsembleRiskManager and CrossBookSyncGate are the key
 new architectural primitives that changed how gross risk is controlled.
 
+### CTF Merge/Mint Arbitrage
+
+The CTF merge detector exposes a fee-aware net edge rather than a gross spread.
+For YES ask $A_{yes}$, NO ask $A_{no}$, EWMA gas estimate $G$, per-leg taker
+fees $F_{yes}$ and $F_{no}$, and slippage reserve $S$, the detector computes:
+
+$$
+E_{net} = 1 - (A_{yes} + A_{no}) - G - F_{yes} - F_{no} - S
+$$
+
+Signals are eligible only when $E_{net}$ clears the configured minimum yield.
+This keeps the event contract aligned with post-cost economics rather than a
+pre-fee dislocation that disappears after execution overhead.
+
+The gas component uses an O(1) EWMA baseline rather than raw per-tick gas. That
+stabilizes the detector during noisy fee regimes, but it also means a sudden
+gas spike may not suppress the first spike tick if the prior baseline was low
+enough. The smoothing behavior is intentional and is part of the paper replay
+contract rather than an implementation accident.
+
+Desync suppression follows the same discipline as CrossBookSyncGate, but for a
+two-leg binary book instead of an arbitrary relationship set. If the YES and NO
+top-of-book timestamps diverge by more than the configured tolerance, the tick
+is discarded before any state mutation, including the gas EWMA update.
+
+The paper adapter normalizes conviction from detector economics directly:
+
+$$
+c = \min\left(1, \max\left(0, \frac{E_{net}}{E_{max}}\right)\right)
+$$
+
+where $E_{max}$ is the configured maximum expected net edge for CTF paper
+dispatch sizing.
+
+Live execution mode for this path is not wired yet; any future live deployment
+must remain behind the DispatchGuard layer.
+
+### SI-9 Combinatorial Arbitrage Execution
+
+The isolated SI-9 execution path treats a mutually exclusive cluster as a
+single fee-aware object rather than a set of independent books.
+
+For cluster YES asks $A_i$, leg count $N$, per-leg taker fee $F$, and per-leg
+slippage reserve $S$, the detector computes:
+
+$$
+E_{gross} = 1 - \sum_{i=1}^{N} A_i
+$$
+
+$$
+E_{net} = E_{gross} - N \cdot F - N \cdot S
+$$
+
+where $A_i$ is the visible YES ask for leg $i$, $E_{gross}$ is the raw
+Dutch-book edge, and $E_{net}$ is the execution-facing edge after cost budget.
+Signals are eligible only when $E_{net}$ clears the configured minimum yield.
+
+Sizing is depth-bounded and equal-share across the full cluster:
+
+$$
+Q = \min_i q_i
+$$
+
+where $q_i$ is the visible ask size on leg $i$. The bottleneck leg is chosen
+from the shallowest visible depth, then by highest ask among equal-depth legs,
+and finally by deterministic tie-break policy. The live default uses
+lexicographic market id so replay and runtime resolve ties identically.
+
+Staleness suppression is the SI-9 analogue of CrossBookSyncGate discipline.
+CrossBookSyncGate protects coordinated strategies from cross-book timestamp
+divergence, while SI-9 rejects any cluster whose leg age exceeds the configured
+ask-age budget at evaluation time. No cluster is executable when one leg is
+stale relative to the evaluation timestamp.
+
+The detector exposes two distinct state contracts.
+
+- `tradeable_snapshot()` always requires an explicit `eval_timestamp_ms` and is
+  the runtime-safe surface.
+- `cluster_snapshot()` returns raw state plus `would_be_tradeable` and
+  `suppression_reason` metadata for monitoring.
+- `cluster_snapshot(eval_timestamp_ms=...)` computes staleness against the
+  injected timestamp.
+- `cluster_snapshot(eval_timestamp_ms=None)` preserves the legacy replay path by
+  inferring freshness from the latest visible cluster timestamp.
+
+Execution is bottleneck-first through a frozen `Si9ExecutionManifest`. All legs
+share a fixed target size, the bottleneck leg is dispatched first, and the
+manifest carries the stale/cancel timing controls needed for reconciliation.
+
+Hanging-leg handling is modeled as explicit unwind taxonomy rather than generic
+paper failure. Causes include second-leg rejection, later cluster rejection,
+coordination-bus eviction after partial execution, stale-cluster aborts, and
+manual abort paths reserved for future live control.
+
+For filled size $Q_i$, original fill price $P_i$, and current best bid $B_i$,
+the per-leg unwind estimate is:
+
+$$
+C_i = Q_i \cdot (P_i - B_i)
+$$
+
+and total estimated unwind cost is:
+
+$$
+C_{total} = \sum_i C_i
+$$
+
+Recommended unwind action is selected in fixed order:
+
+1. `MARKET_SELL` if the unwind reason is `GUARD_CIRCUIT_OPEN` or if
+   $C_{total}$ is at or above the market-sell threshold
+2. `PASSIVE_UNWIND` if $C_{total}$ is at or below the passive-unwind threshold
+3. `HOLD_FOR_RECOVERY` otherwise
+
+The escalation path is functional rather than stateful. A manifest carrying
+`HOLD_FOR_RECOVERY` is re-evaluated later, and if elapsed time exceeds
+`max_hold_recovery_ms`, a new manifest is returned with `MARKET_SELL`. The
+original unwind manifest remains unchanged.
+
+Live unwind execution is not wired yet. Two gaps remain explicit before this
+path can be handed to a live PositionManager.
+
+- the paper unwind estimator currently uses a visible-book proxy and therefore
+  still needs live best-bid state for production cost estimation
+- the cancel-or-hold execution path is only recorded in paper mode and must be
+  implemented behind DispatchGuard before live unwind actions are allowed
+
 ## Replay And Research Layer
 
 ### O(1) Aggregation

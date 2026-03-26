@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 from itertools import count
 from typing import Any, Callable, Mapping
 
+from src.execution.priority_context import PriorityOrderContext
+
 
 _PRIORITY_PRICE_EPSILON = Decimal("0.000001")
 _NATIVE_PRICE_QUANTUM = Decimal("0.000001")
@@ -52,6 +54,13 @@ def _round_size(size: float) -> float:
     return rounded
 
 
+def _round_size_allow_zero(size: float) -> float:
+    rounded = round(float(size), 4)
+    if rounded < 0.0:
+        raise ValueError("Order size cannot be negative")
+    return rounded
+
+
 @dataclass(frozen=True, slots=True)
 class MevMarketSnapshot:
     yes_bid: float
@@ -89,6 +98,7 @@ class MevOrderPayload:
     liquidity_intent: str
     time_in_force: str
     post_only: bool
+    context: PriorityOrderContext | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -309,23 +319,41 @@ class MevExecutionRouter:
 
     def execute_priority_sequence(
         self,
-        target_price: float,
-        anchor_volume: float,
-        max_capital: float,
+        context: PriorityOrderContext,
     ) -> MevExecutionBatch:
-        if anchor_volume <= 0.0:
-            raise ValueError("anchor_volume must be strictly positive")
-        if max_capital <= 0.0:
-            raise ValueError("max_capital must be strictly positive")
-
         route_id = self._next_route_id("PRIORITY")
-        target_price_decimal = _normalize_native_price(target_price)
+        payloads = self._build_priority_sequence_payloads(route_id, context)
+        return self._dispatch_batch(route_id, "priority_sequence", payloads)
+
+    def plan_priority_sequence(
+        self,
+        context: PriorityOrderContext,
+    ) -> MevExecutionBatch:
+        # Dry-run planning still advances the route-id counter; leave that intact for now
+        # and revisit explicit route-id injection when live execution mode is introduced.
+        route_id = self._next_route_id("PRIORITY")
+        payloads = self._build_priority_sequence_payloads(route_id, context)
+        return MevExecutionBatch(
+            route_id=route_id,
+            playbook="priority_sequence",
+            payloads=payloads,
+            responses=(),
+        )
+
+    def _build_priority_sequence_payloads(
+        self,
+        route_id: str,
+        context: PriorityOrderContext,
+    ) -> tuple[MevOrderPayload, MevOrderPayload]:
+        target_price_decimal = _normalize_native_price(context.target_price)
         optimized_price_decimal = _normalize_native_price(target_price_decimal + _PRIORITY_PRICE_EPSILON)
 
         optimized_price = float(optimized_price_decimal)
         anchor_price = float(target_price_decimal)
-        affordable_size = float(_to_decimal(max_capital) / optimized_price_decimal)
-        sequence_size = _round_size(min(float(anchor_volume), affordable_size))
+        affordable_size_decimal = context.max_capital / optimized_price_decimal
+        base_size_decimal = min(context.anchor_volume, affordable_size_decimal)
+        effective_size_decimal = base_size_decimal * context.conviction_scalar
+        sequence_size = _round_size_allow_zero(float(effective_size_decimal))
 
         target_price_str = format_native_price(target_price_decimal)
         optimized_price_str = format_native_price(optimized_price_decimal)
@@ -336,20 +364,23 @@ class MevExecutionRouter:
                 route_id=route_id,
                 sequence=1,
                 playbook="priority_sequence",
-                market_id="PRIORITY_SEQUENCE",
-                direction="UNSPECIFIED",
+                market_id=context.market_id,
+                direction=context.side,
                 side="BUY",
                 price=optimized_price,
                 size=sequence_size,
                 liquidity_intent="PRIORITY",
                 time_in_force="GTC",
                 post_only=False,
+                context=context,
                 metadata={
-                    "capital_limit": round(float(max_capital), 4),
-                    "anchor_volume": round(float(anchor_volume), 4),
+                    "capital_limit": format_native_price(context.max_capital),
+                    "anchor_volume": format_native_price(context.anchor_volume),
                     "target_price": target_price_str,
                     "optimized_price": optimized_price_str,
                     "priority_epsilon": epsilon_str,
+                    "base_size": format_native_price(base_size_decimal),
+                    "effective_size": format_native_price(effective_size_decimal),
                     "rationale": "queue_priority_entry_at_native_precision",
                 },
             ),
@@ -357,27 +388,29 @@ class MevExecutionRouter:
                 route_id=route_id,
                 sequence=2,
                 playbook="priority_sequence",
-                market_id="PRIORITY_SEQUENCE",
-                direction="UNSPECIFIED",
+                market_id=context.market_id,
+                direction=context.side,
                 side="SELL",
                 price=anchor_price,
                 size=sequence_size,
                 liquidity_intent="CONDITIONAL",
                 time_in_force="GTC",
                 post_only=False,
+                context=context,
                 metadata={
                     "conditional_order_type": "STOP_LIMIT",
-                    "anchor_volume": round(float(anchor_volume), 4),
+                    "anchor_volume": format_native_price(context.anchor_volume),
                     "linked_entry_sequence": 1,
                     "trigger_price": target_price_str,
                     "stop_price": target_price_str,
                     "limit_price": target_price_str,
                     "exit_anchor_price": target_price_str,
+                    "effective_size": format_native_price(effective_size_decimal),
                     "rationale": "predefined_exit_against_anchor_node",
                 },
             ),
         )
-        return self._dispatch_batch(route_id, "priority_sequence", payloads)
+        return payloads
 
     def _dispatch_batch(
         self,

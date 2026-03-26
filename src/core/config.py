@@ -87,6 +87,15 @@ def _env_int(key: str, default: int = 0) -> int:
 
 def _env_bool(key: str, default: bool = True) -> bool:
     return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
+    
+def _validate_fraction(name: str, value: float, *, allow_zero: bool) -> None:
+    numeric = float(value)
+    if allow_zero:
+        if not 0.0 <= numeric < 1.0:
+            raise ValueError(f"{name} must be >= 0 and < 1; got {numeric!r}")
+        return
+    if not 0.0 < numeric < 1.0:
+        raise ValueError(f"{name} must be > 0 and < 1; got {numeric!r}")
 
 
 # â”€â”€ Strategy defaults â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -614,6 +623,10 @@ class StrategyParams:
     contagion_arb_max_pairs_per_leader: int = _env_int("CONTAGION_ARB_MAX_PAIRS_PER_LEADER", 3)
     contagion_arb_max_lagging_spread_pct: float = _env_float("CONTAGION_ARB_MAX_LAGGING_SPREAD_PCT", 3.0)
     contagion_arb_max_last_trade_age_s: float = _env_float("CONTAGION_ARB_MAX_LAST_TRADE_AGE_S", 300.0)
+    contagion_arb_max_leader_age_ms: float = _env_float("CONTAGION_ARB_MAX_LEADER_AGE_MS", 5000.0)
+    contagion_arb_max_lagger_age_ms: float = _env_float("CONTAGION_ARB_MAX_LAGGER_AGE_MS", 30000.0)
+    contagion_arb_max_causal_lag_ms: float = _env_float("CONTAGION_ARB_MAX_CAUSAL_LAG_MS", 600000.0)
+    contagion_arb_allow_negative_lag: bool = _env_bool("CONTAGION_ARB_ALLOW_NEGATIVE_LAG", False)
     debug_force_contagion_signal: bool = _env_bool("DEBUG_FORCE_CONTAGION_SIGNAL", False)
     max_cross_book_desync_ms: float = _env_float(
         "MAX_CROSS_BOOK_DESYNC_MS",
@@ -739,9 +752,23 @@ class Settings:
     eoa_private_key: str = field(default_factory=lambda: _env("EOA_PRIVATE_KEY"))
 
     # Polygon RPC
-    polygon_rpc_url: str = field(default_factory=lambda: _env("POLYGON_RPC_URL"))
+    polygon_rpc_url: str = field(
+        default_factory=lambda: _env("POLYGON_RPC_URL", _env("POLYGON_RPC_HTTP_URL"))
+    )
+    polygon_rpc_http_url: str = field(
+        default_factory=lambda: _env("POLYGON_RPC_HTTP_URL", _env("POLYGON_RPC_URL"))
+    )
     polygon_rpc_wss_url: str = field(
         default_factory=lambda: _env("POLYGON_RPC_WSS_URL")
+    )
+    uma_optimistic_oracle_address: str = field(
+        default_factory=lambda: _env("UMA_OPTIMISTIC_ORACLE_ADDRESS")
+    )
+    mev_shadow_sweep_premium_pct: float = field(
+        default_factory=lambda: _env_float("MEV_SHADOW_SWEEP_PREMIUM_PCT", 0.03)
+    )
+    mev_d3_panic_threshold: float = field(
+        default_factory=lambda: _env_float("MEV_D3_PANIC_THRESHOLD", 0.12)
     )
 
     # Polygonscan
@@ -774,6 +801,17 @@ class Settings:
         if not raw_dep and _env_bool("PAPER_MODE", True):
             object.__setattr__(self, "deployment_env", DeploymentEnv.PAPER)
             object.__setattr__(self, "paper_mode", True)
+        
+        _validate_fraction(
+            "MEV_SHADOW_SWEEP_PREMIUM_PCT",
+            self.mev_shadow_sweep_premium_pct,
+            allow_zero=True,
+        )
+        _validate_fraction(
+            "MEV_D3_PANIC_THRESHOLD",
+            self.mev_d3_panic_threshold,
+            allow_zero=False,
+        )
 
     # Strategy
     strategy: StrategyParams = field(default_factory=StrategyParams)

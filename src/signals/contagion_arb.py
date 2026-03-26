@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from src.core.config import settings
 from src.core.logger import get_logger
-from src.signals.microstructure_utils import CrossBookSyncGate
+from src.signals.microstructure_utils import CausalLagAssessment, CausalLagGate, CrossBookSyncGate
 from src.signals.resolution_probability import ResolutionProbabilityEngine
 
 if TYPE_CHECKING:
@@ -99,6 +99,10 @@ class ContagionArbDetector:
         max_pairs_per_leader: int | None = None,
         shadow_mode: bool | None = None,
         max_cross_book_desync_ms: float | None = None,
+        max_leader_age_ms: float | None = None,
+        max_lagger_age_ms: float | None = None,
+        max_causal_lag_ms: float | None = None,
+        allow_negative_lag: bool | None = None,
         on_sync_block: Callable[[Any], None] | None = None,
     ) -> None:
         strat = settings.strategy
@@ -140,6 +144,28 @@ class ContagionArbDetector:
         self._shadow = shadow_mode if shadow_mode is not None else strat.contagion_arb_shadow
         self._debug_force_signal = bool(strat.debug_force_contagion_signal)
         self._sync_gate = CrossBookSyncGate(max_cross_book_desync_ms)
+        self._causal_lag_gate = CausalLagGate(
+            max_leader_age_ms=(
+                strat.contagion_arb_max_leader_age_ms
+                if max_leader_age_ms is None
+                else max_leader_age_ms
+            ),
+            max_lagger_age_ms=(
+                strat.contagion_arb_max_lagger_age_ms
+                if max_lagger_age_ms is None
+                else max_lagger_age_ms
+            ),
+            max_causal_lag_ms=(
+                strat.contagion_arb_max_causal_lag_ms
+                if max_causal_lag_ms is None
+                else max_causal_lag_ms
+            ),
+            allow_negative_lag=(
+                strat.contagion_arb_allow_negative_lag
+                if allow_negative_lag is None
+                else allow_negative_lag
+            ),
+        )
         self._on_sync_block = on_sync_block
 
         self._markets: dict[str, MarketInfo] = {}
@@ -149,10 +175,20 @@ class ContagionArbDetector:
         self._last_signal_at: dict[str, float] = {}
         self._diagnostics: dict[str, int] = {
             "evaluations_total": 0,
+            "evaluations_with_previous_snapshot": 0,
+            "toxicity_spikes_detected": 0,
             "reject_no_toxicity_spike": 0,
             "reject_insufficient_leader_impulse": 0,
             "reject_correlation_too_low": 0,
             "reject_residual_shift_too_small": 0,
+            "cross_market_pairs_evaluated": 0,
+            "legacy_sync_pairs_passed": 0,
+            "accepted_causal_lag_count": 0,
+            "reject_leader_snapshot_stale": 0,
+            "reject_lagger_snapshot_stale": 0,
+            "reject_lagger_newer_than_leader": 0,
+            "reject_causal_lag_too_large": 0,
+            "reject_missing_causal_timestamp": 0,
             "signals_emitted": 0,
             "forced_signals_emitted": 0,
         }
@@ -168,6 +204,12 @@ class ContagionArbDetector:
             **self._diagnostics,
             "debug_force_contagion_signal": self._debug_force_signal,
             "debug_force_move_threshold": self._DEBUG_FORCE_MOVE_THRESHOLD,
+            "causal_lag_config": {
+                "max_leader_age_ms": self._causal_lag_gate.config.max_leader_age_ms,
+                "max_lagger_age_ms": self._causal_lag_gate.config.max_lagger_age_ms,
+                "max_causal_lag_ms": self._causal_lag_gate.config.max_causal_lag_ms,
+                "allow_negative_lag": self._causal_lag_gate.config.allow_negative_lag,
+            },
             "top_leader_shift_samples": [dict(sample) for sample in self._top_leader_shift_samples],
             "top_toxicity_impulse_samples": [dict(sample) for sample in self._top_toxicity_impulse_samples],
         }
@@ -244,6 +286,8 @@ class ContagionArbDetector:
         if previous is None:
             return []
 
+        self._diagnostics["evaluations_with_previous_snapshot"] += 1
+
         if self._debug_force_signal:
             return self._evaluate_forced_signal(
                 market=market,
@@ -256,6 +300,7 @@ class ContagionArbDetector:
         if not spikes:
             self._diagnostics["reject_no_toxicity_spike"] += 1
             return []
+        self._diagnostics["toxicity_spikes_detected"] += 1
 
         signals: list[ContagionArbSignal] = []
         candidate_universe = universe[: self._universe_size] if universe else list(self._markets.values())[: self._universe_size]
@@ -301,10 +346,12 @@ class ContagionArbDetector:
                 lag_snapshot = self._snapshots.get(lagger.condition_id)
                 if lag_snapshot is None:
                     continue
-                lag_sync_assessment = self._sync_gate.assess((leader_snapshot, lag_snapshot))
-                if not lag_sync_assessment.is_synchronized:
-                    if self._on_sync_block is not None:
-                        self._on_sync_block(lag_sync_assessment)
+                lag_causal_assessment = self._assess_causal_pair(
+                    leader_snapshot,
+                    lag_snapshot,
+                    reference_timestamp=now,
+                )
+                if not lag_causal_assessment.is_valid:
                     continue
 
                 correlation = self._pair_correlation(market.condition_id, lagger.condition_id)
@@ -355,6 +402,10 @@ class ContagionArbDetector:
                         "expected_probability_shift": round(direction_sign * residual_shift, 6),
                         "correlation": round(correlation, 6),
                         "thematic_group": thematic_group,
+                        "leader_age_ms": round(lag_causal_assessment.leader_age_ms, 3),
+                        "lagger_age_ms": round(lag_causal_assessment.lagger_age_ms, 3),
+                        "causal_lag_ms": round(lag_causal_assessment.causal_lag_ms, 3),
+                        "causal_gate_result": lag_causal_assessment.gate_result,
                     },
                     signal_name="contagion_arb",
                 )
@@ -382,7 +433,13 @@ class ContagionArbDetector:
                         timestamp=now,
                         score=float(dislocation.score),
                         is_shadow=self._shadow,
-                        metadata=dict(dislocation.metadata),
+                        metadata={
+                            **dict(dislocation.metadata),
+                            "leader_age_ms": round(lag_causal_assessment.leader_age_ms, 3),
+                            "lagger_age_ms": round(lag_causal_assessment.lagger_age_ms, 3),
+                            "causal_lag_ms": round(lag_causal_assessment.causal_lag_ms, 3),
+                            "causal_gate_result": lag_causal_assessment.gate_result,
+                        },
                     )
                 )
 
@@ -417,10 +474,12 @@ class ContagionArbDetector:
             if lag_snapshot is None:
                 continue
 
-            lag_sync_assessment = self._sync_gate.assess((leader_snapshot, lag_snapshot))
-            if not lag_sync_assessment.is_synchronized:
-                if self._on_sync_block is not None:
-                    self._on_sync_block(lag_sync_assessment)
+            lag_causal_assessment = self._assess_causal_pair(
+                leader_snapshot,
+                lag_snapshot,
+                reference_timestamp=timestamp,
+            )
+            if not lag_causal_assessment.is_valid:
                 continue
 
             thematic_group = self._shared_theme(market, lagger)
@@ -461,6 +520,10 @@ class ContagionArbDetector:
                         "leader_price_shift": round(leader_shift, 6),
                         "thematic_group": thematic_group,
                         "correlation": round(correlation, 6),
+                        "leader_age_ms": round(lag_causal_assessment.leader_age_ms, 3),
+                        "lagger_age_ms": round(lag_causal_assessment.lagger_age_ms, 3),
+                        "causal_lag_ms": round(lag_causal_assessment.causal_lag_ms, 3),
+                        "causal_gate_result": lag_causal_assessment.gate_result,
                     },
                 )
             )
@@ -500,6 +563,39 @@ class ContagionArbDetector:
         if matrix is None or not hasattr(matrix, "get"):
             return 0.0
         return max(0.0, min(1.0, float(matrix.get(market_a, market_b))))
+
+    def _assess_causal_pair(
+        self,
+        leader_snapshot: ContagionSnapshot,
+        lag_snapshot: ContagionSnapshot,
+        *,
+        reference_timestamp: float,
+    ) -> CausalLagAssessment:
+        self._diagnostics["cross_market_pairs_evaluated"] += 1
+        legacy_sync = self._sync_gate.assess((leader_snapshot, lag_snapshot))
+        if legacy_sync.is_synchronized:
+            self._diagnostics["legacy_sync_pairs_passed"] += 1
+
+        assessment = self._causal_lag_gate.assess(
+            leader_snapshot,
+            lag_snapshot,
+            reference_timestamp=reference_timestamp,
+        )
+        if assessment.is_valid:
+            self._diagnostics["accepted_causal_lag_count"] += 1
+            return assessment
+
+        if assessment.gate_result == "leader_stale":
+            self._diagnostics["reject_leader_snapshot_stale"] += 1
+        elif assessment.gate_result == "lagger_stale":
+            self._diagnostics["reject_lagger_snapshot_stale"] += 1
+        elif assessment.gate_result == "lagger_newer_than_leader":
+            self._diagnostics["reject_lagger_newer_than_leader"] += 1
+        elif assessment.gate_result == "causal_lag_too_large":
+            self._diagnostics["reject_causal_lag_too_large"] += 1
+        else:
+            self._diagnostics["reject_missing_causal_timestamp"] += 1
+        return assessment
 
     def _record_top_sample(
         self,

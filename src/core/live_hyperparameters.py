@@ -157,6 +157,12 @@ def _validate_numeric_constraints(name: str, value: float) -> None:
         raise LiveHyperparameterValidationError(f"{name} must be strictly greater than 0")
     if name == "max_cross_book_desync_ms" and value <= 0.0:
         raise LiveHyperparameterValidationError(f"{name} must be strictly greater than 0")
+    if name in {
+        "contagion_arb_max_leader_age_ms",
+        "contagion_arb_max_lagger_age_ms",
+        "contagion_arb_max_causal_lag_ms",
+    } and value <= 0.0:
+        raise LiveHyperparameterValidationError(f"{name} must be strictly greater than 0")
     if _is_zero_one_bounded(name) and not (0.0 <= value <= 1.0):
         raise LiveHyperparameterValidationError(f"{name} must be between 0.0 and 1.0")
 
