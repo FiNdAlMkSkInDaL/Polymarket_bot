@@ -1,412 +1,375 @@
 # Architecture
 
-This document describes the checked-in trading architecture as it exists in the
-repository today. It is written for quantitative engineers who need exact
-runtime and replay behavior, not a simplified product summary.
+This document describes the current checked-in architecture at HEAD. It is a
+runtime and control-flow document, not a product brief. Where the codebase
+contains both legacy and current paths, this file distinguishes between code
+that exists, code that is wired, and code that actively governs live trading.
+
+## Current Runtime Shape
+
+The live system is centered on three layers:
+
+1. `src/bot.py` owns process startup, websocket consumption, order-book
+   updates, legacy strategy loops, and background health tasks.
+2. `src/execution/live_execution_boundary.py` is the hard boundary between the
+   Python runtime and the Polymarket venue. In LIVE mode it builds the
+   transport, signer, nonce manager, wallet balance provider, and OFI exit
+   router. In PAPER mode it intentionally returns a no-op boundary.
+3. `src/execution/multi_signal_orchestrator.py` coordinates the shared live
+   execution substrate: dispatch guard, priority dispatcher, OFI entry bridge,
+   CTF adapter, SI-9 adapter, unwind escalation, position lifecycle, load
+   shedding, observability, and wallet balance cache.
+
+The architecture is therefore not a single-strategy bot. It is a shared
+execution surface with multiple alpha lanes attached to it.
+
+## Live Graph
+
+The current live graph is:
+
+1. Market data enters through the bot websocket and L2 websocket tasks.
+2. `OrderbookTracker` instances update best bid/ask, depth, toxicity, and
+   snapshot timestamps in O(1) time.
+3. Alpha lanes react to those updates in parallel:
+   - OFI Momentum emits live entry intents into `MultiSignalOrchestrator`.
+   - Contagion arb evaluates on BBO updates and routes accepted signals into
+     the RPE fast-strike position path.
+   - Legacy and optional loops such as `PureMarketMaker` can still run, but
+     they are not part of the orchestrator control plane.
+4. The orchestrator sends live orders through `PriorityDispatcher`, which is
+   the single bottleneck for venue dispatch, margin checks, MEV routing, and
+   normalized receipts.
+5. `LiveWalletBalanceProvider` polls the venue in the background, maintains an
+   in-memory USDC cache, and feeds margin state back into both the orchestrator
+   and `PositionManager`.
+6. `OrchestratorHealthMonitor` snapshots the orchestrator and exposes a
+   fail-closed `is_safe_to_trade(current_timestamp_ms)` gate used by the live
+   event loops.
+
+Two important consequences follow from this design:
+
+- The runtime is event-driven. Health, exits, and signal conversion are driven
+  by market-data updates and orchestrator ticks rather than slow periodic
+  polling.
+- The venue-facing path is centralized. Even when the bot evaluates multiple
+  alpha families, network submission is serialized through the same dispatcher
+  and balance cache.
+
+## MultiSignalOrchestrator
+
+`MultiSignalOrchestrator` is the live control graph, not just a convenience
+wrapper.
+
+It owns these shared components:
+
+- `SignalCoordinationBus` for cross-strategy slot management and coordination.
+- `DispatchGuard` for centralized suppression accounting and dispatch checks.
+- `PriorityDispatcher` for routing a `PriorityOrderContext` into paper, dry
+  run, or live execution.
+- `CtfPaperAdapter`, `OfiSignalBridge`, and `Si9PaperAdapter` as the strategy
+  adapters that convert higher-level signals into dispatch intents.
+- `UnwindExecutor` and escalation policy for hanging-leg and recovery flows.
+- `PositionLifecycleInterface` for reservation, confirmation, and release.
+- `OrchestratorLoadShedder` for ranked-market admission control.
+- `LiveWalletBalanceProvider` and `OfiExitRouter` when the deployment phase is
+  LIVE.
+
+The orchestrator currently exposes four operational surfaces:
+
+1. `on_ctf_signal(...)`
+2. `on_ofi_signal(...)`
+3. `on_si9_signal(...)`
+4. `on_tick(...)`
+
+`on_tick(...)` handles unwind escalation, surrender decisions, and lifecycle
+release. Snapshot generation is also centralized there, which is what lets the
+health monitor reason over one coherent state object instead of a loose set of
+side channels.
+
+## OFI Momentum Lane
+
+### Entry Path
+
+The current OFI live path is the most deeply integrated orchestrator lane.
+
+On each eligible NO-side OFI momentum signal in `src/bot.py`, the bot:
+
+1. checks `is_safe_to_trade(...)` when the live OFI runtime is active,
+2. constructs an `OfiEntrySignal` using `Decimal` prices, sizes, conviction,
+   and timestamps,
+3. sends that signal into `MultiSignalOrchestrator.on_ofi_signal(...)`,
+4. lets `OfiSignalBridge` allocate side locks and convert the signal into a
+   `PriorityOrderContext`, and
+5. dispatches through `PriorityDispatcher`.
 
-## System Shape
+This is the current live OFI entry contract. In PAPER mode the bot still has a
+legacy `_on_panic_signal(...)` path, but that is not the live venue path.
 
-The repository is a multi-strategy event-driven trading system built around a
-shared runtime substrate:
+### Exit Path
 
-- src/bot.py orchestrates books, trades, detectors, and background control
-  loops.
-- src/trading/position_manager.py owns position lifecycle, local exits, and
-  shared execution-time risk checks.
-- src/trading/stop_loss.py converts BBO changes into immediate exit evaluation.
-- src/data/orderbook.py maintains live top-of-book state and O(1) depth
-  baselines.
-- src/backtest/strategy.py mirrors live behavior in deterministic replay
-  adapters.
-- src/backtest/wfo_optimizer.py drives Optuna walk-forward studies and artifact
-  export.
-- src/core/live_hyperparameters.py and scripts/inject_wfo_champions.py bridge
-  optimization outputs into production configuration.
+The OFI exit model is intentionally severed from the old visible generic-exit
+flow.
 
-The codebase contains multiple alpha families. The runtime does not assume a
-single flagship strategy.
+Current live behavior is:
 
-## Alpha Portfolio
+1. Entry fills leave the position with locally owned exit state rather than a
+   generic resting take-profit order.
+2. `MultiSignalOrchestrator.evaluate_ofi_exit(...)` uses
+   `OfiLocalExitMonitor` when book trackers are available, or falls back to a
+   local target/stop/time-stop decision derived from the stored `Decimal`
+   fields.
+3. `MultiSignalOrchestrator.route_ofi_exit(...)` hands the decision to
+   `OfiExitRouter`.
+4. `OfiExitRouter` submits one of three exit forms:
+   - immediate taker exit for target or stop hits,
+   - passive limit exit for time-stop handling,
+   - promotion from passive to taker when the passive wait budget or slippage
+     budget is breached.
 
-### OFI Momentum
+### Hazard-Style Brackets And Liquidity Vacuums
 
-Primary modules:
+The execution model remains a hidden, locally monitored OFI bracket system.
+The stored `drawn_tp`, `drawn_stop`, and `drawn_time_ms` fields are the control
+surface for that bracket. Time-stop exits are not fired blindly:
 
-- src/signals/ofi_momentum.py
-- src/execution/momentum_taker.py
-- src/trading/position_manager.py
-- src/trading/stop_loss.py
-- src/backtest/strategy.py
+- `OfiLocalExitMonitor` can suppress time-stop action during a liquidity
+  vacuum.
+- The replay and tracing utilities use the same vacuum concept through the
+  replay order book EWMA baselines.
+- `scripts/trace_ofi_fold.py` explicitly measures the OFI drop funnel,
+  including TVI penalty suppressions, depth-vacuum suppressions, cooldowns,
+  and size-floor vetoes.
 
-OFI Momentum is a taker-style microstructure strategy built around rolling
-top-of-book imbalance and TVI-sensitive confirmation. The signal is short-hold,
-latency-sensitive, and explicitly designed to monetize queue-pressure rather
-than passive spread capture.
+Operationally, OFI exits are now strategy-owned microstructure decisions, not
+just generic sell orders.
 
-### Contagion Arb
+## Contagion Lane
 
-Primary modules:
+The contagion architecture has two distinct pieces at HEAD: a live signal lane
+and an archive qualification lane.
 
-- src/signals/contagion_arb.py
-- src/signals/microstructure_utils.py
-- src/backtest/strategy.py
-- src/backtest/wfo_optimizer.py
+### Live Contagion Evaluation
 
-Contagion Arb monitors thematic groups of markets, detects toxicity spikes on a
-leader book, and propagates that shock into lagging books subject to
-correlation, residual, spread, and synchronization gates.
+Live contagion is evaluated on every relevant BBO update in `src/bot.py`.
 
-### SI-9 Combinatorial Arb
+The bot:
 
-Primary modules:
+1. checks `is_safe_to_trade(...)` before evaluating contagion in live mode,
+2. computes current YES mid-price and toxicity from live YES and NO books,
+3. calls `ContagionArbDetector.evaluate_market(...)`, and
+4. routes accepted non-shadow signals into `_on_contagion_signal(...)`, which
+   then opens an RPE fast-strike position when spread, freshness, cooldown,
+   stop-loss cooldown, and ensemble-risk gates all pass.
 
-- src/signals/combinatorial_arb.py
-- src/data/arb_clusters.py
-- src/trading/position_manager.py
-- src/bot.py
+This is parallel to OFI Momentum, but it is not currently dispatched through a
+dedicated orchestrator adapter. The orchestrator protects the lane via shared
+health gating; the actual contagion execution still enters through the
+position-manager fast-strike path.
 
-SI-9 looks for mutually exclusive clusters whose YES best bids imply a
-sub-$1.00$ Dutch-book. It is structurally multi-leg and therefore uses a
-different execution model from the directional strategies.
+### Archive Qualification: UniverseBuilder + ContagionValidator
 
-### SI-10 Bayesian Joint-Probability Arb
+The current contagion research and curation stack lives in moved modules:
 
-Primary modules:
+- `src/data/universe_builder.py`
+- `src/tools/contagion_validator.py`
+- `scripts/cli_universe_builder.py`
 
-- src/signals/bayesian_arb.py
-- src/backtest/strategy.py
-- src/backtest/wfo_optimizer.py
-- src/bot.py
+`UniverseBuilder` builds candidate leader-lagger clusters from archived YES
+series. It enforces:
 
-SI-10 evaluates configured base/base/joint relationships directly from live
-YES-book snapshots and fee-aware edge math. It uses the same synchronization
-gate as the other coordinated strategies.
+- minimum empirical correlation,
+- minimum observed events per day,
+- minimum archive days,
+- maximum lagger freshness,
+- optional causal ordering.
 
-### Legacy Paths
+`ContagionValidator` then replays archived data with an instrumented
+`ContagionReplayAdapter` and records:
 
-PURE_MM, panic, drift, RPE, oracle, and related support code remain in the
-repository. They are relevant for replay, regression, and selective deployment,
-but they are not the correct umbrella description of the architecture.
+- cross-market pairs evaluated,
+- causal gate pass rate,
+- legacy sync pass rate,
+- signals fired,
+- fills executed,
+- dominant suppressor,
+- lagger-age percentiles,
+- optional per-event telemetry.
 
-## Execution Layer
+The accepted archive baseline used by `scripts/cli_universe_builder.py` is:
 
-### Event-Driven Runtime
+- `max_lagger_age_ms = 600000`
+- `max_causal_lag_ms = 600000`
+- `max_leader_age_ms = 5000`
 
-The live runtime is built around market-data events rather than polling loops.
+That 600,000 ms freshness contract is not a doc convention. It is encoded in
+the CLI defaults and reinforced by the validator sweep artifacts.
 
-- OrderbookTracker updates top-of-book state from price_change and book events.
-- BBO changes invoke stop-loss and local-exit evaluation.
-- PositionManager owns entry state, exit state, fill reconciliation, and exit
-  routing.
-- The timeout loop exists as a backstop, not as the primary execution trigger.
+## SI-9 And CTF Adapters
 
-This matters because the high-conviction paths are latency-sensitive and should
-not wait for coarse periodic polling to react to market state.
+The orchestrator also carries CTF and SI-9 execution contracts.
 
-### Stochastic Hazard-Rate Exits For OFI
+### CTF
 
-The OFI execution layer no longer posts a deterministic visible take-profit
-order after entry fill.
+`CtfPaperAdapter` consumes fee-aware merge signals and emits receipts backed by
+strict `Decimal` manifests. `CtfExecutionManifest`, `CtfLegManifest`, and
+`CtfExecutionReceipt` reject non-`Decimal` monetary fields and enforce a
+well-formed two-leg execution contract.
 
-Instead:
+### SI-9
 
-1. src/execution/momentum_taker.py draws a private DrawnMomentumBracket via
-   draw_stochastic_momentum_bracket().
-2. The draw uses bounded exponential hazard-style sampling around the configured
-   means for take-profit percentage, stop-loss percentage, and max hold time.
-3. src/trading/position_manager.py stores the sampled target, stop, and hold
-   horizon on the position as drawn_tp, drawn_stop, drawn_time,
-   drawn_tp_pct, and drawn_stop_pct.
-4. on_entry_filled() arms the position for local monitoring and deliberately
-   leaves pos.exit_order unset.
+`MultiSignalOrchestrator.on_si9_signal(...)` supports cluster reservation,
+execution via `Si9PaperAdapter`, hanging-leg unwind manifests, and escalation
+through `on_tick(...)`.
 
-Why this design exists:
+That contract is present and tested in HEAD. The bot also still maintains its
+legacy combo-arb loop, so documentation must not claim that every SI-9 action
+already routes through the orchestrator in production.
 
-- a posted deterministic TP advertises the strategy footprint to the market
-- the signal is short-lived and does not benefit from revealing its full exit
-  geometry
-- replay parity is still preserved because the same bracket sampler is reused
-  there with deterministic seeding
+## LiveExecutionBoundary
 
-This is not a cosmetic randomization layer. It is a change in execution model:
-the exit is now hidden and strategy-owned.
+`build_live_execution_boundary(...)` is the hard runtime split between paper
+and live.
 
-### Local Exit Monitoring
+Outside LIVE deployment it returns:
 
-The local OFI exit path is centered in PositionManager.evaluate_ofi_local_exit().
-That function is triggered from two places:
+- `venue_adapter = None`
+- `wallet_balance_provider = None`
+- `ofi_exit_router = None`
 
-- src/trading/stop_loss.py when a BBO update arrives for the traded asset
-- PositionManager.check_timeouts() as a periodic backstop
+In LIVE deployment it constructs:
 
-Exit logic is evaluated in this order:
+1. an `AiohttpClobTransport` running on a dedicated async transport loop,
+2. a `PolymarketClobAdapter`,
+3. a `ClobNonceManager`,
+4. a `ClobSigner` bound to the Polymarket CTF exchange EIP-712 domain,
+5. a `LiveWalletBalanceProvider` tracking `USDC`, and
+6. an `OfiExitRouter` with OFI-scoped client-order IDs.
 
-1. if a local target exit is already working, avoid duplicate submissions
-2. if smart-passive time-stop mode is active, either continue waiting or
-   promote to taker
-3. if current best bid reaches the hidden target, call force_target_exit()
-4. if current best bid breaches the hidden stop, call force_stop_loss()
-5. if the stochastic hold horizon expires, begin time-stop handling
+That is the current live boundary. No live order path should bypass it.
 
-The important architectural point is that OFI exits are no longer generic sell
-orders sitting in the book. They are stateful local decisions tied to the live
-book.
+## PriorityDispatcher And The Network Bottleneck
 
-### Liquidity-Vacuum Suppression
+`PriorityDispatcher` is where all venue-bound traffic converges.
 
-Time-stop exits are not fired blindly. The runtime suppresses OFI time-stop
-exits during transient order-book vacuums.
+It performs the following in order:
 
-Mechanics:
+1. optional `DispatchGuard` check,
+2. MEV routing via `MevExecutionRouter.plan_priority_sequence(...)`,
+3. envelope serialization,
+4. mode-specific execution,
+5. receipt normalization into a `DispatchReceipt`.
 
-- OrderbookTracker maintains O(1) EWMA baselines for top bid and ask depth.
-- PositionManager._should_suppress_ofi_time_stop_exit() compares current depth
-  against those EWMAs.
-- The exit is suppressed when depth collapses below the configured vacuum ratio
-  and spread simultaneously blows out beyond the configured multiple of the
-  baseline spread.
-- The exit becomes eligible again only after recovery relative to the EWMA
-  baselines.
-
-This prevents the bot from converting a stale momentum exit into a worst-quote
-liquidity donation during a temporary microstructure vacuum.
-
-### Smart-Passive Time-Stop Fallback
-
-When the hold horizon expires without target or stop being hit, the OFI path
-can enter smart-passive exit mode before promoting to taker. This preserves the
-existing maker-fallback logic while keeping the exit locally owned.
-
-### Replay Parity
-
-Replay mirrors the same OFI model.
-
-- src/backtest/strategy.py uses draw_stochastic_momentum_bracket() when opening
-  OFI positions.
-- Replay positions carry the same drawn fields as live positions.
-- Replay exit checks mirror local target, local stop, and time-stop handling.
-- WFO injects stochastic_seed values so each Optuna trial is deterministic even
-  though brackets are stochastic.
-
-The result is parity without reintroducing visible deterministic brackets.
-
-## Risk Layer
-
-### EnsembleRiskManager
-
-src/trading/ensemble_risk.py implements an O(1) directional exposure gate
-across strategies.
-
-The core problem is that scalar net exposure is insufficient once multiple
-strategies can hold YES and NO inventory on the same market. The manager
-therefore maintains:
-
-- one hash map keyed by market_id for directional ownership counts
-- one position index keyed by position_id for exact release bookkeeping
-
-Per market, exposure is split into:
-
-- yes_by_strategy
-- no_by_strategy
-
-The operational rule is simple: a strategy may not open new exposure in a
-direction if another strategy already owns that same directional slot on the
-market.
-
-This prevents gross risk stacking such as:
-
-- OFI Momentum opening NO
-- RPE opening more NO on the same market
-- SI-10 opening another NO expression on the same book
-
-All of can_enter(), register_position(), and release_position() are O(1) in the
-size of the tracked state.
-
-### CrossBookSyncGate
-
-src/signals/microstructure_utils.py implements CrossBookSyncGate, another O(1)
-primitive.
-
-It performs a max-minus-min timestamp divergence check across a small set of
-related book snapshots and returns a CrossBookSyncAssessment containing:
-
-- is_synchronized
-- latest_timestamp
-- delta_ms
-- book_count
-
-If any snapshot is missing a valid timestamp, synchronization fails
-immediately. Otherwise:
+In LIVE mode it also performs an O(1) margin gate before the order reaches the
+venue:
 
 $$
-\Delta_{ms} = (\max t_i - \min t_i) \times 1000
+\text{required margin} = \text{order price} \times \text{effective size}
 $$
 
-Signals are suppressed when:
+The dispatcher compares that against:
 
 $$
-\Delta_{ms} > \text{MAX\_CROSS\_BOOK\_DESYNC\_MS}
+\text{available margin} = \text{LiveWalletBalanceProvider.get\_available\_margin("USDC")}
 $$
 
-This gate is instantiated in:
+If available margin is insufficient, the order is rejected locally with
+`guard_reason = "INSUFFICIENT_MARGIN"` and never reaches the exchange.
 
-- ComboArbDetector for SI-9 cluster evaluation
-- ContagionArbDetector for leader/lagger synchronization
-- BayesianArbDetector for base/base/joint triplets
+This is the current network bottleneck by design. Multiple alpha lanes can
+race to produce intent, but only one dispatcher contract is allowed to convert
+intent into venue traffic.
 
-The purpose is not cosmetic data hygiene. It is a hard defense against trading
-one leg of a relationship on stale or asynchronously updated books.
+## O(1) LiveWalletBalanceProvider Margin Gate
 
-### Additional Shared Risk Controls
+`LiveWalletBalanceProvider` maintains a cached `Decimal` balance per tracked
+asset and updates it from a background poll loop.
 
-Other live risk components remain layered around the two primitives above:
+Important properties:
 
-- DeploymentGuard caps size by deployment phase
-- PortfolioCorrelationEngine applies concentration haircuts and VaR-based size
-  control
-- LatencyGuard and heartbeat infrastructure mark stale books and throttle
-  execution
-- hanging-leg logic in SI-9 flattens partial fills that can no longer be
-  completed safely
+- `get_available_margin(...)` is O(1) dictionary access.
+- The provider rejects negative or non-finite balances.
+- The bot registers a balance update callback so USDC changes are reflected in
+  `PositionManager` immediately.
+- Poll failures caused by rate limits, timeouts, or transport circuit opens are
+  logged but do not silently fabricate balances.
 
-Those are important, but EnsembleRiskManager and CrossBookSyncGate are the key
-new architectural primitives that changed how gross risk is controlled.
+This is what makes the dispatcher-side margin check fast enough to sit directly
+on the live path.
 
-### CTF Merge/Mint Arbitrage
+## Strict Decimal-Only Execution Boundary
 
-The CTF merge detector exposes a fee-aware net edge rather than a gross spread.
-For YES ask $A_{yes}$, NO ask $A_{no}$, EWMA gas estimate $G$, per-leg taker
-fees $F_{yes}$ and $F_{no}$, and slippage reserve $S$, the detector computes:
+HEAD now enforces a strict `Decimal` execution contract across the live venue
+path.
 
-$$
-E_{net} = 1 - (A_{yes} + A_{no}) - G - F_{yes} - F_{no} - S
-$$
+Examples:
 
-Signals are eligible only when $E_{net}$ clears the configured minimum yield.
-This keeps the event contract aligned with post-cost economics rather than a
-pre-fee dislocation that disappears after execution overhead.
+- `ClobSigner` requires decimal strings for venue payload prices and sizes,
+  quantizes them to micro units, and rejects non-string or non-finite numeric
+  inputs.
+- execution manifests such as `CtfExecutionManifest` and related receipts
+  reject non-`Decimal` values for prices, sizes, fees, and PnL fields.
+- live wallet balance polling and dispatch receipts store balances, prices,
+  sizes, and remaining size as `Decimal` values.
 
-The gas component uses an O(1) EWMA baseline rather than raw per-tick gas. That
-stabilizes the detector during noisy fee regimes, but it also means a sudden
-gas spike may not suppress the first spike tick if the prior baseline was low
-enough. The smoothing behavior is intentional and is part of the paper replay
-contract rather than an implementation accident.
+The rule is:
 
-Desync suppression follows the same discipline as CrossBookSyncGate, but for a
-two-leg binary book instead of an arbitrary relationship set. If the YES and NO
-top-of-book timestamps diverge by more than the configured tolerance, the tick
-is discarded before any state mutation, including the gas EWMA update.
+- strategy code may still originate from float-heavy market data,
+- but once a signal is translated into an execution intent, the venue-facing
+  path is `Decimal` only until the final payload boundary.
 
-The paper adapter normalizes conviction from detector economics directly:
+This is a correctness constraint, not stylistic preference.
 
-$$
-c = \min\left(1, \max\left(0, \frac{E_{net}}{E_{max}}\right)\right)
-$$
+## Fail-Closed Health Layer
 
-where $E_{max}$ is the configured maximum expected net edge for CTF paper
-dispatch sizing.
+`src/execution/orchestrator_health_monitor.py` wraps the orchestrator in a
+conservative health gate.
 
-Live execution mode for this path is not wired yet; any future live deployment
-must remain behind the DispatchGuard layer.
+It marks the runtime unsafe when any of the following occurs:
 
-## Replay And Research Layer
+- orchestrator snapshot health is RED,
+- snapshot age exceeds the stale-snapshot threshold,
+- heartbeat gap breaches the configured interval budget,
+- consecutive release failures reach the configured halt threshold.
 
-### O(1) Aggregation
+The live bot checks `is_safe_to_trade(...)` before:
 
-The replay plane relies on incremental OHLCV and depth state rather than full
-window recomputation.
+- converting OFI momentum signals into live orchestrator entries,
+- evaluating contagion arb on live BBO updates,
+- running the combo-arb loop in live mode.
 
-- rolling VWAP, volatility, and related moments are updated incrementally
-- replay order books keep OFI windows and top-depth EWMAs in O(1) state
-- BotReplayAdapter advertises self_aggregates_trades = True so the engine does
-  not duplicate bar work
+This is the current fail-closed posture. Health does not merely annotate the
+runtime; it actively suppresses signal conversion.
 
-This optimization is operationally significant because WFO trial throughput
-depends on it.
+## Deployment And Observability
 
-### WFO Model
+The production-facing PAPER deployment is run under `systemd` using:
 
-src/backtest/wfo_optimizer.py runs walk-forward studies with these properties:
+- `scripts/polymarket-bot.service`
+- `scripts/install_paper_service.sh`
 
-- rolling or anchored fold generation
-- Optuna study storage in SQLite
-- per-trial child-process isolation
-- hard wall-clock timeout enforcement
-- champion report export with per-fold and aggregate metrics
+The service model is:
 
-Champion parameters are exported by _export_champion_params() as:
+- tmpfs secret material prepared in `ExecStartPre`,
+- stale shared-memory segments removed before startup,
+- bot started with `python -m src.cli run --env PAPER`,
+- stdout and stderr shipped to `journald`,
+- automatic restart enabled.
 
-```json
-{
-  "params": {"param_name": 1.23},
-  "meta": {
-    "champion_fold": 3,
-    "oos_sharpe": 1.11,
-    "generated_at": "..."
-  }
-}
-```
+Offline latency profiling is performed outside the running process by exporting
+`journalctl` output and feeding it into `scripts/profile_latency_logs.py`.
 
-OFI studies additionally thread stochastic_seed through replay so the sampled
-hidden brackets remain deterministic within each trial and champion replay.
+That split is intentional: the bot emits journal-backed telemetry online, and
+profiling happens offline against exported logs.
 
-## Deployment Parameter Plane
+## Module Location Corrections
 
-### Artifact Handoff
+Several architectural modules moved relative to older documentation. The
+current locations are:
 
-The research-to-production bridge is explicit.
+- `src/execution/live_wallet_balance.py`
+- `src/tools/contagion_validator.py`
+- `src/data/universe_builder.py`
 
-1. A WFO run emits champion_params.json.
-2. scripts/inject_wfo_champions.py loads one or more champion artifacts.
-3. The injector validates all overrides against StrategyParams.
-4. The injector merges the params in input order and writes
-   live_hyperparameters.json atomically.
-5. src/core/config.py applies those overrides during bootstrap.
-
-### Validation Model
-
-src/core/live_hyperparameters.py is the sole validation authority for this
-handoff.
-
-It enforces at minimum:
-
-- payload must be a JSON object
-- params must resolve to known StrategyParams fields
-- None, NaN, and infinite values are invalid
-- strictly positive edge thresholds remain strictly positive
-- percentile and correlation-style fields remain in [0, 1]
-- max_cross_book_desync_ms remains strictly positive
-
-If live_hyperparameters.json exists but is invalid, config bootstrap raises a
-hard error. The architecture chooses deterministic failure over silent drift.
-
-### File Locations
-
-- default live override path: repository-root live_hyperparameters.json
-- override env var: LIVE_HYPERPARAMETERS_PATH
-
-## Operational Distinctions That Must Stay Explicit
-
-When documenting or extending the system, keep these categories separate:
-
-- code present in source
-- code wired into the runtime
-- code enabled by default
-- code approved for a given desk deployment
-
-This repository has enough optionality that collapsing those categories will
-produce incorrect operational guidance.
-
-## Bottom Line
-
-The current architecture is best understood as four cooperating layers:
-
-1. multiple alpha generators, including OFI, contagion, SI-9, and SI-10
-2. an execution layer that now hides OFI exit geometry with stochastic local
-   brackets
-3. a risk layer built around O(1) exposure and synchronization gates
-4. a research-to-production parameter plane driven by WFO artifacts and strict
-   boot-time validation
-
-Describing the repository as a generic market maker would now be materially
-wrong.
+Any document that still refers to `src/core/live_wallet_balance.py`,
+`src/trading/contagion_validator.py`, or `src/trading/universe_builder.py` is
+describing a pre-HEAD layout.

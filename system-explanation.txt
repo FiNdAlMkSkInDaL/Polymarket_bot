@@ -1,0 +1,239 @@
+Polymarket Bot System Explanation
+
+This file explains the physical runtime behavior of the current checked-in
+system. It is intentionally operational: what starts, what runs, what can halt
+trading, and how signals reach the venue.
+
+1. Process Model
+
+The live runtime is anchored in src/bot.py.
+
+At startup the bot creates:
+
+- websocket and L2 consumers,
+- order and book processing loops,
+- timeout, health, stats, cleanup, and paper-summary loops,
+- the orchestrator tick loop,
+- the wallet balance poll loop when the live execution boundary exposes a
+  wallet balance provider,
+- optional legacy loops such as PureMarketMaker when their config switches are
+  enabled.
+
+The important architectural point is that this is one process with multiple
+concurrent event loops, not a group of independent daemons. Shared state lives
+inside the bot, PositionManager, order books, and the live orchestrator.
+
+2. Live Execution Boundary
+
+The venue-facing boundary is built by src/execution/live_execution_boundary.py.
+
+In PAPER mode the boundary is intentionally empty:
+
+- no venue adapter,
+- no wallet balance provider,
+- no OFI exit router.
+
+In LIVE mode the boundary constructs the objects that are allowed to touch the
+exchange:
+
+- AiohttpClobTransport on a dedicated async transport loop,
+- PolymarketClobAdapter,
+- ClobNonceManager,
+- ClobSigner bound to the Polymarket CTF exchange EIP-712 domain,
+- LiveWalletBalanceProvider for cached USDC margin,
+- OfiExitRouter for OFI-specific exit orders.
+
+This boundary is the line between local strategy logic and external venue side
+effects.
+
+3. MultiSignalOrchestrator Runtime
+
+The current orchestration layer is src/execution/multi_signal_orchestrator.py.
+
+It owns the shared execution substrate:
+
+- SignalCoordinationBus,
+- DispatchGuard,
+- PriorityDispatcher,
+- OFI entry bridge,
+- CTF adapter,
+- SI-9 adapter,
+- unwind executor and escalation policy,
+- position lifecycle hooks,
+- load shedding,
+- observability snapshots,
+- wallet balance provider,
+- OFI exit routing.
+
+The bot constructs the orchestrator at startup and then keeps it alive through
+the orchestrator tick loop. Every orchestrator tick can:
+
+- escalate pending unwind manifests,
+- surrender hanging legs,
+- release positions,
+- refresh health snapshots.
+
+4. Parallel Signal Lanes
+
+The system now runs multiple alpha lanes in parallel, but not all of them use
+the same execution adapter.
+
+OFI Momentum:
+
+- live OFI entries are converted into OfiEntrySignal objects,
+- those signals are sent into MultiSignalOrchestrator.on_ofi_signal(...),
+- the orchestrator bridge and dispatcher decide whether they reach the venue.
+
+Contagion arb:
+
+- live contagion is evaluated directly in the bot on BBO updates,
+- accepted signals route into the RPE fast-strike entry path,
+- the lane is wrapped by the orchestrator health gate even though it is not a
+  dedicated orchestrator adapter today.
+
+SI-9 / cluster execution:
+
+- the orchestrator has a current SI-9 execution and unwind contract,
+- the bot still maintains legacy combo-arb control logic as well,
+- documentation should therefore treat SI-9 as an available orchestrator lane,
+  not as the only active cluster path.
+
+5. PureMarketMaker And Legacy Separation
+
+PureMarketMaker still exists in the repository and can still be started by
+config. It is not the center of the current architecture.
+
+What has changed:
+
+- PureMarketMaker is not part of MultiSignalOrchestrator.
+- PureMarketMaker is not the owner of the shared venue boundary.
+- PureMarketMaker is not the fail-closed health boundary for the live runtime.
+
+The practical meaning is that the current system should be understood as an
+orchestrated multi-strategy runtime that can still host legacy loops, not as a
+maker bot with optional extras attached to it.
+
+6. OFI Exit Path Is Severed From Generic Resting Exits
+
+The old mental model of OFI exits as generic visible exit orders is no longer
+correct.
+
+Current behavior:
+
+- OFI positions carry local target, stop, and hold-time state,
+- MultiSignalOrchestrator.evaluate_ofi_exit(...) decides whether the position
+  should hold, hit target, hit stop, or trigger a time-stop,
+- OfiExitRouter decides how to express that exit on the venue.
+
+Time-stop behavior is especially important:
+
+- the router can submit a passive exit first,
+- it can later promote that order to a taker exit,
+- the local exit monitor can suppress time-stop action during a liquidity
+  vacuum.
+
+That means OFI exits are now strategy-owned local decisions rather than a
+generic visible order-management problem.
+
+7. Fail-Closed Health Gates
+
+The system uses src/execution/orchestrator_health_monitor.py as the hard live
+trading gate.
+
+The health monitor declares the runtime unsafe when:
+
+- orchestrator health is RED,
+- snapshot age is stale,
+- heartbeat timing is broken,
+- position release failures accumulate past threshold.
+
+The bot checks is_safe_to_trade(current_timestamp_ms) before it will:
+
+- convert OFI momentum signals into live orchestrator entries,
+- evaluate contagion arb in live mode,
+- continue the live combo-arb loop.
+
+This is fail-closed behavior. An unsafe state does not just emit telemetry; it
+halts new signal conversion.
+
+8. Decimal-Only Venue Path
+
+The execution path is now strict about Decimal handling.
+
+Examples:
+
+- wallet balances are cached as Decimal values,
+- dispatch receipts use Decimal fill sizes and prices,
+- execution manifests reject non-Decimal monetary fields,
+- ClobSigner requires decimal strings at the payload boundary and quantizes to
+  micro units before signing.
+
+The practical rule is simple: once a live signal becomes an execution intent,
+the venue-facing contract is Decimal only.
+
+9. O(1) Margin Gate
+
+PriorityDispatcher performs the live margin check before the venue call.
+
+It computes required margin from order price and effective size, then compares
+that against the cached USDC balance from LiveWalletBalanceProvider.
+
+Because the balance provider uses an in-memory dictionary cache, the check is
+O(1). If margin is insufficient, the dispatcher rejects the order locally with
+INSUFFICIENT_MARGIN and the exchange is never touched.
+
+10. Deployment With systemd
+
+The current VPS deployment path is scripts/install_paper_service.sh.
+
+That script:
+
+- stops ad-hoc PAPER bot processes,
+- installs scripts/polymarket-bot.service into /etc/systemd/system,
+- reloads and enables systemd,
+- restarts polymarket-bot.service,
+- runs a forward-data audit,
+- prints the latest journal tail.
+
+The service unit itself:
+
+- runs the bot from /home/botuser/polymarket-bot,
+- decrypts .env.age into /dev/shm/secrets/.env before start,
+- removes stale shared-memory segments,
+- launches python -m src.cli run --env PAPER,
+- writes stdout and stderr to journald,
+- restarts automatically on failure.
+
+11. Offline journald Telemetry Profiling
+
+Operational telemetry is written online to journald. Profiling is done offline.
+
+The supported workflow is:
+
+1. export journal output with journalctl,
+2. feed the exported text into scripts/profile_latency_logs.py,
+3. inspect summary stats and histogram output outside the running bot.
+
+This split keeps runtime instrumentation simple while preserving a usable
+latency-analysis workflow after the fact.
+
+12. Contagion Research Pipeline
+
+The archive-backed contagion pipeline now lives in moved modules:
+
+- src/data/universe_builder.py
+- src/tools/contagion_validator.py
+- scripts/cli_universe_builder.py
+
+UniverseBuilder selects viable leader-lagger clusters from archive data.
+ContagionValidator replays those clusters and measures causal-lag pass rates,
+fills, suppressors, and lagger-age distributions.
+
+The accepted baseline encoded by the CLI is:
+
+- max_lagger_age_ms = 600000
+- max_causal_lag_ms = 600000
+- max_leader_age_ms = 5000
+
+That 600,000 ms freshness posture is part of the current system contract, not a
+historical note.

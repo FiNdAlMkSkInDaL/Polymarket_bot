@@ -1,196 +1,196 @@
 # Polymarket Bot
 
-Institutional trading stack for Polymarket microstructure, combinatorial, and
-joint-probability execution.
+Polymarket Bot is a multi-strategy trading stack built around a shared live
+execution surface, archive-backed research tools, and a paper deployment
+workflow managed by `systemd`.
 
-This repository is not a single-strategy market maker. The checked-in runtime,
-replay, and optimization layers support multiple alpha streams, a shared risk
-and execution substrate, and an Optuna-to-production parameter deployment path.
+The important current-state distinction is:
 
-Use this file as the operator-facing overview. Use ARCHITECTURE.md for the
-technical source of truth.
+- the bot still contains legacy strategies and compatibility code,
+- the live execution architecture is now organized around
+  `MultiSignalOrchestrator`, `LiveExecutionBoundary`, `PriorityDispatcher`,
+  `LiveWalletBalanceProvider`, and a strict `Decimal` venue path,
+- the contagion research plane is now driven by `UniverseBuilder` and
+  `ContagionValidator`.
 
-## Current State
+See `ARCHITECTURE.md` for the control-flow source of truth.
 
-- Deployment mode defaults to PAPER via DEPLOYMENT_ENV.
-- The runtime wires multiple alpha streams into one bot and one shared risk
-  surface.
-- Research and deployment now share a formal parameter handoff via
-  champion_params.json and live_hyperparameters.json.
-- PURE_MM remains in the repository for legacy replay and regression, but it is
-  no longer the right mental model for the system.
+## Current Runtime Summary
 
-## Feature Set
+- OFI Momentum live entries go through `MultiSignalOrchestrator`.
+- Live OFI exits are locally owned and routed through `OfiExitRouter` rather
+  than generic visible resting exits.
+- Contagion arb runs in parallel on BBO updates and routes accepted signals
+  into the fast-strike RPE path, while being protected by orchestrator health.
+- `PriorityDispatcher` is the network bottleneck for live venue submission.
+- `LiveWalletBalanceProvider` supplies an O(1) cached USDC margin gate before
+  live dispatch.
+- `OrchestratorHealthMonitor.is_safe_to_trade(...)` fail-closes the live OFI,
+  contagion, and combo-arb loops when orchestrator health degrades.
 
-### Alpha Streams
+## Deployment
 
-- OFI Momentum with TVI-sensitive confirmation and toxicity-aware sizing.
-- Contagion Arb, a Domino-style cross-market toxicity propagation strategy.
-- SI-9 combinatorial arbitrage for mutually exclusive negRisk clusters.
-- SI-10 Bayesian joint-probability arbitrage across configured base/base/joint
-  triplets.
-- Legacy panic, drift, RPE, oracle, and passive-maker paths that remain in the
-  codebase for compatibility, research, and selective deployment.
+### CI/CD Workflow
 
-### Shared Infrastructure
+The current deployment workflow for the VPS-managed PAPER service is based on
+`scripts/install_paper_service.sh`.
 
-- Event-driven order-book tracking with O(1) top-of-book metrics and top-depth
-  EWMA baselines.
-- Hidden stochastic OFI exit management monitored locally instead of posting a
-  deterministic take-profit order to the book.
-- O(1) ensemble exposure gating to prevent multi-strategy directional stacking
-  on the same market.
-- Cross-book synchronization gating for multi-leg and multi-market signals.
-- Replay adapters for OFI, contagion, Bayesian, and legacy strategies.
-- Optuna walk-forward optimization with child-process timeouts and SQLite study
-  storage.
-- Boot-time live hyperparameter override loading with strict validation.
+Typical flow on the server:
 
-## Strategy Matrix
-
-| Strategy | Runtime Status | Notes |
-| --- | --- | --- |
-| OFI Momentum | Implemented in live/replay | Uses aggressive entry and hidden local exits |
-| Contagion Arb | Implemented in live/replay | Enabled by config, shadow mode on by default |
-| SI-9 Combinatorial Arb | Implemented in live/replay | Runtime-wired, explicitly gated by config |
-| SI-10 Bayesian Arb | Implemented in live/replay | Runtime-wired, explicitly gated by config |
-| PURE_MM | Legacy | Kept for replay, comparative study, and regression |
-
-"Implemented" means the code path is merged and wired into the bot or replay
-stack. It does not imply that every strategy is enabled in the same deployment.
-
-## Alpha Summaries
-
-### OFI Momentum With TVI
-
-OFI Momentum trades fast queue-pressure dislocations using aggressive entry.
-The detector measures rolling order-flow imbalance and uses TVI sensitivity via
-the ofi_tvi_kappa parameter. Once a position is filled, the strategy does not
-leave a visible deterministic take-profit order resting on the book. Instead,
-the runtime draws a private bracket and monitors hidden target, stop, and hold
-time locally.
-
-Operational consequences:
-
-- entry is taker-style and latency-sensitive
-- exits are monitored from BBO changes and timeout backstops
-- replay and WFO reuse the same bracket draw logic for parity
-
-### Contagion Arb
-
-Contagion Arb groups markets by thematic tags, watches leader-book toxicity,
-and projects that impulse into lagging books through correlation and residual
-filters. The signal is suppressed when the relevant books are not synchronized
-within the configured cross-book desync budget.
-
-### SI-9 Combinatorial Arb
-
-SI-9 scans mutually exclusive event clusters and looks for the Dutch-book case
-where the sum of YES best bids drops sufficiently below $1.00$. It keeps share
-counts equal across legs, works the bottleneck leg passively first, and uses a
-hanging-leg unwind path to avoid naked partial exposure.
-
-### SI-10 Bayesian Joint-Probability Arb
-
-SI-10 evaluates configured base/base/joint triplets in O(1) time using live
-YES-book snapshots, fee-aware edge math, depth constraints, and the same
-cross-book synchronization gate used by the other coordinated strategies.
-
-## MLOps Pipeline
-
-The repository now has a formal research-to-runtime handoff.
-
-### Research Side
-
-- WFO runs through src/backtest/wfo_optimizer.py using Optuna studies backed by
-  SQLite.
-- Each study exports a report and a champion_params.json artifact.
-- champion_params.json contains a params object plus metadata such as fold,
-  degradation, trade counts, and generation time.
-
-### Deployment Side
-
-- scripts/inject_wfo_champions.py accepts one or more WFO output directories or
-  champion_params.json files.
-- The injector resolves each artifact, validates parameter names and values,
-  merges them in input order, and writes live_hyperparameters.json atomically.
-- Existing live_hyperparameters.json values are loaded first, then overlaid by
-  the supplied champion artifacts.
-
-### Boot-Time Loading
-
-- src/core/config.py loads live_hyperparameters.json during settings bootstrap.
-- src/core/live_hyperparameters.py validates overrides before they touch the
-  frozen StrategyParams dataclass.
-- Invalid live hyperparameters fail the boot with a hard error instead of
-  silently degrading into stale defaults.
-- LIVE_HYPERPARAMETERS_PATH can override the default file location.
-
-### Validation Rules
-
-- unknown strategy parameter names are rejected
-- None, NaN, and infinite values are rejected
-- edge thresholds ending in _usd or _cents must stay strictly positive
-- percentile and correlation-style fields must remain inside [0, 1]
-- max_cross_book_desync_ms must be strictly positive
-
-## WFO Usage Notes
-
-Before heavy optimization runs, disable file logging:
-
-```powershell
-$env:BOT_DISABLE_FILE_LOGGING='1'
+```bash
+cd /home/botuser/polymarket-bot
+git pull origin main
+./scripts/install_paper_service.sh
 ```
 
-Why:
+What the installer does:
 
-- Optuna launches many child-process backtests
-- rotating file logging adds avoidable disk contention
-- the optimizer already has checkpoint and artifact outputs
+1. stops ad-hoc `python -m src.cli run --env PAPER` processes,
+2. copies `scripts/polymarket-bot.service` into `/etc/systemd/system/`,
+3. reloads `systemd`,
+4. enables and restarts `polymarket-bot.service`,
+5. runs `scripts/audit_forward_data.py` against the current UTC day, and
+6. prints a service status plus the latest journal tail.
 
-Representative entry points:
+The service itself:
 
-```powershell
-python wfo_ofi_momentum.py
-python wfo_contagion_arb.py
-python wfo_bayesian_arb.py
+- runs as `botuser`,
+- uses `/home/botuser/polymarket-bot/.venv/bin/python -m src.cli run --env PAPER`,
+- decrypts `.env.age` into `/dev/shm/secrets/.env` at start,
+- cleans `/dev/shm/pmb_*` before launch,
+- writes logs to `journald`,
+- restarts automatically.
+
+Useful commands after deployment:
+
+```bash
+sudo systemctl status polymarket-bot.service --no-pager
+sudo journalctl -u polymarket-bot.service -n 100 --no-pager
+sudo journalctl -u polymarket-bot.service -f
 ```
+
+### Offline Telemetry Profiling
+
+The runtime logs to `journald`. Offline latency profiling is done by exporting
+those logs and analyzing them with `scripts/profile_latency_logs.py`.
+
+Example:
+
+```bash
+sudo journalctl -u polymarket-bot.service --since "2026-03-26 00:00:00" --no-pager > exported-journal.txt
+python scripts/profile_latency_logs.py exported-journal.txt --output latency_hist.png
+```
+
+The profiler parses latency-like events, prints summary percentiles, and emits
+a histogram with a configurable threshold marker.
+
+## Research And Data Tools
+
+### Universe Builder / Contagion Validator
+
+The current universe curation tool is `scripts/cli_universe_builder.py`.
+
+It combines:
+
+- `src/data/universe_builder.py` for archive-backed leader-lagger cluster
+  construction,
+- `src/tools/contagion_validator.py` for replay validation and causal lag
+  telemetry.
+
+Default contagion freshness posture:
+
+- `max_lagger_age_ms = 600000`
+- `max_causal_lag_ms = 600000`
+- `max_leader_age_ms = 5000`
+
+Example:
+
+```bash
+python scripts/cli_universe_builder.py \
+  --clusters-json data/si10_relationships_march2026.json \
+  --archive-path data/vps_march2026 \
+  --market-map data/market_map.json \
+  --output-json artifacts/universe_builder/report.json \
+  --require-causal-ordering
+```
+
+What it does:
+
+1. loads candidate clusters,
+2. builds an archive-backed recommended cluster,
+3. validates that cluster with `ContagionValidator`, and
+4. prints both the builder funnel and validator funnel.
+
+Optional flags worth knowing:
+
+- `--max-events` for faster iteration on large archives,
+- `--emit-per-event-telemetry` to include pair-level causal telemetry,
+- `--min-correlation`, `--min-events-per-day`, and `--min-archive-days` to
+  tighten builder admission.
+
+### OFI Fold Trace Tool
+
+The current OFI drop-funnel tracer is `scripts/trace_ofi_fold.py`.
+
+It replays a walk-forward fold and reports how many candidate OFI events are
+lost to:
+
+- thresholding,
+- TVI penalties,
+- depth-vacuum suppression,
+- cooldown,
+- meta vetoes,
+- size-floor vetoes.
+
+Example:
+
+```bash
+python scripts/trace_ofi_fold.py \
+  --data-dir data/vps_march2026 \
+  --market-configs data/market_map_top25.json \
+  --fold-index 2 \
+  --train-days 35 \
+  --test-days 7 \
+  --step-days 7 \
+  --embargo-days 1 \
+  --max-markets 25
+```
+
+Notes:
+
+- `--data-dir` may point at the archive root or directly at `raw_ticks`; the
+  script normalizes either form.
+- If the selected fold window contains zero L2 events, the tool now fails
+  loudly with a fatal error instead of silently returning an empty funnel.
 
 ## Repository Layout
 
 ```text
 src/
-├── backtest/      Replay engine, matching engine, WFO optimizer, telemetry
-├── core/          Config, guards, process management, live hyperparameter loader
-├── data/          Market discovery, OHLCV, L2 books, adapters
-├── execution/     Execution helpers including OFI bracket drawing
-├── monitoring/    Trade store, health reporting, Telegram notifications
-├── signals/       OFI, contagion, SI-9, SI-10, and legacy detectors
-├── strategies/    Legacy live strategy implementations such as PURE_MM
-├── trading/       Position manager, stop-loss engine, combo lifecycle, risk
-├── bot.py         Runtime orchestrator
-└── cli.py         Operator CLI
+  bot.py                     Live runtime and background loops
+  core/                      Config, guards, process management
+  data/                      Archive readers, market discovery, universe builder
+  execution/                 Orchestrator, boundary, dispatcher, venue plumbing
+  signals/                   OFI, contagion, SI-9, SI-10, and related detectors
+  strategies/                Legacy standalone strategy implementations
+  tools/                     Replay validators and analysis utilities
+scripts/
+  install_paper_service.sh   Current PAPER deployment entry point
+  profile_latency_logs.py    Offline journald latency profiler
+  cli_universe_builder.py    Universe builder + contagion validator CLI
+  trace_ofi_fold.py          OFI walk-forward funnel tracer
 ```
 
-## Documentation Rules
+## Notes On Legacy Paths
 
-Keep these distinctions explicit when updating docs:
+`PureMarketMaker` still exists and can still be started when
+`settings.strategy.pure_mm_enabled` is true. That does not make it the primary
+architecture.
 
-- code present in the repository
-- code wired into the runtime
-- code enabled by default
-- code approved for a specific deployment
+At HEAD:
 
-This repo supports more than one thing at once. The docs should reflect the
-actual wiring without collapsing everything into a single live posture claim.
-
-- PURE_MM defaults that still exist in config
-- legacy directional code paths still present for compatibility
-- SI-9 and OFI components that are wired in source but used differently across
-   live paper, replay, and research workflows
-
-## Further Reading
-
-- See `ARCHITECTURE.md` for the full system architecture and rationale
-- See `src/backtest/wfo_optimizer.py` for timeout and study orchestration
-- See `src/data/ohlcv.py` for the incremental rolling-state implementation
+- `PureMarketMaker` is a legacy optional loop,
+- live OFI entries and exits are controlled by the orchestrator and live
+  execution boundary,
+- contagion live execution is still a bot-managed fast-strike lane protected by
+  orchestrator health rather than a dedicated orchestrator adapter.
