@@ -287,6 +287,13 @@ def _load_trace_market_configs(data_dir: str, market_configs_path: str) -> list[
         return _load_market_configs(data_dir)
 
 
+def _resolve_trace_data_dir(data_dir: str) -> str:
+    path = Path(data_dir)
+    if path.name in {"raw_ticks", "ticks"}:
+        return str(path.parent)
+    return str(path)
+
+
 def trace_ofi_fold(
     *,
     data_dir: str,
@@ -309,7 +316,8 @@ def trace_ofi_fold(
     initial_cash: Decimal,
     signal_cooldown_minutes: Decimal,
 ) -> TraceReport:
-    available_dates = MarketDataRecorder.available_dates(data_dir)
+    trace_data_dir = _resolve_trace_data_dir(data_dir)
+    available_dates = MarketDataRecorder.available_dates(trace_data_dir)
     folds = generate_folds(
         available_dates,
         train_days=train_days,
@@ -320,16 +328,16 @@ def trace_ofi_fold(
     if fold_index < 0 or fold_index >= len(folds):
         raise ValueError(f"fold_index {fold_index} out of range for {len(folds)} folds")
 
-    market_configs = _load_trace_market_configs(data_dir, market_configs_path)
+    market_configs = _load_trace_market_configs(trace_data_dir, market_configs_path)
     if not market_configs:
         raise FileNotFoundError(f"no market configs found at {market_configs_path}")
     selected_configs = market_configs[:max_markets]
     no_asset_ids = tuple(config["no_asset_id"] for config in selected_configs)
 
     fold = folds[fold_index]
-    loader = _build_data_loader(data_dir, fold.test_dates, asset_ids=set(no_asset_ids))
+    loader = _build_data_loader(trace_data_dir, fold.test_dates, asset_ids=set(no_asset_ids))
     if loader is None:
-        loader = _build_data_loader(data_dir, fold.test_dates)
+        loader = _build_data_loader(trace_data_dir, fold.test_dates)
     if loader is None:
         raise FileNotFoundError("no replay data found for selected fold")
 
@@ -371,8 +379,12 @@ def trace_ofi_fold(
     size_floor_suppressions = 0
     first_event_ts: float | None = None
     last_event_ts: float | None = None
+    total_l2_events_seen = 0
 
     for event in loader:
+        if event.event_type in ("l2_delta", "l2_snapshot"):
+            total_l2_events_seen += 1
+
         state = states.get(event.asset_id)
         if state is None:
             continue
@@ -447,6 +459,15 @@ def trace_ofi_fold(
 
         final_valid_signals += 1
         state.last_signal_time_ms = timestamp_ms
+
+    if total_l2_events_seen == 0:
+        window_start = fold.test_dates[0] if fold.test_dates else "unknown"
+        window_end = fold.test_dates[-1] if fold.test_dates else "unknown"
+        raise RuntimeError(
+            "fatal: selected date window contains 0 L2 events; "
+            f"data_dir={data_dir} resolved_data_dir={trace_data_dir} "
+            f"window={window_start}..{window_end}"
+        )
 
     return TraceReport(
         window=TraceWindow(
