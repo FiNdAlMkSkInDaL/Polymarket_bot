@@ -419,11 +419,7 @@ class TradingBot:
             m.condition_id for m in all_tracked[:l2_limit]
         }
 
-        tracked_markets = sorted(
-            (am.info for am in self.lifecycle.active.values()),
-            key=lambda market: market.daily_volume_usd,
-            reverse=True,
-        )[:l2_limit]
+        tracked_markets = all_tracked[:l2_limit]
         await self._reconcile_tracked_markets(tracked_markets)
 
         stale_evicted = self.lifecycle.check_stale_markets(
