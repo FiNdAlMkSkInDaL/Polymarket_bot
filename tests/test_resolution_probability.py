@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -1195,10 +1196,12 @@ class TestNearResolvedPriceGuard:
         mock_rpe = MagicMock()
         mock_rpe.evaluate = MagicMock(return_value=None)
         bot._rpe = mock_rpe
+        bot._rpe_lane_enabled = MagicMock(return_value=True)
 
         mock_no_agg = MagicMock()
         mock_no_agg.current_price = 0.50
         bot._no_aggs["NO_OK"] = mock_no_agg
+        bot._yes_aggs["YES_OK"] = MagicMock(last_trade_time=time.time())
 
         bot.whale_monitor = MagicMock()
         bot.whale_monitor.has_confluence = MagicMock(return_value=False)

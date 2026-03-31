@@ -28,7 +28,7 @@ class ObservabilitySnapshot:
 
 
 class GuardObservabilityPanel:
-    def __init__(self, guards: dict[str, DispatchGuard], bus: SignalCoordinationBus):
+    def __init__(self, guards: dict[str, DispatchGuard], bus: SignalCoordinationBus | None = None):
         self._guards = guards
         self._bus = bus
 
@@ -38,7 +38,9 @@ class GuardObservabilityPanel:
             signal_source: guard.guard_snapshot(snapshot_timestamp_ms)
             for signal_source, guard in self._guards.items()
         }
-        bus_snapshot = self._bus.bus_snapshot(snapshot_timestamp_ms)
+        bus_snapshot = self._empty_bus_snapshot(snapshot_timestamp_ms)
+        if self._bus is not None:
+            bus_snapshot = self._bus.bus_snapshot(snapshot_timestamp_ms)
         total_circuit_opens = sum(
             1 for snapshot in per_source.values() if snapshot["circuit_state"] == "OPEN"
         )
@@ -68,6 +70,16 @@ class GuardObservabilityPanel:
             total_active_slots=bus_snapshot.total_active_slots,
             highest_suppression_source=highest_suppression_source,
             system_health=system_health,
+        )
+
+    @staticmethod
+    def _empty_bus_snapshot(snapshot_timestamp_ms: int) -> CoordinationBusSnapshot:
+        return CoordinationBusSnapshot(
+            snapshot_timestamp_ms=int(snapshot_timestamp_ms),
+            total_active_slots=0,
+            slots_by_source={},
+            slots_by_market={},
+            expired_reclaimed_count=0,
         )
 
     def suppression_report(self, current_timestamp_ms: int) -> list[SuppressionEntry]:

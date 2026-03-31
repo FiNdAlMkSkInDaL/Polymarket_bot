@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Literal
 
 from src.execution.alpha_adapters import ofi_to_context
 from src.execution.dispatch_guard import DispatchGuard
-from src.execution.entry_signals import OfiEntrySignal
 from src.execution.guard_observability import GuardObservabilityPanel, ObservabilitySnapshot
 from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.ofi_exit_router import OfiExitRouter
 from src.execution.ofi_local_exit_monitor import OfiExitDecision, OfiLocalExitMonitor
 from src.execution.ofi_paper_ledger import OfiLedgerSnapshot, OfiPaperLedger
+from src.execution.ofi_signal_bridge import OfiEntrySignal
 from src.execution.orderbook_best_bid_provider import OrderbookBestBidProvider
 from src.execution.orchestrator_load_shedder import OrchestratorLoadShedder
 from src.execution.priority_context import PriorityOrderContext

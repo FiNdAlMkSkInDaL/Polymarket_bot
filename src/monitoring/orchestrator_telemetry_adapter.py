@@ -27,7 +27,7 @@ class OrchestratorTelemetryAdapter:
         health_report = self._health_monitor.check(timestamp_ms)
         orchestrator_snapshot = self._orchestrator.orchestrator_snapshot(timestamp_ms)
         guard_snapshot = self._orchestrator.guard.guard_snapshot(timestamp_ms)
-        bus_snapshot = self._orchestrator.bus.bus_snapshot(timestamp_ms)
+        bus_snapshot = orchestrator_snapshot.observability.bus_snapshot
 
         return {
             "timestamp_ms": timestamp_ms,
@@ -63,55 +63,15 @@ class OrchestratorTelemetryAdapter:
                     "slots_by_source": bus_snapshot.slots_by_source,
                     "slots_by_market": bus_snapshot.slots_by_market,
                     "expired_reclaimed_count": bus_snapshot.expired_reclaimed_count,
-                    "active_slot_leases": self._active_slot_leases(timestamp_ms),
+                    "active_slot_leases": [],
                 }
             ),
             "unwind_ledger": self._json_safe(
                 {
-                    "active_unwinds": self._active_unwinds(),
+                    "active_unwinds": [],
                 }
             ),
         }
-
-    def _active_slot_leases(self, current_timestamp_ms: int) -> list[dict[str, Any]]:
-        leases: list[dict[str, Any]] = []
-        for (market_id, side), slot in sorted(self._orchestrator.bus._slot_map.items()):
-            leases.append(
-                {
-                    "market_id": market_id,
-                    "side": side,
-                    "signal_source": slot.signal_source,
-                    "lease_expires_ms": slot.lease_expires_ms,
-                    "expiration_horizon_ms": max(0, int(slot.lease_expires_ms) - int(current_timestamp_ms)),
-                }
-            )
-        return leases
-
-    def _active_unwinds(self) -> list[dict[str, Any]]:
-        active_unwinds: list[dict[str, Any]] = []
-        for cluster_id, manifest in sorted(self._orchestrator._pending_unwinds.items()):
-            active_unwinds.append(
-                {
-                    "cluster_id": cluster_id,
-                    "unwind_reason": manifest.unwind_reason,
-                    "recommended_action": manifest.recommended_action,
-                    "unwind_timestamp_ms": manifest.unwind_timestamp_ms,
-                    "total_estimated_unwind_cost": manifest.total_estimated_unwind_cost,
-                    "hanging_legs": [
-                        {
-                            "market_id": leg.market_id,
-                            "side": leg.side,
-                            "filled_size": leg.filled_size,
-                            "filled_price": leg.filled_price,
-                            "current_best_bid": leg.current_best_bid,
-                            "estimated_unwind_cost": leg.estimated_unwind_cost,
-                            "leg_index": leg.leg_index,
-                        }
-                        for leg in manifest.hanging_legs
-                    ],
-                }
-            )
-        return active_unwinds
 
     def _json_safe(self, value: Any):
         if isinstance(value, Decimal):

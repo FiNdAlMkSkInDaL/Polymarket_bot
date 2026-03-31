@@ -122,6 +122,9 @@ class Position:
     drawn_time: float = 0.0
     drawn_tp_pct: float = 0.0
     drawn_stop_pct: float = 0.0
+    time_stop_delay_seconds: float = 0.0
+    time_stop_suppression_count: int = 0
+    exit_price_minus_drawn_stop_cents: float = 0.0
 
     # Bidirectional support (RPE)
     trade_asset_id: str = ""   # actual token traded (YES or NO); fallback to no_asset_id
@@ -155,6 +158,8 @@ class Position:
     fee_enabled: bool = True
     sl_trigger_cents: float = 0.0     # fee-adaptive stop-loss threshold
     trailing_offset_cents: float = 0.0  # vol-adaptive trailing stop offset
+    expected_net_target_per_share_cents: float = 0.0
+    expected_net_target_minus_one_tick_per_share_cents: float = 0.0
 
     # V4: Probe sizing flag
     is_probe: bool = False
@@ -286,14 +291,15 @@ class PositionManager:
         # ── Trade store stats cache (OE-1) ─────────────────────────────
         # Caches get_stats() results with a 5-second TTL to avoid
         # blocking aiosqlite reads on every signal evaluation.
-        self._stats_cache: dict[str, Any] | None = None
-        self._stats_cache_time: float = 0.0
+        self._stats_cache: dict[str | None, dict[str, Any]] = {}
+        self._stats_cache_time: dict[str | None, float] = {}
         self._STATS_CACHE_TTL: float = 5.0
         self._daily_pnl_date: str = ""  # YYYY-MM-DD
         self._cumulative_pnl_cents: float = 0.0
         self._peak_pnl_cents: float = 0.0
         self._max_drawdown_cents: float = 0.0
         self._circuit_breaker_tripped: bool = False
+        self._last_entry_rejection_reasons: dict[tuple[str, str], str] = {}
         # Serialize entry attempts to prevent concurrent entries on
         # the same market/event from racing past risk gates.
         self._entry_lock = asyncio.Lock()
@@ -329,6 +335,23 @@ class PositionManager:
         meta = signal_metadata or {}
         source = meta.get("signal_source") or getattr(signal, "signal_source", "")
         return self._normalize_strategy_source(source or fallback)
+
+    def _remember_entry_rejection_reason(
+        self,
+        strategy_source: str,
+        market_id: str,
+        reason: str,
+    ) -> None:
+        key = (self._normalize_strategy_source(strategy_source), str(market_id or ""))
+        self._last_entry_rejection_reasons[key] = str(reason or "")
+
+    def pop_last_entry_rejection_reason(
+        self,
+        strategy_source: str,
+        market_id: str,
+    ) -> str | None:
+        key = (self._normalize_strategy_source(strategy_source), str(market_id or ""))
+        return self._last_entry_rejection_reasons.pop(key, None)
 
     def _ensemble_allows_entry(
         self,
@@ -555,33 +578,38 @@ class PositionManager:
         return (time.time() - last_sl) >= settings.strategy.stop_loss_cooldown_s
 
     # ── Cached trade-store stats ───────────────────────────────────────────
-    async def _get_cached_stats(self) -> dict[str, Any]:
+    async def _get_cached_stats(self, signal_type: str | None = None) -> dict[str, Any]:
         """Return trade-store stats with a 5-second TTL cache.
 
         Avoids a blocking aiosqlite read on every signal evaluation.
         Cache is invalidated whenever a trade is recorded.
         """
         now = time.time()
+        cache_key = signal_type
         if (
-            self._stats_cache is not None
-            and (now - self._stats_cache_time) < self._STATS_CACHE_TTL
+            cache_key in self._stats_cache
+            and (now - self._stats_cache_time.get(cache_key, 0.0)) < self._STATS_CACHE_TTL
         ):
-            return self._stats_cache
+            return self._stats_cache[cache_key]
         if self._trade_store is None:
             return {}
         try:
-            self._stats_cache = await self._trade_store.get_stats()
-            self._stats_cache_time = now
+            if signal_type:
+                stats = await self._trade_store.get_stats(signal_type=signal_type)
+            else:
+                stats = await self._trade_store.get_stats()
+            self._stats_cache[cache_key] = stats
+            self._stats_cache_time[cache_key] = now
         except Exception:
             log.warning("trade_store_stats_unavailable")
-            if self._stats_cache is None:
-                self._stats_cache = {}
-        return self._stats_cache
+            if cache_key not in self._stats_cache:
+                self._stats_cache[cache_key] = {}
+        return self._stats_cache[cache_key]
 
     def _invalidate_stats_cache(self) -> None:
         """Invalidate the stats cache (call after recording a trade)."""
-        self._stats_cache = None
-        self._stats_cache_time = 0.0
+        self._stats_cache = {}
+        self._stats_cache_time = {}
 
     # ── Pillar 16.2: Self-healing alpha throttle ─────────────────────────
     async def _compute_strategy_multiplier(self, signal_type: str) -> float:
@@ -962,6 +990,7 @@ class PositionManager:
             )
 
         meta = signal_metadata or {}
+        strategy_source = self._resolve_strategy_source(signal, signal_metadata, fallback="panic")
         meta_weight = max(0.0, float(meta.get("meta_weight", 1.0)))
         entry_size = round(sizing.size_shares * meta_weight, 2)
         toxicity_index = float(meta.get("toxicity_index", 0.0) or 0.0)
@@ -979,15 +1008,28 @@ class PositionManager:
         if toxicity_index <= 0.0:
             toxicity_index = float(getattr(signal, "toxicity_index", 0.0) or 0.0)
         toxicity_index = max(0.0, toxicity_index)
+        if toxicity_index >= settings.strategy.ofi_toxicity_veto_threshold:
+            self._remember_entry_rejection_reason(
+                strategy_source,
+                signal.market_id,
+                "toxicity_veto",
+            )
+            log.info(
+                "momentum_toxicity_veto",
+                market=signal.market_id,
+                toxicity_index=round(toxicity_index, 4),
+                threshold=round(settings.strategy.ofi_toxicity_veto_threshold, 4),
+            )
+            return None
         toxicity_size_mult = compute_toxicity_size_multiplier(
             toxicity_index,
             elevated_threshold=settings.strategy.ofi_toxicity_scale_threshold,
-            max_multiplier=settings.strategy.ofi_toxicity_size_boost_max,
+            min_multiplier=settings.strategy.ofi_toxicity_size_haircut_floor,
         )
-        if toxicity_size_mult > 1.0:
+        if toxicity_size_mult < 1.0:
             entry_size = round(entry_size * toxicity_size_mult, 2)
             log.info(
-                "momentum_toxicity_size_boost_applied",
+                "momentum_toxicity_size_haircut_applied",
                 market=signal.market_id,
                 toxicity_index=round(toxicity_index, 4),
                 size_multiplier=round(toxicity_size_mult, 4),
@@ -1015,15 +1057,27 @@ class PositionManager:
         if self._guard is not None:
             entry_size = self._guard.get_allowed_trade_shares(entry_size, best_ask)
 
+        configured_max_hold_seconds = min(
+            float(DEFAULT_MOMENTUM_MAX_HOLD_SECONDS),
+            float(settings.strategy.ofi_momentum_max_hold_seconds),
+        )
         if isinstance(signal, OFIMomentumSignal):
             max_hold_seconds = float(
-                signal.max_hold_seconds or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+                min(
+                    float(signal.max_hold_seconds or configured_max_hold_seconds),
+                    configured_max_hold_seconds,
+                )
             )
         else:
             max_hold_seconds = float(
-                getattr(signal, "max_hold_seconds", 0) or DEFAULT_MOMENTUM_MAX_HOLD_SECONDS
+                min(
+                    float(getattr(signal, "max_hold_seconds", 0) or configured_max_hold_seconds),
+                    configured_max_hold_seconds,
+                )
             )
         drawn_bracket = draw_stochastic_momentum_bracket(
+            mean_take_profit_pct=settings.strategy.ofi_momentum_take_profit_pct,
+            mean_stop_loss_pct=settings.strategy.ofi_momentum_stop_loss_pct,
             mean_max_hold_seconds=max_hold_seconds,
             rng=self._ofi_rng,
         )
@@ -1031,6 +1085,21 @@ class PositionManager:
         stop_price = drawn_bracket.stop_price(best_ask)
         target_price = drawn_bracket.target_price(best_ask)
         max_hold_seconds = float(drawn_bracket.max_hold_seconds)
+
+        if ((target_price - best_ask) * 100.0) < settings.strategy.ofi_min_target_edge_cents:
+            self._remember_entry_rejection_reason(
+                strategy_source,
+                signal.market_id,
+                "insufficient_edge",
+            )
+            log.info(
+                "skip_entry_insufficient_edge",
+                spread_cents=round((target_price - best_ask) * 100.0, 2),
+                min_viable=round(settings.strategy.ofi_min_target_edge_cents, 2),
+                exec_mode="taker",
+                margin=settings.strategy.desired_margin_cents,
+            )
+            return None
 
         max_loss_cents = settings.strategy.max_loss_per_trade_cents
         if max_loss_cents > 0 and best_ask > 0 and sl_trigger > 0:
@@ -1053,6 +1122,15 @@ class PositionManager:
 
         entry_fee_frac = get_fee_rate(best_ask, fee_enabled=fee_enabled)
         entry_fee_bps = round(entry_fee_frac * 10000)
+        exit_fee_frac = get_fee_rate(target_price, fee_enabled=True)
+        expected_net_target_per_share_cents = max(
+            0.0,
+            ((target_price - best_ask) * 100.0) - (entry_fee_frac * 100.0) - (exit_fee_frac * 100.0),
+        )
+        expected_net_target_minus_one_tick_per_share_cents = max(
+            0.0,
+            expected_net_target_per_share_cents - 1.0,
+        )
 
         pos_id = f"MOMO-{self._next_id}"
         self._next_id += 1
@@ -1090,6 +1168,11 @@ class PositionManager:
             signal_type="ofi_momentum",
             strategy_source=strategy_source,
             meta_weight=meta_weight,
+            expected_net_target_per_share_cents=round(expected_net_target_per_share_cents, 4),
+            expected_net_target_minus_one_tick_per_share_cents=round(
+                expected_net_target_minus_one_tick_per_share_cents,
+                4,
+            ),
             max_hold_seconds=max_hold_seconds,
             entry_toxicity_index=round(toxicity_index, 6),
             drawn_tp=target_price,
@@ -2290,6 +2373,7 @@ class PositionManager:
             return False
 
         now = now if now is not None else time.time()
+        time_stop_deadline = pos.entry_time + (pos.drawn_time or pos.max_hold_seconds or 0.0)
 
         if (
             pos.exit_order is not None
@@ -2302,6 +2386,17 @@ class PositionManager:
             if now >= pos.smart_passive_exit_deadline:
                 decision = self._evaluate_ofi_exit_decision(pos, current_timestamp_ms=int(now * 1000))
                 if decision.action == "SUPPRESSED_BY_VACUUM":
+                    pos.time_stop_suppression_count += 1
+                    if time_stop_deadline > 0:
+                        pos.time_stop_delay_seconds = max(pos.time_stop_delay_seconds, now - time_stop_deadline)
+                    if pos.time_stop_delay_seconds >= OFI_SMART_PASSIVE_TIMEOUT_SECONDS:
+                        forced_fill_price = self._paper_market_sell_price(pos)
+                        if forced_fill_price > 0 and pos.drawn_stop > 0:
+                            pos.exit_price_minus_drawn_stop_cents = round(
+                                (forced_fill_price - pos.drawn_stop) * 100.0,
+                                4,
+                            )
+                        await self._place_aggressive_timeout_exit(pos, reason="time_stop")
                     return True
                 await self._promote_smart_passive_to_taker(pos)
             return True
@@ -2316,9 +2411,34 @@ class PositionManager:
             return True
 
         if decision.action == "SUPPRESSED_BY_VACUUM":
+            pos.time_stop_suppression_count += 1
+            if time_stop_deadline > 0:
+                pos.time_stop_delay_seconds = max(pos.time_stop_delay_seconds, now - time_stop_deadline)
+            if pos.time_stop_delay_seconds >= OFI_SMART_PASSIVE_TIMEOUT_SECONDS:
+                forced_fill_price = self._paper_market_sell_price(pos)
+                if forced_fill_price > 0 and pos.drawn_stop > 0:
+                    pos.exit_price_minus_drawn_stop_cents = round(
+                        (forced_fill_price - pos.drawn_stop) * 100.0,
+                        4,
+                    )
+                await self._place_aggressive_timeout_exit(pos, reason="time_stop")
             return True
 
         if decision.action == "TIME_STOP_TRIGGERED":
+            if time_stop_deadline > 0:
+                pos.time_stop_delay_seconds = max(pos.time_stop_delay_seconds, now - time_stop_deadline)
+            projected_fill_price = self._paper_market_sell_price(pos)
+            if projected_fill_price > 0 and pos.drawn_stop > 0:
+                pos.exit_price_minus_drawn_stop_cents = round(
+                    (projected_fill_price - pos.drawn_stop) * 100.0,
+                    4,
+                )
+            if projected_fill_price > 0 and pos.stop_price > 0 and projected_fill_price <= pos.stop_price:
+                await self._place_aggressive_timeout_exit(pos, reason="time_stop")
+                return True
+            if pos.time_stop_delay_seconds >= OFI_TIME_STOP_RECOVERY_RATIO * OFI_SMART_PASSIVE_TIMEOUT_SECONDS:
+                await self._place_aggressive_timeout_exit(pos, reason="time_stop")
+                return True
             await self._start_smart_passive_time_stop(pos, now)
         return True
 
@@ -3735,6 +3855,9 @@ class ShadowPosition:
     exit_fee_bps: int = 0
     zscore: float = 0.0
     confidence: float = 0.0
+    reference_price: float = 0.0
+    reference_price_band: str = ""
+    toxicity_index: float = 0.0
 
 
 class ShadowExecutionTracker:
@@ -3765,10 +3888,16 @@ class ShadowExecutionTracker:
         direction: str,
         best_ask: float,
         best_bid: float,
+        entry_price: float | None = None,
+        target_price: float | None = None,
+        stop_price: float | None = None,
         entry_size: float = 10.0,
         fee_enabled: bool = True,
         zscore: float = 0.0,
         confidence: float = 0.0,
+        reference_price: float = 0.0,
+        reference_price_band: str = "",
+        toxicity_index: float = 0.0,
         tp_alpha: float = 0.05,
         sl_cents: float = 4.0,
     ) -> ShadowPosition | None:
@@ -3779,7 +3908,10 @@ class ShadowExecutionTracker:
         SL: entry_price - sl_cents/100 (floored at 0.01).
         Fees: Polymarket dynamic fee curve applied to both legs.
         """
-        entry_price = round(best_ask - 0.01, 2)
+        if entry_price is None:
+            entry_price = round(best_ask - 0.01, 2)
+        else:
+            entry_price = round(float(entry_price), 2)
         if entry_price <= 0.01 or entry_price >= 0.99:
             return None
 
@@ -3788,12 +3920,18 @@ class ShadowExecutionTracker:
         entry_fee_bps = round(entry_fee * 10000)
 
         # TP target: partial mean-reversion alpha capture
-        target_price = round(min(0.99, entry_price + tp_alpha), 2)
+        if target_price is None:
+            target_price = round(min(0.99, entry_price + tp_alpha), 2)
+        else:
+            target_price = round(float(target_price), 2)
         exit_fee = get_fee_rate(target_price, fee_enabled=fee_enabled)
         exit_fee_bps = round(exit_fee * 10000)
 
         # SL: fee-adaptive stop-loss
-        sl_price = round(max(0.01, entry_price - sl_cents / 100.0), 2)
+        if stop_price is None:
+            sl_price = round(max(0.01, entry_price - sl_cents / 100.0), 2)
+        else:
+            sl_price = round(float(stop_price), 2)
 
         pos_id = f"SHADOW-{signal_source}-{self._next_id}"
         self._next_id += 1
@@ -3814,6 +3952,9 @@ class ShadowExecutionTracker:
             exit_fee_bps=exit_fee_bps,
             zscore=zscore,
             confidence=confidence,
+            reference_price=reference_price,
+            reference_price_band=reference_price_band,
+            toxicity_index=toxicity_index,
         )
 
         self._positions[pos.id] = pos
@@ -3890,7 +4031,10 @@ class ShadowExecutionTracker:
                         trade_id=pos.id,
                         signal_source=pos.signal_source,
                         market_id=pos.market_id,
+                        asset_id=pos.asset_id,
                         direction=pos.direction,
+                        reference_price=pos.reference_price,
+                        reference_price_band=pos.reference_price_band,
                         entry_price=pos.entry_price,
                         entry_size=pos.entry_size,
                         entry_time=pos.entry_time,
@@ -3904,6 +4048,7 @@ class ShadowExecutionTracker:
                         exit_fee_bps=pos.exit_fee_bps,
                         zscore=pos.zscore,
                         confidence=pos.confidence,
+                        toxicity_index=pos.toxicity_index,
                     )
                 except Exception:
                     log.warning("shadow_trade_persist_failed", pos_id=pos.id, exc_info=True)

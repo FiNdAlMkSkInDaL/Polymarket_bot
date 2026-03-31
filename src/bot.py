@@ -79,7 +79,7 @@ from src.signals.contagion_arb import ContagionArbDetector, ContagionArbSignal
 from src.signals.cross_market import CrossMarketSignal, CrossMarketSignalGenerator
 from src.signals.combinatorial_arb import ComboArbDetector, ComboArbSignal, ComboSizer
 from src.signals.bayesian_arb import BayesianArbDetector, BayesianArbRelationshipManager
-from src.data.arb_clusters import ArbitrageClusterManager, ScoredArbCluster
+from src.data.arb_clusters import ArbCluster, ArbitrageClusterManager
 from src.signals.drift_signal import DriftSignal, MeanReversionDrift
 from src.signals.oracle_signal import OracleSignalEngine
 from src.data.oracle_adapter import (
@@ -90,13 +90,13 @@ from src.data.oracle_adapter import (
 )
 from src.data.adapters.ap_election_adapter import APElectionAdapter
 from src.data.adapters.sports_adapter import SportsAdapter
-from src.execution.alpha_adapters import contagion_to_context
 from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.live_execution_boundary import LiveExecutionBoundary, build_live_execution_boundary
-from src.execution.entry_signals import OfiEntrySignal
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
 from src.execution.mev_serializer import deserialize_envelope
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator, OrchestratorConfig
+from src.execution.ofi_signal_bridge import OfiEntrySignal
+from src.execution.priority_context import PriorityOrderContext
 from src.execution.orchestrator_factory import build_live_orchestrator
 from src.execution.orchestrator_health_monitor import HealthMonitorConfig, OrchestratorHealthMonitor
 from src.execution.si9_unwind_manifest import Si9UnwindConfig
@@ -128,6 +128,26 @@ _PANIC_SHADOW_SOURCE = "PANIC_STRICT_SHADOW"
 
 def _decimal_from_number(value: Any) -> Decimal:
     return Decimal(str(value))
+
+
+def _contagion_dispatch_context(
+    *,
+    market_id: str,
+    side: str,
+    target_price: Decimal,
+    anchor_volume: Decimal,
+    max_capital: Decimal,
+    conviction_scalar: Decimal,
+) -> PriorityOrderContext:
+    return PriorityOrderContext(
+        market_id=market_id,
+        side=side,
+        signal_source="CONTAGION",
+        conviction_scalar=conviction_scalar,
+        target_price=target_price,
+        anchor_volume=anchor_volume,
+        max_capital=max_capital,
+    )
 
 
 def _safe_task_done_callback(task: asyncio.Task) -> None:
@@ -330,6 +350,12 @@ class TradingBot:
         self._tracked_single_market_ids: set[str] = set()
         self._tracked_combo_market_ids: set[str] = set()
         self._tracked_combo_event_ids: tuple[str, ...] = ()
+        self._si9_scan_summary: dict[str, int] = {
+            "candidate_events": 0,
+            "admitted_events": 0,
+            "excluded_mixed_neg_risk_event": 0,
+            "excluded_too_few_neg_risk_legs": 0,
+        }
         self._single_name_rejection_counts: dict[str, dict[str, int]] = {}
         self._fee_category_set: set[str] = {
             part.strip().lower()
@@ -474,74 +500,61 @@ class TradingBot:
             reverse=True,
         )
 
-        selected_combo_rankings: list[ScoredArbCluster] = []
+        selected_combo_clusters: list[ArbCluster] = []
         selected_combo_ids: set[str] = set()
         combo_markets: list[MarketInfo] = []
         remaining_combo_budget = combo_budget
         remaining_single_budget = single_budget
-        ranked_clusters: list[ScoredArbCluster] = []
-        selector_summary: dict[str, int] = {}
+        ranked_clusters: list[ArbCluster] = []
+        selector_summary: dict[str, int] = {
+            "candidate_events": 0,
+            "admitted_events": 0,
+            "excluded_mixed_neg_risk_event": 0,
+            "excluded_too_few_neg_risk_legs": 0,
+        }
         if combo_budget > 0 and self._si9_lane_enabled():
-            selection_feedback = (
-                self._combo_detector.selection_feedback()
-                if self._combo_detector is not None
-                else None
+            event_ids = {market.event_id for market in all_tracked if market.event_id}
+            self._cluster_mgr.scan_clusters(all_tracked)
+            ranked_clusters = sorted(
+                self._cluster_mgr.active_clusters,
+                key=lambda cluster: (
+                    sum(
+                        float(getattr(market, "daily_volume_usd", 0.0) or 0.0)
+                        + float(getattr(market, "liquidity_usd", 0.0) or 0.0)
+                        for market in cluster.legs
+                    ),
+                    -cluster.n_legs,
+                ),
+                reverse=True,
             )
-            ranked_clusters = self._cluster_mgr.rank_clusters(
-                all_tracked,
-                selection_feedback=selection_feedback,
-            )
-            selector_summary = self._cluster_mgr.last_scan_summary()
-
-            for diagnostic in self._cluster_mgr.last_scan_diagnostics():
-                if diagnostic.admitted:
-                    continue
-                log.info(
-                    "si9_selector_excluded",
-                    event_id=diagnostic.event_id,
-                    reason=diagnostic.reason,
-                    total_legs=diagnostic.total_legs,
-                    neg_risk_legs=diagnostic.neg_risk_legs,
-                    accepting_orders_ratio=diagnostic.accepting_orders_ratio,
-                    liquid_legs=diagnostic.liquid_legs,
-                )
+            selector_summary = {
+                "candidate_events": len(event_ids),
+                "admitted_events": len(ranked_clusters),
+                "excluded_mixed_neg_risk_event": 0,
+                "excluded_too_few_neg_risk_legs": max(0, len(event_ids) - len(ranked_clusters)),
+            }
+        self._si9_scan_summary = selector_summary
 
         if combo_budget > 0:
-            for ranked in ranked_clusters:
-                if self._exclude_recently_unactionable_si9_cluster(ranked):
-                    log.info(
-                        "si9_selector_excluded",
-                        event_id=ranked.cluster.event_id,
-                        reason="recent_unactionable_feedback",
-                        n_legs=ranked.cluster.n_legs,
-                        score=ranked.score,
-                        feedback_penalty=ranked.feedback_penalty,
-                        signal_bonus=ranked.signal_bonus,
-                        last_feedback_reason=ranked.last_feedback_reason,
-                    )
-                    continue
-
-                leg_count = len(ranked.cluster.legs)
+            for cluster in ranked_clusters:
+                leg_count = len(cluster.legs)
                 if self._exclude_low_quality_oversized_si9_cluster(
-                    ranked,
+                    cluster,
                     tracked_capacity=tracked_capacity,
                 ):
                     log.info(
                         "si9_selector_excluded",
-                        event_id=ranked.cluster.event_id,
+                        event_id=cluster.event_id,
                         reason="oversized_low_quality_event",
                         n_legs=leg_count,
-                        score=ranked.score,
+                        score=self._si9_cluster_score(cluster),
                         score_floor=settings.strategy.min_market_score,
                         capacity_share=round(leg_count / tracked_capacity, 4),
-                        feedback_penalty=ranked.feedback_penalty,
-                        signal_bonus=ranked.signal_bonus,
-                        last_feedback_reason=ranked.last_feedback_reason,
                     )
                     continue
 
                 cluster_legs = sorted(
-                    ranked.cluster.legs,
+                    cluster.legs,
                     key=lambda market: market.daily_volume_usd,
                     reverse=True,
                 )
@@ -549,16 +562,12 @@ class TradingBot:
                 if leg_count > total_remaining_capacity:
                     log.info(
                         "si9_selector_excluded",
-                        event_id=ranked.cluster.event_id,
+                        event_id=cluster.event_id,
                         reason="insufficient_total_capacity",
                         n_legs=leg_count,
                         remaining_combo_budget=remaining_combo_budget,
                         remaining_single_budget=remaining_single_budget,
-                        score=ranked.score,
-                        completeness_ratio=ranked.completeness_ratio,
-                        feedback_penalty=ranked.feedback_penalty,
-                        signal_bonus=ranked.signal_bonus,
-                        last_feedback_reason=ranked.last_feedback_reason,
+                        score=self._si9_cluster_score(cluster),
                     )
                     continue
 
@@ -571,17 +580,13 @@ class TradingBot:
                     remaining_combo_budget -= leg_count
 
                 combo_markets.extend(cluster_legs)
-                selected_combo_rankings.append(ranked)
+                selected_combo_clusters.append(cluster)
                 selected_combo_ids.update(market.condition_id for market in cluster_legs)
                 log.info(
                     "si9_selector_selected",
-                    event_id=ranked.cluster.event_id,
+                    event_id=cluster.event_id,
                     n_legs=leg_count,
-                    score=ranked.score,
-                    completeness_ratio=ranked.completeness_ratio,
-                    feedback_penalty=ranked.feedback_penalty,
-                    signal_bonus=ranked.signal_bonus,
-                    last_feedback_reason=ranked.last_feedback_reason,
+                    score=self._si9_cluster_score(cluster),
                     borrowed_single_budget=borrowed_single_budget,
                     remaining_combo_budget=remaining_combo_budget,
                     remaining_single_budget=remaining_single_budget,
@@ -599,7 +604,7 @@ class TradingBot:
         self._tracked_single_market_ids = {market.condition_id for market in single_markets}
         self._tracked_combo_market_ids = {market.condition_id for market in combo_markets}
         self._tracked_combo_event_ids = tuple(
-            ranked.cluster.event_id for ranked in selected_combo_rankings
+            cluster.event_id for cluster in selected_combo_clusters
         )
 
         log.info(
@@ -615,6 +620,13 @@ class TradingBot:
             si9_admitted_events=selector_summary.get("admitted_events", 0),
         )
         return (combo_markets + single_markets)[:l2_limit]
+
+    def _si9_cluster_score(self, cluster: ArbCluster) -> float:
+        return sum(
+            float(getattr(market, "daily_volume_usd", 0.0) or 0.0)
+            + float(getattr(market, "liquidity_usd", 0.0) or 0.0)
+            for market in cluster.legs
+        )
 
     def _warm_market_limit(self) -> int:
         return max(
@@ -674,32 +686,14 @@ class TradingBot:
 
         return warm_markets
 
-    def _exclude_recently_unactionable_si9_cluster(self, ranked: ScoredArbCluster) -> bool:
-        if ranked.signal_bonus > 0.0:
-            return False
-
-        if ranked.feedback_penalty < settings.strategy.si9_feedback_exclusion_penalty:
-            return False
-
-        if ranked.last_feedback_reason in _SI9_HARD_EXCLUDE_FEEDBACK_REASONS:
-            return True
-
-        if ranked.last_feedback_reason.startswith("guardrail_"):
-            return ranked.guardrail_distance >= _SI9_STRUCTURAL_GUARDRAIL_DISTANCE
-
-        return False
-
     def _exclude_low_quality_oversized_si9_cluster(
         self,
-        ranked: ScoredArbCluster,
+        cluster: ArbCluster,
         *,
         tracked_capacity: int,
     ) -> bool:
-        if ranked.signal_bonus > 0.0:
-            return False
-
         configured_leg_cap = max(int(settings.strategy.si9_max_legs), 0)
-        leg_count = max(ranked.cluster.n_legs, 0)
+        leg_count = max(cluster.n_legs, 0)
         if leg_count <= 0:
             return False
         if configured_leg_cap > 0 and leg_count <= configured_leg_cap:
@@ -709,7 +703,7 @@ class TradingBot:
         if capacity_share < _SI9_OVERSIZED_EVENT_CAPACITY_SHARE:
             return False
 
-        return ranked.score < settings.strategy.min_market_score
+        return self._si9_cluster_score(cluster) < settings.strategy.min_market_score
 
     def _record_single_name_rejection(
         self,
@@ -753,7 +747,6 @@ class TradingBot:
 
         newly_added, evicted = await self.lifecycle.refresh(
             orderbook_trackers=self._book_trackers,
-            yes_aggs=self._yes_aggs,
             trade_counts=self._trade_counts,
             whale_tokens=whale_tokens,
             open_position_markets=open_markets,
@@ -4458,7 +4451,7 @@ class TradingBot:
             entry_fill: tuple[float, float] | None = None
             if self.deployment_env == DeploymentEnv.PAPER and self._live_orchestrator is not None:
                 dispatch_receipt = self._live_orchestrator.dispatcher.dispatch(
-                    contagion_to_context(
+                    _contagion_dispatch_context(
                         market_id=market.condition_id,
                         side=shadow_direction,
                         target_price=_decimal_from_number(entry_price),
@@ -4574,7 +4567,7 @@ class TradingBot:
                     anchor_volume = _decimal_from_number(max(getattr(book.snapshot(), "ask_depth_usd", 1.0), 1.0))
                 except Exception:
                     anchor_volume = Decimal("1")
-            dispatch_context = contagion_to_context(
+            dispatch_context = _contagion_dispatch_context(
                 market_id=market.condition_id,
                 side=trade_direction,
                 target_price=_decimal_from_number(entry_price),
@@ -5865,7 +5858,7 @@ class TradingBot:
                     "single_name_markets": len(self._tracked_single_market_ids),
                     "si9_markets": len(self._tracked_combo_market_ids),
                     "si9_events": list(self._tracked_combo_event_ids),
-                    "si9_scan_summary": self._cluster_mgr.last_scan_summary(),
+                    "si9_scan_summary": dict(self._si9_scan_summary),
                 }
                 health["observing_market_blockers"] = {
                     "counts": self.lifecycle.observing_blocker_counts(),

@@ -50,16 +50,28 @@ def compute_toxicity_size_multiplier(
     toxicity_index: float,
     *,
     elevated_threshold: float,
-    max_multiplier: float,
+    max_multiplier: float | None = None,
+    min_multiplier: float | None = None,
 ) -> float:
-    """Map a normalised toxicity reading into a bounded size multiplier."""
+    """Map a normalised toxicity reading into a bounded size multiplier.
+
+    When ``min_multiplier`` is provided, elevated toxicity progressively
+    haircuts size down from ``1.0`` toward that floor. Otherwise the helper
+    preserves the legacy boost behavior driven by ``max_multiplier``.
+    """
     idx = max(0.0, min(1.0, float(toxicity_index or 0.0)))
     threshold = max(0.0, min(0.999999, float(elevated_threshold or 0.0)))
+    progress = min(1.0, (idx - threshold) / max(1e-9, 1.0 - threshold))
+
+    if min_multiplier is not None:
+        floor = min(1.0, max(0.0, float(min_multiplier or 1.0)))
+        if idx <= threshold or floor >= 1.0:
+            return 1.0
+        return 1.0 - progress * (1.0 - floor)
+
     ceiling = max(1.0, float(max_multiplier or 1.0))
     if idx <= threshold or ceiling <= 1.0:
         return 1.0
-
-    progress = min(1.0, (idx - threshold) / max(1e-9, 1.0 - threshold))
     return 1.0 + progress * (ceiling - 1.0)
 
 

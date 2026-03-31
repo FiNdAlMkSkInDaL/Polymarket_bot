@@ -197,6 +197,9 @@ class StrategyParams:
     toxicity_sweep_depth_ratio: float = _env_float("TOXICITY_SWEEP_DEPTH_RATIO", 0.25)
     ofi_toxicity_scale_threshold: float = _env_float("OFI_TOXICITY_SCALE_THRESHOLD", 0.60)
     ofi_toxicity_veto_threshold: float = _env_float("OFI_TOXICITY_VETO_THRESHOLD", 0.75)
+    # Legacy WFO/live-hyperparameter alias retained for backwards compatibility
+    # with existing champion artifact payloads.
+    ofi_toxicity_size_boost_max: float = _env_float("OFI_TOXICITY_SIZE_BOOST_MAX", 1.0)
     ofi_toxicity_size_haircut_floor: float = _env_float("OFI_TOXICITY_SIZE_HAIRCUT_FLOOR", 0.35)
     ofi_min_target_edge_cents: float = _env_float("OFI_MIN_TARGET_EDGE_CENTS", 4.0)
     ofi_momentum_take_profit_pct: float = _env_float("OFI_MOMENTUM_TAKE_PROFIT_PCT", 0.02)

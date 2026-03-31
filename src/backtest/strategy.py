@@ -391,9 +391,9 @@ class BotReplayAdapter(StrategyABC):
         toxicity_mult = compute_toxicity_size_multiplier(
             getattr(sig, "toxicity_index", 0.0),
             elevated_threshold=self._params.ofi_toxicity_scale_threshold,
-            max_multiplier=self._params.ofi_toxicity_size_boost_max,
+            min_multiplier=self._params.ofi_toxicity_size_haircut_floor,
         )
-        if toxicity_mult > 1.0:
+        if toxicity_mult != 1.0:
             size *= toxicity_mult
         if size < 1:
             return

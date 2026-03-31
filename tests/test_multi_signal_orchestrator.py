@@ -6,8 +6,8 @@ from decimal import Decimal
 import pytest
 
 from src.execution.dispatch_guard_config import DispatchGuardConfig
-from src.execution.entry_signals import OfiEntrySignal
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator, OrchestratorConfig
+from src.execution.ofi_signal_bridge import OfiEntrySignal
 from src.execution.orchestrator_factory import build_paper_orchestrator
 from src.rewards.models import RewardPosterIntent
 

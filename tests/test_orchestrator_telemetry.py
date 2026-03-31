@@ -6,24 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.detectors.ctf_peg_config import CtfPegConfig
-from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
 from src.execution.dispatch_guard_config import DispatchGuardConfig
-from src.execution.escalation_policy_interface import EscalationPolicyInterface
 from src.execution.live_execution_boundary import LiveExecutionBoundary
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
+from src.execution.multi_signal_orchestrator import OrchestratorConfig
 from src.execution.orchestrator_factory import build_live_orchestrator
 from src.execution.orchestrator_health_monitor import HealthMonitorConfig, OrchestratorHealthMonitor
-from src.execution.ofi_signal_bridge import OfiSignalBridgeConfig
 from src.execution.priority_context import PriorityOrderContext
-from src.execution.si9_execution_manifest import Si9ExecutionManifest, Si9LegManifest
-from src.execution.si9_paper_adapter import Si9PaperAdapterConfig
-from src.execution.si9_unwind_manifest import Si9UnwindConfig, Si9UnwindLeg, Si9UnwindManifest
-from src.execution.signal_coordination_bus import CoordinationBusConfig
-from src.execution.unwind_executor_interface import PaperUnwindExecutor
 from src.execution.venue_adapter_interface import VenueAdapter, VenueCancelResponse, VenueOrderResponse, VenueOrderStatus
 from src.monitoring.orchestrator_telemetry_adapter import OrchestratorTelemetryAdapter
-from src.execution.multi_signal_orchestrator import OrchestratorConfig
 
 
 class _StubTracker:
@@ -42,9 +33,6 @@ class _StubPositionManager:
         self.max_open = 4
 
     def get_open_positions(self) -> list[object]:
-        return []
-
-    def cleanup_closed(self) -> list[object]:
         return []
 
 
@@ -79,29 +67,13 @@ class _StubVenueAdapter(VenueAdapter):
         return Decimal("100.000000")
 
 
-class _StubEscalationPolicy(EscalationPolicyInterface):
-    def should_escalate(self, manifest: Si9UnwindManifest, current_timestamp_ms: int) -> bool:
-        _ = (manifest, current_timestamp_ms)
-        return False
-
-    def should_surrender(self, manifest: Si9UnwindManifest, current_timestamp_ms: int) -> bool:
-        _ = (manifest, current_timestamp_ms)
-        return False
-
-
 def _config() -> LiveOrchestratorConfig:
     return LiveOrchestratorConfig(
         orchestrator_config=OrchestratorConfig(
             tick_interval_ms=50,
-            max_pending_unwinds=4,
-            max_concurrent_clusters=4,
-            signal_sources_enabled=frozenset({"CTF", "SI9", "OFI"}),
-        ),
-        bus_config=CoordinationBusConfig(
-            slot_lease_ms=500,
-            max_slots_per_source=10,
-            max_total_slots=10,
-            allow_same_source_reentry=False,
+            max_pending_unwinds=0,
+            max_concurrent_clusters=1,
+            signal_sources_enabled=frozenset({"OFI", "CONTAGION", "REWARD"}),
         ),
         guard_config=DispatchGuardConfig(
             dedup_window_ms=100,
@@ -111,55 +83,10 @@ def _config() -> LiveOrchestratorConfig:
             circuit_breaker_reset_ms=300,
             max_open_positions_per_market=10,
         ),
-        ctf_adapter_config=CtfPaperAdapterConfig(
-            max_expected_net_edge=Decimal("0.25"),
-            max_capital_per_signal=Decimal("25"),
-            default_anchor_volume=Decimal("10"),
-            taker_fee_yes=Decimal("0.01"),
-            taker_fee_no=Decimal("0.01"),
-            cancel_on_stale_ms=250,
-            max_size_per_leg=Decimal("8"),
-            mode="paper",
-            bus=None,
-        ),
-        si9_adapter_config=Si9PaperAdapterConfig(
-            max_expected_net_edge=Decimal("0.05"),
-            max_capital_per_cluster=Decimal("20"),
-            max_leg_fill_wait_ms=100,
-            cancel_on_stale_ms=50,
-            mode="paper",
-            unwind_config=_unwind_config(),
-            bus=None,
-        ),
-        ofi_bridge_config=OfiSignalBridgeConfig(
-            max_capital_per_signal=Decimal("15"),
-            mode="paper",
-            slot_side_lock=True,
-            source_enabled=True,
-        ),
-        ctf_peg_config=CtfPegConfig(
-            min_yield=Decimal("0.05"),
-            taker_fee_yes=Decimal("0.01"),
-            taker_fee_no=Decimal("0.01"),
-            slippage_budget=Decimal("0.005"),
-            gas_ewma_alpha=Decimal("0.5"),
-            max_desync_ms=400,
-        ),
-        si9_cluster_configs=(("cluster-1", ("mkt-a", "mkt-b", "mkt-c")),),
-        unwind_config=_unwind_config(),
         deployment_phase="PAPER",
         session_id="telemetry-session",
         max_position_release_failures=2,
         heartbeat_interval_ms=100,
-    )
-
-
-def _unwind_config() -> Si9UnwindConfig:
-    return Si9UnwindConfig(
-        market_sell_threshold=Decimal("0.040000"),
-        passive_unwind_threshold=Decimal("0.010000"),
-        max_hold_recovery_ms=100,
-        min_best_bid=Decimal("0.010000"),
     )
 
 
@@ -173,8 +100,6 @@ def _build_adapter() -> tuple[OrchestratorTelemetryAdapter, OrchestratorHealthMo
             wallet_balance_provider=None,
             ofi_exit_router=None,
         ),
-        unwind_executor=PaperUnwindExecutor(_unwind_config()),
-        escalation_policy=_StubEscalationPolicy(),
     )
     health_monitor = OrchestratorHealthMonitor(
         orchestrator,
@@ -184,14 +109,10 @@ def _build_adapter() -> tuple[OrchestratorTelemetryAdapter, OrchestratorHealthMo
             min_heartbeat_interval_ms=100,
         ),
     )
-    adapter = OrchestratorTelemetryAdapter(orchestrator, health_monitor)
-    return adapter, health_monitor
+    return OrchestratorTelemetryAdapter(orchestrator, health_monitor), health_monitor
 
 
-def _seed_live_state(adapter: OrchestratorTelemetryAdapter, timestamp_ms: int) -> None:
-    orchestrator = adapter._orchestrator
-    guard = orchestrator.guard
-    bus = orchestrator.bus
+def _record_guard_activity(adapter: OrchestratorTelemetryAdapter, timestamp_ms: int) -> None:
     context = PriorityOrderContext(
         market_id="mkt-a",
         side="YES",
@@ -201,43 +122,8 @@ def _seed_live_state(adapter: OrchestratorTelemetryAdapter, timestamp_ms: int) -
         max_capital=Decimal("10"),
         conviction_scalar=Decimal("0.8"),
     )
-    bus.request_slot("mkt-a", "YES", "OFI", timestamp_ms)
-    bus.request_slot("mkt-a", "NO", "OFI", timestamp_ms)
-    guard.record_dispatch(context, timestamp_ms)
-    guard.record_suppression("OFI")
-    manifest = Si9ExecutionManifest(
-        cluster_id="cluster-1",
-        legs=(
-            Si9LegManifest("mkt-a", "YES", Decimal("0.31"), Decimal("2"), True, 0),
-            Si9LegManifest("mkt-b", "YES", Decimal("0.32"), Decimal("2"), False, 1),
-        ),
-        net_edge=Decimal("0.02"),
-        required_share_counts=Decimal("2"),
-        bottleneck_market_id="mkt-a",
-        manifest_timestamp_ms=timestamp_ms,
-        max_leg_fill_wait_ms=200,
-        cancel_on_stale_ms=300,
-    )
-    unwind_manifest = Si9UnwindManifest(
-        cluster_id="cluster-1",
-        hanging_legs=(
-            Si9UnwindLeg(
-                market_id="mkt-a",
-                side="YES",
-                filled_size=Decimal("2"),
-                filled_price=Decimal("0.31"),
-                current_best_bid=Decimal("0.29"),
-                estimated_unwind_cost=Decimal("0.04"),
-                leg_index=0,
-            ),
-        ),
-        unwind_reason="BUS_EVICTED",
-        original_manifest=manifest,
-        unwind_timestamp_ms=timestamp_ms,
-        total_estimated_unwind_cost=Decimal("0.04"),
-        recommended_action="PASSIVE_UNWIND",
-    )
-    orchestrator._pending_unwinds["cluster-1"] = unwind_manifest
+    adapter._orchestrator.guard.record_dispatch(context, timestamp_ms)
+    adapter._orchestrator.guard.record_suppression("OFI")
 
 
 def test_constructor_requires_orchestrator() -> None:
@@ -264,7 +150,7 @@ def test_export_health_snapshot_includes_health_monitor_fields() -> None:
 
 def test_export_health_snapshot_includes_dispatch_guard_state() -> None:
     adapter, _ = _build_adapter()
-    _seed_live_state(adapter, 1_700_000_000_000)
+    _record_guard_activity(adapter, 1_700_000_000_000)
 
     snapshot = adapter.export_health_snapshot(1_700_000_000_050)
 
@@ -273,29 +159,22 @@ def test_export_health_snapshot_includes_dispatch_guard_state() -> None:
     assert snapshot["dispatch_guard"]["active_open_positions_by_market"]["mkt-a"] == 1
 
 
-def test_export_health_snapshot_includes_coordination_bus_leases_and_horizons() -> None:
+def test_export_health_snapshot_reports_empty_coordination_bus_for_lean_kernel() -> None:
     adapter, _ = _build_adapter()
-    _seed_live_state(adapter, 1_700_000_000_000)
 
     snapshot = adapter.export_health_snapshot(1_700_000_000_100)
-    leases = snapshot["coordination_bus"]["active_slot_leases"]
 
-    assert len(leases) == 2
-    assert leases[0]["lease_expires_ms"] == 1_700_000_000_500
-    assert leases[0]["expiration_horizon_ms"] == 400
+    assert snapshot["coordination_bus"]["total_active_slots"] == 0
+    assert snapshot["coordination_bus"]["slots_by_source"] == {}
+    assert snapshot["coordination_bus"]["active_slot_leases"] == []
 
 
-def test_export_health_snapshot_includes_active_unwinds() -> None:
+def test_export_health_snapshot_reports_empty_unwind_ledger_for_lean_kernel() -> None:
     adapter, _ = _build_adapter()
-    _seed_live_state(adapter, 1_700_000_000_000)
 
     snapshot = adapter.export_health_snapshot(1_700_000_000_100)
-    active_unwinds = snapshot["unwind_ledger"]["active_unwinds"]
 
-    assert len(active_unwinds) == 1
-    assert active_unwinds[0]["cluster_id"] == "cluster-1"
-    assert active_unwinds[0]["total_estimated_unwind_cost"] == "0.04"
-    assert active_unwinds[0]["hanging_legs"][0]["filled_price"] == "0.31"
+    assert snapshot["unwind_ledger"]["active_unwinds"] == []
 
 
 def test_export_health_snapshot_converts_release_failures_into_serializable_health_state() -> None:
@@ -312,28 +191,10 @@ def test_export_health_snapshot_converts_release_failures_into_serializable_heal
 
 def test_export_health_snapshot_json_dumps_without_type_error() -> None:
     adapter, _ = _build_adapter()
-    _seed_live_state(adapter, 1_700_000_000_000)
+    _record_guard_activity(adapter, 1_700_000_000_000)
 
     payload = adapter.export_health_snapshot(1_700_000_000_100)
 
     encoded = json.dumps(payload)
 
     assert isinstance(encoded, str)
-
-
-def test_export_health_snapshot_evicts_expired_leases_using_injected_timestamp() -> None:
-    adapter, _ = _build_adapter()
-    _seed_live_state(adapter, 1_700_000_000_000)
-
-    snapshot = adapter.export_health_snapshot(1_700_000_000_600)
-
-    assert snapshot["coordination_bus"]["total_active_slots"] == 0
-    assert snapshot["coordination_bus"]["active_slot_leases"] == []
-
-
-def test_export_health_snapshot_returns_empty_unwind_ledger_when_no_pending_unwinds() -> None:
-    adapter, _ = _build_adapter()
-
-    snapshot = adapter.export_health_snapshot(1_700_000_000_000)
-
-    assert snapshot["unwind_ledger"]["active_unwinds"] == []

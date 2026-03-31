@@ -80,6 +80,8 @@ def _draw_hazard_bounded(
 
 def draw_stochastic_momentum_bracket(
     *,
+    mean_take_profit_pct: float = DEFAULT_MOMENTUM_TP_PCT,
+    mean_stop_loss_pct: float = DEFAULT_MOMENTUM_SL_PCT,
     mean_max_hold_seconds: float = DEFAULT_MOMENTUM_MAX_HOLD_SECONDS,
     rng: random.Random | None = None,
 ) -> DrawnMomentumBracket:
@@ -88,14 +90,14 @@ def draw_stochastic_momentum_bracket(
     return DrawnMomentumBracket(
         take_profit_pct=_draw_hazard_bounded(
             rng,
-            mean_value=DEFAULT_MOMENTUM_TP_PCT,
+            mean_value=mean_take_profit_pct,
             low_scale=_MOMENTUM_TP_LOW_SCALE,
             high_scale=_MOMENTUM_TP_HIGH_SCALE,
             minimum_value=0.005,
         ),
         stop_loss_pct=_draw_hazard_bounded(
             rng,
-            mean_value=DEFAULT_MOMENTUM_SL_PCT,
+            mean_value=mean_stop_loss_pct,
             low_scale=_MOMENTUM_SL_LOW_SCALE,
             high_scale=_MOMENTUM_SL_HIGH_SCALE,
             minimum_value=0.005,
