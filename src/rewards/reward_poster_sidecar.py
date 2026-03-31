@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from src.core.config import settings
+from src.core.logger import get_logger
 from src.data.market_discovery import MarketInfo
 from src.execution.reward_poster_adapter import RewardPosterAdapter, RewardQuoteState
 from src.rewards.reward_selector import RewardSelector
@@ -14,6 +15,9 @@ from src.rewards.reward_shadow_metrics import build_shadow_extra_payload
 
 _FLATTEN_DELAY_MS = 30_000
 _TERMINAL_QUOTE_STATES = {"REJECTED", "FILLED", "CANCELLED"}
+
+
+log = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -144,8 +148,17 @@ class RewardPosterSidecar:
         candidates = self._selector.static_candidates(self._markets_provider(), timestamp_ms)
         admitted = {market.condition_id: market for market in candidates[: max(settings.strategy.reward_market_cap, 0)]}
         removed_market_ids = set(self._admitted_markets).difference(admitted)
+        previous_market_ids = set(self._admitted_markets)
         self._admitted_markets = admitted
         self._last_refresh_ms = timestamp_ms
+        if force or previous_market_ids != set(admitted):
+            log.info(
+                "reward_sidecar_universe_refreshed",
+                candidate_count=len(candidates),
+                admitted_count=len(admitted),
+                removed_count=len(removed_market_ids),
+                admitted_market_ids=list(admitted)[:8],
+            )
         for quote in list(self._working_quotes.values()):
             if quote.market_id in removed_market_ids and quote.status in {"WORKING", "PARTIAL"}:
                 self._store_quote(self._adapter.cancel_quote(quote, timestamp_ms), quote_reason="MARKET_REMOVED")

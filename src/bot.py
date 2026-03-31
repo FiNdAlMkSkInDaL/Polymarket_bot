@@ -947,6 +947,13 @@ class TradingBot:
                 now_ms=self._current_timestamp_ms,
                 shadow_persist_callback=self._persist_reward_shadow_trade,
             )
+        log.info(
+            "orchestrator_runtime_ready",
+            tick_interval_ms=self._orchestrator_tick_interval_ms,
+            reward_lane_enabled=self._reward_lane_enabled(),
+            reward_sidecar_enabled=self._reward_sidecar is not None,
+            signal_sources=sorted(self._live_orchestrator_config().orchestrator_config.signal_sources_enabled),
+        )
         if self._pure_mm_lane_enabled():
             self._pure_mm = PureMarketMaker(
                 executor=self.executor,
@@ -1469,17 +1476,17 @@ class TradingBot:
                     events = self._live_orchestrator.on_tick(current_timestamp_ms)
                 else:
                     events = await asyncio.to_thread(self._live_orchestrator.on_tick, current_timestamp_ms)
+                if any(event.event_type == "UNWIND_COMPLETE" for event in events):
+                    self._orchestrator_health_monitor.reset_release_failure_count()
+                self._orchestrator_health_monitor.check(current_timestamp_ms)
+                if self._reward_sidecar is not None:
+                    self._reward_sidecar.on_tick(current_timestamp_ms)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self._orchestrator_health_monitor.record_position_release_failure()
                 log.error("orchestrator_tick_error", exc_info=True)
                 continue
-            if any(event.event_type == "UNWIND_COMPLETE" for event in events):
-                self._orchestrator_health_monitor.reset_release_failure_count()
-            self._orchestrator_health_monitor.check(current_timestamp_ms)
-            if self._reward_sidecar is not None:
-                self._reward_sidecar.on_tick(current_timestamp_ms)
 
     def _fan_out_live_best_yes_ask(self, asset_id: str) -> None:
         _ = asset_id

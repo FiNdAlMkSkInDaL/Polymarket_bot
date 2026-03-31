@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from src.core.logger import get_logger
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator
 from src.execution.priority_context import PriorityOrderContext
+
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,7 @@ class OrchestratorHealthMonitor:
         self._config = config
         self._consecutive_release_failures = 0
         self._last_check_timestamp_ms: int | None = None
+        self._last_reported_health: tuple[str, str | None] | None = None
         dispatcher = getattr(self._orchestrator, "dispatcher", None)
         bind_gate = getattr(dispatcher, "bind_pre_dispatch_gate", None)
         if callable(bind_gate):
@@ -95,6 +100,18 @@ class OrchestratorHealthMonitor:
             allows_position_management=(effective_health != "RED"),
             allows_new_panic_entries=(effective_health == "GREEN"),
         )
+        health_signature = (report.orchestrator_health, report.halt_reason)
+        if health_signature != self._last_reported_health:
+            log.info(
+                "orchestrator_health_status",
+                health=report.orchestrator_health,
+                is_safe_to_trade=report.is_safe_to_trade,
+                halt_reason=report.halt_reason,
+                last_snapshot_age_ms=report.last_snapshot_age_ms,
+                heartbeat_ok=report.heartbeat_ok,
+                consecutive_release_failures=report.consecutive_release_failures,
+            )
+            self._last_reported_health = health_signature
         if advance_heartbeat:
             self._last_check_timestamp_ms = timestamp_ms
         return report

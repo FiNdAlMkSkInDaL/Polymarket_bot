@@ -74,6 +74,13 @@ class EmergencyDrainMarket:
     recovery_start: float = 0.0     # when depth first recovered
 
 
+@dataclass(frozen=True)
+class TradeabilityAssessment:
+    tier: str
+    reason: str
+    live_metrics: dict[str, float | int | str | None] = field(default_factory=dict)
+
+
 class MarketLifecycleManager:
     """Manages the three-tier market universe.
 
@@ -353,6 +360,62 @@ class MarketLifecycleManager:
             return om.score
         return None
 
+    def tradeability_assessment(self, condition_id: str) -> TradeabilityAssessment:
+        if condition_id in self.emergency:
+            market = self.emergency[condition_id]
+            return TradeabilityAssessment(
+                tier="emergency",
+                reason=market.reason or "emergency_drain",
+                live_metrics={
+                    "score": round(float(getattr(market.info, "score", 0.0) or 0.0), 1),
+                },
+            )
+        if condition_id in self.draining:
+            market = self.draining[condition_id]
+            return TradeabilityAssessment(
+                tier="draining",
+                reason=market.reason or "draining",
+                live_metrics={
+                    "score": round(float(getattr(market.info, "score", 0.0) or 0.0), 1),
+                },
+            )
+        if condition_id in self.observing:
+            return self._observing_assessment(condition_id)
+        if condition_id in self.active:
+            market = self.active[condition_id]
+            return TradeabilityAssessment(
+                tier="active",
+                reason="tradeable",
+                live_metrics={
+                    "score": round(market.score.total, 1),
+                },
+            )
+        return TradeabilityAssessment(tier="untracked", reason="untracked", live_metrics={})
+
+    def observing_blocker_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for condition_id in self.observing:
+            reason = self._observing_assessment(condition_id).reason
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    def observing_blockers_snapshot(self, *, limit: int = 10) -> dict[str, dict[str, object]]:
+        sample: dict[str, dict[str, object]] = {}
+        for condition_id in list(self.observing)[: max(limit, 0)]:
+            assessment = self._observing_assessment(condition_id)
+            blockers = [assessment.reason]
+            if assessment.reason != "score_below_threshold":
+                score = self.get_score(condition_id)
+                if score < settings.strategy.min_market_score:
+                    blockers.append("score_below_threshold")
+            sample[condition_id] = {
+                "primary_reason": assessment.reason,
+                "blockers": blockers,
+                "score": round(self.get_score(condition_id), 1),
+                "live_metrics": assessment.live_metrics,
+            }
+        return sample
+
     # ────────────────────────── Mutations ──────────────────────────────────
 
     def drain_market(self, condition_id: str, reason: str = "manual") -> None:
@@ -580,6 +643,31 @@ class MarketLifecycleManager:
                 )
             else:
                 om.score = score
+
+    def _observing_assessment(self, condition_id: str) -> TradeabilityAssessment:
+        market = self.observing.get(condition_id)
+        if market is None:
+            return TradeabilityAssessment(tier="untracked", reason="untracked", live_metrics={})
+
+        now = time.time()
+        observation_period_s = settings.strategy.observation_period_minutes * 60
+        age_s = max(0.0, now - market.entered_at)
+        score = round(market.score.total, 1)
+        if age_s < observation_period_s:
+            reason = "observation_period"
+        elif market.score.total < settings.strategy.min_market_score:
+            reason = "score_below_threshold"
+        else:
+            reason = "awaiting_promotion"
+        return TradeabilityAssessment(
+            tier="observing",
+            reason=reason,
+            live_metrics={
+                "score": score,
+                "observation_age_s": round(age_s, 1),
+                "observation_remaining_s": round(max(observation_period_s - age_s, 0.0), 1),
+            },
+        )
 
     def _move_to_draining(self, condition_id: str, reason: str) -> None:
         """Move from active/observing to draining."""
