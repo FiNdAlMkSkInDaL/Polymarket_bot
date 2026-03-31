@@ -103,6 +103,11 @@ class MarketInfo:
     accepting_orders: bool = True
     tags: str = ""
     neg_risk: bool = False
+    reward_program_active: bool = False
+    reward_daily_rate_usd: float = 0.0
+    reward_min_size: float = 0.0
+    reward_max_spread_cents: float = 0.0
+    reward_competition_score: float = 0.0
 
 
 async def fetch_active_markets(
@@ -322,9 +327,10 @@ async def _fetch_gamma_events(
     # SI-9 cluster discovery needs all negRisk legs for an event present in
     # the bootstrap universe. Per-event deduplication collapses each event to
     # a single market and guarantees zero clusters downstream.
+    si9_enabled = settings.strategy.lane_is_live("si9_combo") or settings.strategy.si9_arb_enabled
     one_per_event = (
         settings.strategy.one_market_per_event
-        and not settings.strategy.si9_arb_enabled
+        and not si9_enabled
     )
     gamma_url = "https://gamma-api.polymarket.com/events"
     markets: list[MarketInfo] = []
@@ -543,8 +549,9 @@ def _parse_market(
         # SI-9 combo arb is enabled, in which case we admit them for
         # cluster discovery (they are filtered separately).
         is_neg_risk = bool(raw.get("negRisk", False))
+        si9_enabled = settings.strategy.lane_is_live("si9_combo") or settings.strategy.si9_arb_enabled
         if settings.strategy.reject_neg_risk and is_neg_risk:
-            if not settings.strategy.si9_arb_enabled:
+            if not si9_enabled:
                 return None, {
                     "reason": "neg_risk_group",
                     "group_title": raw.get("groupItemTitle", "")[:40],
@@ -646,6 +653,54 @@ def _parse_market(
                 "question": question,
             }
 
+        reward_entries = raw.get("clobRewards") or []
+        reward_program_active = False
+        reward_daily_rate_usd = float(raw.get("rewardsDailyRate") or 0.0)
+        reward_min_size = float(raw.get("rewardsMinSize") or 0.0)
+        reward_max_spread_cents = float(raw.get("rewardsMaxSpread") or 0.0)
+        reward_competition_score = float(raw.get("competitive") or 0.0)
+        if isinstance(reward_entries, list):
+            now_utc = datetime.now(timezone.utc)
+            for reward_entry in reward_entries:
+                if not isinstance(reward_entry, dict):
+                    continue
+                start_raw = reward_entry.get("startDate") or reward_entry.get("start_date")
+                end_raw = reward_entry.get("endDate") or reward_entry.get("end_date")
+                try:
+                    start_date = (
+                        datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                        if start_raw
+                        else None
+                    )
+                    reward_end_date = (
+                        datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                        if end_raw
+                        else None
+                    )
+                except ValueError:
+                    start_date = None
+                    reward_end_date = None
+                within_window = (
+                    (start_date is None or start_date <= now_utc)
+                    and (reward_end_date is None or reward_end_date >= now_utc)
+                )
+                if within_window:
+                    reward_program_active = True
+                    reward_daily_rate_usd = max(
+                        reward_daily_rate_usd,
+                        float(reward_entry.get("rewardsDailyRate") or reward_entry.get("dailyRate") or 0.0),
+                    )
+                    reward_min_size = max(
+                        reward_min_size,
+                        float(reward_entry.get("rewardsMinSize") or reward_entry.get("minSize") or 0.0),
+                    )
+                    reward_max_spread_cents = max(
+                        reward_max_spread_cents,
+                        float(reward_entry.get("rewardsMaxSpread") or reward_entry.get("maxSpread") or 0.0),
+                    )
+
+        reward_program_active = reward_program_active or reward_daily_rate_usd > 0.0
+
         return MarketInfo(
             condition_id=raw.get("condition_id", ""),
             question=raw.get("question", ""),
@@ -659,6 +714,11 @@ def _parse_market(
             accepting_orders=bool(raw.get("acceptingOrders", True)),
             tags=raw.get("tags", raw.get("category", "")),
             neg_risk=bool(raw.get("negRisk", False)),
+            reward_program_active=reward_program_active,
+            reward_daily_rate_usd=reward_daily_rate_usd,
+            reward_min_size=reward_min_size,
+            reward_max_spread_cents=reward_max_spread_cents,
+            reward_competition_score=reward_competition_score,
         ), None
 
     except (KeyError, TypeError, ValueError) as exc:

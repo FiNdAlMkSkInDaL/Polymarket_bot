@@ -67,7 +67,8 @@ from src.trading.chaser import ChaserState, OrderChaser
 from src.trading.ensemble_risk import EnsembleRiskManager
 from src.trading.executor import OrderExecutor, OrderSide, OrderStatus, OrderStatusPoller
 from src.trading.fee_cache import FeeCache
-from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState
+from src.trading.fees import compute_adaptive_stop_loss_cents, compute_net_pnl_cents, get_fee_rate
+from src.trading.position_manager import ComboPosition, ComboState, PositionManager, PositionState, ShadowExecutionTracker
 from src.trading.portfolio_correlation import PortfolioCorrelationEngine
 from src.trading.stop_loss import StopLossMonitor
 from src.trading.stealth_executor import StealthExecutor
@@ -75,10 +76,10 @@ from src.trading.take_profit import compute_dynamic_spread, compute_take_profit
 from src.signals.regime_detector import RegimeDetector
 from src.signals.iceberg_detector import IcebergDetector
 from src.signals.contagion_arb import ContagionArbDetector, ContagionArbSignal
-from src.signals.cross_market import CrossMarketSignalGenerator
+from src.signals.cross_market import CrossMarketSignal, CrossMarketSignalGenerator
 from src.signals.combinatorial_arb import ComboArbDetector, ComboArbSignal, ComboSizer
 from src.signals.bayesian_arb import BayesianArbDetector, BayesianArbRelationshipManager
-from src.data.arb_clusters import ArbitrageClusterManager
+from src.data.arb_clusters import ArbitrageClusterManager, ScoredArbCluster
 from src.signals.drift_signal import DriftSignal, MeanReversionDrift
 from src.signals.oracle_signal import OracleSignalEngine
 from src.data.oracle_adapter import (
@@ -89,22 +90,19 @@ from src.data.oracle_adapter import (
 )
 from src.data.adapters.ap_election_adapter import APElectionAdapter
 from src.data.adapters.sports_adapter import SportsAdapter
-from src.detectors.ctf_peg_config import CtfPegConfig
-from src.execution.ctf_paper_adapter import CtfPaperAdapterConfig
+from src.execution.alpha_adapters import contagion_to_context
 from src.execution.dispatch_guard_config import DispatchGuardConfig
 from src.execution.live_execution_boundary import LiveExecutionBoundary, build_live_execution_boundary
-from src.execution.live_escalation_policy import LiveEscalationPolicy
+from src.execution.entry_signals import OfiEntrySignal
 from src.execution.live_orchestrator_config import LiveOrchestratorConfig
-from src.execution.live_unwind_cost_estimator import LiveUnwindCostEstimator
-from src.execution.live_unwind_executor import LiveUnwindExecutor
+from src.execution.mev_serializer import deserialize_envelope
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator, OrchestratorConfig
-from src.execution.ofi_signal_bridge import OfiEntrySignal, OfiSignalBridgeConfig
 from src.execution.orchestrator_factory import build_live_orchestrator
 from src.execution.orchestrator_health_monitor import HealthMonitorConfig, OrchestratorHealthMonitor
-from src.execution.si9_paper_adapter import Si9PaperAdapterConfig
 from src.execution.si9_unwind_manifest import Si9UnwindConfig
-from src.execution.signal_coordination_bus import CoordinationBusConfig
 from src.execution.ofi_local_exit_monitor import OfiExitDecision
+from src.rewards.reward_poster_sidecar import RewardPosterSidecar
+from src.rewards.reward_selector import RewardSelector
 from src.trading.adverse_selection_monitor import AdverseSelectionMonitor, make_fill_record
 from src.strategies.pure_market_maker import PureMarketMaker
 
@@ -115,6 +113,17 @@ except ImportError:
     MarketDataRecorder = None  # type: ignore[misc,assignment]
 
 log = get_logger(__name__)
+
+
+_SI9_HARD_EXCLUDE_FEEDBACK_REASONS = {
+    "infeasible_size",
+    "thin_bid_depth",
+}
+_SI9_STRUCTURAL_GUARDRAIL_DISTANCE = 0.05
+_SI9_OVERSIZED_EVENT_CAPACITY_SHARE = 0.5
+_CROSS_MARKET_SHADOW_SOURCE = "SI-3_CrossMarket"
+_OFI_REVERSE_SHADOW_SOURCE = "OFI_REVERSE_SHADOW"
+_PANIC_SHADOW_SOURCE = "PANIC_STRICT_SHADOW"
 
 
 def _decimal_from_number(value: Any) -> Decimal:
@@ -188,6 +197,7 @@ class TradingBot:
         # Components (initialised in start())
         self.executor = OrderExecutor(paper_mode=self.paper_mode)
         self.trade_store = TradeStore()
+        self._shadow_tracker = ShadowExecutionTracker(self.trade_store)
 
         # Portfolio Correlation Engine (Pillar 15)
         self.pce = PortfolioCorrelationEngine(
@@ -261,7 +271,11 @@ class TradingBot:
         # SI-2: _iceberg_detectors initialised above (before PositionManager)
 
         # SI-3: Cross-market signal generator
-        self._cross_market = CrossMarketSignalGenerator(self.pce) if settings.strategy.cross_mkt_enabled else None
+        self._cross_market = (
+            CrossMarketSignalGenerator(self.pce)
+            if self._cross_market_lane_enabled()
+            else None
+        )
 
         # SI-4: Stealth executor wrapper
         self._stealth = StealthExecutor(self.executor) if settings.strategy.stealth_enabled else None
@@ -287,13 +301,18 @@ class TradingBot:
         # The CryptoPriceModel and GenericBayesianModel are stateless
         # per call; the per-market estimate cache inside the RPE already
         # keys by market_id, so one instance suffices.
-        self._rpe = ResolutionProbabilityEngine(
-            models=[
-                CryptoPriceModel(
-                    price_fn=lambda: self._get_crypto_spot(),
-                ),
-                GenericBayesianModel(),
-            ],
+        self._rpe: ResolutionProbabilityEngine | None = None
+        if self._rpe_lane_enabled() or self._contagion_lane_enabled():
+            self._rpe = ResolutionProbabilityEngine(
+                models=[
+                    CryptoPriceModel(
+                        price_fn=lambda: self._get_crypto_spot(),
+                    ),
+                    GenericBayesianModel(),
+                ],
+            )
+        self._rpe_calibration: RPECalibrationTracker | None = (
+            RPECalibrationTracker() if self._rpe is not None else None
         )
         self._contagion_arb: ContagionArbDetector | None = (
             ContagionArbDetector(
@@ -301,11 +320,17 @@ class TradingBot:
                 self._rpe,
                 on_sync_block=lambda _assessment: self.sync_telemetry.record_contagion_block(),
             )
-            if settings.strategy.contagion_arb_enabled
+            if self._contagion_lane_enabled() and self._rpe is not None
             else None
         )
+        self._rpe_last_signal: dict[str, float] = {}
         self._rpe_last_spot: float | None = None
         self._l2_active_set: set[str] = set()
+        self._warm_market_ids: set[str] = set()
+        self._tracked_single_market_ids: set[str] = set()
+        self._tracked_combo_market_ids: set[str] = set()
+        self._tracked_combo_event_ids: tuple[str, ...] = ()
+        self._single_name_rejection_counts: dict[str, dict[str, int]] = {}
         self._fee_category_set: set[str] = {
             part.strip().lower()
             for part in (settings.strategy.fee_enabled_categories or "").split(",")
@@ -368,10 +393,344 @@ class TradingBot:
         self._order_poller: OrderStatusPoller | None = None
         self._stop_loss_monitor: StopLossMonitor | None = None
         self._pure_mm: PureMarketMaker | None = None
+        self._reward_sidecar: RewardPosterSidecar | None = None
         self._live_orchestrator: MultiSignalOrchestrator | None = None
         self._live_execution_boundary: LiveExecutionBoundary | None = None
         self._orchestrator_health_monitor: OrchestratorHealthMonitor | None = None
         self._orchestrator_tick_interval_ms: int = settings.strategy.heartbeat_check_ms
+
+    def _panic_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("panic") or settings.strategy.panic_shadow_mode
+
+    def _ofi_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_live("ofi_momentum")
+
+    def _contagion_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("contagion")
+
+    def _contagion_shadow_runtime_enabled(self) -> bool:
+        return settings.strategy.contagion_shadow_runtime_enabled()
+
+    def _reward_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("reward")
+
+    def _contagion_live_enabled(self) -> bool:
+        return settings.strategy.lane_is_live("contagion")
+
+    def _rpe_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("rpe")
+
+    def _oracle_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("oracle")
+
+    def _pure_mm_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_live("pure_market_maker")
+
+    def _si9_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_live("si9_combo")
+
+    def _cross_market_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_active("cross_market")
+
+    def _si10_lane_enabled(self) -> bool:
+        return settings.strategy.lane_is_live("si10_bayesian")
+
+    def _tracked_market_budgets(self, l2_limit: int) -> tuple[int, int]:
+        """Split tracked-market capacity between single-name and SI-9."""
+        if l2_limit <= 0:
+            return 0, 0
+
+        strat = settings.strategy
+        if not self._si9_lane_enabled():
+            return l2_limit, 0
+
+        single_override = int(strat.tracked_single_name_markets)
+        combo_override = int(strat.si9_tracked_market_budget)
+
+        if single_override < 0 and combo_override < 0:
+            combo_budget = max(2, round(l2_limit * 0.4)) if l2_limit >= 4 else max(0, l2_limit - 1)
+            return max(0, l2_limit - combo_budget), combo_budget
+
+        if single_override < 0:
+            combo_budget = max(0, min(combo_override, l2_limit))
+            return max(0, l2_limit - combo_budget), combo_budget
+
+        if combo_override < 0:
+            single_budget = max(0, min(single_override, l2_limit))
+            return single_budget, max(0, l2_limit - single_budget)
+
+        single_budget = max(0, min(single_override, l2_limit))
+        combo_budget = max(0, min(combo_override, l2_limit - single_budget))
+        return single_budget, combo_budget
+
+    def _select_tracked_markets(self, all_tracked: list[MarketInfo]) -> list[MarketInfo]:
+        """Prefer full SI-9 events and then backfill with top single-name markets."""
+        l2_limit = settings.strategy.max_active_l2_markets
+        single_budget, combo_budget = self._tracked_market_budgets(l2_limit)
+        tracked_capacity = max(1, single_budget + combo_budget)
+        sorted_markets = sorted(
+            all_tracked,
+            key=lambda market: market.daily_volume_usd,
+            reverse=True,
+        )
+
+        selected_combo_rankings: list[ScoredArbCluster] = []
+        selected_combo_ids: set[str] = set()
+        combo_markets: list[MarketInfo] = []
+        remaining_combo_budget = combo_budget
+        remaining_single_budget = single_budget
+        ranked_clusters: list[ScoredArbCluster] = []
+        selector_summary: dict[str, int] = {}
+        if combo_budget > 0 and self._si9_lane_enabled():
+            selection_feedback = (
+                self._combo_detector.selection_feedback()
+                if self._combo_detector is not None
+                else None
+            )
+            ranked_clusters = self._cluster_mgr.rank_clusters(
+                all_tracked,
+                selection_feedback=selection_feedback,
+            )
+            selector_summary = self._cluster_mgr.last_scan_summary()
+
+            for diagnostic in self._cluster_mgr.last_scan_diagnostics():
+                if diagnostic.admitted:
+                    continue
+                log.info(
+                    "si9_selector_excluded",
+                    event_id=diagnostic.event_id,
+                    reason=diagnostic.reason,
+                    total_legs=diagnostic.total_legs,
+                    neg_risk_legs=diagnostic.neg_risk_legs,
+                    accepting_orders_ratio=diagnostic.accepting_orders_ratio,
+                    liquid_legs=diagnostic.liquid_legs,
+                )
+
+        if combo_budget > 0:
+            for ranked in ranked_clusters:
+                if self._exclude_recently_unactionable_si9_cluster(ranked):
+                    log.info(
+                        "si9_selector_excluded",
+                        event_id=ranked.cluster.event_id,
+                        reason="recent_unactionable_feedback",
+                        n_legs=ranked.cluster.n_legs,
+                        score=ranked.score,
+                        feedback_penalty=ranked.feedback_penalty,
+                        signal_bonus=ranked.signal_bonus,
+                        last_feedback_reason=ranked.last_feedback_reason,
+                    )
+                    continue
+
+                leg_count = len(ranked.cluster.legs)
+                if self._exclude_low_quality_oversized_si9_cluster(
+                    ranked,
+                    tracked_capacity=tracked_capacity,
+                ):
+                    log.info(
+                        "si9_selector_excluded",
+                        event_id=ranked.cluster.event_id,
+                        reason="oversized_low_quality_event",
+                        n_legs=leg_count,
+                        score=ranked.score,
+                        score_floor=settings.strategy.min_market_score,
+                        capacity_share=round(leg_count / tracked_capacity, 4),
+                        feedback_penalty=ranked.feedback_penalty,
+                        signal_bonus=ranked.signal_bonus,
+                        last_feedback_reason=ranked.last_feedback_reason,
+                    )
+                    continue
+
+                cluster_legs = sorted(
+                    ranked.cluster.legs,
+                    key=lambda market: market.daily_volume_usd,
+                    reverse=True,
+                )
+                total_remaining_capacity = remaining_combo_budget + remaining_single_budget
+                if leg_count > total_remaining_capacity:
+                    log.info(
+                        "si9_selector_excluded",
+                        event_id=ranked.cluster.event_id,
+                        reason="insufficient_total_capacity",
+                        n_legs=leg_count,
+                        remaining_combo_budget=remaining_combo_budget,
+                        remaining_single_budget=remaining_single_budget,
+                        score=ranked.score,
+                        completeness_ratio=ranked.completeness_ratio,
+                        feedback_penalty=ranked.feedback_penalty,
+                        signal_bonus=ranked.signal_bonus,
+                        last_feedback_reason=ranked.last_feedback_reason,
+                    )
+                    continue
+
+                borrowed_single_budget = 0
+                if leg_count > remaining_combo_budget:
+                    borrowed_single_budget = leg_count - remaining_combo_budget
+                    remaining_single_budget = max(0, remaining_single_budget - borrowed_single_budget)
+                    remaining_combo_budget = 0
+                else:
+                    remaining_combo_budget -= leg_count
+
+                combo_markets.extend(cluster_legs)
+                selected_combo_rankings.append(ranked)
+                selected_combo_ids.update(market.condition_id for market in cluster_legs)
+                log.info(
+                    "si9_selector_selected",
+                    event_id=ranked.cluster.event_id,
+                    n_legs=leg_count,
+                    score=ranked.score,
+                    completeness_ratio=ranked.completeness_ratio,
+                    feedback_penalty=ranked.feedback_penalty,
+                    signal_bonus=ranked.signal_bonus,
+                    last_feedback_reason=ranked.last_feedback_reason,
+                    borrowed_single_budget=borrowed_single_budget,
+                    remaining_combo_budget=remaining_combo_budget,
+                    remaining_single_budget=remaining_single_budget,
+                )
+                if remaining_combo_budget == 0:
+                    if remaining_single_budget == 0:
+                        break
+
+        single_candidates = [
+            market for market in sorted_markets if market.condition_id not in selected_combo_ids
+        ]
+        single_slots = min(len(single_candidates), remaining_single_budget + remaining_combo_budget)
+        single_markets = single_candidates[:single_slots]
+
+        self._tracked_single_market_ids = {market.condition_id for market in single_markets}
+        self._tracked_combo_market_ids = {market.condition_id for market in combo_markets}
+        self._tracked_combo_event_ids = tuple(
+            ranked.cluster.event_id for ranked in selected_combo_rankings
+        )
+
+        log.info(
+            "tracked_market_selection",
+            total_selected=len(combo_markets) + len(single_markets),
+            l2_limit=l2_limit,
+            single_name_budget=single_budget,
+            single_name_selected=len(single_markets),
+            si9_market_budget=combo_budget,
+            si9_selected=len(combo_markets),
+            si9_events=list(self._tracked_combo_event_ids),
+            si9_candidate_events=selector_summary.get("candidate_events", 0),
+            si9_admitted_events=selector_summary.get("admitted_events", 0),
+        )
+        return (combo_markets + single_markets)[:l2_limit]
+
+    def _warm_market_limit(self) -> int:
+        return max(
+            int(settings.strategy.max_active_l2_markets),
+            int(settings.strategy.warm_market_observation_limit),
+        )
+
+    def _select_warm_markets(
+        self,
+        all_tracked: list[MarketInfo],
+        tracked_markets: list[MarketInfo],
+        *,
+        open_market_ids: set[str] | None = None,
+    ) -> list[MarketInfo]:
+        warm_limit = self._warm_market_limit()
+        if warm_limit <= 0:
+            return list(tracked_markets)
+
+        open_market_ids = open_market_ids or set()
+        active_ids = set(self.lifecycle.active)
+        required_ids = {
+            *(market.condition_id for market in tracked_markets),
+            *active_ids,
+            *open_market_ids,
+        }
+        market_by_id = {market.condition_id: market for market in all_tracked}
+
+        warm_markets: list[MarketInfo] = []
+        seen: set[str] = set()
+
+        def include(market: MarketInfo | None) -> None:
+            if market is None or market.condition_id in seen:
+                return
+            seen.add(market.condition_id)
+            warm_markets.append(market)
+
+        for market in tracked_markets:
+            include(market)
+
+        for condition_id in required_ids:
+            include(market_by_id.get(condition_id))
+
+        ranked_candidates = sorted(
+            all_tracked,
+            key=lambda market: (
+                market.condition_id in active_ids,
+                market.condition_id in open_market_ids,
+                float(getattr(market, "score", 0.0) or 0.0),
+                float(market.daily_volume_usd or 0.0),
+            ),
+            reverse=True,
+        )
+        for market in ranked_candidates:
+            if len(warm_markets) >= warm_limit:
+                break
+            include(market)
+
+        return warm_markets
+
+    def _exclude_recently_unactionable_si9_cluster(self, ranked: ScoredArbCluster) -> bool:
+        if ranked.signal_bonus > 0.0:
+            return False
+
+        if ranked.feedback_penalty < settings.strategy.si9_feedback_exclusion_penalty:
+            return False
+
+        if ranked.last_feedback_reason in _SI9_HARD_EXCLUDE_FEEDBACK_REASONS:
+            return True
+
+        if ranked.last_feedback_reason.startswith("guardrail_"):
+            return ranked.guardrail_distance >= _SI9_STRUCTURAL_GUARDRAIL_DISTANCE
+
+        return False
+
+    def _exclude_low_quality_oversized_si9_cluster(
+        self,
+        ranked: ScoredArbCluster,
+        *,
+        tracked_capacity: int,
+    ) -> bool:
+        if ranked.signal_bonus > 0.0:
+            return False
+
+        configured_leg_cap = max(int(settings.strategy.si9_max_legs), 0)
+        leg_count = max(ranked.cluster.n_legs, 0)
+        if leg_count <= 0:
+            return False
+        if configured_leg_cap > 0 and leg_count <= configured_leg_cap:
+            return False
+
+        capacity_share = leg_count / max(tracked_capacity, 1)
+        if capacity_share < _SI9_OVERSIZED_EVENT_CAPACITY_SHARE:
+            return False
+
+        return ranked.score < settings.strategy.min_market_score
+
+    def _record_single_name_rejection(
+        self,
+        strategy: str,
+        market: MarketInfo,
+        reason: str,
+        *,
+        log_event: bool = True,
+        **details: Any,
+    ) -> None:
+        strategy_key = (strategy or "unknown").lower()
+        strategy_counts = self._single_name_rejection_counts.setdefault(strategy_key, {})
+        strategy_counts[reason] = strategy_counts.get(reason, 0) + 1
+        if log_event:
+            log.info(
+                "single_name_signal_rejected",
+                strategy=strategy_key,
+                market=market.condition_id,
+                reason=reason,
+                **details,
+            )
 
     async def _refresh_markets_once(self, *, decay_counters: bool) -> None:
         """Refresh the tracked market universe once."""
@@ -394,6 +753,7 @@ class TradingBot:
 
         newly_added, evicted = await self.lifecycle.refresh(
             orderbook_trackers=self._book_trackers,
+            yes_aggs=self._yes_aggs,
             trade_counts=self._trade_counts,
             whale_tokens=whale_tokens,
             open_position_markets=open_markets,
@@ -412,15 +772,18 @@ class TradingBot:
                     self._unwire_market(m)
                     break
 
-        l2_limit = settings.strategy.max_active_l2_markets
         all_tracked = self.lifecycle.get_all_tracked()
-        all_tracked.sort(key=lambda m: m.daily_volume_usd, reverse=True)
-        self._l2_active_set = {
-            m.condition_id for m in all_tracked[:l2_limit]
-        }
-
-        tracked_markets = all_tracked[:l2_limit]
-        await self._reconcile_tracked_markets(tracked_markets)
+        tracked_markets = self._select_tracked_markets(all_tracked)
+        self._l2_active_set = {market.condition_id for market in tracked_markets}
+        warm_markets = self._select_warm_markets(
+            all_tracked,
+            tracked_markets,
+            open_market_ids=open_markets,
+        )
+        self._warm_market_ids = {market.condition_id for market in warm_markets}
+        await self._reconcile_warm_markets(warm_markets)
+        if self._reward_sidecar is not None:
+            self._reward_sidecar.replace_market_universe(list(self._markets), self._current_timestamp_ms())
 
         stale_evicted = self.lifecycle.check_stale_markets(
             yes_aggs=self._yes_aggs,
@@ -487,7 +850,7 @@ class TradingBot:
     async def start(self) -> None:
         """Start background tasks and live runtime services for the trading bot."""
         self._running = True
-        self._start_time = time.time()
+        self._start_time = time.monotonic()
         mode_label = self.deployment_env.value
 
         # Polygon head-lag checker (moved from adverse-selection guard)
@@ -529,11 +892,7 @@ class TradingBot:
                 min_heartbeat_interval_ms=self._orchestrator_tick_interval_ms,
             ),
         )
-        if self._live_orchestrator.wallet_balance_provider is not None:
-            self._live_orchestrator.wallet_balance_provider.set_balance_update_callback(self._on_wallet_balance_update)
-            self.positions.set_wallet_balance(
-                self._live_orchestrator.wallet_balance_provider.get_available_margin("USDC")
-            )
+        self._initialize_wallet_balance()
         self._apply_live_market_target_map()
 
         # Event-driven stop-loss monitor (Pillar 11) — no polling task
@@ -583,17 +942,30 @@ class TradingBot:
         )
         # Wire monitor into PositionManager for exec-mode downgrade on suspension
         self.positions._maker_monitor = self._maker_monitor
-        self._pure_mm = PureMarketMaker(
-            executor=self.executor,
-            get_active_markets=lambda: [am.info for am in self.lifecycle.active.values()],
-            get_l2_books=lambda: self._l2_books,
-            get_book_trackers=lambda: self._book_trackers,
-            get_l2_active_set=lambda: self._l2_active_set,
-            latency_guard=self.latency_guard,
-            fast_kill_event=self._fast_kill_event,
-            maker_monitor=self._maker_monitor,
-            iceberg_detectors=self._iceberg_detectors,
-        )
+        if self._reward_lane_enabled() and self._live_orchestrator is not None and self._orchestrator_health_monitor is not None:
+            self._reward_sidecar = RewardPosterSidecar(
+                orchestrator=self._live_orchestrator,
+                selector=RewardSelector(),
+                markets_provider=lambda: list(self._markets),
+                market_by_asset_provider=lambda asset_id: self._market_map.get(asset_id),
+                book_provider=lambda asset_id: self._book_trackers.get(asset_id),
+                health_report_provider=lambda current_timestamp_ms: self._orchestrator_health_monitor.check(current_timestamp_ms),
+                maker_monitor=self._maker_monitor,
+                now_ms=self._current_timestamp_ms,
+                shadow_persist_callback=self._persist_reward_shadow_trade,
+            )
+        if self._pure_mm_lane_enabled():
+            self._pure_mm = PureMarketMaker(
+                executor=self.executor,
+                get_active_markets=lambda: [am.info for am in self.lifecycle.active.values()],
+                get_l2_books=lambda: self._l2_books,
+                get_book_trackers=lambda: self._book_trackers,
+                get_l2_active_set=lambda: self._l2_active_set,
+                latency_guard=self.latency_guard,
+                fast_kill_event=self._fast_kill_event,
+                maker_monitor=self._maker_monitor,
+                iceberg_detectors=self._iceberg_detectors,
+            )
         # Wire stealth executor into PositionManager for sliced probe scale-ups
         if self._stealth is not None:
             self.positions._stealth = self._stealth
@@ -618,29 +990,33 @@ class TradingBot:
             asyncio.create_task(self._ghost_liquidity_loop(), name="ghost_liquidity"),
             asyncio.create_task(self._order_poller.run(), name="order_status_poller"),
             asyncio.create_task(self._health_reporter(), name="health_reporter"),
-            asyncio.create_task(self._rpe_crypto_retrigger_loop(), name="rpe_retrigger"),
             asyncio.create_task(self._stale_bar_flush_loop(), name="stale_bar_flush"),
             asyncio.create_task(self._paper_summary_loop(), name="paper_summary"),
         ]
+
+        if self._rpe_lane_enabled() and self._rpe is not None:
+            self._tasks.append(
+                asyncio.create_task(self._rpe_crypto_retrigger_loop(), name="rpe_retrigger")
+            )
 
         if self._live_orchestrator is not None and self._live_orchestrator.wallet_balance_provider is not None:
             self._tasks.append(
                 asyncio.create_task(self._wallet_balance_poll_loop(), name="wallet_balance_poll")
             )
 
-        if settings.strategy.pure_mm_enabled:
+        if self._pure_mm is not None:
             self._tasks.append(
                 asyncio.create_task(self._pure_mm.run(), name="pure_market_maker")
             )
 
         # SI-8: Oracle Latency Arbitrage polling loop (if enabled)
-        if settings.strategy.oracle_arb_enabled:
+        if self._oracle_lane_enabled():
             self._tasks.append(
                 asyncio.create_task(self._oracle_polling_loop(), name="oracle_poll")
             )
 
         # SI-9: Combinatorial Arbitrage cluster scanning + execution
-        if settings.strategy.si9_arb_enabled:
+        if self._si9_lane_enabled():
             # Build initial clusters from discovered markets
             self._cluster_mgr.scan_clusters(self._markets)
             # Ensure YES-token books exist for cluster legs
@@ -658,7 +1034,7 @@ class TradingBot:
                 asyncio.create_task(self._combo_arbitrage_loop(), name="combo_arb")
             )
 
-        if settings.strategy.si10_bayesian_arb_enabled:
+        if self._si10_lane_enabled():
             self._bayesian_cluster_mgr.scan_clusters(self._markets)
             for tid in self._bayesian_cluster_mgr.all_cluster_asset_ids():
                 if tid not in self._book_trackers:
@@ -778,13 +1154,27 @@ class TradingBot:
         if settings.strategy.regime_enabled:
             self._regime_detectors[m.condition_id] = RegimeDetector(m.condition_id)
 
-        self._ofi_detectors[m.condition_id] = OFIMomentumDetector(
+        self._detectors[m.condition_id] = PanicDetector(
             market_id=m.condition_id,
+            yes_asset_id=m.yes_token_id,
             no_asset_id=m.no_token_id,
-            window_ms=settings.strategy.window_ms,
-            threshold=settings.strategy.ofi_threshold,
-            tvi_kappa=settings.strategy.ofi_tvi_kappa,
+            yes_aggregator=yes_agg,
+            no_aggregator=no_agg,
+            zscore_threshold=settings.strategy.panic_zscore_threshold,
+            volume_ratio_threshold=settings.strategy.panic_volume_ratio_threshold,
+            trend_guard_pct=settings.strategy.panic_trend_guard_pct,
+            trend_guard_bars=settings.strategy.panic_trend_guard_bars,
+            ofi_veto_threshold=settings.strategy.panic_ofi_veto_threshold,
         )
+
+        if self._ofi_lane_enabled():
+            self._ofi_detectors[m.condition_id] = OFIMomentumDetector(
+                market_id=m.condition_id,
+                no_asset_id=m.no_token_id,
+                window_ms=settings.strategy.window_ms,
+                threshold=settings.strategy.ofi_threshold,
+                tvi_kappa=settings.strategy.ofi_tvi_kappa,
+            )
         if self._contagion_arb is not None:
             self._contagion_arb.register_market(m)
 
@@ -843,7 +1233,8 @@ class TradingBot:
         self._ofi_detectors.pop(m.condition_id, None)
         if self._contagion_arb is not None:
             self._contagion_arb.unregister_market(m.condition_id)
-        self._rpe.clear_market(m.condition_id)
+        if self._rpe is not None:
+            self._rpe.clear_market(m.condition_id)
         self.pce.unregister_market(m.condition_id)
         self._book_trackers.pop(m.yes_token_id, None)
         self._book_trackers.pop(m.no_token_id, None)
@@ -864,9 +1255,13 @@ class TradingBot:
         self._recent_trade_volume.pop(m.condition_id, None)
         self._markets = [x for x in self._markets if x.condition_id != m.condition_id]
 
-    async def _reconcile_tracked_markets(self, target_markets: list[MarketInfo]) -> None:
-        """Keep wired/subscribed markets aligned to the tracked universe cap."""
+    def _market_uses_full_l2(self, market: MarketInfo) -> bool:
+        return market.yes_token_id in self._l2_books and market.no_token_id in self._l2_books
+
+    async def _reconcile_warm_markets(self, target_markets: list[MarketInfo]) -> None:
+        """Keep wired/subscribed markets aligned to the warm universe and L2 tier."""
         target_by_id = {market.condition_id: market for market in target_markets}
+        current_by_id = {market.condition_id: market for market in self._markets}
 
         for market in list(self._markets):
             if market.condition_id in target_by_id:
@@ -877,9 +1272,22 @@ class TradingBot:
                 await self._l2_ws.remove_assets([market.yes_token_id, market.no_token_id])
             self._unwire_market(market)
 
+        for condition_id, market in list(current_by_id.items()):
+            if condition_id not in target_by_id:
+                continue
+            wants_full_l2 = market.condition_id in self._l2_active_set and settings.strategy.l2_enabled
+            if wants_full_l2 == self._market_uses_full_l2(market):
+                continue
+            if self._ws:
+                await self._ws.remove_assets([market.yes_token_id, market.no_token_id])
+            if self._l2_ws:
+                await self._l2_ws.remove_assets([market.yes_token_id, market.no_token_id])
+            self._unwire_market(market)
+            current_by_id.pop(condition_id, None)
+
         new_asset_ids: list[str] = []
         new_l2_books: dict[str, L2OrderBook] = {}
-        current_ids = {market.condition_id for market in self._markets}
+        current_ids = set(current_by_id)
         for market in target_markets:
             if market.condition_id in current_ids:
                 continue
@@ -922,6 +1330,8 @@ class TradingBot:
         raise RuntimeError("POLYBOT_SESSION_ID is required for live orchestrator startup")
 
     def _si9_cluster_configs(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        if not self._si9_lane_enabled():
+            return ()
         self._cluster_mgr.scan_clusters(self._markets)
         return tuple(
             (cluster.event_id, tuple(leg.condition_id for leg in cluster.legs))
@@ -930,7 +1340,7 @@ class TradingBot:
 
     def _orchestrator_market_books(self) -> dict[str, tuple[OrderbookTracker, OrderbookTracker]]:
         market_books: dict[str, tuple[OrderbookTracker, OrderbookTracker]] = {}
-        for market in self._markets:
+        for market in self._tracked_l2_markets():
             yes_tracker = self._book_trackers.get(market.yes_token_id)
             no_tracker = self._book_trackers.get(market.no_token_id)
             if yes_tracker is None or no_tracker is None:
@@ -951,66 +1361,28 @@ class TradingBot:
     def _live_orchestrator_config(self) -> LiveOrchestratorConfig:
         heartbeat_interval_ms = max(int(settings.strategy.heartbeat_check_ms), 1)
         self._orchestrator_tick_interval_ms = heartbeat_interval_ms
-        max_concurrent_clusters = max(int(settings.strategy.si9_max_concurrent_combos), 1)
-        max_slots = max(int(settings.strategy.max_active_l2_markets), 1)
-        max_slots_per_source = max(1, min(max_slots, 10))
+        signal_sources: set[str] = set()
+        if self._ofi_lane_enabled():
+            signal_sources.add("OFI")
+        if self._contagion_arb is not None:
+            signal_sources.add("CONTAGION")
+        if self._reward_lane_enabled():
+            signal_sources.add("REWARD")
         return LiveOrchestratorConfig(
             orchestrator_config=OrchestratorConfig(
                 tick_interval_ms=heartbeat_interval_ms,
-                max_pending_unwinds=max_concurrent_clusters,
-                max_concurrent_clusters=max_concurrent_clusters,
-                signal_sources_enabled=frozenset({"CTF", "SI9", "OFI"}),
-            ),
-            bus_config=CoordinationBusConfig(
-                slot_lease_ms=heartbeat_interval_ms,
-                max_slots_per_source=max_slots_per_source,
-                max_total_slots=max_slots,
-                allow_same_source_reentry=False,
+                max_pending_unwinds=0,
+                max_concurrent_clusters=1,
+                signal_sources_enabled=frozenset(signal_sources),
             ),
             guard_config=DispatchGuardConfig(
                 dedup_window_ms=heartbeat_interval_ms,
-                max_dispatches_per_source_per_window=max_slots_per_source,
+                max_dispatches_per_source_per_window=max(1, min(max(int(settings.strategy.max_active_l2_markets), 1), 10)),
                 rate_window_ms=max(heartbeat_interval_ms * 2, 1),
                 circuit_breaker_threshold=2,
                 circuit_breaker_reset_ms=max(heartbeat_interval_ms * 6, 1),
                 max_open_positions_per_market=max(int(getattr(self.positions, "max_open", 1)), 1),
             ),
-            ctf_adapter_config=CtfPaperAdapterConfig(
-                max_expected_net_edge=Decimal("0.250000"),
-                max_capital_per_signal=_decimal_from_number(settings.strategy.max_trade_size_usd),
-                default_anchor_volume=Decimal("10.000000"),
-                taker_fee_yes=Decimal("0.010000"),
-                taker_fee_no=Decimal("0.010000"),
-                cancel_on_stale_ms=heartbeat_interval_ms,
-                max_size_per_leg=Decimal("8.000000"),
-                mode="paper",
-                bus=None,
-            ),
-            si9_adapter_config=Si9PaperAdapterConfig(
-                max_expected_net_edge=Decimal("0.050000"),
-                max_capital_per_cluster=_decimal_from_number(settings.strategy.si9_max_per_combo_usd),
-                max_leg_fill_wait_ms=max(int(settings.strategy.si9_max_leg_delay_ms), 1),
-                cancel_on_stale_ms=heartbeat_interval_ms,
-                mode="paper",
-                unwind_config=self._si9_unwind_config(),
-                bus=None,
-            ),
-            ofi_bridge_config=OfiSignalBridgeConfig(
-                max_capital_per_signal=_decimal_from_number(settings.strategy.max_trade_size_usd),
-                mode="paper",
-                slot_side_lock=True,
-                source_enabled=True,
-            ),
-            ctf_peg_config=CtfPegConfig(
-                min_yield=Decimal("0.050000"),
-                taker_fee_yes=Decimal("0.010000"),
-                taker_fee_no=Decimal("0.010000"),
-                slippage_budget=Decimal("0.005000"),
-                gas_ewma_alpha=Decimal("0.500000"),
-                max_desync_ms=400,
-            ),
-            si9_cluster_configs=self._si9_cluster_configs(),
-            unwind_config=self._si9_unwind_config(),
             deployment_phase=self._deployment_phase_for_orchestrator(),
             session_id=self._require_orchestrator_session_id(),
             max_position_release_failures=2,
@@ -1021,7 +1393,7 @@ class TradingBot:
         return build_live_execution_boundary(
             deployment_phase=self._deployment_phase_for_orchestrator(),
             session_id=self._require_orchestrator_session_id(),
-            market_by_condition={market.condition_id: market for market in self._markets},
+            market_by_condition={market.condition_id: market for market in self._tracked_l2_markets()},
             now_ms=self._current_timestamp_ms,
             clob_client=None if self.deployment_env == DeploymentEnv.PAPER else self.executor._get_clob_client(),
         )
@@ -1029,42 +1401,23 @@ class TradingBot:
     def _build_live_orchestrator_runtime(self, execution_boundary: LiveExecutionBoundary) -> MultiSignalOrchestrator:
         config = self._live_orchestrator_config()
         market_books = self._orchestrator_market_books()
-        if self.deployment_env == DeploymentEnv.PAPER:
-            from src.execution.escalation_policy_interface import PaperEscalationPolicy
-            from src.execution.si9_unwind_evaluator import Si9UnwindEvaluator
-            from src.execution.unwind_executor_interface import PaperUnwindExecutor
-
-            unwind_executor = PaperUnwindExecutor(config.unwind_config)
-            escalation_policy = PaperEscalationPolicy(
-                Si9UnwindEvaluator(config.unwind_config),
-                surrender_after_ms=max(config.unwind_config.max_hold_recovery_ms, 1),
-            )
-        else:
-            from src.execution.client_order_id import ClientOrderIdGenerator
-            from src.execution.orderbook_best_bid_provider import OrderbookBestBidProvider
-
-            provider = OrderbookBestBidProvider(market_books)
-            cost_estimator = LiveUnwindCostEstimator(
-                {market_id: provider for market_id in market_books}
-            )
-            escalation_policy = LiveEscalationPolicy(cost_estimator, config.unwind_config)
-            unwind_executor = LiveUnwindExecutor(
-                execution_boundary.venue_adapter,
-                ClientOrderIdGenerator("UNWIND", config.session_id),
-            )
-
         return build_live_orchestrator(
             config=config,
             orderbook_tracker=market_books,
             position_manager=self.positions,
             execution_boundary=execution_boundary,
-            unwind_executor=unwind_executor,
-            escalation_policy=escalation_policy,
             ofi_exit_trackers=self._book_trackers,
         )
 
     def _ranked_live_market_ids(self) -> list[str]:
-        return [market.condition_id for market in sorted(self._markets, key=lambda row: row.daily_volume_usd, reverse=True)]
+        return [
+            market.condition_id
+            for market in sorted(
+                self._tracked_l2_markets(),
+                key=lambda row: row.daily_volume_usd,
+                reverse=True,
+            )
+        ]
 
     def _apply_live_market_target_map(self) -> None:
         if self._live_orchestrator is None or self._live_orchestrator.load_shedder is None:
@@ -1072,15 +1425,34 @@ class TradingBot:
         self._live_orchestrator.load_shedder.update_target_map(self._ranked_live_market_ids())
 
     def _sync_live_orchestrator_clusters(self) -> None:
-        if self._live_orchestrator is None or self._live_orchestrator.si9_detector is None:
-            return
-        detector = self._live_orchestrator.si9_detector
-        detector.cluster_members.clear()
-        for cluster_id, market_ids in self._si9_cluster_configs():
-            detector.register_cluster(cluster_id, market_ids)
+        return
 
     def _current_timestamp_ms(self) -> int:
         return time.time_ns() // 1_000_000
+
+    def _persist_reward_shadow_trade(self, payload: dict[str, object]) -> None:
+        task = asyncio.create_task(self._record_reward_shadow_trade(payload), name="reward_shadow_persist")
+        task.add_done_callback(_safe_task_done_callback)
+
+    async def _record_reward_shadow_trade(self, payload: dict[str, object]) -> None:
+        try:
+            await self.trade_store.record_shadow_trade(**payload)
+        except Exception:
+            log.warning(
+                "reward_shadow_persist_failed",
+                trade_id=str(payload.get("trade_id", "")),
+                exc_info=True,
+            )
+
+    def _initialize_wallet_balance(self) -> None:
+        provider = None if self._live_orchestrator is None else self._live_orchestrator.wallet_balance_provider
+        if provider is not None:
+            provider.set_balance_update_callback(self._on_wallet_balance_update)
+            self.positions.set_wallet_balance(provider.get_available_margin("USDC"))
+            return
+
+        if self.paper_mode and float(self.positions._wallet_balance_usd) <= 0.0:
+            self.positions.set_wallet_balance(settings.strategy.paper_starting_balance_usd)
 
     def _on_wallet_balance_update(self, asset_symbol: str, balance: Decimal) -> None:
         if str(asset_symbol or "").strip().upper() != "USDC":
@@ -1113,36 +1485,16 @@ class TradingBot:
             if any(event.event_type == "UNWIND_COMPLETE" for event in events):
                 self._orchestrator_health_monitor.reset_release_failure_count()
             self._orchestrator_health_monitor.check(current_timestamp_ms)
+            if self._reward_sidecar is not None:
+                self._reward_sidecar.on_tick(current_timestamp_ms)
 
     def _fan_out_live_best_yes_ask(self, asset_id: str) -> None:
-        if self._live_orchestrator is None:
-            return
-        market_info = self._market_map.get(asset_id)
-        if market_info is None or asset_id != market_info.yes_token_id:
-            return
-        tracker = self._book_trackers.get(asset_id)
-        if tracker is None or not getattr(tracker, "has_data", False):
-            return
-        snapshot = tracker.snapshot()
-        best_ask = getattr(snapshot, "best_ask", 0.0)
-        if best_ask <= 0.0:
-            return
-        levels = tracker.levels("ask", 1)
-        if not levels:
-            return
-        ask_size = getattr(levels[0], "size", 0.0)
-        if ask_size <= 0.0:
-            return
-        self._live_orchestrator.on_best_yes_ask_update(
-            market_info.condition_id,
-            _decimal_from_number(best_ask),
-            _decimal_from_number(ask_size),
-            self._current_timestamp_ms(),
-        )
+        _ = asset_id
+        return
 
     def _has_live_ofi_exit_runtime(self) -> bool:
         return (
-            self.deployment_env != DeploymentEnv.PAPER
+            self._ofi_lane_enabled()
             and self._live_orchestrator is not None
             and self._live_orchestrator.ofi_exit_router is not None
         )
@@ -1171,6 +1523,60 @@ class TradingBot:
             "best_bid": _decimal_from_number(max(0.0, best_bid)),
             "best_ask": _decimal_from_number(max(0.0, best_ask)),
         }
+
+    @staticmethod
+    def _dispatch_fill_from_receipt(receipt: Any) -> tuple[float, float] | None:
+        fill_price = getattr(receipt, "fill_price", None)
+        fill_size = getattr(receipt, "fill_size", None)
+        if fill_price is not None and fill_size is not None:
+            resolved_price = float(fill_price)
+            resolved_size = float(fill_size)
+            if resolved_price > 0.0 and resolved_size > 0.0:
+                return resolved_price, resolved_size
+
+        partial_fill_price = getattr(receipt, "partial_fill_price", None)
+        partial_fill_size = getattr(receipt, "partial_fill_size", None)
+        if partial_fill_price is not None and partial_fill_size is not None:
+            resolved_price = float(partial_fill_price)
+            resolved_size = float(partial_fill_size)
+            if resolved_price > 0.0 and resolved_size > 0.0:
+                return resolved_price, resolved_size
+
+        serialized_envelope = str(getattr(receipt, "serialized_envelope", "") or "").strip()
+        if not serialized_envelope:
+            return None
+
+        try:
+            envelope = deserialize_envelope(serialized_envelope)
+        except Exception:
+            return None
+
+        payloads = envelope.get("payloads")
+        if not isinstance(payloads, list) or not payloads:
+            return None
+
+        first_payload = payloads[0]
+        if not isinstance(first_payload, dict):
+            return None
+
+        try:
+            planned_price = float(first_payload.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return None
+
+        metadata = first_payload.get("metadata")
+        effective_size_raw = metadata.get("effective_size") if isinstance(metadata, dict) else None
+        if effective_size_raw is None:
+            effective_size_raw = first_payload.get("size")
+
+        try:
+            planned_size = float(effective_size_raw or 0.0)
+        except (TypeError, ValueError):
+            return None
+
+        if planned_price <= 0.0 or planned_size <= 0.0:
+            return None
+        return planned_price, planned_size
 
     def _build_live_ofi_exit_position_state(self, pos: Any, current_timestamp_ms: int) -> dict[str, Any]:
         exit_asset = pos.trade_asset_id or pos.no_asset_id
@@ -1583,6 +1989,9 @@ class TradingBot:
         """
         from src.trading.executor import Order  # avoid circular at module-level
 
+        if self._reward_sidecar is not None and self._reward_sidecar.on_fill(order, current_timestamp_ms=self._current_timestamp_ms()):
+            return
+
         if hasattr(self, "_pure_mm") and self._pure_mm is not None:
             if await self._pure_mm.on_order_fill(order):
                 if (
@@ -1873,6 +2282,7 @@ class TradingBot:
                     _, signal_dicts = msg
                     if signal_dicts:
                         log.info("cross_market_signals_received", count=len(signal_dicts))
+                        await self._consume_cross_market_signals(signal_dicts)
                 elif cmd == "prior_validation":
                     _, summary = msg
                     log.info("pce_prior_validation_received", **summary)
@@ -1912,6 +2322,7 @@ class TradingBot:
             spread_score=round(score.score, 1),
             raw_spread_cents=round(score.raw_spread_cents, 2),
         )
+        await self._tick_shadow_tracker_for_asset(asset_id)
         await self._evaluate_live_ofi_exit_path(asset_id)
         # Drive event-driven stop-loss evaluation
         await self._stop_loss_monitor.on_bbo_update(
@@ -1922,9 +2333,13 @@ class TradingBot:
         # Tick the maker adverse-selection monitor (schedules T+5/15/60 marks)
         if self._maker_monitor is not None:
             await self._maker_monitor.tick()
+        if self._reward_sidecar is not None:
+            self._reward_sidecar.on_book_update(asset_id, current_timestamp_ms=self._current_timestamp_ms())
 
-        await self._evaluate_ofi_momentum(asset_id)
-        await self._evaluate_contagion_arb(asset_id)
+        if self._ofi_lane_enabled():
+            await self._evaluate_ofi_momentum(asset_id)
+        if self._contagion_arb is not None:
+            await self._evaluate_contagion_arb(asset_id)
 
     def _on_orderbook_bbo_change(self, asset_id: str, snapshot: Any) -> None:
         """Callback from basic OrderbookTracker when the BBO changes.
@@ -1938,61 +2353,124 @@ class TradingBot:
             name=f"ofi_exit_bbo_{asset_id[:12]}",
         )
         _safe_fire_and_forget(
+            self._tick_shadow_tracker_for_asset(asset_id),
+            name=f"shadow_bbo_{asset_id[:12]}",
+        )
+        if self._reward_sidecar is not None:
+            self._reward_sidecar.on_book_update(asset_id, current_timestamp_ms=self._current_timestamp_ms())
+        _safe_fire_and_forget(
             self._stop_loss_monitor.on_bbo_update(
                 asset_id,
                 exclude_signal_types={"ofi_momentum"} if self._has_live_ofi_exit_runtime() else None,
             ),
             name=f"stop_loss_bbo_{asset_id[:12]}",
         )
-        _safe_fire_and_forget(
-            self._evaluate_ofi_momentum(asset_id),
-            name=f"ofi_bbo_{asset_id[:12]}",
-        )
-        _safe_fire_and_forget(
-            self._evaluate_contagion_arb(asset_id),
-            name=f"contagion_bbo_{asset_id[:12]}",
-        )
+        if self._ofi_lane_enabled():
+            _safe_fire_and_forget(
+                self._evaluate_ofi_momentum(asset_id),
+                name=f"ofi_bbo_{asset_id[:12]}",
+            )
+        if self._contagion_arb is not None:
+            _safe_fire_and_forget(
+                self._evaluate_contagion_arb(asset_id),
+                name=f"contagion_bbo_{asset_id[:12]}",
+            )
 
     async def _evaluate_ofi_momentum(self, asset_id: str) -> None:
         """Evaluate OFI momentum on book updates and route BUY signals."""
+        if not self._ofi_lane_enabled():
+            return
+
         market_info = self._market_map.get(asset_id)
         if market_info is None or asset_id != market_info.no_token_id:
             return
 
         if not self.lifecycle.is_tradeable(market_info.condition_id):
+            assessment = self.lifecycle.tradeability_assessment(market_info.condition_id)
+            self._record_single_name_rejection(
+                "ofi_momentum",
+                market_info,
+                f"not_tradeable_{assessment.reason}",
+                log_event=False,
+                tier=assessment.tier,
+                **assessment.live_metrics,
+            )
             return
         if not market_info.accepting_orders:
+            self._record_single_name_rejection("ofi_momentum", market_info, "not_accepting_orders", log_event=False)
             return
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            self._record_single_name_rejection("ofi_momentum", market_info, "signal_cooldown", log_event=False)
             return
 
         current_timestamp_ms = self._current_timestamp_ms()
         is_live_ofi_runtime = (
-            self.deployment_env != DeploymentEnv.PAPER
-            and self._live_orchestrator is not None
+            self._live_orchestrator is not None
             and self._orchestrator_health_monitor is not None
         )
-        if is_live_ofi_runtime and not self._orchestrator_health_monitor.is_safe_to_trade(current_timestamp_ms):
+        if not is_live_ofi_runtime:
+            self._record_single_name_rejection("ofi_momentum", market_info, "runtime_disabled", log_event=False)
             return
 
         detector = self._ofi_detectors.get(market_info.condition_id)
         no_book = self._book_trackers.get(market_info.no_token_id)
         no_agg = self._no_aggs.get(market_info.no_token_id)
         if detector is None or no_book is None or no_agg is None or not no_book.has_data:
+            reason = "missing_detector"
+            if no_book is None or not getattr(no_book, "has_data", False):
+                reason = "missing_no_book"
+            elif no_agg is None:
+                reason = "missing_no_aggregator"
+            self._record_single_name_rejection("ofi_momentum", market_info, reason, log_event=False)
             return
 
         l2_no = self._l2_books.get(market_info.no_token_id)
         if l2_no is not None and not l2_no.is_reliable:
+            self._record_single_name_rejection("ofi_momentum", market_info, "l2_unreliable", log_event=False)
             return
 
         sig = detector.generate_signal(no_book=no_book, trade_aggregator=no_agg)
         if sig is None:
+            self._record_single_name_rejection("ofi_momentum", market_info, "no_signal", log_event=False)
+            return
+
+        trade_price = float(sig.no_best_ask or 0.0)
+        if trade_price >= 0.97 or trade_price <= 0.03:
+            self._record_single_name_rejection("ofi_momentum", market_info, "near_resolved_price", log_event=False)
+            self.lifecycle.drain_market(market_info.condition_id, reason="near_resolved_price")
+            return
+
+        if not (settings.strategy.min_tradeable_price < trade_price < settings.strategy.max_tradeable_price):
+            self._record_single_name_rejection("ofi_momentum", market_info, "price_out_of_band", log_event=False)
+            return
+
+        if sig.trade_flow_imbalance < settings.strategy.ofi_min_trade_flow_imbalance:
+            self._record_single_name_rejection(
+                "ofi_momentum",
+                market_info,
+                "weak_trade_flow_confirmation",
+                log_event=False,
+            )
+            return
+
+        if sig.tvi_multiplier < settings.strategy.ofi_min_tvi_multiplier:
+            self._record_single_name_rejection(
+                "ofi_momentum",
+                market_info,
+                "weak_tvi_confirmation",
+                log_event=False,
+            )
+            return
+
+        if sig.toxicity_index >= settings.strategy.ofi_toxicity_veto_threshold:
+            self._record_single_name_rejection("ofi_momentum", market_info, "toxicity_veto", log_event=False)
             return
 
         regime_det = self._regime_detectors.get(market_info.condition_id)
         regime_score = regime_det.regime_score if regime_det else 0.5
         meta_decision = self._meta_controller.evaluate("ofi_momentum", regime_score)
         if meta_decision.vetoed:
+            self._record_single_name_rejection("ofi_momentum", market_info, "meta_controller_veto", log_event=False)
             log.info(
                 "meta_controller_veto",
                 market_id=market_info.condition_id[:16],
@@ -2003,6 +2481,7 @@ class TradingBot:
             return
 
         if sig.direction != "BUY":
+            self._record_single_name_rejection("ofi_momentum", market_info, "non_buy_signal", log_event=False)
             log.debug(
                 "ofi_momentum_sell_observed",
                 market_id=market_info.condition_id,
@@ -2011,59 +2490,36 @@ class TradingBot:
             return
 
         if not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+            self._record_single_name_rejection("ofi_momentum", market_info, "stop_loss_cooldown", log_event=False)
             log.info(
                 "stop_loss_cooldown_suppressed_ofi",
                 market_id=market_info.condition_id[:16],
             )
             return
 
-        if is_live_ofi_runtime:
-            live_signal = OfiEntrySignal(
-                market_id=market_info.condition_id,
-                side="NO",
-                target_price=_decimal_from_number(sig.no_best_ask),
-                anchor_volume=_decimal_from_number(sig.top_ask_size),
-                conviction_scalar=_decimal_from_number(min(max(abs(sig.rolling_vi), 0.0), 1.0)),
-                signal_timestamp_ms=int(sig.timestamp_ms),
-                tvi_kappa=_decimal_from_number(max(sig.tvi_multiplier - 1.0, 0.0)),
-                ofi_window_ms=max(int(sig.window_ms), 1),
-            )
-            self._live_orchestrator.on_ofi_signal(
-                live_signal,
-                _decimal_from_number(settings.strategy.max_trade_size_usd),
-                int(sig.timestamp_ms),
-            )
-            self.lifecycle.record_signal(market_info.condition_id)
-            return
+        self._open_ofi_reverse_shadow_position(market_info, sig, reference_price=trade_price)
 
-        self.lifecycle.record_signal(market_info.condition_id)
-        await self._on_panic_signal(
-            sig,
-            no_agg,
-            market_info,
-            signal_metadata={
-                "signal_source": "ofi_momentum",
-                "direction": sig.direction,
-                "rolling_vi": sig.rolling_vi,
-                "current_vi": sig.current_vi,
-                "toxicity_index": sig.toxicity_index,
-                "toxicity_depth_evaporation": sig.toxicity_depth_evaporation,
-                "toxicity_sweep_ratio": sig.toxicity_sweep_ratio,
-                "meta_weight": meta_decision.weight,
-                "regime_score": regime_score,
-            },
+        live_signal = OfiEntrySignal(
+            market_id=market_info.condition_id,
+            side="NO",
+            target_price=_decimal_from_number(sig.no_best_ask),
+            anchor_volume=_decimal_from_number(sig.top_ask_size),
+            conviction_scalar=_decimal_from_number(min(max(abs(sig.rolling_vi), 0.0), 1.0)),
+            signal_timestamp_ms=int(sig.timestamp_ms),
+            tvi_kappa=_decimal_from_number(max(sig.tvi_multiplier - 1.0, 0.0)),
+            ofi_window_ms=max(int(sig.window_ms), 1),
         )
+        self._live_orchestrator.on_ofi_signal(
+            live_signal,
+            _decimal_from_number(settings.strategy.max_trade_size_usd),
+            int(sig.timestamp_ms),
+        )
+        self.lifecycle.record_signal(market_info.condition_id)
+        return
 
     async def _evaluate_contagion_arb(self, asset_id: str) -> None:
         """Evaluate the toxicity contagion detector on every BBO update."""
         if self._contagion_arb is None:
-            return
-
-        if (
-            self.deployment_env != DeploymentEnv.PAPER
-            and self._orchestrator_health_monitor is not None
-            and not self._orchestrator_health_monitor.is_safe_to_trade(self._current_timestamp_ms())
-        ):
             return
 
         market_info = self._market_map.get(asset_id)
@@ -2140,15 +2596,27 @@ class TradingBot:
 
         # Only trade active-tier markets
         if not self.lifecycle.is_tradeable(market_info.condition_id):
+            assessment = self.lifecycle.tradeability_assessment(market_info.condition_id)
+            rejection_reason = f"not_tradeable_{assessment.reason}"
+            details = {
+                "tier": assessment.tier,
+                **assessment.live_metrics,
+            }
+            self._record_single_name_rejection("panic", market_info, rejection_reason, log_event=False, **details)
+            self._record_single_name_rejection("rpe", market_info, rejection_reason, log_event=False, **details)
             return
 
         # ── Fix 4: Real-time drain if market stopped accepting orders ──
         if not market_info.accepting_orders:
+            self._record_single_name_rejection("panic", market_info, "not_accepting_orders", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "not_accepting_orders", log_event=False)
             self.lifecycle.drain_market(market_info.condition_id, reason="not_accepting_orders")
             return
 
         # Signal cooldown check
         if not self.lifecycle.is_cooled_down(market_info.condition_id):
+            self._record_single_name_rejection("panic", market_info, "signal_cooldown", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "signal_cooldown", log_event=False)
             return
 
         # ── L2 book reliability gate ───────────────────────────────
@@ -2156,6 +2624,8 @@ class TradingBot:
         # Skip signal evaluation but do NOT evict — let recovery continue.
         l2_yes = self._l2_books.get(market_info.yes_token_id)
         if l2_yes is not None and not l2_yes.is_reliable:
+            self._record_single_name_rejection("panic", market_info, "l2_unreliable", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "l2_unreliable", log_event=False)
             log.info(
                 "l2_book_unreliable",
                 asset_id=market_info.yes_token_id,
@@ -2166,10 +2636,13 @@ class TradingBot:
 
         detector = self._detectors.get(market_info.condition_id)
         if not detector:
+            self._record_single_name_rejection("panic", market_info, "missing_detector", log_event=False)
             return
 
         no_agg = self._no_aggs.get(market_info.no_token_id)
         if not no_agg:
+            self._record_single_name_rejection("panic", market_info, "missing_no_aggregator", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "missing_no_aggregator", log_event=False)
             return
 
         # Use real orderbook best_ask if available, else fall back to last trade
@@ -2181,6 +2654,8 @@ class TradingBot:
             no_best_ask = no_agg.current_price
 
         if no_best_ask <= 0:
+            self._record_single_name_rejection("panic", market_info, "invalid_no_best_ask", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "invalid_no_best_ask", log_event=False)
             return
 
         # ── Derive YES close price for price-band checks ───────────────
@@ -2188,6 +2663,8 @@ class TradingBot:
 
         # ── Fix 2: Near-resolved price auto-drain ──────────────────────
         if yes_price >= 0.97 or yes_price <= 0.03:
+            self._record_single_name_rejection("panic", market_info, "near_resolved_price", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "near_resolved_price", log_event=False)
             self.lifecycle.drain_market(market_info.condition_id, reason="near_resolved_price")
             return
 
@@ -2195,6 +2672,9 @@ class TradingBot:
         min_price = settings.strategy.min_tradeable_price
         max_price = settings.strategy.max_tradeable_price
         price_in_band = min_price < yes_price < max_price
+        if not price_in_band:
+            self._record_single_name_rejection("panic", market_info, "price_out_of_band", log_event=False)
+            self._record_single_name_rejection("rpe", market_info, "price_out_of_band", log_event=False)
 
         # Whale confluence check
         whale = self.whale_monitor.has_confluence(market_info.no_token_id)
@@ -2241,6 +2721,7 @@ class TradingBot:
                 # SI-6: Meta-strategy controller — regime-weighted master switch
                 meta_decision = self._meta_controller.evaluate("panic", _regime_score)
                 if meta_decision.vetoed:
+                    self._record_single_name_rejection("panic", market_info, "meta_controller_veto", log_event=False)
                     log.info(
                         "meta_controller_veto",
                         market_id=market_info.condition_id[:16],
@@ -2249,8 +2730,15 @@ class TradingBot:
                         reason=meta_decision.veto_reason,
                     )
                 elif not self.positions.is_stop_loss_cooled_down(market_info.condition_id):
+                    self._record_single_name_rejection("panic", market_info, "stop_loss_cooldown", log_event=False)
                     log.info(
                         "stop_loss_cooldown_suppressed",
+                        market_id=market_info.condition_id[:16],
+                    )
+                elif not self.positions.is_panic_loss_cooled_down(market_info.condition_id):
+                    self._record_single_name_rejection("panic", market_info, "panic_post_loss_cooldown", log_event=False)
+                    log.info(
+                        "panic_post_loss_cooldown_suppressed",
                         market_id=market_info.condition_id[:16],
                     )
                 else:
@@ -2265,6 +2753,8 @@ class TradingBot:
                             "meta_weight": meta_decision.weight,
                         },
                     )
+            else:
+                self._record_single_name_rejection("panic", market_info, "no_signal", log_event=False)
 
             # ── V3: Drift signal (low-volatility mean-reversion) ───────────
             # Only evaluate when PanicDetector did NOT fire — ensures
@@ -2323,7 +2813,7 @@ class TradingBot:
 
         # ── RPE evaluation (Pillar 14) ───────────────────────────────────
         rpe = self._rpe
-        if rpe and price_in_band:
+        if self._rpe_lane_enabled() and rpe and price_in_band:
             # Deliverable D: Data freshness gate
             # Use last_trade_time (updated on every trade) instead of
             # bars[-1].open_time (only updated when a bar closes).
@@ -2333,6 +2823,7 @@ class TradingBot:
             max_age = settings.strategy.rpe_max_data_age_seconds
             if yes_agg_rpe:
                 if yes_agg_rpe.last_trade_time <= 0:
+                    self._record_single_name_rejection("rpe", market_info, "no_trade_data", log_event=False)
                     # No trades received at all — genuinely stale
                     log.info(
                         "rpe_no_trade_data",
@@ -2341,6 +2832,7 @@ class TradingBot:
                     return
                 data_age = time.time() - yes_agg_rpe.last_trade_time
                 if data_age > max_age:
+                    self._record_single_name_rejection("rpe", market_info, "stale_data", log_event=False)
                     log.info(
                         "rpe_stale_data",
                         market=market_info.condition_id,
@@ -2378,6 +2870,8 @@ class TradingBot:
                 )
                 if rpe_signal:
                     await self._on_rpe_signal(rpe_signal, market_info, days, current_price=yes_price)
+                else:
+                    self._record_single_name_rejection("rpe", market_info, "no_signal", log_event=False)
             except Exception:
                 log.warning("rpe_evaluation_error", market=market_info.condition_id, exc_info=True)
 
@@ -2394,6 +2888,7 @@ class TradingBot:
             log_event="ensemble_risk_blocked_bot_signal",
             extra={"signal_type": strategy_source},
         ):
+            self._record_single_name_rejection(strategy_source, market, "ensemble_veto", log_event=False)
             return
 
         # Fire-and-forget — Telegram notification must NOT block the
@@ -2424,19 +2919,59 @@ class TradingBot:
 
             # ── Minimum ask-depth gate ─────────────────────────────────
             snap = no_book.snapshot()
-            min_depth = settings.strategy.min_ask_depth_usd
+            min_depth = (
+                settings.strategy.panic_min_ask_depth_usd
+                if strategy_source == "panic"
+                else settings.strategy.min_ask_depth_usd
+            )
             if snap.ask_depth_usd < min_depth:
+                self._record_single_name_rejection(strategy_source, market, "thin_asks", log_event=False)
                 log.info(
                     "panic_rejected_thin_asks",
                     market=market.condition_id,
                     ask_depth_usd=round(snap.ask_depth_usd, 2),
                     min_required=min_depth,
+                    strategy=strategy_source,
                 )
                 return
+
+            if strategy_source == "panic":
+                spread_cents = float(getattr(no_book, "spread_cents", 0.0) or 0.0)
+                max_spread_cents = float(settings.strategy.panic_max_spread_cents)
+                if max_spread_cents > 0 and spread_cents > max_spread_cents:
+                    self._record_single_name_rejection(strategy_source, market, "wide_spread", log_event=False)
+                    log.info(
+                        "panic_rejected_wide_spread",
+                        market=market.condition_id,
+                        spread_cents=round(spread_cents, 2),
+                        max_allowed=max_spread_cents,
+                    )
+                    return
+
+                min_support_ratio = float(settings.strategy.panic_min_book_depth_ratio)
+                if min_support_ratio > 0 and book_depth < min_support_ratio:
+                    self._record_single_name_rejection(strategy_source, market, "weak_bid_support", log_event=False)
+                    log.info(
+                        "panic_rejected_weak_bid_support",
+                        market=market.condition_id,
+                        book_depth_ratio=round(book_depth, 3),
+                        min_required=min_support_ratio,
+                    )
+                    return
 
         # Fetch fee rates for this token
         # Determine if market is fee-enabled based on category
         fee_enabled = self._is_fee_enabled(market)
+
+        if strategy_source == "panic" and settings.strategy.panic_shadow_runtime_enabled():
+            self._open_panic_shadow_position(
+                sig,
+                no_agg,
+                market,
+                fee_enabled=fee_enabled,
+                days_to_resolution=days,
+            )
+            return
 
         pos = await self.positions.open_position(
             sig,
@@ -2472,6 +3007,15 @@ class TradingBot:
                 chaser_task.add_done_callback(_safe_task_done_callback)
                 pos.entry_chaser_task = chaser_task
             # else: order already placed directly by PositionManager
+
+        if pos is None:
+            rejection_reason = self.positions.pop_last_entry_rejection_reason(strategy_source, market.condition_id)
+            self._record_single_name_rejection(
+                strategy_source,
+                market,
+                rejection_reason or "position_manager_rejected",
+                log_event=False,
+            )
 
         if pos and self.positions.circuit_breaker_active:
             await self.telegram.send(
@@ -2519,6 +3063,7 @@ class TradingBot:
         now = time.monotonic()
         last_fire = self._rpe_last_signal.get(market.condition_id, 0.0)
         if now - last_fire < strat.rpe_cooldown_seconds:
+            self._record_single_name_rejection("rpe", market, "signal_cooldown", log_event=False)
             log.debug(
                 "rpe_cooldown_active",
                 market=market.condition_id,
@@ -2569,6 +3114,7 @@ class TradingBot:
                 reason=edge.rejection_reason,
             )
             if not edge.viable:
+                self._record_single_name_rejection("rpe", market, "eqs_rejected", log_event=False)
                 log.info(
                     "rpe_eqs_rejected",
                     market=market.condition_id,
@@ -2590,21 +3136,26 @@ class TradingBot:
 
         # ── Record in calibration tracker (Deliverable A) ────────────
         model_meta = meta.get("model_metadata", {})
-        self._rpe_calibration.record_signal(
-            market_id=market.condition_id,
-            model_prob=model_prob,
-            market_price=display_price,
-            direction=direction,
-            timestamp=time.time(),
-            shadow=shadow,
-            prior_source=model_meta.get("prior_source", ""),
-            l2_active=model_meta.get("l2_active", False),
-            theta_w_prior=model_meta.get("w_prior", 0.0),
-        )
+        if self._rpe_calibration is not None:
+            self._rpe_calibration.record_signal(
+                market_id=market.condition_id,
+                model_prob=model_prob,
+                market_price=display_price,
+                direction=direction,
+                timestamp=time.time(),
+                shadow=shadow,
+                prior_source=model_meta.get("prior_source", ""),
+                l2_active=model_meta.get("l2_active", False),
+                theta_w_prior=model_meta.get("w_prior", 0.0),
+            )
 
         # ── Telegram notification (with calibration footer) ───────────
         cal_footer = ""
-        cal_stats = self._rpe_calibration.calibration_summary()
+        cal_stats = (
+            self._rpe_calibration.calibration_summary()
+            if self._rpe_calibration is not None
+            else {}
+        )
         if cal_stats.get("resolved", 0) >= 20:
             brier = cal_stats.get("brier_score", "n/a")
             logloss = cal_stats.get("log_loss", "n/a")
@@ -2648,6 +3199,7 @@ class TradingBot:
         # ── Live-mode safety gates (conservative RPE activation) ───────
         # Gate 1: Require higher confidence than the base threshold
         if confidence < 0.15:
+            self._record_single_name_rejection("rpe", market, "confidence_too_low", log_event=False)
             log.info(
                 "rpe_live_confidence_too_low",
                 market=market.condition_id,
@@ -2662,6 +3214,7 @@ class TradingBot:
             len(no_agg.bars) if no_agg else 0,
         )
         if bar_count < 10:
+            self._record_single_name_rejection("rpe", market, "insufficient_bars", log_event=False)
             log.info(
                 "rpe_live_insufficient_bars",
                 market=market.condition_id,
@@ -2673,6 +3226,7 @@ class TradingBot:
         # ── Deliverable C: Position deduplication ────────────────────
         positioned = self._positioned_asset_ids()
         if market.yes_token_id in positioned or market.no_token_id in positioned:
+            self._record_single_name_rejection("rpe", market, "already_positioned", log_event=False)
             log.info(
                 "rpe_already_positioned",
                 market=market.condition_id,
@@ -2702,6 +3256,7 @@ class TradingBot:
                 entry_price = round(yes_agg.current_price, 2) if yes_agg else 0.0
 
         if entry_price <= 0:
+            self._record_single_name_rejection("rpe", market, "invalid_entry_price", log_event=False)
             return
 
         # ── Minimum ask-depth gate (RPE path) ────────────────────────
@@ -2709,6 +3264,7 @@ class TradingBot:
             snap_depth = book.snapshot()
             min_depth = settings.strategy.min_ask_depth_usd
             if snap_depth.ask_depth_usd < min_depth:
+                self._record_single_name_rejection("rpe", market, "thin_asks", log_event=False)
                 log.info(
                     "rpe_rejected_thin_asks",
                     market=market.condition_id,
@@ -2723,6 +3279,7 @@ class TradingBot:
         _rpe_regime_score = rpe_regime_det.regime_score if rpe_regime_det else 0.5
         rpe_meta = self._meta_controller.evaluate("rpe", _rpe_regime_score)
         if rpe_meta.vetoed:
+            self._record_single_name_rejection("rpe", market, "meta_controller_veto", log_event=False)
             log.info(
                 "meta_controller_veto",
                 market_id=market.condition_id[:16],
@@ -2810,6 +3367,9 @@ class TradingBot:
                     book=book,
                     signal_metadata=probe_meta,
                 )
+
+        if pos is None:
+            self._record_single_name_rejection("rpe", market, "position_manager_rejected", log_event=False)
 
         if pos:
             # Fast-strike positions skip the chaser — order was placed
@@ -3150,6 +3710,525 @@ class TradingBot:
                 return m
         return None
 
+    def _find_market_for_cross_market_signal(
+        self,
+        market_id: str,
+        asset_id: str,
+    ) -> MarketInfo | None:
+        market = self._find_market(market_id)
+        if market is not None:
+            return market
+        mapped_market = self._market_map.get(asset_id)
+        if mapped_market is not None and mapped_market.condition_id == market_id:
+            return mapped_market
+        return None
+
+    def _get_reliable_book_bbo(self, asset_id: str) -> tuple[float, float, str | None]:
+        book = self._book_trackers.get(asset_id)
+        if book is None or not getattr(book, "has_data", False):
+            return 0.0, 0.0, "missing_book"
+
+        l2_book = self._l2_books.get(asset_id)
+        if l2_book is not None and not l2_book.is_reliable:
+            return 0.0, 0.0, "l2_unreliable"
+
+        try:
+            snap = book.snapshot()
+        except Exception:
+            return 0.0, 0.0, "snapshot_failed"
+
+        best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+        best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+        if best_bid <= 0.0 or best_ask <= 0.0:
+            return 0.0, 0.0, "missing_bbo"
+        if best_bid > best_ask:
+            return 0.0, 0.0, "crossed_book"
+        return best_bid, best_ask, None
+
+    def _plan_panic_shadow_trade(
+        self,
+        *,
+        signal: BaseSignal,
+        no_agg: OHLCVAggregator,
+        no_book: OrderbookTracker | None,
+        days_to_resolution: int,
+        fee_enabled: bool,
+    ) -> tuple[dict[str, float], str | None]:
+        """Mirror the live panic plan without opening capital."""
+        strat = settings.strategy
+        entry_price = round(float(getattr(signal, "no_best_ask", 0.0) or 0.0) - 0.01, 2)
+        if entry_price <= 0.0 or entry_price >= 1.0:
+            return {}, "invalid_entry_price"
+
+        actual_depth_ratio = 1.0
+        if no_book is not None and no_book.has_data:
+            actual_depth_ratio = float(getattr(no_book, "book_depth_ratio", 1.0) or 1.0)
+
+        iceberg_active = False
+        iceberg_detector = self._iceberg_detectors.get(getattr(signal, "no_asset_id", ""))
+        if iceberg_detector is not None:
+            strongest = iceberg_detector.strongest_iceberg("BUY")
+            if (
+                strongest is not None
+                and strongest.confidence >= strat.iceberg_peg_min_confidence
+            ):
+                iceberg_active = True
+
+        entry_fee_frac = get_fee_rate(entry_price, fee_enabled=fee_enabled)
+        entry_fee_bps = round(entry_fee_frac * 10000)
+        tp = compute_take_profit(
+            entry_price=entry_price,
+            no_vwap=no_agg.rolling_vwap,
+            realised_vol=no_agg.rolling_volatility,
+            whale_confluence=bool(getattr(signal, "whale_confluence", False)),
+            iceberg_active=iceberg_active,
+            book_depth_ratio=actual_depth_ratio,
+            days_to_resolution=days_to_resolution,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=0,
+            fee_enabled=fee_enabled,
+        )
+        if not tp.viable:
+            return {}, "low_spread"
+
+        exec_mode = "maker" if strat.maker_routing_enabled else "taker"
+        if exec_mode == "maker":
+            min_viable_spread = float(strat.desired_margin_cents)
+        else:
+            exit_fee_cents = get_fee_rate(tp.target_price, fee_enabled=True) * 100.0
+            min_viable_spread = (
+                2.0 * float(strat.paper_slippage_cents)
+                + entry_fee_frac * 100.0
+                + exit_fee_cents
+                + float(strat.desired_margin_cents)
+            )
+        if tp.spread_cents < min_viable_spread:
+            return {
+                "target_price": tp.target_price,
+                "min_viable_spread": float(min_viable_spread),
+            }, "insufficient_edge"
+
+        sl_trigger = compute_adaptive_stop_loss_cents(
+            sl_base_cents=strat.stop_loss_cents,
+            entry_price=entry_price,
+            fee_enabled=fee_enabled,
+            ewma_vol=no_agg.rolling_downside_vol_ewma or None,
+            ref_vol=strat.sl_vol_ref,
+            is_adaptive=strat.sl_vol_adaptive,
+            max_multiplier=strat.sl_vol_multiplier_max,
+        )
+        stop_price = round(max(0.01, entry_price - sl_trigger / 100.0), 4)
+        expected_net_target_per_share_cents = compute_net_pnl_cents(
+            entry_price=entry_price,
+            exit_price=tp.target_price,
+            size=1.0,
+            fee_enabled=fee_enabled,
+            is_maker_entry=(exec_mode == "maker"),
+            is_maker_exit=(exec_mode == "maker"),
+        )
+        expected_net_target_minus_one_tick_per_share_cents = compute_net_pnl_cents(
+            entry_price=entry_price,
+            exit_price=max(0.01, round(tp.target_price - 0.01, 4)),
+            size=1.0,
+            fee_enabled=fee_enabled,
+            is_maker_entry=(exec_mode == "maker"),
+            is_maker_exit=(exec_mode == "maker"),
+        )
+        if (
+            expected_net_target_per_share_cents
+            < float(strat.panic_min_expected_net_target_per_share_cents)
+            or expected_net_target_minus_one_tick_per_share_cents
+            < float(strat.panic_min_expected_net_target_minus_one_tick_per_share_cents)
+        ):
+            return {
+                "target_price": tp.target_price,
+                "expected_net_target_per_share_cents": (
+                    expected_net_target_per_share_cents
+                ),
+                "expected_net_target_minus_one_tick_per_share_cents": (
+                    expected_net_target_minus_one_tick_per_share_cents
+                ),
+            }, "insufficient_expected_edge"
+
+        return {
+            "entry_price": entry_price,
+            "target_price": tp.target_price,
+            "stop_price": stop_price,
+            "sl_trigger_cents": float(sl_trigger),
+            "expected_net_target_per_share_cents": (
+                expected_net_target_per_share_cents
+            ),
+            "expected_net_target_minus_one_tick_per_share_cents": (
+                expected_net_target_minus_one_tick_per_share_cents
+            ),
+        }, None
+
+    def _open_panic_shadow_position(
+        self,
+        signal: BaseSignal,
+        no_agg: OHLCVAggregator,
+        market: MarketInfo,
+        *,
+        fee_enabled: bool,
+        days_to_resolution: int,
+    ) -> bool:
+        best_bid, best_ask, rejection_reason = self._get_reliable_book_bbo(
+            getattr(signal, "no_asset_id", "")
+        )
+        if rejection_reason is not None:
+            self._record_single_name_rejection(
+                "panic",
+                market,
+                rejection_reason,
+                log_event=False,
+            )
+            log.info(
+                "panic_shadow_rejected",
+                market_id=market.condition_id,
+                asset_id=getattr(signal, "no_asset_id", ""),
+                reason=rejection_reason,
+            )
+            return False
+
+        no_book = self._book_trackers.get(getattr(signal, "no_asset_id", ""))
+        plan, rejection_reason = self._plan_panic_shadow_trade(
+            signal=signal,
+            no_agg=no_agg,
+            no_book=no_book,
+            days_to_resolution=days_to_resolution,
+            fee_enabled=fee_enabled,
+        )
+        if rejection_reason is not None:
+            self._record_single_name_rejection(
+                "panic",
+                market,
+                rejection_reason,
+                log_event=False,
+            )
+            log.info(
+                "panic_shadow_rejected",
+                market_id=market.condition_id,
+                asset_id=getattr(signal, "no_asset_id", ""),
+                reason=rejection_reason,
+                target_price=round(float(plan.get("target_price", 0.0) or 0.0), 4),
+                expected_target_cents=round(
+                    float(plan.get("expected_net_target_per_share_cents", 0.0) or 0.0),
+                    4,
+                ),
+                expected_target_minus_one_tick_cents=round(
+                    float(
+                        plan.get(
+                            "expected_net_target_minus_one_tick_per_share_cents", 0.0
+                        )
+                        or 0.0
+                    ),
+                    4,
+                ),
+            )
+            return False
+
+        entry_size = round(
+            float(settings.strategy.max_trade_size_usd)
+            / max(float(plan["entry_price"]), 0.01),
+            2,
+        )
+        if entry_size < 1.0:
+            self._record_single_name_rejection(
+                "panic",
+                market,
+                "insufficient_size",
+                log_event=False,
+            )
+            log.info(
+                "panic_shadow_rejected",
+                market_id=market.condition_id,
+                asset_id=getattr(signal, "no_asset_id", ""),
+                reason="insufficient_size",
+            )
+            return False
+
+        zscore = abs(float(getattr(signal, "zscore", 0.0) or 0.0))
+        threshold = max(1e-9, float(settings.strategy.panic_zscore_threshold))
+        confidence = min(1.0, max(0.0, (zscore - threshold) / threshold))
+        reference_price = float(getattr(signal, "yes_price", 0.0) or 0.0)
+
+        pos = self._shadow_tracker.open_shadow_position(
+            signal_source=_PANIC_SHADOW_SOURCE,
+            market_id=market.condition_id,
+            asset_id=getattr(signal, "no_asset_id", ""),
+            direction="NO",
+            best_ask=best_ask,
+            best_bid=best_bid,
+            entry_price=float(plan["entry_price"]),
+            target_price=float(plan["target_price"]),
+            stop_price=float(plan["stop_price"]),
+            entry_size=entry_size,
+            fee_enabled=fee_enabled,
+            zscore=zscore,
+            confidence=confidence,
+            reference_price=reference_price,
+            toxicity_index=0.0,
+        )
+        if pos is None:
+            self._record_single_name_rejection(
+                "panic",
+                market,
+                "invalid_entry_price",
+                log_event=False,
+            )
+            log.info(
+                "panic_shadow_rejected",
+                market_id=market.condition_id,
+                asset_id=getattr(signal, "no_asset_id", ""),
+                reason="invalid_entry_price",
+            )
+            return False
+
+        log.info(
+            "panic_shadow_opened",
+            market_id=market.condition_id,
+            asset_id=getattr(signal, "no_asset_id", ""),
+            entry_price=round(float(plan["entry_price"]), 4),
+            target_price=round(float(plan["target_price"]), 4),
+            stop_price=round(float(plan["stop_price"]), 4),
+            entry_size=round(entry_size, 4),
+            zscore=round(zscore, 6),
+            confidence=round(confidence, 6),
+            expected_target_cents=round(
+                float(plan["expected_net_target_per_share_cents"]), 4
+            ),
+            expected_target_minus_one_tick_cents=round(
+                float(plan["expected_net_target_minus_one_tick_per_share_cents"]),
+                4,
+            ),
+        )
+        return True
+
+    async def _consume_cross_market_signals(
+        self,
+        signals: list[dict[str, Any] | CrossMarketSignal],
+    ) -> None:
+        opened = 0
+        rejected = 0
+
+        for signal in signals:
+            if self._open_cross_market_shadow_position(signal):
+                opened += 1
+            else:
+                rejected += 1
+
+        log.info(
+            "cross_market_shadow_batch_processed",
+            received=len(signals),
+            opened=opened,
+            rejected=rejected,
+        )
+
+    def _open_cross_market_shadow_position(
+        self,
+        signal: dict[str, Any] | CrossMarketSignal,
+    ) -> bool:
+        def _value(key: str, default: Any = "") -> Any:
+            if isinstance(signal, dict):
+                return signal.get(key, default)
+            return getattr(signal, key, default)
+
+        lagging_market_id = str(_value("lagging_market_id", "") or "")
+        direction = str(_value("direction", "") or "").upper()
+        asset_id = str(_value("lagging_asset_id", "") or "")
+        signal_source = str(_value("signal_source", _CROSS_MARKET_SHADOW_SOURCE) or _CROSS_MARKET_SHADOW_SOURCE)
+        zscore = float(_value("z_score", 0.0) or 0.0)
+        confidence = float(_value("confidence", 0.0) or 0.0)
+
+        market = self._find_market_for_cross_market_signal(lagging_market_id, asset_id)
+        if not asset_id and market is not None:
+            asset_id = market.yes_token_id if direction == "YES" else market.no_token_id
+
+        if not lagging_market_id and market is not None:
+            lagging_market_id = market.condition_id
+
+        if direction not in {"YES", "NO"} or not lagging_market_id or not asset_id:
+            if market is not None:
+                self._record_single_name_rejection("cross_market", market, "invalid_signal_payload", log_event=False)
+            log.info(
+                "cross_market_shadow_rejected",
+                market_id=lagging_market_id,
+                asset_id=asset_id,
+                direction=direction,
+                reason="invalid_signal_payload",
+            )
+            return False
+
+        best_bid, best_ask, rejection_reason = self._get_reliable_book_bbo(asset_id)
+        if rejection_reason is not None:
+            if market is not None:
+                self._record_single_name_rejection("cross_market", market, rejection_reason, log_event=False)
+            log.info(
+                "cross_market_shadow_rejected",
+                market_id=lagging_market_id,
+                asset_id=asset_id,
+                direction=direction,
+                reason=rejection_reason,
+            )
+            return False
+
+        pos = self._shadow_tracker.open_shadow_position(
+            signal_source=signal_source,
+            market_id=lagging_market_id,
+            asset_id=asset_id,
+            direction=direction,
+            best_ask=best_ask,
+            best_bid=best_bid,
+            zscore=zscore,
+            confidence=confidence,
+        )
+        if pos is None:
+            if market is not None:
+                self._record_single_name_rejection("cross_market", market, "invalid_entry_price", log_event=False)
+            log.info(
+                "cross_market_shadow_rejected",
+                market_id=lagging_market_id,
+                asset_id=asset_id,
+                direction=direction,
+                reason="invalid_entry_price",
+            )
+            return False
+
+        return True
+
+    def _open_ofi_reverse_shadow_position(
+        self,
+        market: MarketInfo,
+        sig: OFIMomentumSignal,
+        *,
+        reference_price: float,
+    ) -> bool:
+        if not settings.strategy.ofi_reverse_shadow_enabled:
+            return False
+
+        min_reference_price = float(settings.strategy.ofi_reverse_shadow_min_reference_price)
+        max_reference_price = float(settings.strategy.ofi_reverse_shadow_max_reference_price)
+        if not (min_reference_price <= reference_price < max_reference_price):
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                "reference_price_out_of_band",
+                log_event=False,
+            )
+            return False
+
+        asset_id = market.yes_token_id
+        best_bid, best_ask, rejection_reason = self._get_reliable_book_bbo(asset_id)
+        if rejection_reason is not None:
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                rejection_reason,
+                log_event=False,
+            )
+            return False
+
+        if best_ask >= 0.97 or best_ask <= 0.03:
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                "reverse_near_resolved_price",
+                log_event=False,
+            )
+            return False
+
+        if not (settings.strategy.min_tradeable_price < best_ask < settings.strategy.max_tradeable_price):
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                "reverse_price_out_of_band",
+                log_event=False,
+            )
+            return False
+
+        confidence = min(
+            max(abs(float(sig.rolling_vi or sig.current_vi or sig.ofi or 0.0)), 0.0),
+            1.0,
+        )
+        entry_size = round(
+            float(settings.strategy.max_trade_size_usd) / max(best_ask, 0.01),
+            2,
+        )
+        if entry_size < 1.0:
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                "reverse_insufficient_size",
+                log_event=False,
+            )
+            return False
+
+        toxicity_index = 0.0
+        book = self._book_trackers.get(asset_id)
+        metrics_fn = getattr(book, "toxicity_metrics", None)
+        if callable(metrics_fn):
+            try:
+                metrics = metrics_fn("BUY")
+                if isinstance(metrics, dict):
+                    toxicity_index = float(metrics.get("toxicity_index", 0.0) or 0.0)
+            except Exception:
+                log.warning(
+                    "ofi_reverse_shadow_toxicity_snapshot_failed",
+                    market_id=market.condition_id,
+                    asset_id=asset_id,
+                    exc_info=True,
+                )
+
+        pos = self._shadow_tracker.open_shadow_position(
+            signal_source=_OFI_REVERSE_SHADOW_SOURCE,
+            market_id=market.condition_id,
+            asset_id=asset_id,
+            direction="YES",
+            best_ask=best_ask,
+            best_bid=best_bid,
+            entry_price=best_ask,
+            entry_size=entry_size,
+            fee_enabled=self._is_fee_enabled(market),
+            zscore=float(sig.rolling_vi or sig.ofi or 0.0),
+            confidence=confidence,
+            reference_price=reference_price,
+            reference_price_band=f"{min_reference_price:.2f}-{max_reference_price:.2f}",
+            toxicity_index=toxicity_index,
+        )
+        if pos is None:
+            self._record_single_name_rejection(
+                "ofi_reverse_shadow",
+                market,
+                "invalid_entry_price",
+                log_event=False,
+            )
+            return False
+
+        log.info(
+            "ofi_reverse_shadow_opened",
+            market_id=market.condition_id,
+            asset_id=asset_id,
+            direction="YES",
+            reference_price=round(reference_price, 4),
+            reference_price_band=f"{min_reference_price:.2f}-{max_reference_price:.2f}",
+            entry_price=round(pos.entry_price, 4),
+            entry_size=round(pos.entry_size, 4),
+            rolling_vi=round(float(sig.rolling_vi or sig.ofi or 0.0), 6),
+            confidence=round(confidence, 6),
+            toxicity_index=round(toxicity_index, 6),
+        )
+        return True
+
+    async def _tick_shadow_tracker_for_asset(self, asset_id: str) -> None:
+        if self._shadow_tracker.open_count <= 0:
+            return
+
+        best_bid, best_ask, rejection_reason = self._get_reliable_book_bbo(asset_id)
+        if rejection_reason is not None:
+            return
+
+        await self._shadow_tracker.tick(asset_id, best_bid, best_ask)
+
     def _build_contagion_matrix_entry(
         self,
         signal: ContagionArbSignal,
@@ -3235,17 +4314,10 @@ class TradingBot:
         market: MarketInfo,
     ) -> None:
         """Route a contagion arb signal into the RPE fast-strike entry path."""
-        if signal.is_shadow:
-            log.info(
-                "contagion_signal_shadow",
-                leading_market=signal.leading_market_id,
-                lagging_market=signal.lagging_market_id,
-                direction=signal.direction,
-                implied_probability=round(signal.implied_probability, 4),
-                correlation=round(signal.correlation, 4),
-                thematic_group=signal.thematic_group,
-            )
+        if not self._contagion_lane_enabled():
             return
+
+        shadow_mode = signal.is_shadow or self._contagion_shadow_runtime_enabled()
 
         if not self.lifecycle.is_tradeable(market.condition_id):
             return
@@ -3357,6 +4429,132 @@ class TradingBot:
             "toxicity_percentile": signal.toxicity_percentile,
             "correlation": signal.correlation,
         })
+
+        if shadow_mode:
+            if signal.direction == "buy_no":
+                asset_id = market.no_token_id
+                shadow_direction = "NO"
+            else:
+                asset_id = market.yes_token_id
+                shadow_direction = "YES"
+
+            best_bid, best_ask, rejection_reason = self._get_reliable_book_bbo(asset_id)
+            if rejection_reason is not None:
+                self._record_single_name_rejection(
+                    "contagion",
+                    market,
+                    rejection_reason,
+                    log_event=False,
+                )
+                log.info(
+                    "contagion_shadow_rejected",
+                    market_id=market.condition_id,
+                    asset_id=asset_id,
+                    direction=shadow_direction,
+                    reason=rejection_reason,
+                )
+                return
+
+            entry_fill: tuple[float, float] | None = None
+            if self.deployment_env == DeploymentEnv.PAPER and self._live_orchestrator is not None:
+                dispatch_receipt = self._live_orchestrator.dispatcher.dispatch(
+                    contagion_to_context(
+                        market_id=market.condition_id,
+                        side=shadow_direction,
+                        target_price=_decimal_from_number(entry_price),
+                        anchor_volume=_decimal_from_number(
+                            float(settings.strategy.max_trade_size_usd) / max(entry_price, 0.01)
+                        ),
+                        max_capital=_decimal_from_number(settings.strategy.max_trade_size_usd),
+                        conviction_scalar=Decimal("1"),
+                    ),
+                    self._current_timestamp_ms(),
+                    enforce_guard=True,
+                )
+                if not dispatch_receipt.executed and dispatch_receipt.guard_reason is not None:
+                    self._record_single_name_rejection(
+                        "contagion",
+                        market,
+                        str(dispatch_receipt.guard_reason).lower(),
+                        log_event=False,
+                    )
+                    log.info(
+                        "contagion_shadow_rejected",
+                        market_id=market.condition_id,
+                        asset_id=asset_id,
+                        direction=shadow_direction,
+                        reason=dispatch_receipt.guard_reason,
+                    )
+                    return
+                entry_fill = self._dispatch_fill_from_receipt(dispatch_receipt)
+
+            if entry_fill is not None:
+                entry_price, entry_size = entry_fill
+            else:
+                entry_size = round(
+                    float(settings.strategy.max_trade_size_usd) / max(entry_price, 0.01),
+                    2,
+                )
+            if entry_size < 1.0:
+                self._record_single_name_rejection(
+                    "contagion",
+                    market,
+                    "insufficient_size",
+                    log_event=False,
+                )
+                log.info(
+                    "contagion_shadow_rejected",
+                    market_id=market.condition_id,
+                    asset_id=asset_id,
+                    direction=shadow_direction,
+                    reason="insufficient_size",
+                )
+                return
+
+            pos = self._shadow_tracker.open_shadow_position(
+                signal_source=signal.signal_source,
+                market_id=market.condition_id,
+                asset_id=asset_id,
+                direction=shadow_direction,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                entry_price=entry_price,
+                entry_size=entry_size,
+                fee_enabled=fee_enabled,
+                zscore=signal.score,
+                confidence=signal.confidence,
+                reference_price=signal.implied_probability,
+                toxicity_index=signal.leader_toxicity,
+            )
+            if pos is None:
+                self._record_single_name_rejection(
+                    "contagion",
+                    market,
+                    "invalid_entry_price",
+                    log_event=False,
+                )
+                log.info(
+                    "contagion_shadow_rejected",
+                    market_id=market.condition_id,
+                    asset_id=asset_id,
+                    direction=shadow_direction,
+                    reason="invalid_entry_price",
+                )
+                return
+
+            self.lifecycle.record_signal(market.condition_id)
+            log.info(
+                "contagion_signal_shadow",
+                leading_market=signal.leading_market_id,
+                lagging_market=signal.lagging_market_id,
+                direction=signal.direction,
+                implied_probability=round(signal.implied_probability, 4),
+                correlation=round(signal.correlation, 4),
+                thematic_group=signal.thematic_group,
+                shadow_position_id=pos.id,
+            )
+            return
+
         trade_direction = "NO" if signal.direction == "buy_no" else "YES"
         if not self._ensemble_allows_entry(
             strategy_source=signal.signal_source,
@@ -3366,6 +4564,45 @@ class TradingBot:
             extra={"leading_market_id": signal.leading_market_id},
         ):
             return
+
+        dispatch_timestamp_ms = self._current_timestamp_ms()
+        dispatch_context = None
+        if self._live_orchestrator is not None:
+            anchor_volume = Decimal("1")
+            if book is not None and getattr(book, "has_data", False):
+                try:
+                    anchor_volume = _decimal_from_number(max(getattr(book.snapshot(), "ask_depth_usd", 1.0), 1.0))
+                except Exception:
+                    anchor_volume = Decimal("1")
+            dispatch_context = contagion_to_context(
+                market_id=market.condition_id,
+                side=trade_direction,
+                target_price=_decimal_from_number(entry_price),
+                anchor_volume=anchor_volume,
+                max_capital=_decimal_from_number(settings.strategy.max_trade_size_usd),
+                conviction_scalar=_decimal_from_number(min(max(signal.confidence, 0.0), 1.0)),
+            )
+            intent = self._live_orchestrator.dispatcher.evaluate_intent(
+                dispatch_context,
+                dispatch_timestamp_ms,
+                enforce_guard=True,
+            )
+            if not intent.allowed:
+                log.info(
+                    "contagion_dispatcher_rejected",
+                    market=market.condition_id,
+                    reason=intent.reason,
+                    leader_market=signal.leading_market_id,
+                )
+                await self._record_contagion_matrix(
+                    signal,
+                    market,
+                    book=book,
+                    agg=agg,
+                    suppressed=True,
+                    suppression_reason=f"dispatcher_{intent.reason or 'rejected'}",
+                )
+                return
 
         pos = await self.positions.open_rpe_position(
             market_id=market.condition_id,
@@ -3383,6 +4620,12 @@ class TradingBot:
             latency_healthy=True,
         )
         if pos:
+            if dispatch_context is not None and self._live_orchestrator is not None:
+                self._live_orchestrator.dispatcher.record_external_dispatch(
+                    dispatch_context,
+                    dispatch_timestamp_ms,
+                    enforce_guard=True,
+                )
             self.lifecycle.record_signal(market.condition_id)
             if getattr(pos, "fast_strike", False):
                 log.info(
@@ -3418,7 +4661,7 @@ class TradingBot:
         direction = meta.get("direction", "buy_no")
         model_prob = meta.get("model_probability", 0.5)
         confidence = meta.get("confidence", 0.0)
-        shadow = settings.strategy.oracle_shadow_mode
+        shadow = settings.strategy.oracle_shadow_runtime_enabled()
         strat = settings.strategy
 
         # ── Per-market cooldown ────────────────────────────────────
@@ -3660,9 +4903,18 @@ class TradingBot:
 
     async def _record_and_notify_exit(self, pos: Any) -> None:
         try:
+            await self._persist_closed_position(pos)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("record_notify_exit_error", pos_id=pos.id, exc_info=True)
+
+    async def _persist_closed_position(self, pos: Any) -> None:
+        if not getattr(pos, "_recorded", False):
             await self.trade_store.record(pos)
             setattr(pos, "_recorded", True)
             self.positions._invalidate_stats_cache()
+        if not getattr(pos, "_exit_notified", False):
             await self.telegram.notify_exit(
                 pos.id,
                 pos.entry_price,
@@ -3671,10 +4923,7 @@ class TradingBot:
                 pos.exit_reason,
                 self.positions.smart_passive_counters,
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.error("record_notify_exit_error", pos_id=pos.id, exc_info=True)
+            setattr(pos, "_exit_notified", True)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Pillar 1 — Passive-aggressive chaser flows
@@ -3697,6 +4946,13 @@ class TradingBot:
         # Resolve the correct asset_id — RPE positions may trade YES.
         entry_asset = pos.trade_asset_id or pos.no_asset_id
         try:
+            if (
+                pos.entry_order is not None
+                and pos.entry_order.status == OrderStatus.LIVE
+            ):
+                await self.executor.cancel_order(pos.entry_order)
+                pos.entry_order = None
+
             chaser = OrderChaser(
                 executor=self.executor,
                 book=no_book,
@@ -4141,24 +5397,17 @@ class TradingBot:
             try:
                 await self.positions.check_timeouts(exclude_signal_types={"ofi_momentum"})
 
-                # Record timeouts (only once — mark as recorded)
+                # Backstop any closed position whose first async persist/notify
+                # attempt was missed or failed.
                 for pos in self.positions.get_all_positions():
                     if (
                         pos.state == PositionState.CLOSED
                         and (
-                            pos.exit_reason in ("timeout", "time_stop")
-                            or pos.signal_type == "ofi_momentum"
+                            not getattr(pos, "_recorded", False)
+                            or not getattr(pos, "_exit_notified", False)
                         )
-                        and not getattr(pos, "_recorded", False)
                     ):
-                        await self.trade_store.record(pos)
-                        setattr(pos, "_recorded", True)
-                        self.positions._invalidate_stats_cache()
-                        await self.telegram.notify_exit(
-                            pos.id, pos.entry_price, pos.exit_price,
-                            pos.pnl_cents, pos.exit_reason,
-                        )
-                        pos._recorded = True  # type: ignore[attr-defined]
+                        await self._persist_closed_position(pos)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -4221,6 +5470,7 @@ class TradingBot:
                     cm_signals = self._cross_market.scan()
                     if cm_signals:
                         log.info("cross_market_scan", signals=len(cm_signals))
+                        await self._consume_cross_market_signals(cm_signals)
             except asyncio.CancelledError:
                 break
             except (KeyError, ValueError) as exc:
@@ -4290,8 +5540,51 @@ class TradingBot:
                             "🟢 <b>Paper-trading criteria MET</b> — ready for live deployment!"
                         )
 
+                shadow_overview = await self.trade_store.get_shadow_source_overview()
+                if shadow_overview:
+                    log.info(
+                        "shadow_strategy_overview",
+                        shadow_sources=shadow_overview,
+                    )
+                    panic_shadow = next(
+                        (
+                            row
+                            for row in shadow_overview
+                            if row.get("signal_source") == _PANIC_SHADOW_SOURCE
+                        ),
+                        None,
+                    )
+                    if panic_shadow is not None and int(
+                        panic_shadow.get("total_trades", 0) or 0
+                    ) >= 20:
+                        log_method = (
+                            log.info
+                            if bool(panic_shadow.get("passes_go_live", False))
+                            else log.warning
+                        )
+                        log_method(
+                            "panic_shadow_decision_state",
+                            total_trades=int(panic_shadow.get("total_trades", 0) or 0),
+                            expectancy_cents=round(
+                                float(panic_shadow.get("expectancy_cents", 0.0) or 0.0),
+                                4,
+                            ),
+                            win_rate=round(
+                                float(panic_shadow.get("win_rate", 0.0) or 0.0),
+                                4,
+                            ),
+                            passes_go_live=bool(
+                                panic_shadow.get("passes_go_live", False)
+                            ),
+                        )
+                    await self.telegram.notify_shadow_summary(shadow_overview)
+
                 # ── RPE calibration gate check ────────────────────────
-                cal_stats = self._rpe_calibration.calibration_summary()
+                cal_stats = (
+                    self._rpe_calibration.calibration_summary()
+                    if self._rpe_calibration is not None
+                    else {}
+                )
                 resolved_n = cal_stats.get("resolved", 0)
 
                 if settings.strategy.rpe_generic_enabled and resolved_n < 30:
@@ -4509,6 +5802,7 @@ class TradingBot:
                     "latency_guard_state": latency_state,
                     "heartbeat_state": heartbeat_state,
                     "active_positions": len(self.positions.get_open_positions()),
+                    "wallet_balance_usd": round(float(self.positions._wallet_balance_usd), 4),
                     "active_markets": len(self.lifecycle.active),
                     "observing_markets": len(self.lifecycle.observing),
                 }
@@ -4565,6 +5859,29 @@ class TradingBot:
                     l2_total_desyncs / max(1, l2_total_deltas), 6
                 )
                 health["l2_unreliable_books"] = l2_unreliable_count
+                health["tracked_market_selection"] = {
+                    "warm_markets": len(self._warm_market_ids),
+                    "warm_market_limit": self._warm_market_limit(),
+                    "single_name_markets": len(self._tracked_single_market_ids),
+                    "si9_markets": len(self._tracked_combo_market_ids),
+                    "si9_events": list(self._tracked_combo_event_ids),
+                    "si9_scan_summary": self._cluster_mgr.last_scan_summary(),
+                }
+                health["observing_market_blockers"] = {
+                    "counts": self.lifecycle.observing_blocker_counts(),
+                    "sample": self.lifecycle.observing_blockers_snapshot(limit=10),
+                }
+                if self._combo_detector is not None:
+                    health["tracked_market_selection"]["si9_selection_feedback"] = (
+                        self._combo_detector.selection_feedback(self._tracked_combo_event_ids)
+                    )
+                    health["tracked_market_selection"]["si9_recent_evaluations"] = (
+                        self._combo_detector.evaluation_snapshot(self._tracked_combo_event_ids)
+                    )
+                health["single_name_rejection_counts"] = {
+                    strategy: dict(reason_counts)
+                    for strategy, reason_counts in self._single_name_rejection_counts.items()
+                }
                 health["smart_passive_counters"] = self.positions.smart_passive_counters
                 health["contagion_matrix"] = list(self._recent_contagion_matrix)
 
@@ -4599,18 +5916,62 @@ class TradingBot:
                 pass
             raise
 
+    @staticmethod
+    def _market_refresh_sleep_seconds(
+        *,
+        full_refresh_interval_s: float,
+        observation_period_s: float,
+        next_full_refresh_deadline: float,
+        now: float,
+    ) -> float:
+        """Return the next sleep interval for the market refresh loop.
+
+        Full discovery/decay refreshes should remain on the configured
+        ``MARKET_REFRESH_MINUTES`` cadence, but observation-tier markets
+        should be reconsidered as soon as their observation window expires
+        after restart. This helper therefore caps the next wake-up at the
+        shorter of the observation period and the remaining time until the
+        next full refresh.
+        """
+        promotion_interval_s = max(1.0, min(full_refresh_interval_s, observation_period_s))
+        time_to_full_refresh_s = max(0.0, next_full_refresh_deadline - now)
+        if time_to_full_refresh_s <= 0.0:
+            return 0.0
+        return min(promotion_interval_s, time_to_full_refresh_s)
+
     async def _market_refresh_loop(self) -> None:
-        """Periodically re-discover, re-score, promote/demote/evict."""
-        interval = settings.strategy.market_refresh_minutes * 60
+        """Periodically re-discover, re-score, promote/demote/evict.
+
+        Full refreshes stay on the configured discovery cadence so trade-count
+        decay and Gamma polling semantics remain unchanged. Between those full
+        refreshes, the loop performs earlier non-decaying refreshes whenever
+        the observation window is shorter than the discovery cadence, allowing
+        observing markets to promote promptly after restart.
+        """
+        full_refresh_interval_s = max(1.0, settings.strategy.market_refresh_minutes * 60)
+        observation_period_s = max(1.0, settings.strategy.observation_period_minutes * 60)
+        next_full_refresh_deadline = time.monotonic() + full_refresh_interval_s
         while self._running:
+            sleep_s = self._market_refresh_sleep_seconds(
+                full_refresh_interval_s=full_refresh_interval_s,
+                observation_period_s=observation_period_s,
+                next_full_refresh_deadline=next_full_refresh_deadline,
+                now=time.monotonic(),
+            )
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+
+            decay_counters = time.monotonic() >= next_full_refresh_deadline
             try:
-                await self._refresh_markets_once(decay_counters=True)
+                await self._refresh_markets_once(decay_counters=decay_counters)
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("market_refresh_error", error=str(exc), exc_info=True)
-            await asyncio.sleep(interval)
+            finally:
+                if decay_counters:
+                    next_full_refresh_deadline = time.monotonic() + full_refresh_interval_s
 
     async def _pce_refresh_loop(self) -> None:
         """Periodically recompute correlations, persist, and send dashboard."""

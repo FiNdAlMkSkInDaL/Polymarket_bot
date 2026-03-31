@@ -36,6 +36,14 @@ class DeploymentEnv(str, Enum):
     PRODUCTION = "PRODUCTION"
 
 
+class LaneState(str, Enum):
+    """Explicit runtime state for a strategy lane."""
+
+    OFF = "OFF"
+    SHADOW = "SHADOW"
+    LIVE = "LIVE"
+
+
 # Hardcoded â€” intentionally NOT configurable via env var.
 PENNY_LIVE_MAX_TRADE_USD: float = 5.0
 
@@ -87,6 +95,31 @@ def _env_int(key: str, default: int = 0) -> int:
 
 def _env_bool(key: str, default: bool = True) -> bool:
     return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
+
+
+def _env_lane_state(key: str, default: LaneState) -> LaneState:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return LaneState(raw.upper())
+    except ValueError as exc:
+        allowed = ", ".join(state.value for state in LaneState)
+        raise ValueError(
+            f"Invalid lane state for env var {key!r}: {raw!r}. Expected one of: {allowed}."
+        ) from exc
+
+
+def _coerce_lane_state(name: str, value: LaneState | str) -> LaneState:
+    if isinstance(value, LaneState):
+        return value
+    if isinstance(value, str):
+        try:
+            return LaneState(value.upper())
+        except ValueError as exc:
+            allowed = ", ".join(state.value for state in LaneState)
+            raise ValueError(f"{name} must be one of: {allowed}") from exc
+    raise TypeError(f"{name} must be a LaneState or string; got {type(value)!r}")
     
 def _validate_fraction(name: str, value: float, *, allow_zero: bool) -> None:
     numeric = float(value)
@@ -115,6 +148,40 @@ class StrategyParams:
     # Whale monitor adaptive polling threshold.
     whale_zscore_threshold: float = _env_float("WHALE_ZSCORE_THRESHOLD", 0.20)
 
+    # Explicit lane-state reset.
+    panic_lane_state: LaneState = _env_lane_state("PANIC_LANE_STATE", LaneState.LIVE)
+    ofi_momentum_lane_state: LaneState = _env_lane_state("OFI_MOMENTUM_LANE_STATE", LaneState.OFF)
+    contagion_lane_state: LaneState = _env_lane_state("CONTAGION_LANE_STATE", LaneState.SHADOW)
+    rpe_lane_state: LaneState = _env_lane_state("RPE_LANE_STATE", LaneState.OFF)
+    oracle_lane_state: LaneState = _env_lane_state("ORACLE_LANE_STATE", LaneState.OFF)
+    pure_market_maker_lane_state: LaneState = _env_lane_state(
+        "PURE_MARKET_MAKER_LANE_STATE",
+        LaneState.OFF,
+    )
+    si9_combo_lane_state: LaneState = _env_lane_state("SI9_COMBO_LANE_STATE", LaneState.OFF)
+    cross_market_lane_state: LaneState = _env_lane_state("CROSS_MARKET_LANE_STATE", LaneState.OFF)
+    si10_bayesian_lane_state: LaneState = _env_lane_state("SI10_BAYESIAN_LANE_STATE", LaneState.OFF)
+    reward_lane_state: LaneState = _env_lane_state("REWARD_LANE_STATE", LaneState.OFF)
+
+    # Panic mean-reversion gates. Tightened from the legacy detector
+    # defaults to suppress weak disturbances that have been low-quality live.
+    panic_zscore_threshold: float = _env_float("PANIC_ZSCORE_THRESHOLD", 0.75)
+    panic_volume_ratio_threshold: float = _env_float("PANIC_VOLUME_RATIO_THRESHOLD", 1.25)
+    panic_trend_guard_pct: float = _env_float("PANIC_TREND_GUARD_PCT", 0.05)
+    panic_trend_guard_bars: int = _env_int("PANIC_TREND_GUARD_BARS", 10)
+    panic_ofi_veto_threshold: float = _env_float("PANIC_OFI_VETO_THRESHOLD", 50.0)
+    panic_min_ask_depth_usd: float = _env_float("PANIC_MIN_ASK_DEPTH_USD", 40.0)
+    panic_max_spread_cents: float = _env_float("PANIC_MAX_SPREAD_CENTS", 3.0)
+    panic_min_book_depth_ratio: float = _env_float("PANIC_MIN_BOOK_DEPTH_RATIO", 0.25)
+    panic_post_loss_cooldown_s: float = _env_float("PANIC_POST_LOSS_COOLDOWN_S", 1800.0)
+    panic_min_expected_net_target_per_share_cents: float = _env_float(
+        "PANIC_MIN_EXPECTED_NET_TARGET_PER_SHARE_CENTS", 2.0
+    )
+    panic_min_expected_net_target_minus_one_tick_per_share_cents: float = _env_float(
+        "PANIC_MIN_EXPECTED_NET_TARGET_MINUS_ONE_TICK_PER_SHARE_CENTS", 1.0
+    )
+    panic_shadow_mode: bool = _env_bool("PANIC_SHADOW_MODE", False)
+
     # Take-profit
     alpha_default: float = _env_float("ALPHA_DEFAULT", 0.50)
     alpha_min: float = _env_float("ALPHA_MIN", 0.40)
@@ -123,11 +190,25 @@ class StrategyParams:
     ofi_threshold: float = _env_float("OFI_THRESHOLD", 0.75)
     window_ms: int = _env_int("OFI_WINDOW_MS", 2000)
     ofi_tvi_kappa: float = _env_float("OFI_TVI_KAPPA", 1.0)
+    ofi_min_trade_flow_imbalance: float = _env_float("OFI_MIN_TRADE_FLOW_IMBALANCE", 0.10)
+    ofi_min_tvi_multiplier: float = _env_float("OFI_MIN_TVI_MULTIPLIER", 0.75)
     toxicity_window_ms: int = _env_int("TOXICITY_WINDOW_MS", 2000)
     toxicity_depth_evaporation_pct: float = _env_float("TOXICITY_DEPTH_EVAPORATION_PCT", 0.20)
     toxicity_sweep_depth_ratio: float = _env_float("TOXICITY_SWEEP_DEPTH_RATIO", 0.25)
     ofi_toxicity_scale_threshold: float = _env_float("OFI_TOXICITY_SCALE_THRESHOLD", 0.60)
-    ofi_toxicity_size_boost_max: float = _env_float("OFI_TOXICITY_SIZE_BOOST_MAX", 2.0)
+    ofi_toxicity_veto_threshold: float = _env_float("OFI_TOXICITY_VETO_THRESHOLD", 0.75)
+    ofi_toxicity_size_haircut_floor: float = _env_float("OFI_TOXICITY_SIZE_HAIRCUT_FLOOR", 0.35)
+    ofi_min_target_edge_cents: float = _env_float("OFI_MIN_TARGET_EDGE_CENTS", 4.0)
+    ofi_momentum_take_profit_pct: float = _env_float("OFI_MOMENTUM_TAKE_PROFIT_PCT", 0.02)
+    ofi_momentum_stop_loss_pct: float = _env_float("OFI_MOMENTUM_STOP_LOSS_PCT", 0.01)
+    ofi_momentum_max_hold_seconds: int = _env_int("OFI_MOMENTUM_MAX_HOLD_SECONDS", 120)
+    # Reverse OFI shadow candidate: reuse the live OFI entry trigger but
+    # route the opposite YES-side outcome into shadow tracking only.
+    # The reference price is the original NO-side OFI ask used by the
+    # current live path so cohort filters remain comparable.
+    ofi_reverse_shadow_enabled: bool = _env_bool("OFI_REVERSE_SHADOW_ENABLED", False)
+    ofi_reverse_shadow_min_reference_price: float = _env_float("OFI_REVERSE_SHADOW_MIN_REFERENCE_PRICE", 0.80)
+    ofi_reverse_shadow_max_reference_price: float = _env_float("OFI_REVERSE_SHADOW_MAX_REFERENCE_PRICE", 0.95)
     take_profit_pct: float = _env_float("TAKE_PROFIT_PCT", 0.02)
     stop_loss_pct: float = _env_float("STOP_LOSS_PCT", 0.02)
 
@@ -214,6 +295,7 @@ class StrategyParams:
     # Risk
     max_trade_size_usd: float = _env_float("MAX_TRADE_SIZE_USD", 15.0)
     max_wallet_risk_pct: float = _env_float("MAX_WALLET_RISK_PCT", 20.0)
+    paper_starting_balance_usd: float = _env_float("PAPER_STARTING_BALANCE_USD", 250.0)
 
     # Time limits
     entry_timeout_seconds: int = _env_int("ENTRY_TIMEOUT_SECONDS", 300)
@@ -233,9 +315,12 @@ class StrategyParams:
     # Load shedding: maximum markets with full L2 book reconstruction.
     # Remaining discovered markets use lightweight price/trade-only tracking.
     max_active_l2_markets: int = _env_int("MAX_ACTIVE_L2_MARKETS", 25)
+    warm_market_observation_limit: int = _env_int("WARM_MARKET_OBSERVATION_LIMIT", 200)
+    tracked_single_name_markets: int = _env_int("TRACKED_SINGLE_NAME_MARKETS", -1)
+    si9_tracked_market_budget: int = _env_int("SI9_TRACKED_MARKET_BUDGET", -1)
 
     # Pure maker quoting universe and sizing.
-    pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", True)
+    pure_mm_enabled: bool = _env_bool("PURE_MM_ENABLED", False)
     pure_mm_max_markets: int = _env_int("PURE_MM_MAX_MARKETS", 25)
     pure_mm_quote_size_usd: float = _env_float("PURE_MM_QUOTE_SIZE_USD", 5.0)
     pure_mm_inventory_cap_usd: float = _env_float("PURE_MM_INVENTORY_CAP_USD", 15.0)
@@ -248,9 +333,26 @@ class StrategyParams:
     pure_mm_depth_window_s: float = _env_float("PURE_MM_DEPTH_WINDOW_S", 2.0)
     pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.20)
 
+    reward_refresh_interval_ms: int = _env_int("REWARD_REFRESH_INTERVAL_MS", 30_000)
+    reward_market_cap: int = _env_int("REWARD_MARKET_CAP", 8)
+    reward_quote_cap: int = _env_int("REWARD_QUOTE_CAP", 12)
+    reward_daily_reward_floor: float = _env_float("REWARD_DAILY_REWARD_FLOOR", 15.0)
+    reward_to_competition_floor: float = _env_float("REWARD_TO_COMPETITION_FLOOR", 5.0)
+    reward_quote_notional_cap: float = _env_float("REWARD_QUOTE_NOTIONAL_CAP", 25.0)
+    reward_inventory_cap: float = _env_float("REWARD_INVENTORY_CAP", 50.0)
+    reward_cancel_on_stale_ms: int = _env_int("REWARD_CANCEL_ON_STALE_MS", 15_000)
+    reward_replace_only_if_price_moves_ticks: int = _env_int("REWARD_REPLACE_ONLY_IF_PRICE_MOVES_TICKS", 1)
+    reward_safe_mid_min_price: float = _env_float("REWARD_SAFE_MID_MIN_PRICE", 0.10)
+    reward_safe_mid_max_price: float = _env_float("REWARD_SAFE_MID_MAX_PRICE", 0.90)
+    reward_jump_risk_move_pct: float = _env_float("REWARD_JUMP_RISK_MOVE_PCT", 0.05)
+    reward_jump_risk_volatility_pct: float = _env_float("REWARD_JUMP_RISK_VOLATILITY_PCT", 0.05)
+
     # Market scoring
     min_market_score: float = _env_float("MIN_MARKET_SCORE", 40.0)
     observation_period_minutes: int = _env_int("OBSERVATION_PERIOD_MINUTES", 5)
+    market_min_bars_for_activation: int = _env_int("MARKET_MIN_BARS_FOR_ACTIVATION", 1)
+    market_max_last_trade_age_s: float = _env_float("MARKET_MAX_LAST_TRADE_AGE_S", 300.0)
+    market_untradable_cycles_before_evict: int = _env_int("MARKET_UNTRADABLE_CYCLES_BEFORE_EVICT", 1)
     demotion_cycles_before_evict: int = _env_int("DEMOTION_CYCLES_BEFORE_EVICT", 3)
     api_rate_limit_per_sec: int = _env_int("API_RATE_LIMIT_PER_SEC", 5)
 
@@ -380,6 +482,7 @@ class StrategyParams:
     # â”€â”€ Pillar 7: Hybrid-Aggressive Chaser Escalation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     chaser_max_rejections: int = _env_int("CHASER_MAX_REJECTIONS", 3)
     chaser_escalation_ticks: int = _env_int("CHASER_ESCALATION_TICKS", 1)
+    chaser_urgent_rest_timeout_s: float = _env_float("CHASER_URGENT_REST_TIMEOUT_S", 5.0)
     # Anti-toxicity guard: if the adverse-selection p-value drops below
     # this ceiling during a chase, cancel rather than crossing the spread.
     chaser_toxicity_p_value_ceil: float = _env_float("CHASER_TOXICITY_P_VALUE_CEIL", 0.10)
@@ -604,14 +707,14 @@ class StrategyParams:
 
     # â”€â”€ SI-3: Cross-Market Signal Generator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Offensive pairs-style alpha from correlated market lag divergences.
-    cross_mkt_enabled: bool = _env_bool("CROSS_MKT_ENABLED", True)
+    cross_mkt_enabled: bool = _env_bool("CROSS_MKT_ENABLED", False)
     cross_mkt_shadow: bool = _env_bool("CROSS_MKT_SHADOW", True)  # log-only until calibrated
     cross_mkt_min_correlation: float = _env_float("CROSS_MKT_MIN_CORRELATION", 0.50)
     cross_mkt_z_entry: float = _env_float("CROSS_MKT_Z_ENTRY", 2.0)
     cross_mkt_spread_ewma_lambda: float = _env_float("CROSS_MKT_SPREAD_EWMA_LAMBDA", 0.94)
 
     # SI-10: L2 Toxicity Contagion Arb
-    contagion_arb_enabled: bool = _env_bool("CONTAGION_ARB_ENABLED", True)
+    contagion_arb_enabled: bool = _env_bool("CONTAGION_ARB_ENABLED", False)
     contagion_arb_shadow: bool = _env_bool("CONTAGION_ARB_SHADOW", True)
     contagion_arb_min_correlation: float = _env_float("CONTAGION_ARB_MIN_CORRELATION", 0.35)
     contagion_arb_trigger_percentile: float = _env_float("CONTAGION_ARB_TRIGGER_PERCENTILE", 0.95)
@@ -711,6 +814,7 @@ class StrategyParams:
     si9_chase_interval_ms: int = _env_int("SI9_CHASE_INTERVAL_MS", 500)
     si9_scan_interval_ms: int = _env_int("SI9_SCAN_INTERVAL_MS", 500)
     si9_min_leg_depth_usd: float = _env_float("SI9_MIN_LEG_DEPTH_USD", 50.0)
+    si9_feedback_exclusion_penalty: float = _env_float("SI9_FEEDBACK_EXCLUSION_PENALTY", 30.0)
     # Pause maker-leg entry when rolling top-of-book imbalance shows
     # an extreme wave against our passive BUY.
     si9_ofi_window_ms: int = _env_int("SI9_OFI_WINDOW_MS", 2000)
@@ -737,6 +841,79 @@ class StrategyParams:
     si10_maker_ofi_tolerance: float = _env_float("SI10_MAKER_OFI_TOLERANCE", 0.85)
     si10_default_days_to_resolution: float = _env_float("SI10_DEFAULT_DAYS_TO_RESOLUTION", 7.0)
     si10_relationships_json: str = _env("SI10_RELATIONSHIPS_JSON", "[]")
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "panic_lane_state",
+            "ofi_momentum_lane_state",
+            "contagion_lane_state",
+            "rpe_lane_state",
+            "oracle_lane_state",
+            "pure_market_maker_lane_state",
+            "si9_combo_lane_state",
+            "cross_market_lane_state",
+            "si10_bayesian_lane_state",
+            "reward_lane_state",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _coerce_lane_state(field_name, getattr(self, field_name)),
+            )
+
+    def lane_state(self, lane_name: str) -> LaneState:
+        lane_map = {
+            "panic": self.panic_lane_state,
+            "ofi_momentum": self.ofi_momentum_lane_state,
+            "contagion": self.contagion_lane_state,
+            "rpe": self.rpe_lane_state,
+            "oracle": self.oracle_lane_state,
+            "pure_market_maker": self.pure_market_maker_lane_state,
+            "si9_combo": self.si9_combo_lane_state,
+            "cross_market": self.cross_market_lane_state,
+            "si10_bayesian": self.si10_bayesian_lane_state,
+            "reward": self.reward_lane_state,
+        }
+        try:
+            return lane_map[lane_name]
+        except KeyError as exc:
+            available = ", ".join(sorted(lane_map))
+            raise KeyError(f"Unknown lane {lane_name!r}. Available lanes: {available}") from exc
+
+    def lane_is_live(self, lane_name: str) -> bool:
+        return self.lane_state(lane_name) == LaneState.LIVE
+
+    def lane_is_shadow(self, lane_name: str) -> bool:
+        return self.lane_state(lane_name) == LaneState.SHADOW
+
+    def lane_is_off(self, lane_name: str) -> bool:
+        return self.lane_state(lane_name) == LaneState.OFF
+
+    def lane_is_active(self, lane_name: str) -> bool:
+        return self.lane_state(lane_name) != LaneState.OFF
+
+    def panic_shadow_runtime_enabled(self) -> bool:
+        return self.lane_is_shadow("panic") or self.panic_shadow_mode
+
+    def rpe_shadow_runtime_enabled(self) -> bool:
+        if self.lane_is_off("rpe"):
+            return False
+        return self.lane_is_shadow("rpe") or self.rpe_shadow_mode
+
+    def oracle_shadow_runtime_enabled(self) -> bool:
+        if self.lane_is_off("oracle"):
+            return False
+        return self.lane_is_shadow("oracle") or self.oracle_shadow_mode
+
+    def cross_market_shadow_runtime_enabled(self) -> bool:
+        if self.lane_is_off("cross_market"):
+            return False
+        return self.lane_is_shadow("cross_market") or self.cross_mkt_shadow
+
+    def contagion_shadow_runtime_enabled(self) -> bool:
+        if self.lane_is_off("contagion"):
+            return False
+        return self.lane_is_shadow("contagion")
 
 
 @dataclass(frozen=True)
