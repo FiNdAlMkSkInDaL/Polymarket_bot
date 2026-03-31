@@ -1,41 +1,155 @@
 # Polymarket Bot
 
-Polymarket Bot is a multi-strategy trading stack built around a shared live
-execution surface, archive-backed research tools, and a paper deployment
-workflow managed by `systemd`.
+This repository is no longer a broad multi-strategy playground pretending that
+every checked-in subsystem is equally active.
 
-The important current-state distinction is:
+The current runtime has been cut back to a Level 0 execution kernel with one
+live directional candidate, one shadow incubator, a unified dispatcher gate,
+and a journal-first persistence contract.
 
-- the bot still contains legacy strategies and compatibility code,
-- the live execution architecture is now organized around
-  `MultiSignalOrchestrator`, `LiveExecutionBoundary`, `PriorityDispatcher`,
-  `LiveWalletBalanceProvider`, and a strict `Decimal` venue path,
-- the contagion research plane is now driven by `UniverseBuilder` and
-  `ContagionValidator`.
+If you need the control-flow truth, read `ARCHITECTURE.md`. This file is the
+operator summary.
 
-See `ARCHITECTURE.md` for the control-flow source of truth.
+## Current Reality
 
-## Current Runtime Summary
+The bot is currently organized around:
 
-- OFI Momentum live entries go through `MultiSignalOrchestrator`.
-- Live OFI exits are locally owned and routed through `OfiExitRouter` rather
-  than generic visible resting exits.
-- Contagion arb runs in parallel on BBO updates and routes accepted signals
-  into the fast-strike RPE path, while being protected by orchestrator health.
-- `PriorityDispatcher` is the network bottleneck for live venue submission.
-- `LiveWalletBalanceProvider` supplies an O(1) cached USDC margin gate before
-  live dispatch.
-- `OrchestratorHealthMonitor.is_safe_to_trade(...)` fail-closes the live OFI,
-  contagion, and combo-arb loops when orchestrator health degrades.
+- `src/bot.py` as the runtime owner,
+- `src/execution/live_execution_boundary.py` as the only venue-facing
+  boundary,
+- `src/execution/multi_signal_orchestrator.py` as the shared dispatcher and
+  observability control plane,
+- `src/execution/priority_dispatcher.py` as the single pre-dispatch bottleneck,
+- `src/execution/orchestrator_health_monitor.py` as the fail-closed health
+  gate,
+- `src/monitoring/trade_store.py` as the journal-first persistence authority.
+
+The old documentation that described a large adapter graph is stale. The
+current kernel is smaller and stricter.
+
+## Lane States
+
+Default lane states in `src/core/config.py` are:
+
+- Panic: `LIVE`
+- Contagion: `SHADOW`
+- OFI Momentum: `OFF`
+- RPE: `OFF`
+- Oracle: `OFF`
+- PureMarketMaker: `OFF`
+- SI-9 combo: `OFF`
+- Cross-market: `OFF`
+- SI-10 Bayesian: `OFF`
+- Reward sidecar: `OFF` by default
+
+Operationally:
+
+- Panic is the sole live candidate.
+- Contagion is the shadow incubator.
+- Standard OFI, Oracle, Pure MM, and SI-9 are frozen.
+- Reward posting infrastructure exists, but it only runs when explicitly
+  enabled.
+
+## Unified Admission
+
+Live entry admission is now collapsed into the shared dispatcher path.
+
+`PriorityDispatcher` runs:
+
+1. bound pre-dispatch gates,
+2. the shared `DispatchGuard`,
+3. envelope serialization,
+4. mode-specific execution,
+5. receipt normalization.
+
+This is the front door for dispatcher-backed entry.
+
+The practical consequence is that new live risk is no longer supposed to sneak
+through strategy-specific routing tricks.
+
+## Health States
+
+`OrchestratorHealthMonitor` exposes three states:
+
+- `GREEN`: normal operation.
+- `YELLOW`: degraded-risk mode.
+- `RED`: hard stop.
+
+The important operating rule is:
+
+- YELLOW still allows position management and flattening.
+- YELLOW blocks new live entry intents.
+- RED halts the runtime harder.
+
+If you are debugging a missing entry, do not treat YELLOW as harmless.
+
+## Persistence
+
+`src/monitoring/trade_store.py` now uses a journal-first contract.
+
+For both live closed trades and shadow trades it:
+
+1. writes `trade_persistence_journal` first,
+2. writes the ledger row second inside an immediate transaction,
+3. marks the journal row `RECORDED` or `FAILED`.
+
+The persistence model is intentionally loud. Silent drops are no longer an
+acceptable failure mode.
+
+The same module also provides WAL-safe measurement snapshots using:
+
+- SQLite backup,
+- optional JSONL journal capture,
+- a manifest JSON that records snapshot paths and accounting status.
+
+## Reward Poster Sidecar
+
+The repository now contains a reward-posting subsystem:
+
+- `src/rewards/models.py`
+- `src/rewards/reward_selector.py`
+- `src/rewards/reward_poster_sidecar.py`
+- `src/execution/reward_poster_adapter.py`
+- `src/rewards/reward_shadow_metrics.py`
+- `scripts/report_reward_shadow.py`
+
+What it is:
+
+- a maker-only reward quote manager that uses the shared dispatcher,
+- a shadow-measurement pipeline for reward attribution,
+- a reporting surface over persisted reward shadow rows.
+
+What it is not:
+
+- a separate venue adapter,
+- a separate dispatch stack,
+- a reason to add schema bloat to `shadow_trades`.
+
+Reward attribution is packed into `payload_json.extra_payload` inside the
+trade-persistence journal. That is how the sidecar records fields like
+`reward_to_competition` and `estimated_reward_capture_usd` without mutating the
+SQL schema.
+
+## Contagion
+
+Contagion is not the old privileged fast-strike side path anymore.
+
+Current truth:
+
+- it evaluates on BBO updates in `src/bot.py`,
+- it is currently run as the shadow incubator,
+- it clears dispatcher-backed admission before opening shadow or live paths,
+- the live branch still finishes through the existing position machinery after
+  that admission check.
+
+So the correct mental model is: contagion is shadow-first and pays the shared
+gate tax.
 
 ## Deployment
 
-### CI/CD Workflow
+The VPS-managed PAPER flow is still based on `systemd`.
 
-The current deployment workflow for the VPS-managed PAPER service is based on
-`scripts/install_paper_service.sh`.
-
-Typical flow on the server:
+Typical deploy shape on the server:
 
 ```bash
 cd /home/botuser/polymarket-bot
@@ -43,25 +157,7 @@ git pull origin main
 ./scripts/install_paper_service.sh
 ```
 
-What the installer does:
-
-1. stops ad-hoc `python -m src.cli run --env PAPER` processes,
-2. copies `scripts/polymarket-bot.service` into `/etc/systemd/system/`,
-3. reloads `systemd`,
-4. enables and restarts `polymarket-bot.service`,
-5. runs `scripts/audit_forward_data.py` against the current UTC day, and
-6. prints a service status plus the latest journal tail.
-
-The service itself:
-
-- runs as `botuser`,
-- uses `/home/botuser/polymarket-bot/.venv/bin/python -m src.cli run --env PAPER`,
-- decrypts `.env.age` into `/dev/shm/secrets/.env` at start,
-- cleans `/dev/shm/pmb_*` before launch,
-- writes logs to `journald`,
-- restarts automatically.
-
-Useful commands after deployment:
+Useful commands:
 
 ```bash
 sudo systemctl status polymarket-bot.service --no-pager
@@ -69,128 +165,38 @@ sudo journalctl -u polymarket-bot.service -n 100 --no-pager
 sudo journalctl -u polymarket-bot.service -f
 ```
 
-### Offline Telemetry Profiling
+## Measurement Commands
 
-The runtime logs to `journald`. Offline latency profiling is done by exporting
-those logs and analyzing them with `scripts/profile_latency_logs.py`.
-
-Example:
+Reward shadow report:
 
 ```bash
-sudo journalctl -u polymarket-bot.service --since "2026-03-26 00:00:00" --no-pager > exported-journal.txt
-python scripts/profile_latency_logs.py exported-journal.txt --output latency_hist.png
+python scripts/report_reward_shadow.py --db logs/trades.db
 ```
 
-The profiler parses latency-like events, prints summary percentiles, and emits
-a histogram with a configurable threshold marker.
-
-## Research And Data Tools
-
-### Universe Builder / Contagion Validator
-
-The current universe curation tool is `scripts/cli_universe_builder.py`.
-
-It combines:
-
-- `src/data/universe_builder.py` for archive-backed leader-lagger cluster
-  construction,
-- `src/tools/contagion_validator.py` for replay validation and causal lag
-  telemetry.
-
-Default contagion freshness posture:
-
-- `max_lagger_age_ms = 600000`
-- `max_causal_lag_ms = 600000`
-- `max_leader_age_ms = 5000`
-
-Example:
+Shadow cohort study:
 
 ```bash
-python scripts/cli_universe_builder.py \
-  --clusters-json data/si10_relationships_march2026.json \
-  --archive-path data/vps_march2026 \
-  --market-map data/market_map.json \
-  --output-json artifacts/universe_builder/report.json \
-  --require-causal-ordering
+python scripts/shadow_cohort_study.py --db logs/trades.db
 ```
 
-What it does:
-
-1. loads candidate clusters,
-2. builds an archive-backed recommended cluster,
-3. validates that cluster with `ContagionValidator`, and
-4. prints both the builder funnel and validator funnel.
-
-Optional flags worth knowing:
-
-- `--max-events` for faster iteration on large archives,
-- `--emit-per-event-telemetry` to include pair-level causal telemetry,
-- `--min-correlation`, `--min-events-per-day`, and `--min-archive-days` to
-  tighten builder admission.
-
-### OFI Fold Trace Tool
-
-The current OFI drop-funnel tracer is `scripts/trace_ofi_fold.py`.
-
-It replays a walk-forward fold and reports how many candidate OFI events are
-lost to:
-
-- thresholding,
-- TVI penalties,
-- depth-vacuum suppression,
-- cooldown,
-- meta vetoes,
-- size-floor vetoes.
-
-Example:
+Trade cohort study:
 
 ```bash
-python scripts/trace_ofi_fold.py \
-  --data-dir data/vps_march2026 \
-  --market-configs data/market_map_top25.json \
-  --fold-index 2 \
-  --train-days 35 \
-  --test-days 7 \
-  --step-days 7 \
-  --embargo-days 1 \
-  --max-markets 25
+python scripts/trade_cohort_study.py --db logs/trades.db
 ```
 
-Notes:
+Those scripts are meant to consume frozen, WAL-safe measurement data rather
+than optimistic live copies.
 
-- `--data-dir` may point at the archive root or directly at `raw_ticks`; the
-  script normalizes either form.
-- If the selected fold window contains zero L2 events, the tool now fails
-  loudly with a fatal error instead of silently returning an empty funnel.
+## Where To Look First
 
-## Repository Layout
+If you are trying to understand the current bot, start here in this order:
 
-```text
-src/
-  bot.py                     Live runtime and background loops
-  core/                      Config, guards, process management
-  data/                      Archive readers, market discovery, universe builder
-  execution/                 Orchestrator, boundary, dispatcher, venue plumbing
-  signals/                   OFI, contagion, SI-9, SI-10, and related detectors
-  strategies/                Legacy standalone strategy implementations
-  tools/                     Replay validators and analysis utilities
-scripts/
-  install_paper_service.sh   Current PAPER deployment entry point
-  profile_latency_logs.py    Offline journald latency profiler
-  cli_universe_builder.py    Universe builder + contagion validator CLI
-  trace_ofi_fold.py          OFI walk-forward funnel tracer
-```
+1. `src/core/config.py` for lane states.
+2. `src/bot.py` for runtime wiring.
+3. `src/execution/priority_dispatcher.py` for live-entry admission.
+4. `src/execution/orchestrator_health_monitor.py` for degraded-risk behavior.
+5. `src/monitoring/trade_store.py` for persistence and measurement.
+6. `src/rewards/reward_poster_sidecar.py` if the reward lane is in scope.
 
-## Notes On Legacy Paths
-
-`PureMarketMaker` still exists and can still be started when
-`settings.strategy.pure_mm_enabled` is true. That does not make it the primary
-architecture.
-
-At HEAD:
-
-- `PureMarketMaker` is a legacy optional loop,
-- live OFI entries and exits are controlled by the orchestrator and live
-  execution boundary,
-- contagion live execution is still a bot-managed fast-strike lane protected by
-  orchestrator health rather than a dedicated orchestrator adapter.
+Anything older than that mental model is probably lying to you.

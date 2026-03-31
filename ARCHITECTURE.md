@@ -1,263 +1,398 @@
 # Architecture
 
-This document describes the current checked-in architecture at HEAD. It is a
-runtime and control-flow document, not a product brief. Where the codebase
-contains both legacy and current paths, this file distinguishes between code
-that exists, code that is wired, and code that actively governs live trading.
+This document describes the current checked-in runtime shape that actively
+governs trading. It is not a product brief. It is a control-surface document.
+If a component is not mentioned here, assume it is either frozen, legacy, or
+not on the hot path.
 
-## Current Runtime Shape
+## Level 0 Reset
 
-The live system is centered on three layers:
+The repository is no longer organized around a sprawling multi-adapter
+execution graph.
 
-1. `src/bot.py` owns process startup, websocket consumption, order-book
-   updates, legacy strategy loops, and background health tasks.
-2. `src/execution/live_execution_boundary.py` is the hard boundary between the
-   Python runtime and the Polymarket venue. In LIVE mode it builds the
-   transport, signer, nonce manager, wallet balance provider, and OFI exit
-   router. In PAPER mode it intentionally returns a no-op boundary.
-3. `src/execution/multi_signal_orchestrator.py` coordinates the shared live
-   execution substrate: dispatch guard, priority dispatcher, OFI entry bridge,
-   CTF adapter, SI-9 adapter, unwind escalation, position lifecycle, load
-   shedding, observability, and wallet balance cache.
+The current live kernel is deliberately smaller:
 
-The architecture is therefore not a single-strategy bot. It is a shared
-execution surface with multiple alpha lanes attached to it.
+1. `src/bot.py` owns process startup, websocket ingestion, BBO-driven event
+  handling, lane wiring, and the background loops.
+2. `src/execution/live_execution_boundary.py` is the only venue-facing runtime
+  boundary. In LIVE mode it builds the transport, signer, nonce manager, venue
+  adapter, wallet-balance provider, and OFI exit router. In PAPER mode it is
+  intentionally hollow.
+3. `src/execution/multi_signal_orchestrator.py` is now a thin shared control
+  plane around `PriorityDispatcher`, guard observability, OFI accounting, and
+  the reward poster adapter.
+4. `src/execution/priority_dispatcher.py` is the unified pre-dispatch choke
+  point. Admission logic is collapsed here through bound pre-dispatch gates
+  plus the shared `DispatchGuard`.
+5. `src/execution/orchestrator_health_monitor.py` is the fail-closed health
+  gate that feeds the dispatcher and higher-level bot loops.
+6. `src/monitoring/trade_store.py` is the durable persistence surface for both
+  closed trades and shadow trades.
 
-## Live Graph
+This is the new Level 0 kernel. The old story about the orchestrator owning
+slot buses, side locks, and strategy-specific paper adapters is obsolete.
 
-The current live graph is:
+## Deleted Mental Model
 
-1. Market data enters through the bot websocket and L2 websocket tasks.
-2. `OrderbookTracker` instances update best bid/ask, depth, toxicity, and
-   snapshot timestamps in O(1) time.
-3. Alpha lanes react to those updates in parallel:
-   - OFI Momentum emits live entry intents into `MultiSignalOrchestrator`.
-   - Contagion arb evaluates on BBO updates and routes accepted signals into
-     the RPE fast-strike position path.
-   - Legacy and optional loops such as `PureMarketMaker` can still run, but
-     they are not part of the orchestrator control plane.
-4. The orchestrator sends live orders through `PriorityDispatcher`, which is
-   the single bottleneck for venue dispatch, margin checks, MEV routing, and
-   normalized receipts.
-5. `LiveWalletBalanceProvider` polls the venue in the background, maintains an
-   in-memory USDC cache, and feeds margin state back into both the orchestrator
-   and `PositionManager`.
-6. `OrchestratorHealthMonitor` snapshots the orchestrator and exposes a
-   fail-closed `is_safe_to_trade(current_timestamp_ms)` gate used by the live
-   event loops.
+Do not model the current runtime as an orchestrator that owns:
 
-Two important consequences follow from this design:
+- `SignalCoordinationBus`
+- `OfiSignalBridge`
+- `CtfPaperAdapter`
+- `Si9PaperAdapter`
+- generic cross-strategy slot management
+- OFI side-lock routing
 
-- The runtime is event-driven. Health, exits, and signal conversion are driven
-  by market-data updates and orchestrator ticks rather than slow periodic
-  polling.
-- The venue-facing path is centralized. Even when the bot evaluates multiple
-  alpha families, network submission is serialized through the same dispatcher
-  and balance cache.
+That is not the architecture that actively governs the bot now.
 
-## MultiSignalOrchestrator
+Current orchestrator behavior is narrower:
 
-`MultiSignalOrchestrator` is the live control graph, not just a convenience
-wrapper.
+- validate source enablement,
+- validate market admission through the load shedder when present,
+- expose a dispatcher-backed OFI path,
+- expose a dispatcher-backed reward adapter,
+- emit a coherent snapshot for health monitoring.
 
-It owns these shared components:
+## Execution Kernel
 
-- `SignalCoordinationBus` for cross-strategy slot management and coordination.
-- `DispatchGuard` for centralized suppression accounting and dispatch checks.
-- `PriorityDispatcher` for routing a `PriorityOrderContext` into paper, dry
-  run, or live execution.
-- `CtfPaperAdapter`, `OfiSignalBridge`, and `Si9PaperAdapter` as the strategy
-  adapters that convert higher-level signals into dispatch intents.
-- `UnwindExecutor` and escalation policy for hanging-leg and recovery flows.
-- `PositionLifecycleInterface` for reservation, confirmation, and release.
-- `OrchestratorLoadShedder` for ranked-market admission control.
-- `LiveWalletBalanceProvider` and `OfiExitRouter` when the deployment phase is
-  LIVE.
+### Bot
 
-The orchestrator currently exposes four operational surfaces:
+`src/bot.py` is still the runtime owner.
 
-1. `on_ctf_signal(...)`
-2. `on_ofi_signal(...)`
-3. `on_si9_signal(...)`
-4. `on_tick(...)`
+It starts:
 
-`on_tick(...)` handles unwind escalation, surrender decisions, and lifecycle
-release. Snapshot generation is also centralized there, which is what lets the
-health monitor reason over one coherent state object instead of a loose set of
-side channels.
+- websocket and L2 consumers,
+- trade and book processors,
+- stop-loss, timeout, stats, cleanup, health, and summary loops,
+- the orchestrator tick loop,
+- the wallet-balance poll loop when a live balance provider exists,
+- the reward sidecar when the reward lane is active,
+- optional frozen loops only when their lane states are explicitly enabled.
 
-## OFI Momentum Lane
+The bot also owns the high-frequency BBO callbacks that drive:
 
-### Entry Path
+- shadow tracking,
+- OFI exit evaluation,
+- stop-loss monitoring,
+- reward-sidecar quote maintenance,
+- contagion evaluation.
 
-The current OFI live path is the most deeply integrated orchestrator lane.
+### LiveExecutionBoundary
 
-On each eligible NO-side OFI momentum signal in `src/bot.py`, the bot:
+`src/execution/live_execution_boundary.py` remains the hard split between local
+strategy logic and venue side effects.
 
-1. checks `is_safe_to_trade(...)` when the live OFI runtime is active,
-2. constructs an `OfiEntrySignal` using `Decimal` prices, sizes, conviction,
-   and timestamps,
-3. sends that signal into `MultiSignalOrchestrator.on_ofi_signal(...)`,
-4. lets `OfiSignalBridge` allocate side locks and convert the signal into a
-   `PriorityOrderContext`, and
-5. dispatches through `PriorityDispatcher`.
-
-This is the current live OFI entry contract. In PAPER mode the bot still has a
-legacy `_on_panic_signal(...)` path, but that is not the live venue path.
-
-### Exit Path
-
-The OFI exit model is intentionally severed from the old visible generic-exit
-flow.
-
-Current live behavior is:
-
-1. Entry fills leave the position with locally owned exit state rather than a
-   generic resting take-profit order.
-2. `MultiSignalOrchestrator.evaluate_ofi_exit(...)` uses
-   `OfiLocalExitMonitor` when book trackers are available, or falls back to a
-   local target/stop/time-stop decision derived from the stored `Decimal`
-   fields.
-3. `MultiSignalOrchestrator.route_ofi_exit(...)` hands the decision to
-   `OfiExitRouter`.
-4. `OfiExitRouter` submits one of three exit forms:
-   - immediate taker exit for target or stop hits,
-   - passive limit exit for time-stop handling,
-   - promotion from passive to taker when the passive wait budget or slippage
-     budget is breached.
-
-### Hazard-Style Brackets And Liquidity Vacuums
-
-The execution model remains a hidden, locally monitored OFI bracket system.
-The stored `drawn_tp`, `drawn_stop`, and `drawn_time_ms` fields are the control
-surface for that bracket. Time-stop exits are not fired blindly:
-
-- `OfiLocalExitMonitor` can suppress time-stop action during a liquidity
-  vacuum.
-- The replay and tracing utilities use the same vacuum concept through the
-  replay order book EWMA baselines.
-- `scripts/trace_ofi_fold.py` explicitly measures the OFI drop funnel,
-  including TVI penalty suppressions, depth-vacuum suppressions, cooldowns,
-  and size-floor vetoes.
-
-Operationally, OFI exits are now strategy-owned microstructure decisions, not
-just generic sell orders.
-
-## Contagion Lane
-
-The contagion architecture has two distinct pieces at HEAD: a live signal lane
-and an archive qualification lane.
-
-### Live Contagion Evaluation
-
-Live contagion is evaluated on every relevant BBO update in `src/bot.py`.
-
-The bot:
-
-1. checks `is_safe_to_trade(...)` before evaluating contagion in live mode,
-2. computes current YES mid-price and toxicity from live YES and NO books,
-3. calls `ContagionArbDetector.evaluate_market(...)`, and
-4. routes accepted non-shadow signals into `_on_contagion_signal(...)`, which
-   then opens an RPE fast-strike position when spread, freshness, cooldown,
-   stop-loss cooldown, and ensemble-risk gates all pass.
-
-This is parallel to OFI Momentum, but it is not currently dispatched through a
-dedicated orchestrator adapter. The orchestrator protects the lane via shared
-health gating; the actual contagion execution still enters through the
-position-manager fast-strike path.
-
-### Archive Qualification: UniverseBuilder + ContagionValidator
-
-The current contagion research and curation stack lives in moved modules:
-
-- `src/data/universe_builder.py`
-- `src/tools/contagion_validator.py`
-- `scripts/cli_universe_builder.py`
-
-`UniverseBuilder` builds candidate leader-lagger clusters from archived YES
-series. It enforces:
-
-- minimum empirical correlation,
-- minimum observed events per day,
-- minimum archive days,
-- maximum lagger freshness,
-- optional causal ordering.
-
-`ContagionValidator` then replays archived data with an instrumented
-`ContagionReplayAdapter` and records:
-
-- cross-market pairs evaluated,
-- causal gate pass rate,
-- legacy sync pass rate,
-- signals fired,
-- fills executed,
-- dominant suppressor,
-- lagger-age percentiles,
-- optional per-event telemetry.
-
-The accepted archive baseline used by `scripts/cli_universe_builder.py` is:
-
-- `max_lagger_age_ms = 600000`
-- `max_causal_lag_ms = 600000`
-- `max_leader_age_ms = 5000`
-
-That 600,000 ms freshness contract is not a doc convention. It is encoded in
-the CLI defaults and reinforced by the validator sweep artifacts.
-
-## SI-9 And CTF Adapters
-
-The orchestrator also carries CTF and SI-9 execution contracts.
-
-### CTF
-
-`CtfPaperAdapter` consumes fee-aware merge signals and emits receipts backed by
-strict `Decimal` manifests. `CtfExecutionManifest`, `CtfLegManifest`, and
-`CtfExecutionReceipt` reject non-`Decimal` monetary fields and enforce a
-well-formed two-leg execution contract.
-
-### SI-9
-
-`MultiSignalOrchestrator.on_si9_signal(...)` supports cluster reservation,
-execution via `Si9PaperAdapter`, hanging-leg unwind manifests, and escalation
-through `on_tick(...)`.
-
-That contract is present and tested in HEAD. The bot also still maintains its
-legacy combo-arb loop, so documentation must not claim that every SI-9 action
-already routes through the orchestrator in production.
-
-## LiveExecutionBoundary
-
-`build_live_execution_boundary(...)` is the hard runtime split between paper
-and live.
-
-Outside LIVE deployment it returns:
+In PAPER mode it returns no live transport:
 
 - `venue_adapter = None`
 - `wallet_balance_provider = None`
 - `ofi_exit_router = None`
 
-In LIVE deployment it constructs:
+In LIVE mode it builds the only objects that are allowed to touch the venue:
 
-1. an `AiohttpClobTransport` running on a dedicated async transport loop,
-2. a `PolymarketClobAdapter`,
-3. a `ClobNonceManager`,
-4. a `ClobSigner` bound to the Polymarket CTF exchange EIP-712 domain,
-5. a `LiveWalletBalanceProvider` tracking `USDC`, and
-6. an `OfiExitRouter` with OFI-scoped client-order IDs.
+1. transport,
+2. adapter,
+3. nonce manager,
+4. signer,
+5. cached wallet-balance provider,
+6. OFI exit router.
 
-That is the current live boundary. No live order path should bypass it.
+No lane should invent its own venue-facing stack outside this boundary.
 
-## PriorityDispatcher And The Network Bottleneck
+### MultiSignalOrchestrator
 
-`PriorityDispatcher` is where all venue-bound traffic converges.
+`src/execution/multi_signal_orchestrator.py` is now intentionally thin.
 
-It performs the following in order:
+It owns:
 
-1. optional `DispatchGuard` check,
-2. MEV routing via `MevExecutionRouter.plan_priority_sequence(...)`,
-3. envelope serialization,
-4. mode-specific execution,
-5. receipt normalization into a `DispatchReceipt`.
+- `DispatchGuard`
+- `PriorityDispatcher`
+- `GuardObservabilityPanel`
+- `OfiPaperLedger`
+- `RewardPosterAdapter`
+- optional load shedding and wallet-balance plumbing
+- OFI exit router wiring when LIVE
+
+It does not own strategy-specific adapter trees for CTF or SI-9 anymore, and
+it does not act as a generic strategy switchboard.
+
+Its active operational surfaces are:
+
+1. `on_ofi_signal(...)`
+2. `on_reward_intent(...)`
+3. `on_tick(...)`
+4. `orchestrator_snapshot(...)`
+5. `dispatch_guard_reason(...)`
+
+The orchestrator also binds itself as a dispatcher pre-gate. That means source
+enablement and market admission are enforced before the dispatcher ever tries
+to serialize or submit an order.
+
+### PriorityDispatcher
+
+`src/execution/priority_dispatcher.py` is the single admission and dispatch
+bottleneck.
+
+The important reset is architectural, not cosmetic: pre-dispatch logic is no
+longer fragmented across strategy adapters. It is unified here.
+
+Current dispatch order is:
+
+1. run all bound pre-dispatch gates,
+2. run the shared `DispatchGuard` if enabled,
+3. build and serialize the MEV envelope,
+4. execute in `paper`, `dry_run`, or `live` mode,
+5. normalize the result into a `DispatchReceipt`.
+
+This is where live-entry admission now collapses.
+
+The dispatcher is also the shared gate used by:
+
+- OFI live entries,
+- contagion dispatcher-backed admission checks,
+- reward-sidecar quote submission.
+
+### OrchestratorHealthMonitor
+
+`src/execution/orchestrator_health_monitor.py` is the hard live-trading gate.
+
+Its health states are:
+
+- `GREEN`: normal operation.
+- `YELLOW`: degraded-risk mode.
+- `RED`: hard stop.
+
+The important current behavior is:
+
+- `GREEN` allows normal entry and position management.
+- `YELLOW` allows position management, exits, and flattening, but it blocks new
+  live entry intents.
+- `RED` is a hard stop.
+
+That degraded-risk posture is enforced two ways:
+
+1. the monitor reports `allows_position_management=True` and
+  `allows_new_panic_entries=False` outside GREEN,
+2. the monitor binds itself into `PriorityDispatcher` and rejects new
+  dispatcher-backed entries for `OFI`, `CONTAGION`, and `REWARD` while
+  YELLOW.
+
+This matters operationally. YELLOW is not a cosmetic warning state. It is the
+mode where the runtime is allowed to clean up risk but not allowed to open new
+risk.
+
+## Persistence Contract
+
+`src/monitoring/trade_store.py` is the current persistence authority.
+
+The contract is journal first, ledger second.
+
+For both `trades` and `shadow_trades` it now does the following:
+
+1. write a `trade_persistence_journal` row first,
+2. open an immediate transaction for the ledger write,
+3. write the ledger row,
+4. mark the journal row `RECORDED` on success,
+5. mark the journal row `FAILED` on error and log loudly.
+
+The journal is not decorative. It records:
+
+- `journal_key`
+- `ledger_kind`
+- `trade_id`
+- `signal_source`
+- timing fields
+- `payload_json`
+- `ledger_state`
+- `last_error`
+
+The only acceptable steady-state ledger outcome is `RECORDED`.
+
+The runtime now explicitly distinguishes:
+
+- `PENDING`
+- `RECORDED`
+- `FAILED`
+
+This replaced the old silent-drop failure model. Persistence failures are now
+deliberately loud.
+
+### WAL-Safe Snapshotting
+
+The measurement path is also stricter.
+
+`create_wal_safe_remeasurement_snapshot(...)` does not rely on a naive file
+copy. It performs:
+
+1. a passive WAL checkpoint,
+2. an SQLite backup into a frozen snapshot database,
+3. optional JSONL export of `trade_persistence_journal`,
+4. a JSON manifest recording snapshot paths and accounting status.
+
+That snapshot manifest is the measurement contract for offline cohort work.
+
+### Shadow Extra Payload
+
+`record_shadow_trade(...)` now accepts `extra_payload`.
+
+That payload is merged into `payload_json` only, under the reserved top-level
+key `extra_payload`. The SQL schema for `shadow_trades` is unchanged.
+
+This is intentional. Reward-sidecar attribution data belongs in the journaled
+payload, not in schema sprawl.
+
+## Lane States
+
+The default lane posture in `src/core/config.py` is now explicit.
+
+Current defaults:
+
+- Panic: `LIVE`
+- Contagion: `SHADOW`
+- OFI Momentum: `OFF`
+- RPE: `OFF`
+- Oracle: `OFF`
+- PureMarketMaker: `OFF`
+- SI-9 combo: `OFF`
+- Cross-market: `OFF`
+- SI-10 Bayesian: `OFF`
+- Reward sidecar: `OFF` by default, present in code, activated only when the
+  reward lane is enabled
+
+Operationally, that means:
+
+- directional Panic is the sole live candidate,
+- Contagion is the active shadow incubator,
+- Pure MM, SI-9 combo, standard OFI, Oracle, and the rest are frozen,
+- reward posting exists as infrastructure but is not a default always-on lane.
+
+## Panic Lane
+
+Panic is the only current live directional candidate.
+
+Its entry path is still bot-managed through `PositionManager`, not through a
+dedicated dispatcher venue path. But it is governed by the tightened Level 0
+controls:
+
+- lane-state gating,
+- tradeability checks,
+- cooldowns,
+- book-quality gates,
+- ensemble-risk vetoes,
+- orchestrator health gating at the bot layer.
+
+In short: if you are debugging live directional behavior, start with Panic.
+
+## Contagion Lane
+
+Contagion is now the shadow incubator.
+
+The key current truth is:
+
+- the detector still evaluates on BBO updates inside `src/bot.py`,
+- shadow contagion uses dispatcher-backed admission in PAPER mode before the
+  shadow tracker opens a counterfactual position,
+- live contagion no longer gets to bypass the unified pre-dispatch gate.
+
+The live branch still finishes through the existing fast-strike
+`PositionManager` path after admission, but the old fast-strike bypass mental
+model is wrong. The lane now pays the same dispatcher tax at the front door.
+
+That means contagion is no longer a privileged legacy side path. It is a
+shadow-first incubator that must clear the unified gate.
+
+## Reward Poster Sidecar
+
+The reward poster is a new major subsystem.
+
+### Runtime Role
+
+`src/rewards/reward_poster_sidecar.py` is not a separate execution stack. It is
+a shared-kernel client.
+
+It:
+
+- selects admitted reward markets,
+- maintains working quotes,
+- reprices or cancels stale quotes,
+- records one-sided fills into local inventory,
+- persists reward-shadow rows through `trade_store`.
+
+It does not own its own venue adapter.
+
+### Shared Dispatcher Contract
+
+The sidecar uses `RewardPosterIntent` and `RewardExecutionHints` to build a
+`PriorityOrderContext` with `signal_source="REWARD"`.
+
+Those reward execution hints are strict:
+
+- `post_only=True`
+- `time_in_force="GTC"`
+- `liquidity_intent="MAKER_REWARD"`
+- `allow_taker_escalation=False`
+
+That is the contract. Reward posting is maker-only and dispatcher-mediated.
+
+The actual path is:
+
+1. sidecar creates `RewardPosterIntent`,
+2. `RewardPosterAdapter` converts it into a shared `PriorityOrderContext`,
+3. `PriorityDispatcher` runs pre-gates and guard checks,
+4. the returned `DispatchReceipt` is mapped into `RewardQuoteState`.
+
+There is no separate reward venue stack hiding off to the side.
+
+### Reward Shadow Measurement
+
+The sidecar also persists shadow measurement rows via
+`bot._persist_reward_shadow_trade(...)` and `trade_store.record_shadow_trade(...)`.
+
+Reward attribution data is packed into `payload_json.extra_payload`, including
+fields such as:
+
+- `reward_to_competition`
+- `reward_daily_usd`
+- `reward_max_spread_cents`
+- `queue_depth_ahead_usd`
+- `queue_residency_seconds`
+- `fill_occurred`
+- `estimated_reward_capture_usd`
+- `estimated_net_edge_usd`
+- `quote_id`
+- `quote_reason`
+
+This is deliberate. The sidecar extends measurement via journal payloads
+without bloating the SQL schema.
+
+### Reporting Surface
+
+`scripts/report_reward_shadow.py` reads persisted reward-shadow rows and groups
+them by:
+
+- market,
+- signal source,
+- reward-to-competition bucket,
+- fill occurred,
+- emergency flatten.
+
+It emits JSON and Markdown from existing shadow rows. It is a measurement tool,
+not an execution tool.
+
+## What Actively Governs Live Trading
+
+If you need the ruthless current truth, it is this:
+
+1. Panic is the only live directional candidate.
+2. Contagion is being incubated in shadow and must clear the unified
+  pre-dispatch gate.
+3. Reward posting exists as shared-kernel infrastructure, not as a special
+  venue stack.
+4. The dispatcher is the choke point.
+5. YELLOW means manage risk only. Do not add risk.
+6. Trade persistence is journal-first and loud on failure.
+
+Everything else is secondary, frozen, or legacy until explicitly reactivated.
 
 In LIVE mode it also performs an O(1) margin gate before the order reaches the
 venue:
