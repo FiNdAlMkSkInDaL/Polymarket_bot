@@ -322,8 +322,8 @@ class MevExecutionRouter:
         context: PriorityOrderContext,
     ) -> MevExecutionBatch:
         route_id = self._next_route_id("PRIORITY")
-        payloads = self._build_priority_sequence_payloads(route_id, context)
-        return self._dispatch_batch(route_id, "priority_sequence", payloads)
+        playbook, payloads = self._plan_priority_payloads(route_id, context)
+        return self._dispatch_batch(route_id, playbook, payloads)
 
     def plan_priority_sequence(
         self,
@@ -334,13 +334,22 @@ class MevExecutionRouter:
         # PriorityDispatcher uses ClientOrderIdGenerator for live submissions,
         # while route_id remains a deterministic planning/debug envelope field.
         route_id = self._next_route_id("PRIORITY")
-        payloads = self._build_priority_sequence_payloads(route_id, context)
+        playbook, payloads = self._plan_priority_payloads(route_id, context)
         return MevExecutionBatch(
             route_id=route_id,
-            playbook="priority_sequence",
+            playbook=playbook,
             payloads=payloads,
             responses=(),
         )
+
+    def _plan_priority_payloads(
+        self,
+        route_id: str,
+        context: PriorityOrderContext,
+    ) -> tuple[str, tuple[MevOrderPayload, ...]]:
+        if context.signal_source == "REWARD":
+            return "reward_post", self._build_reward_post_payloads(route_id, context)
+        return "priority_sequence", self._build_priority_sequence_payloads(route_id, context)
 
     def _build_priority_sequence_payloads(
         self,
@@ -413,6 +422,37 @@ class MevExecutionRouter:
             ),
         )
         return payloads
+
+    def _build_reward_post_payloads(
+        self,
+        route_id: str,
+        context: PriorityOrderContext,
+    ) -> tuple[MevOrderPayload, ...]:
+        execution_hints = context.execution_hints
+        if execution_hints is None:
+            raise ValueError("REWARD contexts require execution_hints")
+
+        reward_price_decimal = _normalize_native_price(context.target_price)
+        reward_metadata = dict(execution_hints.metadata)
+        reward_metadata.update(context.signal_metadata)
+
+        return (
+            MevOrderPayload(
+                route_id=route_id,
+                sequence=1,
+                playbook="reward_post",
+                market_id=context.market_id,
+                direction=context.side,
+                side="BUY",
+                price=float(reward_price_decimal),
+                size=_round_size(float(context.anchor_volume)),
+                liquidity_intent="MAKER_REWARD",
+                time_in_force=execution_hints.time_in_force,
+                post_only=execution_hints.post_only,
+                context=context,
+                metadata=reward_metadata,
+            ),
+        )
 
     def _dispatch_batch(
         self,

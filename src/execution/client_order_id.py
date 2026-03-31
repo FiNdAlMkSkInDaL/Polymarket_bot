@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 
-ClientOrderSignalSource = Literal["OFI", "SI9", "CTF", "CONTAGION", "MANUAL"]
+ClientOrderSignalSource = Literal["OFI", "SI9", "CTF", "CONTAGION", "MANUAL", "REWARD"]
 
 
 def _require_non_empty_string(name: str, value: str) -> str:
@@ -20,7 +20,7 @@ class ClientOrderIdGenerator:
         session_id: str,
     ) -> None:
         normalized_signal_source = str(signal_source or "").strip().upper()
-        if normalized_signal_source not in {"OFI", "SI9", "CTF", "CONTAGION", "MANUAL"}:
+        if normalized_signal_source not in {"OFI", "SI9", "CTF", "CONTAGION", "MANUAL", "REWARD"}:
             raise ValueError(f"Unsupported signal_source: {signal_source!r}")
 
         normalized_session_id = _require_non_empty_string("session_id", session_id)

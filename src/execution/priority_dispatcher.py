@@ -28,6 +28,15 @@ class MevRouter(Protocol):
         ...
 
 
+class DispatchPreGate(Protocol):
+    def dispatch_guard_reason(
+        self,
+        context: PriorityOrderContext,
+        dispatch_timestamp_ms: int,
+    ) -> str | None:
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class DispatchReceipt:
     context: PriorityOrderContext
@@ -113,6 +122,12 @@ class DispatchReceipt:
                 raise ValueError("paper and dry_run receipts must not set live-only venue fields")
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchIntentDecision:
+    allowed: bool
+    reason: str | None = None
+
+
 class PriorityDispatcher:
     def __init__(
         self,
@@ -139,6 +154,7 @@ class PriorityDispatcher:
         self._venue_adapter = venue_adapter
         self._client_order_id_generator = client_order_id_generator
         self._wallet_balance_provider = wallet_balance_provider
+        self._pre_dispatch_gates: list[DispatchPreGate] = []
 
     @property
     def guard(self) -> DispatchGuard | None:
@@ -148,30 +164,35 @@ class PriorityDispatcher:
     def guard_enabled(self) -> bool:
         return self._guard_enabled
 
+    def bind_pre_dispatch_gate(self, gate: DispatchPreGate) -> None:
+        if gate is None:
+            raise ValueError("gate is required")
+        if all(existing is not gate for existing in self._pre_dispatch_gates):
+            self._pre_dispatch_gates.append(gate)
+
     def dispatch(
         self,
         context: PriorityOrderContext,
         dispatch_timestamp_ms: int,
+        *,
+        enforce_guard: bool | None = None,
     ) -> DispatchReceipt:
-        if self._guard is not None and self._guard_enabled:
-            decision = self._guard.check(context, dispatch_timestamp_ms)
-            if not decision.allowed:
+        guard_enabled = self._guard_enabled if enforce_guard is None else bool(enforce_guard)
+        rejection_reason = self._pre_dispatch_rejection_reason(
+            context,
+            dispatch_timestamp_ms,
+            guard_enabled=guard_enabled,
+        )
+        if rejection_reason is not None:
+            if self._guard is not None and guard_enabled:
                 self._guard.record_suppression(context.signal_source)
-                receipt = DispatchReceipt(
-                    context=context,
-                    mode=self._mode,
-                    executed=False,
-                    fill_price=None,
-                    fill_size=None,
-                    serialized_envelope="",
-                    dispatch_timestamp_ms=dispatch_timestamp_ms,
-                    guard_reason=decision.reason,
-                    partial_fill_size=None,
-                    partial_fill_price=None,
-                    fill_status="NONE",
-                )
-                self._log_dispatch(receipt)
-                return receipt
+            receipt = self._rejected_receipt(
+                context=context,
+                dispatch_timestamp_ms=dispatch_timestamp_ms,
+                reason=rejection_reason,
+            )
+            self._log_dispatch(receipt)
+            return receipt
 
         batch = self._router.plan_priority_sequence(context)
         serialized_envelope = serialize_mev_execution_batch(batch)
@@ -181,10 +202,11 @@ class PriorityDispatcher:
         fill_size: Decimal | None = None
         executed = False
         first_payload = envelope["payloads"][0]
+        effective_size = self._payload_effective_size(first_payload)
 
         if self._mode == "paper":
             fill_price = Decimal(first_payload["price"])
-            fill_size = Decimal(first_payload["metadata"]["effective_size"])
+            fill_size = effective_size
             executed = True
 
         if self._mode == "live":
@@ -194,7 +216,7 @@ class PriorityDispatcher:
                 serialized_envelope=serialized_envelope,
                 first_payload=first_payload,
             )
-            if self._guard is not None and self._guard_enabled and receipt.executed:
+            if self._guard is not None and guard_enabled and receipt.executed:
                 self._guard.record_dispatch(context, dispatch_timestamp_ms)
             self._log_dispatch(receipt)
             return receipt
@@ -211,10 +233,81 @@ class PriorityDispatcher:
             partial_fill_price=None,
             fill_status="FULL" if executed else "NONE",
         )
-        if self._guard is not None and self._guard_enabled:
+        if self._guard is not None and guard_enabled:
             self._guard.record_dispatch(context, dispatch_timestamp_ms)
         self._log_dispatch(receipt)
         return receipt
+
+    def evaluate_intent(
+        self,
+        context: PriorityOrderContext,
+        dispatch_timestamp_ms: int,
+        *,
+        enforce_guard: bool | None = None,
+    ) -> DispatchIntentDecision:
+        guard_enabled = self._guard_enabled if enforce_guard is None else bool(enforce_guard)
+        rejection_reason = self._pre_dispatch_rejection_reason(
+            context,
+            dispatch_timestamp_ms,
+            guard_enabled=guard_enabled,
+        )
+        return DispatchIntentDecision(
+            allowed=(rejection_reason is None),
+            reason=rejection_reason,
+        )
+
+    def record_external_dispatch(
+        self,
+        context: PriorityOrderContext,
+        dispatch_timestamp_ms: int,
+        *,
+        enforce_guard: bool | None = None,
+    ) -> None:
+        guard_enabled = self._guard_enabled if enforce_guard is None else bool(enforce_guard)
+        if self._guard is None or not guard_enabled:
+            return
+        self._guard.record_dispatch(context, dispatch_timestamp_ms)
+
+    def _pre_dispatch_rejection_reason(
+        self,
+        context: PriorityOrderContext,
+        dispatch_timestamp_ms: int,
+        *,
+        guard_enabled: bool,
+    ) -> str | None:
+        for gate in self._pre_dispatch_gates:
+            reason = gate.dispatch_guard_reason(context, dispatch_timestamp_ms)
+            if reason is not None and str(reason).strip():
+                return str(reason).strip()
+
+        if self._guard is None or not guard_enabled:
+            return None
+
+        decision = self._guard.check(context, dispatch_timestamp_ms)
+        if not decision.allowed:
+            return decision.reason
+        return None
+
+    def _rejected_receipt(
+        self,
+        *,
+        context: PriorityOrderContext,
+        dispatch_timestamp_ms: int,
+        reason: str,
+    ) -> DispatchReceipt:
+        return DispatchReceipt(
+            context=context,
+            mode=self._mode,
+            executed=False,
+            fill_price=None,
+            fill_size=None,
+            serialized_envelope="",
+            dispatch_timestamp_ms=dispatch_timestamp_ms,
+            guard_reason=reason,
+            partial_fill_size=None,
+            partial_fill_price=None,
+            fill_status="NONE",
+        )
 
     def _dispatch_live_order(
         self,
@@ -231,7 +324,7 @@ class PriorityDispatcher:
 
         signal_source = context.signal_source
         generator = self._client_order_id_generator
-        if signal_source in {"OFI", "SI9", "CTF", "CONTAGION", "MANUAL"}:
+        if signal_source in {"OFI", "SI9", "CTF", "CONTAGION", "MANUAL", "REWARD"}:
             generator = generator.for_signal_source(signal_source)
 
         client_order_id = generator.generate(
@@ -240,7 +333,7 @@ class PriorityDispatcher:
             timestamp_ms=dispatch_timestamp_ms,
         )
         order_price = Decimal(first_payload["price"])
-        effective_size = Decimal(first_payload["metadata"]["effective_size"])
+        effective_size = self._payload_effective_size(first_payload)
         required_margin = order_price * effective_size
 
         if self._wallet_balance_provider is None:
@@ -268,6 +361,8 @@ class PriorityDispatcher:
             size=effective_size,
             order_type="LIMIT",
             client_order_id=client_order_id,
+            time_in_force=first_payload["time_in_force"],
+            post_only=bool(first_payload["post_only"]),
         )
         order_status = self._venue_adapter.get_order_status(submit_response.client_order_id)
 
@@ -367,3 +462,10 @@ class PriorityDispatcher:
         }
         level = logging.INFO if receipt.executed else logging.DEBUG
         _logger.log(level, json.dumps(log_payload, sort_keys=True))
+
+    @staticmethod
+    def _payload_effective_size(first_payload: dict[str, Any]) -> Decimal:
+        metadata = first_payload.get("metadata")
+        if isinstance(metadata, dict) and "effective_size" in metadata:
+            return Decimal(metadata["effective_size"])
+        return Decimal(str(first_payload["size"]))

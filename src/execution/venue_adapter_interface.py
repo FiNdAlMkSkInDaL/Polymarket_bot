@@ -31,6 +31,9 @@ class VenueAdapter(ABC):
         size: Decimal,
         order_type: Literal["LIMIT", "MARKET"],
         client_order_id: str,
+        *,
+        time_in_force: Literal["GTC", "IOC", "FOK"] = "GTC",
+        post_only: bool = False,
     ) -> "VenueOrderResponse":
         ...
 

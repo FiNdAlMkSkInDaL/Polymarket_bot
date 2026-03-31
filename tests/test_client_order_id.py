@@ -11,6 +11,7 @@ from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.live_wallet_balance import LiveWalletBalanceProvider
 from src.execution.mev_router import MevExecutionRouter
 from src.execution.priority_dispatcher import PriorityDispatcher
+from src.execution.priority_context import PriorityOrderContext, RewardExecutionHints
 from src.execution.venue_adapter_interface import VenueAdapter, VenueOrderResponse, VenueOrderStatus
 
 
@@ -65,7 +66,11 @@ class RecordingVenueAdapter(VenueAdapter):
         size: Decimal,
         order_type: str,
         client_order_id: str,
+        *,
+        time_in_force: str = "GTC",
+        post_only: bool = False,
     ) -> VenueOrderResponse:
+        _ = (market_id, side, price, size, order_type, time_in_force, post_only)
         self.submit_calls.append(client_order_id)
         return replace(self._submit_response, client_order_id=client_order_id)
 
@@ -143,6 +148,12 @@ def test_session_id_longer_than_eight_chars_uses_first_eight() -> None:
     assert generator.generate("MKT-1", "YES", 100) == "OFI-12345678-MKT-1-Y-100"
 
 
+def test_reward_client_order_id_uses_reward_prefix() -> None:
+    generator = ClientOrderIdGenerator("REWARD", "abcd1234-session")
+
+    assert generator.generate("MKT-REWARD", "YES", 101) == "REWARD-abcd1234-MKT-REWA-Y-101"
+
+
 def test_live_dispatcher_without_client_order_id_generator_raises_value_error() -> None:
     with pytest.raises(ValueError, match="client_order_id_generator"):
         PriorityDispatcher(
@@ -215,3 +226,43 @@ def test_dispatcher_prefers_context_signal_source_when_generator_session_is_reus
     receipt = dispatcher.dispatch(_make_context(), 10)
 
     assert receipt.order_id == "OFI-a3f9b2c1-MKT_PRIO-Y-10"
+
+
+def test_live_dispatcher_uses_reward_signal_source_for_client_order_id() -> None:
+    adapter = RecordingVenueAdapter()
+    dispatcher = PriorityDispatcher(
+        _make_router(),
+        "live",
+        venue_adapter=adapter,
+        client_order_id_generator=ClientOrderIdGenerator("MANUAL", "a3f9b2c1-session"),
+        wallet_balance_provider=LiveWalletBalanceProvider(
+            adapter,
+            tracked_assets=["USDC"],
+            initial_balances={"USDC": Decimal("100.000000")},
+        ),
+    )
+    reward_context = PriorityOrderContext(
+        market_id="MKT_REWARD",
+        side="YES",
+        signal_source="REWARD",
+        conviction_scalar=Decimal("1"),
+        target_price=Decimal("0.25"),
+        anchor_volume=Decimal("5"),
+        max_capital=Decimal("1.2500"),
+        execution_hints=RewardExecutionHints(
+            post_only=True,
+            time_in_force="GTC",
+            liquidity_intent="MAKER_REWARD",
+            allow_taker_escalation=False,
+            quote_id="quote-5",
+            tick_size=Decimal("0.01"),
+            cancel_on_stale_ms=1000,
+            replace_only_if_price_moves_ticks=1,
+            metadata={"quote_id": "quote-5"},
+        ),
+        signal_metadata={},
+    )
+
+    receipt = dispatcher.dispatch(reward_context, 10)
+
+    assert receipt.order_id == "REWARD-a3f9b2c1-MKT_REWA-Y-10"

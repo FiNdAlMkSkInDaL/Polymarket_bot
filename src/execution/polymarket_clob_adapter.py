@@ -80,8 +80,14 @@ class PolymarketClobAdapter(VenueAdapter):
         size: Decimal,
         order_type: Literal["LIMIT", "MARKET"],
         client_order_id: str,
+        *,
+        time_in_force: Literal["GTC", "IOC", "FOK"] = "GTC",
+        post_only: bool = False,
     ) -> VenueOrderResponse:
-        time_in_force = self._map_order_type(order_type)
+        clob_time_in_force = self._resolve_time_in_force(
+            order_type=order_type,
+            time_in_force=time_in_force,
+        )
         token_lookup_payload = self._payload_builder.build_token_lookup_payload(
             condition_id=market_id,
             outcome=side,
@@ -96,9 +102,9 @@ class PolymarketClobAdapter(VenueAdapter):
             action="BUY",
             price=price,
             size=size,
-            time_in_force=time_in_force,
+            time_in_force=clob_time_in_force,
             client_order_id=client_order_id,
-            post_only=False,
+            post_only=post_only,
             nonce=nonce,
             expiration=self._default_expiration,
         )
@@ -107,7 +113,7 @@ class PolymarketClobAdapter(VenueAdapter):
         post_order_payload = self._payload_builder.build_post_order_payload(
             signed_order=signed_order,
             owner_id=self._client.owner_id,
-            time_in_force=time_in_force,
+            time_in_force=clob_time_in_force,
             post_only=intent.post_only,
         )
         try:
@@ -198,6 +204,21 @@ class PolymarketClobAdapter(VenueAdapter):
         if isinstance(details, Mapping):
             return PolymarketClobAdapter._extract_expected_nonce(details)
         return None
+
+    @staticmethod
+    def _resolve_time_in_force(
+        *,
+        order_type: Literal["LIMIT", "MARKET"],
+        time_in_force: Literal["GTC", "IOC", "FOK"],
+    ) -> ClobTimeInForce:
+        normalized_time_in_force = str(time_in_force or "GTC").strip().upper()
+        if normalized_time_in_force not in {"GTC", "IOC", "FOK"}:
+            raise ValueError(f"Unsupported time_in_force: {time_in_force!r}")
+        if order_type == "MARKET" and normalized_time_in_force == "GTC":
+            return ClobTimeInForce.IOC
+        if order_type not in {"LIMIT", "MARKET"}:
+            raise ValueError(f"Unsupported order_type: {order_type!r}")
+        return ClobTimeInForce(normalized_time_in_force)
 
     @staticmethod
     def _map_order_type(order_type: Literal["LIMIT", "MARKET"]) -> ClobTimeInForce:

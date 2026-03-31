@@ -12,7 +12,7 @@ from src.events.mev_events import (
 from src.execution.alpha_adapters import ctf_to_context, ofi_to_context, si9_to_context
 from src.execution.mev_dispatcher import MevDispatcher
 from src.execution.priority_dispatcher import PriorityDispatcher
-from src.execution.priority_context import PriorityOrderContext
+from src.execution.priority_context import PriorityOrderContext, RewardExecutionHints
 from src.execution.mev_router import MevExecutionRouter, MevMarketSnapshot
 from src.execution.mev_serializer import deserialize_envelope, serialize_mev_execution_batch
 
@@ -219,6 +219,50 @@ def test_priority_sequence_builds_anchor_exit_with_fixed_precision_json(snapshot
     assert parsed["payloads"][1]["metadata"]["limit_price"] == "0.640000"
     assert "e-" not in serialized.lower()
     assert "e+" not in serialized.lower()
+
+
+def test_reward_context_plans_single_reward_post_payload(snapshot_provider) -> None:
+    router = MevExecutionRouter(snapshot_provider)
+    context = PriorityOrderContext(
+        market_id="MKT_REWARD",
+        side="YES",
+        signal_source="REWARD",
+        conviction_scalar=Decimal("1"),
+        target_price=Decimal("0.42"),
+        anchor_volume=Decimal("15"),
+        max_capital=Decimal("6.3000"),
+        execution_hints=RewardExecutionHints(
+            post_only=True,
+            time_in_force="GTC",
+            liquidity_intent="MAKER_REWARD",
+            allow_taker_escalation=False,
+            quote_id="quote-7",
+            tick_size=Decimal("0.01"),
+            cancel_on_stale_ms=750,
+            replace_only_if_price_moves_ticks=2,
+            metadata={"quote_id": "quote-7", "source": "reward-sidecar"},
+        ),
+        signal_metadata={"campaign": "spring", "source": "reward-kernel"},
+    )
+
+    batch = router.plan_priority_sequence(context)
+
+    assert batch.playbook == "reward_post"
+    assert len(batch.payloads) == 1
+    payload = batch.payloads[0]
+    assert payload.playbook == "reward_post"
+    assert payload.side == "BUY"
+    assert payload.direction == "YES"
+    assert payload.post_only is True
+    assert payload.time_in_force == "GTC"
+    assert payload.liquidity_intent == "MAKER_REWARD"
+    assert payload.price == pytest.approx(0.42)
+    assert payload.size == pytest.approx(15.0)
+    assert payload.metadata == {
+        "quote_id": "quote-7",
+        "source": "reward-kernel",
+        "campaign": "spring",
+    }
 
 
 def test_priority_context_round_trip_scales_effective_size(snapshot_provider) -> None:

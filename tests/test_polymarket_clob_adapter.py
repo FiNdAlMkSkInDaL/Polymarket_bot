@@ -402,6 +402,26 @@ def test_adapter_submit_order_translates_condition_id_and_decimal_payloads() -> 
     _assert_no_floats(transport.post_payloads[0])
 
 
+def test_adapter_submit_order_forwards_explicit_post_only_and_time_in_force() -> None:
+    client = MockClobClient()
+    transport = MockClobTransport()
+    adapter, _ = _adapter_with_transport(client, transport)
+
+    adapter.submit_order(
+        market_id=_condition_id(),
+        side="YES",
+        price=Decimal("0.640001"),
+        size=Decimal("42.500000"),
+        order_type="LIMIT",
+        client_order_id="CID-1",
+        time_in_force="GTC",
+        post_only=True,
+    )
+
+    assert transport.post_payloads[0]["orderType"] == "GTC"
+    assert transport.post_payloads[0]["postOnly"] is True
+
+
 def test_adapter_market_order_uses_ioc_translation() -> None:
     client = MockClobClient()
     transport = MockClobTransport()
@@ -417,6 +437,24 @@ def test_adapter_market_order_uses_ioc_translation() -> None:
     )
 
     assert transport.post_payloads[0]["orderType"] == "FAK"
+
+
+def test_adapter_explicit_time_in_force_overrides_legacy_order_type_mapping() -> None:
+    client = MockClobClient()
+    transport = MockClobTransport()
+    adapter, _ = _adapter_with_transport(client, transport)
+
+    adapter.submit_order(
+        market_id=_condition_id(),
+        side="YES",
+        price=Decimal("0.640001"),
+        size=Decimal("42.500000"),
+        order_type="LIMIT",
+        client_order_id="CID-1",
+        time_in_force="FOK",
+    )
+
+    assert transport.post_payloads[0]["orderType"] == "FOK"
 
 
 def test_adapter_cancel_order_maps_payload_and_response() -> None:

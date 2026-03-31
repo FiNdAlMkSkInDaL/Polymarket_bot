@@ -78,11 +78,13 @@ class VenueRejectionReason(str, Enum):
 class ClobTimeInForce(str, Enum):
     GTC = "GTC"
     IOC = "IOC"
+    FOK = "FOK"
 
 
 class ClobApiOrderType(str, Enum):
     GTC = "GTC"
     FAK = "FAK"
+    FOK = "FOK"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +187,8 @@ class ClobPayloadBuilder:
             return ClobApiOrderType.GTC
         if time_in_force == ClobTimeInForce.IOC:
             return ClobApiOrderType.FAK
+        if time_in_force == ClobTimeInForce.FOK:
+            return ClobApiOrderType.FOK
         raise ValueError(f"Unsupported time_in_force: {time_in_force!r}")
 
 

@@ -128,6 +128,9 @@ class MockVenueAdapter(VenueAdapter):
         size: Decimal,
         order_type: str,
         client_order_id: str,
+        *,
+        time_in_force: str = "GTC",
+        post_only: bool = False,
     ) -> VenueOrderResponse:
         self.submit_calls.append(
             {
@@ -137,6 +140,8 @@ class MockVenueAdapter(VenueAdapter):
                 "size": size,
                 "order_type": order_type,
                 "client_order_id": client_order_id,
+                "time_in_force": time_in_force,
+                "post_only": post_only,
             }
         )
         return replace(self._submit_response, client_order_id=client_order_id)
@@ -290,6 +295,8 @@ def test_live_dispatcher_submits_limit_order_with_router_price_and_effective_siz
             "size": Decimal("42.500000"),
             "order_type": "LIMIT",
             "client_order_id": _expected_client_order_id(10),
+            "time_in_force": "GTC",
+            "post_only": False,
         }
     ]
 
@@ -450,6 +457,8 @@ def test_live_dispatcher_guard_rejection_skips_submit() -> None:
             "size": Decimal("42.500000"),
             "order_type": "LIMIT",
             "client_order_id": _expected_client_order_id(10),
+            "time_in_force": "GTC",
+            "post_only": False,
         }
     ]
 

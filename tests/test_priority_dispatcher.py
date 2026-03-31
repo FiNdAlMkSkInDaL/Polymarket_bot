@@ -10,10 +10,12 @@ import pytest
 from src.execution.alpha_adapters import ctf_to_context, ofi_to_context, si9_to_context
 from src.execution.dispatch_guard import DispatchGuard
 from src.execution.dispatch_guard_config import DispatchGuardConfig
+from src.execution.client_order_id import ClientOrderIdGenerator
 from src.execution.mev_router import MevExecutionRouter
 from src.execution.mev_serializer import deserialize_conviction_scalar, deserialize_envelope
 from src.execution.priority_dispatcher import DispatchReceipt, PriorityDispatcher
-from src.execution.priority_context import PriorityOrderContext
+from src.execution.priority_context import PriorityOrderContext, RewardExecutionHints
+from src.execution.venue_adapter_interface import VenueAdapter, VenueOrderResponse, VenueOrderStatus
 
 
 def _make_router() -> MevExecutionRouter:
@@ -261,3 +263,120 @@ def test_guard_present_rejection_returns_correct_receipt_shape() -> None:
     assert second.fill_size is None
     assert second.serialized_envelope == ""
     assert second.guard_reason == "DUPLICATE"
+
+
+def test_pre_dispatch_gate_rejects_before_router_execution() -> None:
+    dispatcher = PriorityDispatcher(_make_router(), "dry_run")
+
+    class _RejectAllGate:
+        def dispatch_guard_reason(self, context: PriorityOrderContext, dispatch_timestamp_ms: int) -> str | None:
+            _ = (context, dispatch_timestamp_ms)
+            return "DEGRADED_RISK"
+
+    dispatcher.bind_pre_dispatch_gate(_RejectAllGate())
+
+    receipt = dispatcher.dispatch(_make_context(), dispatch_timestamp_ms=33)
+
+    assert receipt.executed is False
+    assert receipt.serialized_envelope == ""
+    assert receipt.guard_reason == "DEGRADED_RISK"
+
+
+class _RecordingWalletBalanceProvider:
+    def get_available_margin(self, asset_symbol: str) -> Decimal:
+        assert asset_symbol == "USDC"
+        return Decimal("100.000000")
+
+
+class _RecordingVenueAdapter(VenueAdapter):
+    def __init__(self) -> None:
+        self.submit_kwargs: dict[str, object] | None = None
+
+    def submit_order(
+        self,
+        market_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        order_type: str,
+        client_order_id: str,
+        *,
+        time_in_force: str = "GTC",
+        post_only: bool = False,
+    ) -> VenueOrderResponse:
+        self.submit_kwargs = {
+            "market_id": market_id,
+            "side": side,
+            "price": price,
+            "size": size,
+            "order_type": order_type,
+            "client_order_id": client_order_id,
+            "time_in_force": time_in_force,
+            "post_only": post_only,
+        }
+        return VenueOrderResponse(
+            client_order_id=client_order_id,
+            venue_order_id="VENUE-1",
+            status="ACCEPTED",
+            rejection_reason=None,
+            venue_timestamp_ms=123,
+            latency_ms=4,
+        )
+
+    def cancel_order(self, client_order_id: str, market_id: str):
+        raise NotImplementedError
+
+    def get_order_status(self, client_order_id: str) -> VenueOrderStatus:
+        return VenueOrderStatus(
+            client_order_id=client_order_id,
+            venue_order_id="VENUE-1",
+            fill_status="OPEN",
+            filled_size=Decimal("0"),
+            remaining_size=Decimal("5.000000"),
+            average_fill_price=None,
+        )
+
+    def get_wallet_balance(self, asset_symbol: str) -> Decimal:
+        _ = asset_symbol
+        return Decimal("100.000000")
+
+
+def test_live_dispatch_forwards_post_only_and_time_in_force_from_first_payload() -> None:
+    dispatcher = PriorityDispatcher(
+        _make_router(),
+        "live",
+        venue_adapter=_RecordingVenueAdapter(),
+        client_order_id_generator=ClientOrderIdGenerator("REWARD", "reward-session"),
+        wallet_balance_provider=_RecordingWalletBalanceProvider(),
+    )
+    reward_context = PriorityOrderContext(
+        market_id="MKT_REWARD",
+        side="YES",
+        signal_source="REWARD",
+        conviction_scalar=Decimal("1"),
+        target_price=Decimal("0.25"),
+        anchor_volume=Decimal("5"),
+        max_capital=Decimal("1.2500"),
+        execution_hints=RewardExecutionHints(
+            post_only=True,
+            time_in_force="GTC",
+            liquidity_intent="MAKER_REWARD",
+            allow_taker_escalation=False,
+            quote_id="quote-99",
+            tick_size=Decimal("0.01"),
+            cancel_on_stale_ms=1000,
+            replace_only_if_price_moves_ticks=1,
+            metadata={"quote_id": "quote-99"},
+        ),
+        signal_metadata={"campaign": "spring"},
+    )
+
+    receipt = dispatcher.dispatch(reward_context, dispatch_timestamp_ms=55)
+    venue_adapter = dispatcher._venue_adapter
+
+    assert receipt.order_id is not None
+    assert venue_adapter is not None
+    assert venue_adapter.submit_kwargs is not None
+    assert venue_adapter.submit_kwargs["time_in_force"] == "GTC"
+    assert venue_adapter.submit_kwargs["post_only"] is True
+    assert venue_adapter.submit_kwargs["order_type"] == "LIMIT"
