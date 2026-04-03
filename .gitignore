@@ -31,3 +31,5 @@ logs/
 dist/
 build/
 *.egg-info/
+
+*.tar.gz
