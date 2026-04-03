@@ -1,0 +1,52 @@
+{
+  "accounting": {
+    "shadow_trades": {
+      "accounting_complete": true,
+      "accounting_completeness": 1.0,
+      "journal_coverage_ratio": 1.0,
+      "journal_failed_rows": 0,
+      "journal_pending_rows": 0,
+      "journal_recorded_rows": 860,
+      "journal_rows": 860,
+      "last_journaled_at": 1774999894.4866838,
+      "ledger_kind": "shadow_trades",
+      "ledger_rows": 860,
+      "legacy_ledger_rows_without_journal": 0,
+      "matched_ledger_rows": 860,
+      "missing_ledger_rows": 0,
+      "sample_legacy_ledger_ids": [],
+      "sample_missing_ledger_ids": [],
+      "signal_source": null
+    },
+    "trades": {
+      "accounting_complete": null,
+      "accounting_completeness": null,
+      "journal_coverage_ratio": null,
+      "journal_failed_rows": 0,
+      "journal_pending_rows": 0,
+      "journal_recorded_rows": 0,
+      "journal_rows": 0,
+      "last_journaled_at": null,
+      "ledger_kind": "trades",
+      "ledger_rows": 0,
+      "legacy_ledger_rows_without_journal": 0,
+      "matched_ledger_rows": 0,
+      "missing_ledger_rows": 0,
+      "sample_legacy_ledger_ids": [],
+      "sample_missing_ledger_ids": [],
+      "signal_source": null
+    }
+  },
+  "created_at": 1774999923.458049,
+  "journal_capture_path": "artifacts\\reward_shadow_snapshots\\reward_shadow_report_20260331T233203Z.trade_persistence_journal.jsonl",
+  "journal_rows_exported": 860,
+  "label": "reward_shadow_report",
+  "manifest_path": "artifacts\\reward_shadow_snapshots\\reward_shadow_report_20260331T233203Z.manifest.json",
+  "snapshot_db_path": "artifacts\\reward_shadow_snapshots\\reward_shadow_report_20260331T233203Z.db",
+  "source_db_path": "logs\\backtest.db",
+  "wal_checkpoint": {
+    "busy": 0,
+    "checkpointed_frames": 0,
+    "log_frames": 0
+  }
+}

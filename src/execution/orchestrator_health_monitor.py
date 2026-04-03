@@ -6,6 +6,7 @@ from typing import Literal
 from src.core.logger import get_logger
 from src.execution.multi_signal_orchestrator import MultiSignalOrchestrator
 from src.execution.priority_context import PriorityOrderContext
+from src.execution.volatility_monitor import RollingMidPriceVolatilityMonitor, VolatilityStatus
 
 
 log = get_logger(__name__)
@@ -16,6 +17,8 @@ class HealthMonitorConfig:
     max_release_failures_before_halt: int
     stale_snapshot_threshold_ms: int
     min_heartbeat_interval_ms: int
+    volatility_window_ms: int = 300_000
+    max_safe_volatility_cents: float = 0.0
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -25,6 +28,10 @@ class HealthMonitorConfig:
             errors.append("stale_snapshot_threshold_ms must be a strictly positive int")
         if not isinstance(self.min_heartbeat_interval_ms, int) or self.min_heartbeat_interval_ms <= 0:
             errors.append("min_heartbeat_interval_ms must be a strictly positive int")
+        if not isinstance(self.volatility_window_ms, int) or self.volatility_window_ms <= 0:
+            errors.append("volatility_window_ms must be a strictly positive int")
+        if self.max_safe_volatility_cents < 0:
+            errors.append("max_safe_volatility_cents must be >= 0")
         if errors:
             raise ValueError("; ".join(errors))
 
@@ -40,6 +47,10 @@ class HealthReport:
     halt_reason: str | None
     allows_position_management: bool = True
     allows_new_panic_entries: bool = True
+    volatility_asset_id: str | None = None
+    rolling_mid_price_volatility_cents: float | None = None
+    volatility_sample_count: int = 0
+    volatility_threshold_breached: bool = False
 
 
 class OrchestratorHealthMonitor:
@@ -53,10 +64,17 @@ class OrchestratorHealthMonitor:
         self._consecutive_release_failures = 0
         self._last_check_timestamp_ms: int | None = None
         self._last_reported_health: tuple[str, str | None] | None = None
+        self._volatility_monitor = RollingMidPriceVolatilityMonitor(
+            window_ms=self._config.volatility_window_ms,
+            max_safe_volatility_cents=self._config.max_safe_volatility_cents,
+        )
         dispatcher = getattr(self._orchestrator, "dispatcher", None)
         bind_gate = getattr(dispatcher, "bind_pre_dispatch_gate", None)
         if callable(bind_gate):
             bind_gate(self)
+
+    def record_mid_price(self, asset_id: str, mid_price: float, timestamp_ms: int) -> None:
+        self._volatility_monitor.record_mid_price(asset_id, mid_price, int(timestamp_ms))
 
     def check(self, current_timestamp_ms: int) -> HealthReport:
         return self._build_report(int(current_timestamp_ms), advance_heartbeat=True)
@@ -83,11 +101,13 @@ class OrchestratorHealthMonitor:
         heartbeat_ok = self._last_check_timestamp_ms is None or (
             heartbeat_gap_ms <= (self._config.min_heartbeat_interval_ms * 3)
         )
+        volatility_status = self._volatility_monitor.current_status(timestamp_ms)
 
         effective_health, halt_reason = self._resolve_health_state(
             snapshot_health=snapshot.health,
             last_snapshot_age_ms=last_snapshot_age_ms,
             heartbeat_ok=heartbeat_ok,
+            volatility_status=volatility_status,
         )
         report = HealthReport(
             timestamp_ms=timestamp_ms,
@@ -99,6 +119,10 @@ class OrchestratorHealthMonitor:
             halt_reason=halt_reason,
             allows_position_management=(effective_health != "RED"),
             allows_new_panic_entries=(effective_health == "GREEN"),
+            volatility_asset_id=volatility_status.asset_id,
+            rolling_mid_price_volatility_cents=volatility_status.sigma_cents,
+            volatility_sample_count=volatility_status.sample_count,
+            volatility_threshold_breached=volatility_status.is_breached,
         )
         health_signature = (report.orchestrator_health, report.halt_reason)
         if health_signature != self._last_reported_health:
@@ -110,6 +134,9 @@ class OrchestratorHealthMonitor:
                 last_snapshot_age_ms=report.last_snapshot_age_ms,
                 heartbeat_ok=report.heartbeat_ok,
                 consecutive_release_failures=report.consecutive_release_failures,
+                volatility_asset_id=report.volatility_asset_id,
+                rolling_mid_price_volatility_cents=report.rolling_mid_price_volatility_cents,
+                volatility_threshold_breached=report.volatility_threshold_breached,
             )
             self._last_reported_health = health_signature
         if advance_heartbeat:
@@ -135,6 +162,7 @@ class OrchestratorHealthMonitor:
         snapshot_health: Literal["GREEN", "YELLOW", "RED"],
         last_snapshot_age_ms: int,
         heartbeat_ok: bool,
+        volatility_status: VolatilityStatus,
     ) -> tuple[Literal["GREEN", "YELLOW", "RED"], str | None]:
         if snapshot_health == "RED":
             return "RED", "ORCHESTRATOR_HEALTH_RED"
@@ -144,6 +172,8 @@ class OrchestratorHealthMonitor:
             return "YELLOW", "STALE_SNAPSHOT"
         if not heartbeat_ok:
             return "YELLOW", "HEARTBEAT_GAP_EXCEEDED"
+        if volatility_status.is_breached:
+            return "YELLOW", "VOLATILITY_THRESHOLD_EXCEEDED"
         if snapshot_health == "YELLOW":
             return "YELLOW", "ORCHESTRATOR_HEALTH_YELLOW"
         return "GREEN", None

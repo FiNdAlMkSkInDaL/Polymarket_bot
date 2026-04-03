@@ -141,20 +141,22 @@ class OrderbookTracker:
         asks_raw = data.get("asks") or []
 
         self._bids = []
-        for b in bids_raw[:self._MAX_LEVELS]:
+        for b in bids_raw:
             try:
                 self._bids.append(_Level(float(b["price"]), float(b["size"])))
             except (KeyError, TypeError, ValueError):
                 continue
         self._bids.sort(key=lambda l: l.price, reverse=True)
+        self._bids = self._bids[:self._MAX_LEVELS]
 
         self._asks = []
-        for a in asks_raw[:self._MAX_LEVELS]:
+        for a in asks_raw:
             try:
                 self._asks.append(_Level(float(a["price"]), float(a["size"])))
             except (KeyError, TypeError, ValueError):
                 continue
         self._asks.sort(key=lambda l: l.price)
+        self._asks = self._asks[:self._MAX_LEVELS]
 
         self._last_update = time.time()
         srv = data.get("timestamp") or data.get("server_timestamp") or data.get("ts")

@@ -1,0 +1,14 @@
+/home/botuser/polymarket-bot/logs/*.log /home/botuser/polymarket-bot/logs/*.jsonl {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    maxsize 100M
+    su botuser botuser
+    create 0640 botuser botuser
+}

@@ -5,6 +5,12 @@ from importlib import import_module
 _EXPORT_MAP = {
 	"OFIMomentumDetector": ("src.signals.ofi_momentum", "OFIMomentumDetector"),
 	"OFIMomentumSignal": ("src.signals.ofi_momentum", "OFIMomentumSignal"),
+	"ExhaustionFader": ("src.signals.exhaustion_fader", "ExhaustionFader"),
+	"HybridArbMaker": ("src.signals.hybrid_arb_maker", "HybridArbMaker"),
+	"LongTailMarketMaker": ("src.signals.long_tail_maker", "LongTailMarketMaker"),
+	"ObiScalper": ("src.signals.obi_scalper", "ObiScalper"),
+	"VacuumMaker": ("src.signals.vacuum_maker", "VacuumMaker"),
+	"WallJumper": ("src.signals.wall_jumper", "WallJumper"),
 	"ContagionArbDetector": ("src.signals.contagion_arb", "ContagionArbDetector"),
 	"ContagionArbSignal": ("src.signals.contagion_arb", "ContagionArbSignal"),
 	"CtfPegDetector": ("src.signals.ctf_peg_detector", "CtfPegDetector"),

@@ -337,6 +337,8 @@ class StrategyParams:
     pure_mm_depth_evaporation_pct: float = _env_float("PURE_MM_DEPTH_EVAPORATION_PCT", 0.20)
 
     reward_refresh_interval_ms: int = _env_int("REWARD_REFRESH_INTERVAL_MS", 30_000)
+    volatility_guard_window_ms: int = _env_int("VOLATILITY_GUARD_WINDOW_MS", 300_000)
+    max_safe_volatility_cents: float = _env_float("MAX_SAFE_VOLATILITY_CENTS", 0.0)
     reward_market_cap: int = _env_int("REWARD_MARKET_CAP", 8)
     reward_quote_cap: int = _env_int("REWARD_QUOTE_CAP", 12)
     reward_daily_reward_floor: float = _env_float("REWARD_DAILY_REWARD_FLOOR", 15.0)
@@ -863,6 +865,10 @@ class StrategyParams:
                 field_name,
                 _coerce_lane_state(field_name, getattr(self, field_name)),
             )
+        if self.volatility_guard_window_ms <= 0:
+            raise ValueError("volatility_guard_window_ms must be a strictly positive int")
+        if self.max_safe_volatility_cents < 0.0:
+            raise ValueError("max_safe_volatility_cents must be >= 0")
 
     def lane_state(self, lane_name: str) -> LaneState:
         lane_map = {

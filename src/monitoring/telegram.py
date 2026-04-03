@@ -54,10 +54,9 @@ class TelegramAlerter:
             await self._client.aclose()
             self._client = None
 
-    async def send(self, message: str, parse_mode: str = "HTML") -> None:
-        """Send a text message to the configured Telegram chat."""
+    async def _send_impl(self, message: str, parse_mode: str = "HTML") -> bool:
         if not self._enabled:
-            return
+            return False
 
         # Rate limiting: drop if we've sent too many messages recently
         now = time.monotonic()
@@ -65,7 +64,7 @@ class TelegramAlerter:
             self._send_times.popleft()
         if len(self._send_times) >= _RATE_LIMIT_MAX:
             log.warning("telegram_rate_limited", dropped_chars=len(message))
-            return
+            return False
 
         # Truncate to Telegram's 4096 char limit
         if len(message) > 4096:
@@ -84,8 +83,19 @@ class TelegramAlerter:
             self._send_times.append(now)
             if resp.status_code != 200:
                 log.warning("telegram_send_failed", status=resp.status_code)
+                return False
+            return True
         except Exception as exc:
             log.warning("telegram_send_error", error=str(exc))
+            return False
+
+    async def send(self, message: str, parse_mode: str = "HTML") -> None:
+        """Send a text message to the configured Telegram chat."""
+        await self._send_impl(message, parse_mode=parse_mode)
+
+    async def send_checked(self, message: str, parse_mode: str = "HTML") -> bool:
+        """Send a message and return whether Telegram acknowledged it."""
+        return await self._send_impl(message, parse_mode=parse_mode)
 
     # ── Convenience methods ─────────────────────────────────────────────────
     async def notify_signal(self, market: str, zscore: float, v_ratio: float) -> None:
@@ -444,6 +454,88 @@ class TelegramAlerter:
             f"{counters_block}"
             f"{sync_gate_block}"
             f"{toxicity_lines}"
+        )
+
+    async def notify_shield_paper_update(self, summary: dict[str, Any]) -> None:
+        active_targets = int(summary.get("active_targets_loaded", 0) or 0)
+        submitted_orders = int(summary.get("submitted_orders", 0) or 0)
+        skipped_existing = int(summary.get("skipped_existing", 0) or 0)
+        rejected_orders = int(summary.get("rejected_orders", 0) or 0)
+        intercepted = int(summary.get("paper_intercepted_payloads", 0) or 0)
+        submitted_notional = float(summary.get("submitted_notional_usd", 0.0) or 0.0)
+        category_counts = summary.get("category_counts") if isinstance(summary.get("category_counts"), dict) else {}
+        top_categories = sorted(category_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:4]
+        category_line = ", ".join(f"{_html.escape(str(name))}:{int(count)}" for name, count in top_categories) if top_categories else "n/a"
+
+        submitted_rows = summary.get("submitted") if isinstance(summary.get("submitted"), list) else []
+        sample_questions = []
+        for row in submitted_rows[:3]:
+            if not isinstance(row, dict):
+                continue
+            question = _html.escape(str(row.get("question", ""))[:72])
+            if question:
+                sample_questions.append(f"- {question}")
+        questions_block = "\n" + "\n".join(sample_questions) if sample_questions else ""
+
+        await self.send(
+            f"🛡️ <b>SHIELD PAPER</b>\n"
+            f"Active targets: {active_targets}\n"
+            f"Paper bids staged: {submitted_orders}  |  Intercepted: {intercepted}\n"
+            f"Skipped existing: {skipped_existing}  |  Rejected: {rejected_orders}\n"
+            f"Planned notional: ${submitted_notional:.2f}\n"
+            f"Top categories: {category_line}"
+            f"{questions_block}"
+        )
+
+    async def notify_sword_paper_update(
+        self,
+        *,
+        scan_summary: dict[str, Any],
+        launch_summary: dict[str, Any] | None = None,
+    ) -> None:
+        executable_strips = int(scan_summary.get("executable_strips", 0) or 0)
+        grouped_events = int(scan_summary.get("grouped_events_considered", 0) or 0)
+        targets = scan_summary.get("targets") if isinstance(scan_summary.get("targets"), list) else []
+
+        top_lines: list[str] = []
+        for idx, row in enumerate(targets[:3], 1):
+            if not isinstance(row, dict):
+                continue
+            title = _html.escape(str(row.get("event_title", ""))[:60])
+            action = _html.escape(str(row.get("recommended_action", ""))[:24])
+            edge = float(row.get("execution_edge_vs_fair_value", 0.0) or 0.0)
+            notional = float(row.get("strip_executable_notional_usd", 0.0) or 0.0)
+            top_lines.append(f"{idx}. {title}  |  {action}  |  edge={edge:+.4f}  |  depth=${notional:.2f}")
+        top_block = "\n" + "\n".join(top_lines) if top_lines else ""
+
+        launch_block = ""
+        if launch_summary is not None:
+            status_counts = launch_summary.get("status_counts") if isinstance(launch_summary.get("status_counts"), dict) else {}
+            intercepted = int(launch_summary.get("paper_intercepted_payloads", 0) or 0)
+            targets_loaded = int(launch_summary.get("targets_loaded", 0) or 0)
+            formatted_counts = ", ".join(f"{_html.escape(str(name))}:{int(count)}" for name, count in sorted(status_counts.items())) or "n/a"
+            launch_block = (
+                "\n"
+                f"Launch targets: {targets_loaded}  |  Intercepted legs: {intercepted}\n"
+                f"Statuses: {formatted_counts}"
+            )
+
+        await self.send(
+            f"⚔️ <b>SWORD PAPER</b>\n"
+            f"Executable strips: {executable_strips}\n"
+            f"Grouped events scanned: {grouped_events}"
+            f"{launch_block}"
+            f"{top_block}"
+        )
+
+    async def notify_pipeline_failure(self, strategy: str, stage: str, message: str) -> None:
+        safe_strategy = _html.escape(strategy[:24])
+        safe_stage = _html.escape(stage[:32])
+        safe_message = _html.escape(message[:1200])
+        await self.send(
+            f"🚨 <b>{safe_strategy} Pipeline Failure</b>\n"
+            f"Stage: <code>{safe_stage}</code>\n"
+            f"{safe_message}"
         )
 
     @staticmethod

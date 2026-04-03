@@ -1,266 +1,232 @@
 Polymarket Bot System Explanation
 
-This file describes the runtime that actually governs trading now.
+This file explains the system that actually runs on the VPS today.
 
-It does not describe deleted adapter lore.
-It does not describe optional historical code as if it were live.
-It describes the Level 0 kernel that currently owns risk.
+The current deployment is a dual-strategy PAPER fund built from two continuous
+background services:
 
-1. Process Model
+- Sword, the grouped-event CLOB arbitrage loop.
+- Shield, the favorite-longshot underwriting loop.
 
-The runtime is still centered on src/bot.py.
+Both services consume live market data. Both launchers currently execute in
+PAPER mode. Both services are independent and keep running in the background
+until systemd stops them.
 
-The bot starts and owns:
+1. What Runs Continuously
 
-- websocket and L2 consumers,
-- trade and book processing loops,
-- timeout, stats, cleanup, health, and paper-summary loops,
-- the orchestrator tick loop,
-- the wallet-balance poll loop when the live boundary exposes a balance
-  provider,
-- reward-sidecar maintenance when the reward lane is enabled,
-- frozen legacy loops only when their lane states are explicitly turned back
-  on.
+The runtime center is `scripts/vps_master_scheduler.sh`.
 
-This is still one process with shared in-memory state. It is not a set of
-independent daemons.
+That script owns the continuous loop behavior for both strategies. It is not a
+timer, not a cron entry, and not a one-shot deploy helper. It is the thing that
+keeps each pipeline alive.
 
-2. Execution Boundary
+The scheduler can run three modes:
 
-src/execution/live_execution_boundary.py is still the only legitimate venue
-boundary.
+- sword
+- shield
+- all
 
-In PAPER mode it is intentionally empty.
+The deployed VPS uses one service per mode instead of one process running both
+loops together. That matters because a Sword restart does not have to interrupt
+Shield, and a Shield failure alert does not stop Sword from continuing to scan.
 
-In LIVE mode it builds the venue-facing objects:
+2. The Sword Service
 
-- transport,
-- adapter,
-- nonce manager,
-- signer,
-- wallet-balance provider,
-- OFI exit router.
+Sword is the arbitrage lane.
 
-No lane should create a separate venue-facing execution stack outside this
-boundary.
+Its systemd unit is `scripts/polymarket-sword-paper.service`. That unit starts
+the scheduler with `--pipeline sword` and sets the loop interval to `300`
+seconds.
 
-3. Orchestrator Scope
+Each Sword cycle is:
 
-The current orchestration layer is src/execution/multi_signal_orchestrator.py.
+1. scan the live Gamma universe for grouped events that are still tradeable and
+   have live order books;
+2. keep only grouped events with at least three active outcomes;
+3. require negative-risk mechanics at the event and leg level;
+4. reject cumulative threshold ladders that are not true Dutch-book baskets;
+5. pull the live YES book for every candidate leg from the CLOB;
+6. decide whether the strip is executable as either:
+   - a `BUY_YES_STRIP`, where the sum of asks is below `1 - fee_buffer`, or
+   - a `SELL_NO_STRIP`, where the sum of bids is above `1 + fee_buffer`;
+7. require every leg to clear the minimum displayed depth check;
+8. write the surviving strip list to `config/live_executable_strips.json`.
 
-It is not the old giant adapter router.
+Once targets exist, the launcher takes over.
 
-The current orchestrator owns:
+3. How Sword Sizes Risk
 
-- DispatchGuard,
-- PriorityDispatcher,
-- guard observability,
-- OFI paper accounting,
-- reward poster adapter,
-- optional load shedding,
-- optional wallet-balance plumbing,
-- optional OFI exit routing.
+Sword does not use a fixed strip size.
 
-It no longer defines the system around SignalCoordinationBus, OfiSignalBridge,
-CtfPaperAdapter, or Si9PaperAdapter. Do not use that model.
+`scripts/launch_clob_arb.py` sizes every strip from the weakest displayed leg.
 
-4. Unified Pre-Dispatch Gate
+The important rule is simple: if one leg is only safe for ten displayed dollars
+at the top of book, the entire basket is sized from that ten-dollar leg.
 
-src/execution/priority_dispatcher.py is the single admission bottleneck.
+The launcher turns the scanner output into a strip cap by:
 
-Before a dispatcher-backed intent reaches the venue path, it goes through:
+1. reading `min_leg_depth_usd_observed`;
+2. rounding it down to a whole-dollar cap;
+3. dividing by the strip execution price sum;
+4. clamping again by the smallest displayed share size across the basket;
+5. enforcing exchange minimum share and notional rules.
 
-1. bound pre-dispatch gates,
-2. shared DispatchGuard checks,
-3. MEV envelope construction and serialization,
-4. paper, dry-run, or live execution,
-5. normalized DispatchReceipt creation.
+That is how Sword stays executable as a basket instead of pretending the
+deepest leg defines safe size.
 
-That is the current execution contract.
+4. How Sword Fires Orders
 
-The point of the reset was to stop scattering entry admission across many
-strategy-specific adapters.
+The scheduler runs Sword in PAPER mode, but it still uses the live launcher.
 
-5. Health States
+The launcher signs every leg, builds the order payloads, and then sends all leg
+submissions concurrently. The default time-in-force is `FOK`, so the deployed
+service currently attempts each strip as a fill-or-kill basket.
 
-src/execution/orchestrator_health_monitor.py now exposes three effective
-states:
+The machine-readable receipt for each cycle goes to
+`data/clob_arb_launch_summary_paper.json`.
 
-- GREEN
-- YELLOW
-- RED
+The human-readable markdown receipt goes to `docs/clob_arb_receipt.md`.
 
-Their operational meaning is:
+5. Sword Anti-Legging Safety
 
-- GREEN: normal operation.
-- YELLOW: degraded-risk mode. Position management is still allowed. New live
-  entries are not.
-- RED: hard stop.
+Sword has an explicit anti-legging safety handler for partial execution.
 
-This is not only advisory telemetry.
+This logic matters even though the VPS is in PAPER mode today, because the
+launcher is wired the same way it would be in live trading.
 
-The monitor binds into PriorityDispatcher and rejects new dispatcher-backed
-entry sources while YELLOW. It also exposes higher-level fields such as
-allows_position_management and allows_new_panic_entries so the bot can block
-new directional risk above the dispatcher too.
+The handler works like this:
 
-If the runtime is YELLOW, the correct behavior is to manage or flatten risk,
-not add risk.
+1. If every leg fills completely, the strip is done.
+2. If nothing fills, the strip is recorded as no fill or submitted.
+3. If some legs fill and others do not, the launcher immediately treats the
+   filled pieces as unwanted inventory and starts a flatten workflow.
 
-6. Lane States
+Flatten Stage 1:
 
-Current default lane states in src/core/config.py are:
+- submit IOC cleanup at the live best bid or best ask, depending on which side
+  must be unwound.
 
-- panic = LIVE
-- contagion = SHADOW
-- ofi_momentum = OFF
-- rpe = OFF
-- oracle = OFF
-- pure_market_maker = OFF
-- si9_combo = OFF
-- cross_market = OFF
-- si10_bayesian = OFF
-- reward = OFF
+Flatten Stage 2:
 
-The practical outcome is simple:
+- if Stage 1 leaves inventory behind, reprice more aggressively by the larger
+  of five cents or five percent from the Stage 1 price;
+- clip the new price into the safe venue range;
+- submit another IOC cleanup order.
 
-- Panic is the only live directional candidate.
-- Contagion is the active shadow incubator.
-- Pure MM, SI-9, standard OFI, Oracle, and the rest are frozen.
-- Reward infrastructure exists in code, but it is not a default always-on
-  lane.
+Every flatten attempt is written into the Sword receipt, including whether the
+launcher had to escalate to Stage 2 and whether any inventory still remained.
 
-7. Panic
+6. The Shield Service
 
-Panic is the runtime's only live directional candidate.
+Shield is the underwriting lane.
 
-It is still bot-managed through PositionManager rather than through a dedicated
-dispatcher execution adapter.
+Its systemd unit is `scripts/polymarket-shield-paper.service`. That unit starts
+the scheduler with `--pipeline shield` and sets the loop interval to `10800`
+seconds.
 
-What actively governs it now:
+Each Shield cycle is:
 
-- lane-state gating,
-- tradeability checks,
-- cooldowns,
-- book-quality gates,
-- ensemble-risk vetoes,
-- bot-level health gating.
+1. page through the live Gamma market set;
+2. keep only active markets that are accepting orders and have an enabled order
+   book;
+3. resolve YES and NO token ids;
+4. prefilter Gamma rows whose YES outcome price is already too expensive;
+5. pull the live YES book from the CLOB;
+6. choose the best live YES reference price;
+7. keep only markets whose YES price is genuinely below five cents;
+8. rank the surviving targets by volume, then liquidity, then cheaper entry;
+9. cut the list down to at most `100` names;
+10. write the target file to `data/flb_results_live.json`.
 
-If you are debugging live directional behavior, start with Panic first.
+The `100` cap is hard-coded into the scanner defaults. It is not an operator
+convention. The scanner enforces it directly.
 
-8. Contagion
+7. How Shield Underwrites Risk
 
-Contagion is no longer supposed to be understood as a special fast-strike bypass.
+`scripts/launch_underwriter.py` turns the Shield target file into passive NO
+quotes.
 
-Current behavior:
+The current implementation expresses its Kelly allocation as a fixed
+per-condition cap:
 
-- the detector still evaluates on BBO updates inside src/bot.py,
-- shadow contagion uses dispatcher-backed admission in PAPER mode before it
-  opens a shadow position,
-- live contagion evaluates through the unified pre-dispatch gate before it
-  hands off to the existing position-management fast-strike machinery.
+- `50` USD notional per market;
+- price `0.95` on the NO side;
+- share size computed as `50 / 0.95` and quantized to exchange precision.
 
-So the accurate statement is not "contagion became a full orchestrator lane".
-The accurate statement is "contagion no longer bypasses unified admission".
+Every submitted order is:
 
-9. Reward Poster Sidecar
+- a limit order;
+- GTC;
+- post-only;
+- one order per selected condition.
 
-The repository now contains a reward-posting subsystem.
+The current continuous deployment is PAPER, so the transport intercepts the
+fully signed payload locally. The launcher still validates credentials and still
+builds the same payload shape it would use in live trading.
 
-The main runtime object is src/rewards/reward_poster_sidecar.py.
+Shield writes:
 
-It does all of the following:
+- `data/underwriter_launch_summary_paper.json`
+- `docs/underwriter_launch_report_paper.md`
 
-- select reward markets,
-- maintain working maker quotes,
-- cancel stale or unsafe quotes,
-- track one-sided fills and local inventory,
-- emit reward shadow persistence payloads.
+In live mode only, Shield also writes a state file so it can skip duplicate
+resting orders on later runs. In paper mode that state write is skipped.
 
-It does not own its own venue adapter.
+8. How Reporting Works
 
-The sidecar uses the shared dispatcher through RewardPosterIntent and
-RewardExecutionHints.
+The reporting contract is file-first.
 
-The reward execution contract is strict:
+The scanner writes the target file.
+The launcher writes the JSON summary and the markdown report.
+The scheduler then reads the JSON summary and calls
+`scripts/send_strategy_telegram_alert.py`.
 
-- post_only must be True,
-- time_in_force must be GTC,
-- liquidity_intent must be MAKER_REWARD,
-- taker escalation is disabled.
+That alert bridge sends:
 
-That means reward posting is intentionally maker-only and centrally gated.
+- a Shield summary with active targets, staged orders, rejected orders, top
+  categories, and sample market names;
+- a Sword summary with executable strip count, grouped event count, status
+  counts, and top strip previews;
+- failure alerts with strategy, failing stage, and message text.
 
-10. Reward Shadow Attribution
+There is also a strict communication-check mode, which is used by the VPS smoke
+test to verify that Telegram is still reachable.
 
-Reward measurement does not expand the SQL schema.
+9. How The OS Keeps It Alive
 
-Instead, src/monitoring/trade_store.py now allows shadow persistence to accept
-extra_payload and stores it only in payload_json.extra_payload inside the
-journaled payload.
+The active paper services use standard systemd resilience settings:
 
-That payload can include fields such as:
+- `Restart=always`
+- journald logging
+- `NoNewPrivileges=true`
+- raised file descriptor limits
 
-- reward_to_competition,
-- reward_daily_usd,
-- reward_max_spread_cents,
-- queue_residency_seconds,
-- fill_occurred,
-- estimated_reward_capture_usd,
-- estimated_net_edge_usd,
-- quote_id,
-- quote_reason,
-- emergency_flatten.
+They also create `/dev/shm/secrets`, decrypt `.env.age` into that memory-backed
+directory during startup, and remove the decrypted file on shutdown.
 
-This is deliberate. Measurement data belongs in the journal payload, not in an
-ever-growing SQL table.
+The checked-in log rotation policy is `config/polymarket-bot.logrotate`. It
+rotates live `.log` and `.jsonl` files daily, keeps `14` rotations, compresses
+old files, and uses `copytruncate` with a `100M` max-size threshold.
 
-11. Persistence Contract
+The checked-in `MemoryMax=750M` systemd hard cap lives in
+`config/polymarket-master.service`, which is the repo's hardened master-service
+template. The active paper units are separate files focused on running one
+pipeline each, while the memory-cap pattern is captured in that master-service
+scaffold.
 
-src/monitoring/trade_store.py now uses a journal-first persistence contract for
-both closed trades and shadow trades.
+10. What A New Developer Should Remember
 
-The write sequence is:
+If you need the shortest correct mental model, it is this:
 
-1. write the trade_persistence_journal row,
-2. begin the ledger transaction,
-3. write the ledger row,
-4. mark the journal row RECORDED on success,
-5. mark the journal row FAILED on error.
+- Sword continuously hunts grouped CLOB Dutch books.
+- Shield continuously hunts sub-5c YES longshots and underwrites them with NO
+  quotes.
+- The scheduler owns the loops.
+- The services keep the loops alive.
+- The launchers write the receipts.
+- Telegram is driven from those receipts.
+- Sword manages partial-fill risk with a two-stage flatten handler.
+- Shield manages portfolio breadth by ranking and hard-capping the target set at
+  `100` names.
 
-The journal tracks explicit states:
-
-- PENDING
-- RECORDED
-- FAILED
-
-Persistence failures are now supposed to be loud and attributable. Silent drops
-are treated as a bug.
-
-12. WAL-Safe Measurement
-
-The trade store also owns WAL-safe remeasurement snapshots.
-
-The snapshot process does not rely on a naive copy of the live SQLite file.
-It does:
-
-- a passive WAL checkpoint,
-- an SQLite backup into a snapshot database,
-- optional JSONL export of the persistence journal,
-- a manifest JSON that records paths and accounting status.
-
-That manifest is the measurement anchor for offline reporting.
-
-13. What Actually Governs The Bot
-
-If you strip away dead architecture language, the current governing logic is:
-
-- Panic is the only live candidate.
-- Contagion is the shadow incubator.
-- Reward posting uses the shared dispatcher and shared persistence surfaces.
-- PriorityDispatcher is the front door for dispatcher-backed risk.
-- YELLOW means exits and flattening only.
-- trade_store is journal-first and loud on failure.
-
-Everything else should be treated as frozen, legacy, or secondary until it is
-explicitly reactivated.
+That is the current deployed system.

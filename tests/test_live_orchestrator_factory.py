@@ -326,3 +326,31 @@ def test_health_monitor_blocks_ofi_and_contagion_during_yellow() -> None:
 
     assert monitor.dispatch_guard_reason(ofi_context, 1000) == "ORCHESTRATOR_HEALTH_YELLOW"
     assert monitor.dispatch_guard_reason(contagion_context, 1000) == "ORCHESTRATOR_HEALTH_YELLOW"
+
+
+def test_health_monitor_turns_yellow_when_mid_price_volatility_exceeds_threshold() -> None:
+    base_snapshot = _build_live_factory_orchestrator().orchestrator_snapshot(1000)
+    monitor = OrchestratorHealthMonitor(
+        _SnapshotStubOrchestrator(base_snapshot),
+        HealthMonitorConfig(
+            max_release_failures_before_halt=2,
+            stale_snapshot_threshold_ms=10_000,
+            min_heartbeat_interval_ms=100,
+            volatility_window_ms=300_000,
+            max_safe_volatility_cents=8.0,
+        ),
+    )
+
+    volatile_mids = [0.45, 0.65, 0.42, 0.68, 0.40, 0.70]
+    for index, mid_price in enumerate(volatile_mids):
+        monitor.record_mid_price("asset-1", mid_price, 1_000 + (index * 1_000))
+
+    report = monitor.check(6_500)
+
+    assert report.orchestrator_health == "YELLOW"
+    assert report.is_safe_to_trade is False
+    assert report.halt_reason == "VOLATILITY_THRESHOLD_EXCEEDED"
+    assert report.volatility_asset_id == "asset-1"
+    assert report.rolling_mid_price_volatility_cents is not None
+    assert report.rolling_mid_price_volatility_cents > 8.0
+    assert report.volatility_threshold_breached is True

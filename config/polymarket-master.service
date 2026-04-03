@@ -1,0 +1,34 @@
+[Unit]
+Description=Polymarket Master Scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/polymarket-bot
+EnvironmentFile=-/dev/shm/secrets/.env
+EnvironmentFile=-/home/botuser/polymarket-bot/.env
+Environment=PATH=/home/botuser/polymarket-bot/.venv/bin:/usr/bin:/bin
+Environment=MASTER_SCHEDULER_ENTRYPOINT=scripts/master_scheduler.py
+ExecStartPre=/bin/mkdir -p /home/botuser/polymarket-bot/logs /home/botuser/polymarket-bot/data /dev/shm/secrets
+ExecStartPre=/bin/chmod 775 /home/botuser/polymarket-bot/logs /home/botuser/polymarket-bot/data
+ExecStartPre=/bin/chown botuser:botuser /home/botuser/polymarket-bot/logs /home/botuser/polymarket-bot/data /dev/shm/secrets
+ExecStartPre=/bin/bash -lc 'if [ -f /home/botuser/polymarket-bot/.env.age ]; then age -d -o /dev/shm/secrets/.env /home/botuser/polymarket-bot/.env.age; fi'
+ExecStartPre=/bin/bash -lc 'rm -f /dev/shm/pmb_*'
+ExecStart=/bin/bash -lc 'exec /home/botuser/polymarket-bot/.venv/bin/python /home/botuser/polymarket-bot/${MASTER_SCHEDULER_ENTRYPOINT}'
+ExecStopPost=/bin/bash -lc 'rm -f /dev/shm/secrets/.env'
+Restart=always
+RestartSec=15
+MemoryMax=750M
+LimitNOFILE=65536
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-master
+
+[Install]
+WantedBy=multi-user.target

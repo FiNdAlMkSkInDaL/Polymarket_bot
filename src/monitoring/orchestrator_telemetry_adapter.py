@@ -43,6 +43,10 @@ class OrchestratorTelemetryAdapter:
                     "is_safe_to_trade": health_report.is_safe_to_trade,
                     "consecutive_release_failures": health_report.consecutive_release_failures,
                     "halt_reason": health_report.halt_reason,
+                    "volatility_asset_id": health_report.volatility_asset_id,
+                    "rolling_mid_price_volatility_cents": health_report.rolling_mid_price_volatility_cents,
+                    "volatility_sample_count": health_report.volatility_sample_count,
+                    "volatility_threshold_breached": health_report.volatility_threshold_breached,
                 }
             ),
             "dispatch_guard": self._json_safe(

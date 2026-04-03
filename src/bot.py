@@ -877,13 +877,31 @@ class TradingBot:
 
         self._live_execution_boundary = self._build_live_execution_boundary_runtime()
         self._live_orchestrator = self._build_live_orchestrator_runtime(self._live_execution_boundary)
-        self._orchestrator_health_monitor = OrchestratorHealthMonitor(
-            self._live_orchestrator,
-            HealthMonitorConfig(
+        volatility_window_ms = max(
+            1,
+            int(getattr(settings.strategy, "volatility_guard_window_ms", 300_000)),
+        )
+        max_safe_volatility_cents = max(
+            0.0,
+            float(getattr(settings.strategy, "max_safe_volatility_cents", 0.0)),
+        )
+        try:
+            health_monitor_config = HealthMonitorConfig(
                 max_release_failures_before_halt=max(1, self._live_orchestrator_config().max_position_release_failures),
                 stale_snapshot_threshold_ms=max(self._orchestrator_tick_interval_ms * 3, 1),
                 min_heartbeat_interval_ms=self._orchestrator_tick_interval_ms,
-            ),
+                volatility_window_ms=volatility_window_ms,
+                max_safe_volatility_cents=max_safe_volatility_cents,
+            )
+        except TypeError:
+            health_monitor_config = HealthMonitorConfig(
+                max_release_failures_before_halt=max(1, self._live_orchestrator_config().max_position_release_failures),
+                stale_snapshot_threshold_ms=max(self._orchestrator_tick_interval_ms * 3, 1),
+                min_heartbeat_interval_ms=self._orchestrator_tick_interval_ms,
+            )
+        self._orchestrator_health_monitor = OrchestratorHealthMonitor(
+            self._live_orchestrator,
+            health_monitor_config,
         )
         self._initialize_wallet_balance()
         self._apply_live_market_target_map()
@@ -2315,6 +2333,7 @@ class TradingBot:
 
     async def _on_l2_bbo_change_inner(self, asset_id: str, score: Any) -> None:
         """Inner implementation — called by the guarded wrapper."""
+        self._record_orchestrator_mid_price(asset_id)
         self._fan_out_live_best_yes_ask(asset_id)
         log.debug(
             "l2_bbo_update",
@@ -2346,7 +2365,7 @@ class TradingBot:
 
         Schedules an async stop-loss evaluation for this asset.
         """
-        del snapshot
+        self._record_orchestrator_mid_price(asset_id, getattr(snapshot, "mid_price", None))
         self._fan_out_live_best_yes_ask(asset_id)
         _safe_fire_and_forget(
             self._evaluate_live_ofi_exit_path(asset_id),
@@ -2375,6 +2394,30 @@ class TradingBot:
                 self._evaluate_contagion_arb(asset_id),
                 name=f"contagion_bbo_{asset_id[:12]}",
             )
+
+    def _record_orchestrator_mid_price(self, asset_id: str, mid_price: float | None = None) -> None:
+        if self._orchestrator_health_monitor is None:
+            return
+        record_mid_price = getattr(self._orchestrator_health_monitor, "record_mid_price", None)
+        if not callable(record_mid_price):
+            return
+        resolved_mid_price = float(mid_price or 0.0)
+        if resolved_mid_price <= 0.0:
+            tracker = self._book_trackers.get(asset_id)
+            if tracker is None:
+                return
+            try:
+                snapshot = tracker.snapshot()
+            except Exception:
+                return
+            resolved_mid_price = float(getattr(snapshot, "mid_price", 0.0) or 0.0)
+        if resolved_mid_price <= 0.0:
+            return
+        record_mid_price(
+            asset_id,
+            resolved_mid_price,
+            self._current_timestamp_ms(),
+        )
 
     async def _evaluate_ofi_momentum(self, asset_id: str) -> None:
         """Evaluate OFI momentum on book updates and route BUY signals."""
@@ -2733,12 +2776,6 @@ class TradingBot:
                     self._record_single_name_rejection("panic", market_info, "stop_loss_cooldown", log_event=False)
                     log.info(
                         "stop_loss_cooldown_suppressed",
-                        market_id=market_info.condition_id[:16],
-                    )
-                elif not self.positions.is_panic_loss_cooled_down(market_info.condition_id):
-                    self._record_single_name_rejection("panic", market_info, "panic_post_loss_cooldown", log_event=False)
-                    log.info(
-                        "panic_post_loss_cooldown_suppressed",
                         market_id=market_info.condition_id[:16],
                     )
                 else:

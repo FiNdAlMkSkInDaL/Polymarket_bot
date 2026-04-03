@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket Shield PAPER Scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/polymarket-bot
+Environment=PATH=/home/botuser/polymarket-bot/.venv/bin:/usr/bin:/bin
+Environment=SHIELD_INTERVAL_SECONDS=10800
+ExecStartPre=/bin/mkdir -p /dev/shm/secrets
+ExecStartPre=/bin/chown botuser:botuser /dev/shm/secrets
+ExecStartPre=/bin/bash -c 'age -d -o /dev/shm/secrets/.env /home/botuser/polymarket-bot/.env.age || true'
+ExecStart=/bin/bash /home/botuser/polymarket-bot/scripts/vps_master_scheduler.sh --pipeline shield
+ExecStopPost=/bin/bash -c 'rm -f /dev/shm/secrets/.env'
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-shield-paper
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from src.monitoring.telegram import TelegramAlerter
@@ -181,3 +183,115 @@ async def test_bayesian_arb_alert_includes_bound_math(monkeypatch):
     assert "Gross: 6.00¢" in sent[0]
     assert "Net EV: $0.5000" in sent[0]
     assert "Annualized: 42.00%" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_shield_paper_update_formats_summary(monkeypatch):
+    alerter = TelegramAlerter(bot_token="token", chat_id="chat")
+    sent: list[str] = []
+
+    async def _capture(message: str, parse_mode: str = "HTML") -> None:
+        del parse_mode
+        sent.append(message)
+
+    monkeypatch.setattr(alerter, "send", _capture)
+
+    await alerter.notify_shield_paper_update(
+        {
+            "active_targets_loaded": 89,
+            "submitted_orders": 7,
+            "skipped_existing": 2,
+            "rejected_orders": 1,
+            "paper_intercepted_payloads": 7,
+            "submitted_notional_usd": "350.00",
+            "category_counts": {"sports": 27, "politics": 18, "business": 9},
+            "submitted": [
+                {"question": "Will BTC hit 120k?"},
+                {"question": "Will Team A win the league?"},
+            ],
+        }
+    )
+
+    assert len(sent) == 1
+    assert "<b>SHIELD PAPER</b>" in sent[0]
+    assert "Paper bids staged: 7" in sent[0]
+    assert "Planned notional: $350.00" in sent[0]
+    assert "sports:27" in sent[0]
+    assert "Will BTC hit 120k?" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_sword_paper_update_formats_scan_and_launch(monkeypatch):
+    alerter = TelegramAlerter(bot_token="token", chat_id="chat")
+    sent: list[str] = []
+
+    async def _capture(message: str, parse_mode: str = "HTML") -> None:
+        del parse_mode
+        sent.append(message)
+
+    monkeypatch.setattr(alerter, "send", _capture)
+
+    await alerter.notify_sword_paper_update(
+        scan_summary={
+            "executable_strips": 2,
+            "grouped_events_considered": 14,
+            "targets": [
+                {
+                    "event_title": "Fed funds range by June?",
+                    "recommended_action": "BUY_YES_STRIP",
+                    "execution_edge_vs_fair_value": -0.031,
+                    "strip_executable_notional_usd": 42.5,
+                }
+            ],
+        },
+        launch_summary={
+            "targets_loaded": 2,
+            "paper_intercepted_payloads": 6,
+            "status_counts": {"SUBMITTED": 2},
+        },
+    )
+
+    assert len(sent) == 1
+    assert "<b>SWORD PAPER</b>" in sent[0]
+    assert "Executable strips: 2" in sent[0]
+    assert "Intercepted legs: 6" in sent[0]
+    assert "BUY_YES_STRIP" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_failure_alert(monkeypatch):
+    alerter = TelegramAlerter(bot_token="token", chat_id="chat")
+    sent: list[str] = []
+
+    async def _capture(message: str, parse_mode: str = "HTML") -> None:
+        del parse_mode
+        sent.append(message)
+
+    monkeypatch.setattr(alerter, "send", _capture)
+
+    await alerter.notify_pipeline_failure("SHIELD", "refresh", "gamma timeout")
+
+    assert len(sent) == 1
+    assert "SHIELD Pipeline Failure" in sent[0]
+    assert "gamma timeout" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_send_checked_returns_false_when_disabled():
+    alerter = TelegramAlerter(bot_token="", chat_id="")
+    assert await alerter.send_checked("hello") is False
+
+
+@pytest.mark.asyncio
+async def test_send_checked_returns_true_on_success(monkeypatch):
+    alerter = TelegramAlerter(bot_token="token", chat_id="chat")
+
+    class _Client:
+        is_closed = False
+
+        async def post(self, url: str, json: dict) -> SimpleNamespace:
+            del url, json
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(alerter, "_get_client", lambda: _Client())
+    assert await alerter.send_checked("hello") is True

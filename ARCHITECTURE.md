@@ -1,510 +1,547 @@
-# Architecture
+# Three-Service Architecture
+
+This repository's production path is a dual-strategy Polymarket fund plus a
+dedicated compressed market-data archive, operated as three long-running
+services on the VPS.
+
+The hot path is deliberately small:
+
+- Sword: scan grouped negative-risk events for executable Dutch-book strips,
+  then fire concurrent CLOB strip orders.
+- Shield: scan the full live market for sub-5c YES longshots, then underwrite
+  them with resting NO quotes.
+- Data Lake: capture live L2 order book updates into highly compressed Parquet
+   archive chunks for replay, research, and audit.
+- Control plane: one trading scheduler shell script, one Telegram bridge, one
+   standalone compressor loop, and three systemd units plus a small artifact set
+   in `config/`, `data/`, `docs/`, and `logs/`.
 
-This document describes the current checked-in runtime shape that actively
-governs trading. It is not a product brief. It is a control-surface document.
-If a component is not mentioned here, assume it is either frozen, legacy, or
-not on the hot path.
+The repository still contains research, replay, and experimental modules, but
+the deployed VPS fund does not need them to run. If a file is not named in
+this document, treat it as support code or offline analysis rather than the
+production loop.
 
-## Level 0 Reset
+## Production Contract
 
-The repository is no longer organized around a sprawling multi-adapter
-execution graph.
+The currently deployed operating model is:
 
-The current live kernel is deliberately smaller:
+1. `scripts/polymarket-sword-paper.service` runs Sword continuously.
+2. `scripts/polymarket-shield-paper.service` runs Shield continuously.
+3. `scripts/polymarket-tick-compressor.service` runs the Data Lake
+   continuously.
+4. Sword and Shield call `scripts/vps_master_scheduler.sh` with a pipeline
+   selector.
+5. All three services consume live market data, but only Sword and Shield
+   build PAPER trading payloads.
+6. The trading launchers run in PAPER mode on the VPS today, but they still
+   build live-shaped orders, signatures, and receipts.
+7. The Data Lake writes hourly compressed Parquet archive chunks under
+   `data/l2_archive/`.
+8. The trading loops emit machine-readable JSON summaries, human-readable
+   markdown receipts, and Telegram alerts.
+9. The Data Lake emits journald heartbeats plus chunk-write telemetry for
+   archive health and progress.
 
-1. `src/bot.py` owns process startup, websocket ingestion, BBO-driven event
-  handling, lane wiring, and the background loops.
-2. `src/execution/live_execution_boundary.py` is the only venue-facing runtime
-  boundary. In LIVE mode it builds the transport, signer, nonce manager, venue
-  adapter, wallet-balance provider, and OFI exit router. In PAPER mode it is
-  intentionally hollow.
-3. `src/execution/multi_signal_orchestrator.py` is now a thin shared control
-  plane around `PriorityDispatcher`, guard observability, OFI accounting, and
-  the reward poster adapter.
-4. `src/execution/priority_dispatcher.py` is the unified pre-dispatch choke
-  point. Admission logic is collapsed here through bound pre-dispatch gates
-  plus the shared `DispatchGuard`.
-5. `src/execution/orchestrator_health_monitor.py` is the fail-closed health
-  gate that feeds the dispatcher and higher-level bot loops.
-6. `src/monitoring/trade_store.py` is the durable persistence surface for both
-  closed trades and shadow trades.
+This is not a cron job, and it is not a single monolithic bot process. It is
+two trading loops plus one independent data-ingestion loop.
 
-This is the new Level 0 kernel. The old story about the orchestrator owning
-slot buses, side locks, and strategy-specific paper adapters is obsolete.
+## Control Plane
 
-## Deleted Mental Model
+`scripts/vps_master_scheduler.sh` is the trading control plane.
 
-Do not model the current runtime as an orchestrator that owns:
+It exposes three modes:
 
-- `SignalCoordinationBus`
-- `OfiSignalBridge`
-- `CtfPaperAdapter`
-- `Si9PaperAdapter`
-- generic cross-strategy slot management
-- OFI side-lock routing
+- `--pipeline sword`
+- `--pipeline shield`
+- `--pipeline all`
 
-That is not the architecture that actively governs the bot now.
+It also exposes `--run-once` for smoke tests and one-shot verification.
 
-Current orchestrator behavior is narrower:
+The checked-in intervals are:
 
-- validate source enablement,
-- validate market admission through the load shedder when present,
-- expose a dispatcher-backed OFI path,
-- expose a dispatcher-backed reward adapter,
-- emit a coherent snapshot for health monitoring.
+- Sword every `300` seconds.
+- Shield every `10800` seconds.
 
-## Execution Kernel
+Each loop follows the same pattern:
 
-### Bot
+1. Run the discovery scanner.
+2. Read the scanner's JSON output.
+3. Skip launch if no targets remain.
+4. Run the strategy launcher in PAPER mode.
+5. Send a strategy-specific Telegram summary.
+6. If a scanner or launcher fails, send a pipeline failure alert and keep the
+   loop alive.
 
-`src/bot.py` is still the runtime owner.
+Production isolation comes from the deployment shape rather than from complex
+in-process orchestration: Sword and Shield are separate services, so one loop
+can restart without taking the other down.
 
-It starts:
+The Data Lake is intentionally outside this scheduler. It runs as its own
+standalone systemd unit and owns its own websocket pool, timed universe
+refresh, and heartbeat telemetry, so the archive can keep running even if a
+trading loop is restarted or reconfigured.
 
-- websocket and L2 consumers,
-- trade and book processors,
-- stop-loss, timeout, stats, cleanup, health, and summary loops,
-- the orchestrator tick loop,
-- the wallet-balance poll loop when a live balance provider exists,
-- the reward sidecar when the reward lane is active,
-- optional frozen loops only when their lane states are explicitly enabled.
+## Sword: CLOB Arbitrage
 
-The bot also owns the high-frequency BBO callbacks that drive:
+Sword is the event-group arbitrage lane.
 
-- shadow tracking,
-- OFI exit evaluation,
-- stop-loss monitoring,
-- reward-sidecar quote maintenance,
-- contagion evaluation.
+### Discovery
 
-### LiveExecutionBoundary
+`scripts/live_bbo_arb_scanner.py` sweeps live Gamma grouped markets and asks a
+single question: can the current best bid or best ask across every outcome be
+traded as a risk-free Dutch book right now?
 
-`src/execution/live_execution_boundary.py` remains the hard split between local
-strategy logic and venue side effects.
+The scanner does the following:
 
-In PAPER mode it returns no live transport:
+1. Pull up to `40` Gamma pages of `500` active, open markets each.
+2. Keep only markets that are active, accepting orders, and have an enabled
+   order book.
+3. Group legs by `event_id`.
+4. Require at least `3` active outcomes in the event.
+5. Require a binary YES/NO token shape for every grouped leg.
+6. Require the grouped event to be flagged for negative-risk execution.
+7. Reject cumulative threshold ladders such as overlapping "at least" or
+   "above" markets.
+8. Pull the live YES book for every candidate leg from the CLOB.
+9. Record each leg's best bid, best ask, and displayed size.
 
-- `venue_adapter = None`
-- `wallet_balance_provider = None`
-- `ofi_exit_router = None`
+The scanner emits two possible strip directions:
 
-In LIVE mode it builds the only objects that are allowed to touch the venue:
+- `BUY_YES_STRIP`: sum of leg asks is less than `1.00 - fee_buffer`.
+- `SELL_NO_STRIP`: sum of leg bids is greater than `1.00 + fee_buffer`.
 
-1. transport,
-2. adapter,
-3. nonce manager,
-4. signer,
-5. cached wallet-balance provider,
-6. OFI exit router.
+The default fee buffer is `0.02`, so the raw boundary checks are:
 
-No lane should invent its own venue-facing stack outside this boundary.
+- buy the full YES strip only if the strip costs less than `0.98`.
+- sell the full NO strip only if the strip pays more than `1.02`.
 
-### MultiSignalOrchestrator
+Every leg must also clear the depth gate of `10` USD at the top of book.
 
-`src/execution/multi_signal_orchestrator.py` is now intentionally thin.
+The scanner writes `config/live_executable_strips.json` with:
 
-It owns:
+- `gamma_markets_scanned`
+- `grouped_events_considered`
+- `executable_strips`
+- filter settings
+- grouping counters
+- rejection counts
+- the executable strip targets themselves
 
-- `DispatchGuard`
-- `PriorityDispatcher`
-- `GuardObservabilityPanel`
-- `OfiPaperLedger`
-- `RewardPosterAdapter`
-- optional load shedding and wallet-balance plumbing
-- OFI exit router wiring when LIVE
+### Dynamic Strip Sizing
 
-It does not own strategy-specific adapter trees for CTF or SI-9 anymore, and
-it does not act as a generic strategy switchboard.
+`scripts/launch_clob_arb.py` turns a scanner target into an executable strip.
 
-Its active operational surfaces are:
+Sizing is driven by the thinnest executable leg, not by a fixed order size.
 
-1. `on_ofi_signal(...)`
-2. `on_reward_intent(...)`
-3. `on_tick(...)`
-4. `orchestrator_snapshot(...)`
-5. `dispatch_guard_reason(...)`
+For each strip:
 
-The orchestrator also binds itself as a dispatcher pre-gate. That means source
-enablement and market admission are enforced before the dispatcher ever tries
-to serialize or submit an order.
+1. Read `min_leg_depth_usd_observed` from the scanner output.
+2. Round it down to a whole-dollar cap.
+3. Divide that cap by the strip execution price sum to get a safe share count.
+4. Clamp again by `strip_max_size_shares_at_bbo`.
+5. Enforce the exchange minimum share and minimum USD checks.
 
-### PriorityDispatcher
+In other words, the launcher never sizes the strip from the deepest leg. It
+sizes from the weakest displayed leg because that is the only way to keep the
+entire strip executable at the quoted edge.
 
-`src/execution/priority_dispatcher.py` is the single admission and dispatch
-bottleneck.
+### Concurrent FOK Execution
 
-The important reset is architectural, not cosmetic: pre-dispatch logic is no
-longer fragmented across strategy adapters. It is unified here.
+Sword launches one order per leg and signs them all before submission.
 
-Current dispatch order is:
+The scheduler currently invokes:
 
-1. run all bound pre-dispatch gates,
-2. run the shared `DispatchGuard` if enabled,
-3. build and serialize the MEV envelope,
-4. execute in `paper`, `dry_run`, or `live` mode,
-5. normalize the result into a `DispatchReceipt`.
+`launch_clob_arb.py --env PAPER --input config/live_executable_strips.json --json-output data/clob_arb_launch_summary_paper.json`
 
-This is where live-entry admission now collapses.
+No `--time-in-force` override is supplied, so the runtime default remains
+`FOK`.
 
-The dispatcher is also the shared gate used by:
+That means the production Sword service currently attempts every strip as a
+concurrent fill-or-kill basket.
 
-- OFI live entries,
-- contagion dispatcher-backed admission checks,
-- reward-sidecar quote submission.
+Operational details:
 
-### OrchestratorHealthMonitor
+- all leg payloads are prepared up front;
+- all leg submissions are fired concurrently with `asyncio.gather(...)`;
+- live mode checks wallet balance before buying a strip;
+- paper mode intercepts the live-shaped payloads locally and records them as
+  paper receipts.
 
-`src/execution/orchestrator_health_monitor.py` is the hard live-trading gate.
+### Anti-Legging Safety Handler
 
-Its health states are:
+The anti-legging path lives inside `launch_clob_arb.py` and is triggered when
+some legs fill but the full strip does not.
 
-- `GREEN`: normal operation.
-- `YELLOW`: degraded-risk mode.
-- `RED`: hard stop.
+The flow is explicit:
 
-The important current behavior is:
+1. If every leg is fully filled, the strip is marked `FULLY_FILLED`.
+2. If no leg fills, the strip remains `NO_FILL` or `SUBMITTED` depending on the
+   venue response.
+3. If at least one leg fills but the strip is incomplete, the launcher enters a
+   flatten workflow immediately.
 
-- `GREEN` allows normal entry and position management.
-- `YELLOW` allows position management, exits, and flattening, but it blocks new
-  live entry intents.
-- `RED` is a hard stop.
+Stage 1 flatten:
 
-That degraded-risk posture is enforced two ways:
+- calculate residual exposure per partially executed leg;
+- look up the live BBO for the affected token;
+- submit an IOC flatten order at the live BBO;
+- use the best bid for sell-side flattening and the best ask for buy-side
+  flattening;
+- tag the result as `BBO_IOC`.
 
-1. the monitor reports `allows_position_management=True` and
-  `allows_new_panic_entries=False` outside GREEN,
-2. the monitor binds itself into `PriorityDispatcher` and rejects new
-  dispatcher-backed entries for `OFI`, `CONTAGION`, and `REWARD` while
-  YELLOW.
+Stage 2 escalation:
 
-This matters operationally. YELLOW is not a cosmetic warning state. It is the
-mode where the runtime is allowed to clean up risk but not allowed to open new
-risk.
+- if inventory remains after Stage 1, reprice aggressively;
+- move the price by the larger of `5%` of the Stage 1 price or an absolute
+  `0.05`;
+- clip the new price into the venue-safe range `0.001` to `0.999`;
+- submit another IOC order;
+- tag the result as `PANIC_IOC`.
 
-## Persistence Contract
+The launcher records whether the strip required flattening, whether Stage 2 was
+needed, and whether any residual inventory survived both stages.
 
-`src/monitoring/trade_store.py` is the current persistence authority.
+### Sword Artifacts
 
-The contract is journal first, ledger second.
+The Sword pipeline persists three operator-facing artifacts:
 
-For both `trades` and `shadow_trades` it now does the following:
+- `config/live_executable_strips.json`: the current opportunity set.
+- `data/clob_arb_launch_summary_paper.json`: machine-readable launch summary.
+- `docs/clob_arb_receipt.md`: human-readable per-strip receipt.
 
-1. write a `trade_persistence_journal` row first,
-2. open an immediate transaction for the ledger write,
-3. write the ledger row,
-4. mark the journal row `RECORDED` on success,
-5. mark the journal row `FAILED` on error and log loudly.
+The JSON summary includes:
 
-The journal is not decorative. It records:
+- `paper_intercepted_payloads`
+- `flatten_events`
+- `flatten_stage2_events`
+- `flatten_failures`
+- `status_counts`
+- `total_planned_notional_usd`
+- per-strip leg results
+- per-strip flatten leg results
 
-- `journal_key`
-- `ledger_kind`
-- `trade_id`
-- `signal_source`
-- timing fields
-- `payload_json`
-- `ledger_state`
-- `last_error`
+## Shield: Favorite-Longshot Underwriter
 
-The only acceptable steady-state ledger outcome is `RECORDED`.
+Shield is the continuous longshot underwriting lane.
 
-The runtime now explicitly distinguishes:
+### Infinite Discovery Loop
 
-- `PENDING`
-- `RECORDED`
-- `FAILED`
+`scripts/live_flb_scanner.py` performs the discovery pass for Shield.
 
-This replaced the old silent-drop failure model. Persistence failures are now
-deliberately loud.
+It continuously sweeps live Gamma markets and keeps only markets that still
+look like true YES longshots on the order book.
 
-### WAL-Safe Snapshotting
+The scanner does the following:
 
-The measurement path is also stricter.
+1. Pull up to `40` Gamma pages of `500` active, open markets each.
+2. Keep only markets that are active, accepting orders, and have an enabled
+   order book.
+3. Resolve YES and NO token ids from Gamma metadata.
+4. Apply a cheap Gamma-side prefilter: YES outcome price must be below `0.08`
+   before the CLOB is queried.
+5. Pull the live YES order book for each surviving market.
+6. Choose the live reference YES price in this order:
+   - best ask if `0.001 < ask < 0.05`
+   - midpoint if the book is two-sided and the midpoint falls in range
+   - Gamma outcome price as the fallback midpoint proxy
+7. Infer a display category from the event title, slug, and question text.
+8. Rank all eligible targets by:
+   - highest `market_volume_24h`
+   - highest `liquidity_clob_usd`
+   - lowest `entry_yes_ask`
+   - alphabetical question text
+9. Hard-cap the emitted target set at `100` markets.
 
-`create_wal_safe_remeasurement_snapshot(...)` does not rely on a naive file
-copy. It performs:
+That cap is not accidental. It is enforced directly by
+`DEFAULT_MAX_SHIELD_TARGETS = 100` and by the default
+`--max-shield-targets 100` argument.
 
-1. a passive WAL checkpoint,
-2. an SQLite backup into a frozen snapshot database,
-3. optional JSONL export of `trade_persistence_journal`,
-4. a JSON manifest recording snapshot paths and accounting status.
+The scanner writes `data/flb_results_live.json` with:
 
-That snapshot manifest is the measurement contract for offline cohort work.
+- `summary.active_bucket.count`
+- category counts
+- discovery stats
+- rejection counts
+- every selected live target
 
-### Shadow Extra Payload
+### Underwriter Execution
 
-`record_shadow_trade(...)` now accepts `extra_payload`.
+`scripts/launch_underwriter.py` converts the scanner output into passive NO
+quotes.
 
-That payload is merged into `payload_json` only, under the reserved top-level
-key `extra_payload`. The SQL schema for `shadow_trades` is unchanged.
+The checked-in implementation expresses its Kelly sizing as a fixed per-name
+cap:
 
-This is intentional. Reward-sidecar attribution data belongs in the journaled
-payload, not in schema sprawl.
+- `MAX_NOTIONAL_PER_CONDITION = 50`
+- `ENTRY_PRICE = 0.95`
 
-## Lane States
+So each selected market becomes one resting NO order worth `50` USD notional at
+price `0.95`.
 
-The default lane posture in `src/core/config.py` is now explicit.
+The share count is computed as:
 
-Current defaults:
+- `order_size = 50 / 0.95`
+- quantized to `0.000001` shares
 
-- Panic: `LIVE`
-- Contagion: `SHADOW`
-- OFI Momentum: `OFF`
-- RPE: `OFF`
-- Oracle: `OFF`
-- PureMarketMaker: `OFF`
-- SI-9 combo: `OFF`
-- Cross-market: `OFF`
-- SI-10 Bayesian: `OFF`
-- Reward sidecar: `OFF` by default, present in code, activated only when the
-  reward lane is enabled
+The execution posture is always passive:
 
-Operationally, that means:
+- side: `NO`
+- order type: `LIMIT`
+- time in force: `GTC`
+- `post_only = True`
 
-- directional Panic is the sole live candidate,
-- Contagion is the active shadow incubator,
-- Pure MM, SI-9 combo, standard OFI, Oracle, and the rest are frozen,
-- reward posting exists as infrastructure but is not a default always-on lane.
+The launcher resolves token ids from the scanner output when present, and falls
+back to Gamma when they are missing.
 
-## Panic Lane
+### PAPER Versus LIVE
 
-Panic is the only current live directional candidate.
+Shield supports both PAPER and LIVE modes.
 
-Its entry path is still bot-managed through `PositionManager`, not through a
-dedicated dispatcher venue path. But it is governed by the tightened Level 0
-controls:
+Important implementation detail: PAPER mode still validates live credentials
+and still builds live-equivalent signed payloads. The only difference is the
+transport layer:
 
-- lane-state gating,
-- tradeability checks,
-- cooldowns,
-- book-quality gates,
-- ensemble-risk vetoes,
-- orchestrator health gating at the bot layer.
+- PAPER intercepts the payload locally.
+- LIVE submits the order through the adapter and persists state.
 
-In short: if you are debugging live directional behavior, start with Panic.
+State behavior:
 
-## Contagion Lane
+- LIVE writes a state file to avoid duplicate resting orders.
+- PAPER deliberately skips state persistence.
 
-Contagion is now the shadow incubator.
+Default paper outputs are:
 
-The key current truth is:
+- `docs/underwriter_launch_report_paper.md`
+- `data/underwriter_launch_summary_paper.json`
 
-- the detector still evaluates on BBO updates inside `src/bot.py`,
-- shadow contagion uses dispatcher-backed admission in PAPER mode before the
-  shadow tracker opens a counterfactual position,
-- live contagion no longer gets to bypass the unified pre-dispatch gate.
+The JSON summary includes:
 
-The live branch still finishes through the existing fast-strike
-`PositionManager` path after admission, but the old fast-strike bypass mental
-model is wrong. The lane now pays the same dispatcher tax at the front door.
+- `active_targets_loaded`
+- `submitted_orders`
+- `skipped_existing`
+- `rejected_orders`
+- `paper_intercepted_payloads`
+- `submitted_notional_usd`
+- category counts
+- the submitted, skipped, rejected, and dry-run rows
 
-That means contagion is no longer a privileged legacy side path. It is a
-shadow-first incubator that must clear the unified gate.
+## Data Lake: Compressed Tick Archive
 
-## Reward Poster Sidecar
+`scripts/live_tick_compressor.py` is the live L2 archive service.
 
-The reward poster is a new major subsystem.
+Its job is not trade execution. Its job is to replace the old bloated JSON or
+CSV raw tick accumulation path with a compact, replayable archive.
 
-### Runtime Role
+### Storage Model
 
-`src/rewards/reward_poster_sidecar.py` is not a separate execution stack. It is
-a shared-kernel client.
+The compressor:
+
+1. resolves the active tradeable universe with `fetch_active_markets(...)`;
+2. builds YES and NO token subscriptions for the selected markets;
+3. shards those subscriptions across websocket connections with up to `50`
+   asset ids per socket;
+4. normalizes snapshots and deltas into a fixed Parquet schema;
+5. buffers rows in an asyncio queue;
+6. writes immutable archive chunks into `data/l2_archive/`.
+
+The checked-in service defaults are:
+
+- output dir: `data/l2_archive/`
+- rotation: `hourly`
+- compression: `zstd`
+- flush rows: `10000`
+- flush seconds: `300`
+
+That means the VPS now stores fresh L2 capture as hourly Parquet parts like:
+
+- `data/l2_archive/YYYY-MM-DD/ticks_YYYY-MM-DD_HH_000001.parquet`
+
+The retained schema keeps replay-critical columns such as `local_ts`,
+`exchange_ts`, `msg_type`, `asset_id`, `market_id`, `outcome`, `price`,
+`size`, `sequence_id`, `side`, and the compact raw `payload` JSON. The raw
+payload is still preserved, but it now lives inside a compressed columnar file
+instead of growing as standalone JSON or CSV dumps.
+
+### Dynamic Universe Refresh
+
+The compressor does not keep a startup-only subscription set.
+
+The checked-in default `--universe-refresh-seconds 7200` means the service
+re-resolves the active tradeable universe every two hours and diffs it against
+the currently bound websocket pool.
+
+The rebinding policy is:
+
+- add and update subscriptions first;
+- remove stale subscriptions second;
+- fill existing sockets up to `max_assets_per_socket` before creating more;
+- retire sockets that become empty.
+
+That keeps the archive aligned with the live tradable universe without tearing
+down the full socket pool on every refresh.
+
+### Heartbeat and Archive Telemetry
+
+The checked-in default `--heartbeat-seconds 900` makes the service emit
+`tick_compressor_heartbeat` every fifteen minutes.
+
+Each heartbeat records:
+
+- `asset_count`
+- `socket_count`
+- `reconnect_count`
+- `refresh_count`
+- `last_refresh_reason`
+- `last_refresh_age_s`
+
+The service also emits `tick_parquet_chunk_written` whenever it flushes a new
+archive part, so journald shows both pool health and archive progress.
+
+Individual websocket shards reconnect with backoff, and the systemd unit
+restarts the process on failure, so the archiver is self-healing at both the
+socket and process layers.
+
+## Telemetry and Reporting
+
+The trading reporting contract is file-first and alert-second. The Data Lake
+loop is archive-first and journal-first.
+
+Each trading launcher produces:
+
+- a JSON summary for machines and downstream scripts;
+- a markdown receipt for humans.
+
+`scripts/send_strategy_telegram_alert.py` turns those artifacts into operator
+alerts.
+
+It supports four commands:
+
+- `shield`: load the Shield launch summary and send active target count,
+  staged/intercepted counts, notional, top categories, and sample questions.
+- `sword`: load the Sword scan summary plus optional launch summary and send
+  executable strip count, grouped event count, per-launch statuses, and the top
+  strip candidates.
+- `failure`: emit a strategy, stage, and message failure alert.
+- `comm-check`: perform a strict Telegram connectivity check and return a
+  failing exit code if Telegram does not acknowledge the message.
+
+`scripts/vps_smoke_test.sh` uses the same reporting surface to verify both
+strategy loops and the Telegram channel end to end.
+
+The compressor does not route through Telegram. Its operator surface is
+journald plus the archive directory. The important events are
+`tick_compressor_heartbeat`, `tick_parquet_chunk_written`,
+`tick_universe_refresh_complete`, and the socket disconnect or silence-timeout
+warnings.
+
+## Service Model and OS Resilience
+
+### Active VPS Services
+
+The active deployment units are:
+
+- `scripts/polymarket-sword-paper.service`
+- `scripts/polymarket-shield-paper.service`
+- `scripts/polymarket-tick-compressor.service`
+
+The Sword and Shield units:
+
+- run as `botuser`;
+- set the project working directory to `/home/botuser/polymarket-bot`;
+- point `PATH` at the repo's virtual environment;
+- use `Restart=always` with `RestartSec=10`;
+- send stdout and stderr to journald;
+- set `LimitNOFILE=65536`;
+- set `NoNewPrivileges=true`;
+- create `/dev/shm/secrets` before start;
+- decrypt `.env.age` to `/dev/shm/secrets/.env` during `ExecStartPre`;
+- remove `/dev/shm/secrets/.env` during `ExecStopPost`.
+
+The compressor unit:
+
+- runs as `botuser`;
+- sets the same project working directory and virtualenv `PATH`;
+- creates `/home/botuser/polymarket-bot/data/l2_archive` during
+   `ExecStartPre`;
+- runs `live_tick_compressor.py` with hourly rotation, `zstd`,
+   `market-limit 200`, `--universe-refresh-seconds 7200`,
+   `--heartbeat-seconds 900`, and `--min-free-gb 10`;
+- uses `Restart=on-failure` with `RestartSec=15`;
+- lowers priority with `Nice=10` plus best-effort IO scheduling;
+- sends stdout and stderr to journald;
+- sets `LimitNOFILE=65536`;
+- sets `NoNewPrivileges=true`.
+
+The trading loop intervals come from the service environment:
+
+- Sword sets `SWORD_INTERVAL_SECONDS=300`.
+- Shield sets `SHIELD_INTERVAL_SECONDS=10800`.
+
+The archiver cadence comes from the service arguments:
+
+- Data Lake universe refresh every `7200` seconds.
+- Data Lake heartbeat every `900` seconds.
+
+### Installation Workflow
+
+`scripts/install_paper_service.sh` is the repo's trading-service installer.
 
 It:
 
-- selects admitted reward markets,
-- maintains working quotes,
-- reprices or cancels stale quotes,
-- records one-sided fills into local inventory,
-- persists reward-shadow rows through `trade_store`.
+1. stops ad-hoc paper processes;
+2. sanitizes shell and service files for Linux line endings;
+3. copies the two trading service units into `/etc/systemd/system/`;
+4. disables the old single-service unit;
+5. enables the two trading units;
+6. restarts them and prints status plus recent journal output.
 
-It does not own its own venue adapter.
+The tick compressor is installed separately as a standalone systemd unit
+because it does not run through the trading scheduler.
 
-### Shared Dispatcher Contract
+### Log Rotation
 
-The sidecar uses `RewardPosterIntent` and `RewardExecutionHints` to build a
-`PriorityOrderContext` with `signal_source="REWARD"`.
+`config/polymarket-bot.logrotate` is the checked-in log rotation policy.
 
-Those reward execution hints are strict:
+It applies to `logs/*.log` and `logs/*.jsonl` and enforces:
 
-- `post_only=True`
-- `time_in_force="GTC"`
-- `liquidity_intent="MAKER_REWARD"`
-- `allow_taker_escalation=False`
+- daily rotation;
+- `14` retained rotations;
+- compression with delayed compression;
+- `copytruncate` for live writers;
+- a `100M` max file size threshold;
+- automatic file recreation as `0640 botuser:botuser`.
 
-That is the contract. Reward posting is maker-only and dispatcher-mediated.
+### Memory Guardrail
 
-The actual path is:
+The checked-in `MemoryMax=750M` hard cap currently lives in the hardened master
+service scaffold at `config/polymarket-master.service`.
 
-1. sidecar creates `RewardPosterIntent`,
-2. `RewardPosterAdapter` converts it into a shared `PriorityOrderContext`,
-3. `PriorityDispatcher` runs pre-gates and guard checks,
-4. the returned `DispatchReceipt` is mapped into `RewardQuoteState`.
+That scaffold also carries:
 
-There is no separate reward venue stack hiding off to the side.
+- `EnvironmentFile` support;
+- `TimeoutStopSec=30`;
+- `KillSignal=SIGINT`;
+- `Restart=always` with `RestartSec=15`.
 
-### Reward Shadow Measurement
+The active paper units are separate templates focused on per-pipeline loop
+execution. The repo's systemd memory-cap pattern is therefore present today,
+but it is defined in the master-service scaffold rather than duplicated inside
+both paper unit files.
 
-The sidecar also persists shadow measurement rows via
-`bot._persist_reward_shadow_trade(...)` and `trade_store.record_shadow_trade(...)`.
+## Files That Matter Most
 
-Reward attribution data is packed into `payload_json.extra_payload`, including
-fields such as:
+If a new developer needs to understand the deployed fund quickly, start here in
+order:
 
-- `reward_to_competition`
-- `reward_daily_usd`
-- `reward_max_spread_cents`
-- `queue_depth_ahead_usd`
-- `queue_residency_seconds`
-- `fill_occurred`
-- `estimated_reward_capture_usd`
-- `estimated_net_edge_usd`
-- `quote_id`
-- `quote_reason`
-
-This is deliberate. The sidecar extends measurement via journal payloads
-without bloating the SQL schema.
-
-### Reporting Surface
-
-`scripts/report_reward_shadow.py` reads persisted reward-shadow rows and groups
-them by:
-
-- market,
-- signal source,
-- reward-to-competition bucket,
-- fill occurred,
-- emergency flatten.
-
-It emits JSON and Markdown from existing shadow rows. It is a measurement tool,
-not an execution tool.
-
-## What Actively Governs Live Trading
-
-If you need the ruthless current truth, it is this:
-
-1. Panic is the only live directional candidate.
-2. Contagion is being incubated in shadow and must clear the unified
-  pre-dispatch gate.
-3. Reward posting exists as shared-kernel infrastructure, not as a special
-  venue stack.
-4. The dispatcher is the choke point.
-5. YELLOW means manage risk only. Do not add risk.
-6. Trade persistence is journal-first and loud on failure.
-
-Everything else is secondary, frozen, or legacy until explicitly reactivated.
-
-In LIVE mode it also performs an O(1) margin gate before the order reaches the
-venue:
-
-$$
-\text{required margin} = \text{order price} \times \text{effective size}
-$$
-
-The dispatcher compares that against:
-
-$$
-\text{available margin} = \text{LiveWalletBalanceProvider.get\_available\_margin("USDC")}
-$$
-
-If available margin is insufficient, the order is rejected locally with
-`guard_reason = "INSUFFICIENT_MARGIN"` and never reaches the exchange.
-
-This is the current network bottleneck by design. Multiple alpha lanes can
-race to produce intent, but only one dispatcher contract is allowed to convert
-intent into venue traffic.
-
-## O(1) LiveWalletBalanceProvider Margin Gate
-
-`LiveWalletBalanceProvider` maintains a cached `Decimal` balance per tracked
-asset and updates it from a background poll loop.
-
-Important properties:
-
-- `get_available_margin(...)` is O(1) dictionary access.
-- The provider rejects negative or non-finite balances.
-- The bot registers a balance update callback so USDC changes are reflected in
-  `PositionManager` immediately.
-- Poll failures caused by rate limits, timeouts, or transport circuit opens are
-  logged but do not silently fabricate balances.
-
-This is what makes the dispatcher-side margin check fast enough to sit directly
-on the live path.
-
-## Strict Decimal-Only Execution Boundary
-
-HEAD now enforces a strict `Decimal` execution contract across the live venue
-path.
-
-Examples:
-
-- `ClobSigner` requires decimal strings for venue payload prices and sizes,
-  quantizes them to micro units, and rejects non-string or non-finite numeric
-  inputs.
-- execution manifests such as `CtfExecutionManifest` and related receipts
-  reject non-`Decimal` values for prices, sizes, fees, and PnL fields.
-- live wallet balance polling and dispatch receipts store balances, prices,
-  sizes, and remaining size as `Decimal` values.
-
-The rule is:
-
-- strategy code may still originate from float-heavy market data,
-- but once a signal is translated into an execution intent, the venue-facing
-  path is `Decimal` only until the final payload boundary.
-
-This is a correctness constraint, not stylistic preference.
-
-## Fail-Closed Health Layer
-
-`src/execution/orchestrator_health_monitor.py` wraps the orchestrator in a
-conservative health gate.
-
-It marks the runtime unsafe when any of the following occurs:
-
-- orchestrator snapshot health is RED,
-- snapshot age exceeds the stale-snapshot threshold,
-- heartbeat gap breaches the configured interval budget,
-- consecutive release failures reach the configured halt threshold.
-
-The live bot checks `is_safe_to_trade(...)` before:
-
-- converting OFI momentum signals into live orchestrator entries,
-- evaluating contagion arb on live BBO updates,
-- running the combo-arb loop in live mode.
-
-This is the current fail-closed posture. Health does not merely annotate the
-runtime; it actively suppresses signal conversion.
-
-## Deployment And Observability
-
-The production-facing PAPER deployment is run under `systemd` using:
-
-- `scripts/polymarket-bot.service`
-- `scripts/install_paper_service.sh`
-
-The service model is:
-
-- tmpfs secret material prepared in `ExecStartPre`,
-- stale shared-memory segments removed before startup,
-- bot started with `python -m src.cli run --env PAPER`,
-- stdout and stderr shipped to `journald`,
-- automatic restart enabled.
-
-Offline latency profiling is performed outside the running process by exporting
-`journalctl` output and feeding it into `scripts/profile_latency_logs.py`.
-
-That split is intentional: the bot emits journal-backed telemetry online, and
-profiling happens offline against exported logs.
-
-## Module Location Corrections
-
-Several architectural modules moved relative to older documentation. The
-current locations are:
-
-- `src/execution/live_wallet_balance.py`
-- `src/tools/contagion_validator.py`
-- `src/data/universe_builder.py`
-
-Any document that still refers to `src/core/live_wallet_balance.py`,
-`src/trading/contagion_validator.py`, or `src/trading/universe_builder.py` is
-describing a pre-HEAD layout.
+1. `scripts/vps_master_scheduler.sh`
+2. `scripts/live_bbo_arb_scanner.py`
+3. `scripts/launch_clob_arb.py`
+4. `scripts/live_flb_scanner.py`
+5. `scripts/launch_underwriter.py`
+6. `scripts/live_tick_compressor.py`
+7. `scripts/send_strategy_telegram_alert.py`
+8. `scripts/polymarket-sword-paper.service`
+9. `scripts/polymarket-shield-paper.service`
+10. `scripts/polymarket-tick-compressor.service`
+11. `config/polymarket-bot.logrotate`
+12. `config/polymarket-master.service`

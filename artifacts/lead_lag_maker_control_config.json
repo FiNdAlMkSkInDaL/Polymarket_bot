@@ -1,0 +1,8 @@
+{
+  "primary_market_id": "0xaeea5f917fc5746387b5f9c0a4263dba035dbb3f0ac6ad72bf92183d21e26739",
+  "secondary_market_id": "0xcfbe2de215f38407317a7ecfff4c13aa591eca2fe428fc203e5669a936009e78",
+  "contagion_move_cents": 9999,
+  "lookback_window_ms": 60000,
+  "cooldown_ms": 5000,
+  "order_size": 5
+}

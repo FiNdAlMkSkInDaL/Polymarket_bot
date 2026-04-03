@@ -91,6 +91,45 @@ class TestOrderbookTracker:
         assert snap.best_bid == 0.45
         assert snap.best_ask == 0.55
 
+    def test_book_snapshot_sorts_before_truncating_levels(self):
+        self.tracker.on_book_snapshot({
+            "bids": [
+                {"price": "0.01", "size": "10"},
+                {"price": "0.02", "size": "10"},
+                {"price": "0.03", "size": "10"},
+                {"price": "0.04", "size": "10"},
+                {"price": "0.05", "size": "10"},
+                {"price": "0.06", "size": "10"},
+                {"price": "0.07", "size": "10"},
+                {"price": "0.08", "size": "10"},
+                {"price": "0.09", "size": "10"},
+                {"price": "0.10", "size": "10"},
+                {"price": "0.95", "size": "10"},
+                {"price": "0.94", "size": "10"},
+            ],
+            "asks": [
+                {"price": "0.99", "size": "10"},
+                {"price": "0.98", "size": "10"},
+                {"price": "0.97", "size": "10"},
+                {"price": "0.96", "size": "10"},
+                {"price": "0.95", "size": "10"},
+                {"price": "0.94", "size": "10"},
+                {"price": "0.93", "size": "10"},
+                {"price": "0.92", "size": "10"},
+                {"price": "0.91", "size": "10"},
+                {"price": "0.90", "size": "10"},
+                {"price": "0.11", "size": "10"},
+                {"price": "0.12", "size": "10"},
+            ],
+        })
+
+        snap = self.tracker.snapshot()
+
+        assert snap.best_bid == 0.95
+        assert snap.best_ask == 0.11
+        assert len(self.tracker.levels("bid", n=20)) == self.tracker._MAX_LEVELS
+        assert len(self.tracker.levels("ask", n=20)) == self.tracker._MAX_LEVELS
+
     def test_book_depth_ratio(self):
         self.tracker.on_book_snapshot({
             "bids": [{"price": "0.50", "size": "200"}],

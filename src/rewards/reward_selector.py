@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from statistics import pstdev
@@ -59,19 +59,47 @@ class RewardSelectionResult:
     reward_to_competition: Decimal = Decimal("0")
 
 
+@dataclass(frozen=True, slots=True)
+class RewardSelectorConfig:
+    min_daily_volume_usd: float = _MID_TIER_MIN_DAILY_VOLUME_USD
+    max_daily_volume_usd: float = _MID_TIER_MAX_DAILY_VOLUME_USD
+    min_days_to_resolution: int = _MIN_REWARD_DAYS_TO_RESOLUTION
+    max_days_to_resolution: int = _MAX_REWARD_DAYS_TO_RESOLUTION
+    min_reward_usd: float = field(default_factory=lambda: float(settings.strategy.reward_daily_reward_floor))
+    min_reward_to_competition: float = field(default_factory=lambda: float(settings.strategy.reward_to_competition_floor))
+    max_spread_cents: float = _VENUE_SPREAD_LIMIT_CENTS
+    min_mid_price: float = field(default_factory=lambda: float(settings.strategy.reward_safe_mid_min_price))
+    max_mid_price: float = field(default_factory=lambda: float(settings.strategy.reward_safe_mid_max_price))
+    jump_risk_move_pct: float = field(default_factory=lambda: float(settings.strategy.reward_jump_risk_move_pct))
+    jump_risk_volatility_pct: float = field(default_factory=lambda: float(settings.strategy.reward_jump_risk_volatility_pct))
+    quote_notional_cap: float = field(default_factory=lambda: float(settings.strategy.reward_quote_notional_cap))
+    cancel_on_stale_ms: int = field(default_factory=lambda: int(settings.strategy.reward_cancel_on_stale_ms))
+    replace_only_if_price_moves_ticks: int = field(
+        default_factory=lambda: int(settings.strategy.reward_replace_only_if_price_moves_ticks)
+    )
+
+
 class RewardSelector:
+    def __init__(self, config: RewardSelectorConfig | None = None) -> None:
+        self._config = config or RewardSelectorConfig()
+
     def static_candidates(self, markets: Sequence[MarketInfo], current_timestamp_ms: int) -> list[MarketInfo]:
-        _ = current_timestamp_ms
         candidates: list[MarketInfo] = []
         for market in markets:
             if not market.reward_program_active:
                 continue
-            if market.reward_daily_rate_usd < settings.strategy.reward_daily_reward_floor:
+            if market.reward_daily_rate_usd < self._config.min_reward_usd:
                 continue
-            if market.daily_volume_usd < _MID_TIER_MIN_DAILY_VOLUME_USD or market.daily_volume_usd > _MID_TIER_MAX_DAILY_VOLUME_USD:
+            if (
+                market.daily_volume_usd < self._config.min_daily_volume_usd
+                or market.daily_volume_usd > self._config.max_daily_volume_usd
+            ):
                 continue
-            days_to_resolution = self._days_to_resolution(market)
-            if days_to_resolution < _MIN_REWARD_DAYS_TO_RESOLUTION or days_to_resolution > _MAX_REWARD_DAYS_TO_RESOLUTION:
+            days_to_resolution = self._days_to_resolution(market, current_timestamp_ms=current_timestamp_ms)
+            if (
+                days_to_resolution < self._config.min_days_to_resolution
+                or days_to_resolution > self._config.max_days_to_resolution
+            ):
                 continue
             if self._looks_like_jump_event(market):
                 continue
@@ -105,18 +133,17 @@ class RewardSelector:
         book_state = self._book_state(book, asset_id=asset_id, current_timestamp_ms=current_timestamp_ms)
         if book_state is None:
             return RewardSelectionResult(False, "BOOK_UNAVAILABLE")
-        if not book_state.fresh or book_state.book_age_ms > settings.strategy.reward_cancel_on_stale_ms:
+        if not book_state.fresh or book_state.book_age_ms > self._config.cancel_on_stale_ms:
             return RewardSelectionResult(False, "STALE_BOOK")
         if book_state.best_bid <= Decimal("0") or book_state.best_ask <= Decimal("0") or book_state.best_ask <= book_state.best_bid:
             return RewardSelectionResult(False, "ONE_SIDED_BOOK")
 
-        spread_limit = Decimal(str(_VENUE_SPREAD_LIMIT_CENTS))
-        reward_limit = _d(market.reward_max_spread_cents) if market.reward_max_spread_cents > 0 else spread_limit
-        if book_state.spread_cents > min(spread_limit, reward_limit):
+        spread_limit = Decimal(str(self._config.max_spread_cents))
+        if book_state.spread_cents > spread_limit:
             return RewardSelectionResult(False, "SPREAD_TOO_WIDE")
 
-        min_mid = _d(settings.strategy.reward_safe_mid_min_price)
-        max_mid = _d(settings.strategy.reward_safe_mid_max_price)
+        min_mid = _d(self._config.min_mid_price)
+        max_mid = _d(self._config.max_mid_price)
         if not (min_mid < book_state.mid_price < max_mid):
             return RewardSelectionResult(False, "MID_OUT_OF_BAND")
 
@@ -126,7 +153,7 @@ class RewardSelector:
             return RewardSelectionResult(False, "VOLATILITY_JUMP_VETO")
 
         reward_to_competition = self._reward_to_competition(market)
-        if reward_to_competition < _d(settings.strategy.reward_to_competition_floor):
+        if reward_to_competition < _d(self._config.min_reward_to_competition):
             return RewardSelectionResult(False, "REWARD_TO_COMPETITION_TOO_LOW", reward_to_competition=reward_to_competition)
 
         if maker_monitor is not None and not maker_monitor.is_maker_allowed(market.condition_id):
@@ -137,7 +164,7 @@ class RewardSelector:
             return RewardSelectionResult(False, "UNSAFE_TARGET_PRICE", reward_to_competition=reward_to_competition)
 
         reward_min_size = max(_d(market.reward_min_size or 0), Decimal("1"))
-        quote_notional_cap = _d(settings.strategy.reward_quote_notional_cap)
+        quote_notional_cap = _d(self._config.quote_notional_cap)
         required_notional = (target_price * reward_min_size).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
         if required_notional <= Decimal("0") or required_notional > quote_notional_cap:
             return RewardSelectionResult(False, "QUOTE_NOTIONAL_CAP_EXCEEDED", reward_to_competition=reward_to_competition)
@@ -156,8 +183,8 @@ class RewardSelector:
             reward_to_competition=reward_to_competition,
             competition_score=_d(max(market.reward_competition_score, 0.0)),
             reward_max_spread_cents=_d(max(market.reward_max_spread_cents, 0.0)),
-            cancel_on_stale_ms=settings.strategy.reward_cancel_on_stale_ms,
-            replace_only_if_price_moves_ticks=settings.strategy.reward_replace_only_if_price_moves_ticks,
+            cancel_on_stale_ms=self._config.cancel_on_stale_ms,
+            replace_only_if_price_moves_ticks=self._config.replace_only_if_price_moves_ticks,
             extra_payload={
                 "book_age_ms": book_state.book_age_ms,
                 "bid_depth_usd": str(book_state.bid_depth_usd),
@@ -168,10 +195,14 @@ class RewardSelector:
         return RewardSelectionResult(True, None, intent=intent, reward_to_competition=reward_to_competition)
 
     @staticmethod
-    def _days_to_resolution(market: MarketInfo) -> int:
+    def _days_to_resolution(market: MarketInfo, *, current_timestamp_ms: int | None = None) -> int:
         if market.end_date is None:
             return -1
-        return max(0, (market.end_date - datetime.now(timezone.utc)).days)
+        if current_timestamp_ms is not None and current_timestamp_ms > 0:
+            reference_time = datetime.fromtimestamp(current_timestamp_ms / 1000.0, tz=timezone.utc)
+        else:
+            reference_time = datetime.now(timezone.utc)
+        return max(0, (market.end_date - reference_time).days)
 
     @staticmethod
     def _looks_like_jump_event(market: MarketInfo) -> bool:
@@ -195,7 +226,7 @@ class RewardSelector:
         bid_depth_usd = _d(getattr(snapshot, "bid_depth_usd", 0.0) or 0.0)
         ask_depth_usd = _d(getattr(snapshot, "ask_depth_usd", 0.0) or 0.0)
         timestamp = float(getattr(snapshot, "timestamp", 0.0) or 0.0)
-        book_age_ms = max(0, int(current_timestamp_ms - int(timestamp * 1000))) if timestamp > 0 else settings.strategy.reward_cancel_on_stale_ms + 1
+        book_age_ms = max(0, int(current_timestamp_ms - int(timestamp * 1000))) if timestamp > 0 else 10**9
         fresh = bool(getattr(snapshot, "fresh", True))
         return RewardBookState(
             asset_id=asset_id,
@@ -226,18 +257,16 @@ class RewardSelector:
             return Decimal("0")
         return candidate.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-    @staticmethod
-    def _recent_move_exceeds_threshold(mid_history: Sequence[tuple[int, Decimal]]) -> bool:
+    def _recent_move_exceeds_threshold(self, mid_history: Sequence[tuple[int, Decimal]]) -> bool:
         if len(mid_history) < 2:
             return False
         first = mid_history[0][1]
         last = mid_history[-1][1]
         if first <= Decimal("0"):
             return False
-        return abs(last - first) / first >= _d(settings.strategy.reward_jump_risk_move_pct)
+        return abs(last - first) / first >= _d(self._config.jump_risk_move_pct)
 
-    @staticmethod
-    def _volatility_jump_exceeds_threshold(mid_history: Sequence[tuple[int, Decimal]]) -> bool:
+    def _volatility_jump_exceeds_threshold(self, mid_history: Sequence[tuple[int, Decimal]]) -> bool:
         if len(mid_history) < 3:
             return False
         returns: list[float] = []
@@ -247,4 +276,4 @@ class RewardSelector:
             returns.append(math.log(float(next_price / prev_price)))
         if len(returns) < 2:
             return False
-        return pstdev(returns) >= float(settings.strategy.reward_jump_risk_volatility_pct)
+        return pstdev(returns) >= float(self._config.jump_risk_volatility_pct)
