@@ -29,12 +29,12 @@ perf = [
     "uvloop>=0.19; sys_platform != 'win32'",
 ]
 data = [
-    "polars>=1.35",
+    "polars>=1.33,<2",
     "pandas>=2.1",
     "pyarrow>=15.0",
 ]
 dev = [
-    "polars>=1.35",
+    "polars>=1.33,<2",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",

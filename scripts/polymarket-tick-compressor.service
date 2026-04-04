@@ -9,10 +9,11 @@ User=botuser
 Group=botuser
 WorkingDirectory=/home/botuser/polymarket-bot
 Environment=PATH=/home/botuser/polymarket-bot/.venv/bin:/usr/bin:/bin
-ExecStartPre=/bin/mkdir -p /home/botuser/polymarket-bot/data/l2_archive
-ExecStart=/home/botuser/polymarket-bot/.venv/bin/python /home/botuser/polymarket-bot/scripts/live_tick_compressor.py --output-dir /home/botuser/polymarket-bot/data/l2_archive --market-limit 200 --flush-rows 10000 --flush-seconds 300 --rotation hourly --compression zstd --universe-refresh-seconds 7200 --heartbeat-seconds 900 --min-free-gb 10
+ExecStartPre=/bin/mkdir -p /home/botuser/polymarket-bot/data/l2_book_live /home/botuser/polymarket-bot/data/l2_book_live/_state
+ExecStart=/home/botuser/polymarket-bot/.venv/bin/python /home/botuser/polymarket-bot/scripts/live_tick_compressor.py --output-dir /home/botuser/polymarket-bot/data/l2_book_live --market-limit 200 --flush-rows 10000 --flush-seconds 300 --rotation hourly --compression zstd --universe-refresh-seconds 7200 --heartbeat-seconds 900 --min-free-gb 10
 Restart=on-failure
 RestartSec=15
+TimeoutStopSec=180
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

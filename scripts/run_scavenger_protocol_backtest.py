@@ -10,6 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import polars as pl
+
 from src.backtest.scavenger_protocol import ScavengerConfig, run_scavenger_backtest
 
 
@@ -23,10 +25,28 @@ def _parse_args() -> argparse.Namespace:
         help="Parquet path, glob pattern, or list of Parquet files matching the scavenger schema.",
     )
     parser.add_argument(
+        "--orders-output",
+        type=Path,
+        default=None,
+        help="Optional output path for raw signal rows (.parquet, .csv, or .json).",
+    )
+    parser.add_argument(
+        "--candidates-output",
+        type=Path,
+        default=None,
+        help="Optional output path for signal rows with nullable fill outcomes (.parquet, .csv, or .json).",
+    )
+    parser.add_argument(
         "--fills-output",
         type=Path,
         default=None,
         help="Optional output path for fill-level results (.parquet, .csv, or .json).",
+    )
+    parser.add_argument(
+        "--portfolio-output",
+        type=Path,
+        default=None,
+        help="Optional output path for capital-aware accepted or rejected trades (.parquet, .csv, or .json).",
     )
     parser.add_argument(
         "--summary-output",
@@ -38,6 +58,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--signal-best-ask-min", type=float, default=0.99)
     parser.add_argument("--signal-best-bid-max", type=float, default=0.96)
     parser.add_argument("--maker-bid-price", type=float, default=0.95)
+    parser.add_argument("--starting-bankroll-usdc", type=float, default=5000.0)
+    parser.add_argument("--max-notional-per-market-usdc", type=float, default=250.0)
     parser.add_argument(
         "--head",
         type=int,
@@ -47,7 +69,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _write_frame(frame, output_path: Path) -> None:
+def _write_frame(frame: pl.DataFrame, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
     if suffix == ".parquet":
@@ -69,6 +91,8 @@ def main() -> None:
         signal_best_ask_min=args.signal_best_ask_min,
         signal_best_bid_max=args.signal_best_bid_max,
         maker_bid_price=args.maker_bid_price,
+        starting_bankroll_usdc=args.starting_bankroll_usdc,
+        max_notional_per_market_usdc=args.max_notional_per_market_usdc,
     )
     source = args.input[0] if len(args.input) == 1 else args.input
     result = run_scavenger_backtest(source, config=config)
@@ -76,14 +100,27 @@ def main() -> None:
     print("Scavenger Protocol summary")
     print(result.summary)
 
-    if result.fills.height:
-        print("\nFill sample")
-        print(result.fills.head(args.head))
+    if result.portfolio.height:
+        print("\nCapital-aware trade sample")
+        print(result.portfolio.head(args.head))
     else:
-        print("\nNo fills matched the maker touch-through rules.")
+        print("\nNo signals were generated.")
+
+    if result.fills.height:
+        print("\nRaw fill sample")
+        print(result.fills.head(args.head))
+
+    if args.orders_output is not None:
+        _write_frame(result.orders, args.orders_output)
+
+    if args.candidates_output is not None:
+        _write_frame(result.candidates, args.candidates_output)
 
     if args.fills_output is not None:
         _write_frame(result.fills, args.fills_output)
+
+    if args.portfolio_output is not None:
+        _write_frame(result.portfolio, args.portfolio_output)
 
     if args.summary_output is not None:
         _write_frame(result.summary, args.summary_output)

@@ -1,0 +1,16 @@
+{
+  "pairs": [
+    {
+      "pair_id": "smoke-alpha",
+      "parent_market_id": "smoke-parent-alpha",
+      "child_market_id": "smoke-child-alpha",
+      "notes": "Profitable dummy squeeze pair for smoke validation."
+    },
+    {
+      "pair_id": "smoke-beta",
+      "parent_market_id": "smoke-parent-beta",
+      "child_market_id": "smoke-child-beta",
+      "notes": "Toxic dummy squeeze pair with a forced orphan flatten."
+    }
+  ]
+}

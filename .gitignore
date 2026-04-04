@@ -21,15 +21,50 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs & data
+# Logs, scratch databases, and runtime traces
 *.log
 *.jsonl
 *.db
+*.db-shm
+*.db-wal
 logs/
+
+# Generated JSON state and summary outputs
+*_state.json
+*_summary.json
+*.summary.json
+summary.json
+
+# Generated data lakes, mirrors, and VPS runtime bundles
+artifacts/
+data/
+vps_shadow_mode/
+vps_data_dump/
+*.parquet
+*.csv
+
+# Local scratch lake-builder outputs
+tmp_real_l2_candidate/
+tmp_real_*.json
+
+# Generated runtime configs
+config/active_amm_targets.json
+config/executable_neg_risk.json
+config/hybrid_arb_universe.json
+config/hybrid_arb_universe_balanced.json
+config/live_executable_strips.json
+config/negative_risk_targets.json
+
+# Generated operator reports
+docs/arb_universe_balanced_summary.md
+docs/arb_universe_summary.md
+docs/clob_arb_receipt.md
+docs/negative_risk_report.md
+docs/underwriter_launch_report.md
+docs/underwriter_launch_report_paper.md
 
 # Distribution
 dist/
 build/
 *.egg-info/
-
 *.tar.gz

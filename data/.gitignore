@@ -1,4 +1,0 @@
-# Exclude large raw tick files from git — these are binary/large data dumps
-ticks/
-*.db-shm
-*.db-wal

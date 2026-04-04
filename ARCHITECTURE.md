@@ -1,446 +1,141 @@
-# Three-Service Architecture
-
-This repository's production path is a dual-strategy Polymarket fund plus a
-dedicated compressed market-data archive, operated as three long-running
-services on the VPS.
-
-The hot path is deliberately small:
-
-- Sword: scan grouped negative-risk events for executable Dutch-book strips,
-  then fire concurrent CLOB strip orders.
-- Shield: scan the full live market for sub-5c YES longshots, then underwrite
-  them with resting NO quotes.
-- Data Lake: capture live L2 order book updates into highly compressed Parquet
-   archive chunks for replay, research, and audit.
-- Control plane: one trading scheduler shell script, one Telegram bridge, one
-   standalone compressor loop, and three systemd units plus a small artifact set
-   in `config/`, `data/`, `docs/`, and `logs/`.
+# Live Rolling Lake And VPS Shadow Mode
 
-The repository still contains research, replay, and experimental modules, but
-the deployed VPS fund does not need them to run. If a file is not named in
-this document, treat it as support code or offline analysis rather than the
-production loop.
+The production architecture is no longer centered on local historical replay.
+After the Temporal Gap investigation, the repository moved to a live-data-first
+model in which the Helsinki VPS is the canonical runtime and the local machine
+is only a mirror, diagnostics host, and code authoring environment.
 
-## Production Contract
+The system now has two authoritative planes:
 
-The currently deployed operating model is:
+- a continuous live L2 archive written to `data/l2_book_live/`
+- an hourly shadow-mode evaluator that runs the current strategy wrappers
+  against the live rolling lake
 
-1. `scripts/polymarket-sword-paper.service` runs Sword continuously.
-2. `scripts/polymarket-shield-paper.service` runs Shield continuously.
-3. `scripts/polymarket-tick-compressor.service` runs the Data Lake
-   continuously.
-4. Sword and Shield call `scripts/vps_master_scheduler.sh` with a pipeline
-   selector.
-5. All three services consume live market data, but only Sword and Shield
-   build PAPER trading payloads.
-6. The trading launchers run in PAPER mode on the VPS today, but they still
-   build live-shaped orders, signatures, and receipts.
-7. The Data Lake writes hourly compressed Parquet archive chunks under
-   `data/l2_archive/`.
-8. The trading loops emit machine-readable JSON summaries, human-readable
-   markdown receipts, and Telegram alerts.
-9. The Data Lake emits journald heartbeats plus chunk-write telemetry for
-   archive health and progress.
+## System Contract
 
-This is not a cron job, and it is not a single monolithic bot process. It is
-two trading loops plus one independent data-ingestion loop.
+1. The Helsinki VPS is the source of truth.
+2. `scripts/live_tick_compressor.py` is the always-on ingestion service.
+3. The compressor writes hourly Parquet shards under
+   `/home/botuser/polymarket-bot/data/l2_book_live/`.
+4. The deployed cron runner invokes `shadow_sentinel_cron.sh` at minute `5` of
+   every hour.
+5. That cron job runs the shadow wrappers sequentially and writes outputs to
+   `/home/botuser/polymarket-bot/shadow_logs/`.
+6. The local host mirrors the VPS lake into
+   `artifacts/l2_parquet_lake_rolling/` for inspection only.
+7. Large historical lakes are no longer the deployment truth surface.
 
-## Control Plane
+## Live Data Plane
 
-`scripts/vps_master_scheduler.sh` is the trading control plane.
+The live data plane is owned by:
 
-It exposes three modes:
+- `scripts/live_tick_compressor.py`
+- `scripts/polymarket-tick-compressor.service`
 
-- `--pipeline sword`
-- `--pipeline shield`
-- `--pipeline all`
+The compressor contract is:
 
-It also exposes `--run-once` for smoke tests and one-shot verification.
+1. Discover the active tradeable universe.
+2. Subscribe to live L2 books.
+3. Maintain the clean best-bid, best-ask, and displayed-depth surface.
+4. Persist hourly, `zstd`-compressed Parquet shards.
 
-The checked-in intervals are:
+The physical quote schema is eight columns:
 
-- Sword every `300` seconds.
-- Shield every `10800` seconds.
+- `timestamp`
+- `market_id`
+- `event_id`
+- `token_id`
+- `best_bid`
+- `best_ask`
+- `bid_depth`
+- `ask_depth`
 
-Each loop follows the same pattern:
+When scanned from the partition root, the dataset is an effective ten-column
+surface because the hive partition columns `date` and `hour` are materialized
+alongside the eight stored quote fields.
 
-1. Run the discovery scanner.
-2. Read the scanner's JSON output.
-3. Skip launch if no targets remain.
-4. Run the strategy launcher in PAPER mode.
-5. Send a strategy-specific Telegram summary.
-6. If a scanner or launcher fails, send a pipeline failure alert and keep the
-   loop alive.
+Operational defaults currently matter:
 
-Production isolation comes from the deployment shape rather than from complex
-in-process orchestration: Sword and Shield are separate services, so one loop
-can restart without taking the other down.
+- universe refresh every `7200` seconds
+- heartbeat every `900` seconds
+- hourly rotation
+- `zstd` compression
 
-The Data Lake is intentionally outside this scheduler. It runs as its own
-standalone systemd unit and owns its own websocket pool, timed universe
-refresh, and heartbeat telemetry, so the archive can keep running even if a
-trading loop is restarted or reconfigured.
+This replaces the old raw JSON or CSV archival path. The archive that matters
+now is the clean live lake.
 
-## Sword: CLOB Arbitrage
+## Shadow Evaluation Plane
 
-Sword is the event-group arbitrage lane.
+The shadow evaluation plane is driven by the deployed `shadow_sentinel_cron.sh`
+on the VPS.
 
-### Discovery
+At minute `5` of every hour it runs, in order:
 
-`scripts/live_bbo_arb_scanner.py` sweeps live Gamma grouped markets and asks a
-single question: can the current best bid or best ask across every outcome be
-traded as a risk-free Dutch book right now?
+1. `scripts/run_scavenger_protocol_historical_sweep.py`
+2. `scripts/run_conditional_probability_squeeze_batch.py`
+3. `scripts/run_mid_tier_probability_compression_historical_sweep.py`
 
-The scanner does the following:
+The deployed script executes from the VPS shadow working tree, builds a fresh
+timestamped run directory under `/home/botuser/polymarket-bot/shadow_logs/`,
+and writes one subdirectory per wrapper.
 
-1. Pull up to `40` Gamma pages of `500` active, open markets each.
-2. Keep only markets that are active, accepting orders, and have an enabled
-   order book.
-3. Group legs by `event_id`.
-4. Require at least `3` active outcomes in the event.
-5. Require a binary YES/NO token shape for every grouped leg.
-6. Require the grouped event to be flagged for negative-risk execution.
-7. Reject cumulative threshold ladders such as overlapping "at least" or
-   "above" markets.
-8. Pull the live YES book for every candidate leg from the CLOB.
-9. Record each leg's best bid, best ask, and displayed size.
+The operator-facing log for the cron runner is:
 
-The scanner emits two possible strip directions:
+- `/home/botuser/polymarket-bot/shadow_logs/cron_runner.log`
 
-- `BUY_YES_STRIP`: sum of leg asks is less than `1.00 - fee_buffer`.
-- `SELL_NO_STRIP`: sum of leg bids is greater than `1.00 + fee_buffer`.
+Important architectural note: the wrapper names still contain `historical` for
+backward compatibility, but the deployed job is evaluating live rolling data
+for the current UTC day.
 
-The default fee buffer is `0.02`, so the raw boundary checks are:
+## Local Mirror Plane
 
-- buy the full YES strip only if the strip costs less than `0.98`.
-- sell the full NO strip only if the strip pays more than `1.02`.
+The local machine mirrors the live VPS archive into
+`artifacts/l2_parquet_lake_rolling/`.
 
-Every leg must also clear the depth gate of `10` USD at the top of book.
+That mirror exists for:
 
-The scanner writes `config/live_executable_strips.json` with:
+- freshness checks
+- post-run inspection
+- lightweight local validation
+- strategy diagnostics against the same live-shaped surface used by shadow mode
 
-- `gamma_markets_scanned`
-- `grouped_events_considered`
-- `executable_strips`
-- filter settings
-- grouping counters
-- rejection counts
-- the executable strip targets themselves
+That mirror does not override the VPS. If local and VPS views disagree, the VPS
+runtime wins.
 
-### Dynamic Strip Sizing
+## Git Boundary
 
-`scripts/launch_clob_arb.py` turns a scanner target into an executable strip.
+The repository only tracks source code, tests, documentation, service files,
+and static configuration.
 
-Sizing is driven by the thinnest executable leg, not by a fixed order size.
+The following are runtime surfaces and must not be committed:
 
-For each strip:
+- `artifacts/`
+- `data/`
+- `vps_shadow_mode/`
+- parquet shards
+- CSV exports
+- logs
+- generated state JSON
+- generated summary JSON
+- generated runtime configs and operator receipts
 
-1. Read `min_leg_depth_usd_observed` from the scanner output.
-2. Round it down to a whole-dollar cap.
-3. Divide that cap by the strip execution price sum to get a safe share count.
-4. Clamp again by `strip_max_size_shares_at_bbo`.
-5. Enforce the exchange minimum share and minimum USD checks.
+This boundary is part of the architecture, not just repository hygiene. The
+runtime produces large, fast-moving operational state; the repository stores
+the code and documentation needed to reproduce and operate that state.
 
-In other words, the launcher never sizes the strip from the deepest leg. It
-sizes from the weakest displayed leg because that is the only way to keep the
-entire strip executable at the quoted edge.
+## Operational Reading Order
 
-### Concurrent FOK Execution
+If you need to understand the live system quickly, read in this order:
 
-Sword launches one order per leg and signs them all before submission.
+1. `scripts/live_tick_compressor.py`
+2. `scripts/polymarket-tick-compressor.service`
+3. `scripts/run_scavenger_protocol_historical_sweep.py`
+4. `scripts/run_conditional_probability_squeeze_batch.py`
+5. `scripts/run_mid_tier_probability_compression_historical_sweep.py`
+6. `README.md`
 
-The scheduler currently invokes:
-
-`launch_clob_arb.py --env PAPER --input config/live_executable_strips.json --json-output data/clob_arb_launch_summary_paper.json`
-
-No `--time-in-force` override is supplied, so the runtime default remains
-`FOK`.
-
-That means the production Sword service currently attempts every strip as a
-concurrent fill-or-kill basket.
-
-Operational details:
-
-- all leg payloads are prepared up front;
-- all leg submissions are fired concurrently with `asyncio.gather(...)`;
-- live mode checks wallet balance before buying a strip;
-- paper mode intercepts the live-shaped payloads locally and records them as
-  paper receipts.
-
-### Anti-Legging Safety Handler
-
-The anti-legging path lives inside `launch_clob_arb.py` and is triggered when
-some legs fill but the full strip does not.
-
-The flow is explicit:
-
-1. If every leg is fully filled, the strip is marked `FULLY_FILLED`.
-2. If no leg fills, the strip remains `NO_FILL` or `SUBMITTED` depending on the
-   venue response.
-3. If at least one leg fills but the strip is incomplete, the launcher enters a
-   flatten workflow immediately.
-
-Stage 1 flatten:
-
-- calculate residual exposure per partially executed leg;
-- look up the live BBO for the affected token;
-- submit an IOC flatten order at the live BBO;
-- use the best bid for sell-side flattening and the best ask for buy-side
-  flattening;
-- tag the result as `BBO_IOC`.
-
-Stage 2 escalation:
-
-- if inventory remains after Stage 1, reprice aggressively;
-- move the price by the larger of `5%` of the Stage 1 price or an absolute
-  `0.05`;
-- clip the new price into the venue-safe range `0.001` to `0.999`;
-- submit another IOC order;
-- tag the result as `PANIC_IOC`.
-
-The launcher records whether the strip required flattening, whether Stage 2 was
-needed, and whether any residual inventory survived both stages.
-
-### Sword Artifacts
-
-The Sword pipeline persists three operator-facing artifacts:
-
-- `config/live_executable_strips.json`: the current opportunity set.
-- `data/clob_arb_launch_summary_paper.json`: machine-readable launch summary.
-- `docs/clob_arb_receipt.md`: human-readable per-strip receipt.
-
-The JSON summary includes:
-
-- `paper_intercepted_payloads`
-- `flatten_events`
-- `flatten_stage2_events`
-- `flatten_failures`
-- `status_counts`
-- `total_planned_notional_usd`
-- per-strip leg results
-- per-strip flatten leg results
-
-## Shield: Favorite-Longshot Underwriter
-
-Shield is the continuous longshot underwriting lane.
-
-### Infinite Discovery Loop
-
-`scripts/live_flb_scanner.py` performs the discovery pass for Shield.
-
-It continuously sweeps live Gamma markets and keeps only markets that still
-look like true YES longshots on the order book.
-
-The scanner does the following:
-
-1. Pull up to `40` Gamma pages of `500` active, open markets each.
-2. Keep only markets that are active, accepting orders, and have an enabled
-   order book.
-3. Resolve YES and NO token ids from Gamma metadata.
-4. Apply a cheap Gamma-side prefilter: YES outcome price must be below `0.08`
-   before the CLOB is queried.
-5. Pull the live YES order book for each surviving market.
-6. Choose the live reference YES price in this order:
-   - best ask if `0.001 < ask < 0.05`
-   - midpoint if the book is two-sided and the midpoint falls in range
-   - Gamma outcome price as the fallback midpoint proxy
-7. Infer a display category from the event title, slug, and question text.
-8. Rank all eligible targets by:
-   - highest `market_volume_24h`
-   - highest `liquidity_clob_usd`
-   - lowest `entry_yes_ask`
-   - alphabetical question text
-9. Hard-cap the emitted target set at `100` markets.
-
-That cap is not accidental. It is enforced directly by
-`DEFAULT_MAX_SHIELD_TARGETS = 100` and by the default
-`--max-shield-targets 100` argument.
-
-The scanner writes `data/flb_results_live.json` with:
-
-- `summary.active_bucket.count`
-- category counts
-- discovery stats
-- rejection counts
-- every selected live target
-
-### Underwriter Execution
-
-`scripts/launch_underwriter.py` converts the scanner output into passive NO
-quotes.
-
-The checked-in implementation expresses its Kelly sizing as a fixed per-name
-cap:
-
-- `MAX_NOTIONAL_PER_CONDITION = 50`
-- `ENTRY_PRICE = 0.95`
-
-So each selected market becomes one resting NO order worth `50` USD notional at
-price `0.95`.
-
-The share count is computed as:
-
-- `order_size = 50 / 0.95`
-- quantized to `0.000001` shares
-
-The execution posture is always passive:
-
-- side: `NO`
-- order type: `LIMIT`
-- time in force: `GTC`
-- `post_only = True`
-
-The launcher resolves token ids from the scanner output when present, and falls
-back to Gamma when they are missing.
-
-### PAPER Versus LIVE
-
-Shield supports both PAPER and LIVE modes.
-
-Important implementation detail: PAPER mode still validates live credentials
-and still builds live-equivalent signed payloads. The only difference is the
-transport layer:
-
-- PAPER intercepts the payload locally.
-- LIVE submits the order through the adapter and persists state.
-
-State behavior:
-
-- LIVE writes a state file to avoid duplicate resting orders.
-- PAPER deliberately skips state persistence.
-
-Default paper outputs are:
-
-- `docs/underwriter_launch_report_paper.md`
-- `data/underwriter_launch_summary_paper.json`
-
-The JSON summary includes:
-
-- `active_targets_loaded`
-- `submitted_orders`
-- `skipped_existing`
-- `rejected_orders`
-- `paper_intercepted_payloads`
-- `submitted_notional_usd`
-- category counts
-- the submitted, skipped, rejected, and dry-run rows
-
-## Data Lake: Compressed Tick Archive
-
-`scripts/live_tick_compressor.py` is the live L2 archive service.
-
-Its job is not trade execution. Its job is to replace the old bloated JSON or
-CSV raw tick accumulation path with a compact, replayable archive.
-
-### Storage Model
-
-The compressor:
-
-1. resolves the active tradeable universe with `fetch_active_markets(...)`;
-2. builds YES and NO token subscriptions for the selected markets;
-3. shards those subscriptions across websocket connections with up to `50`
-   asset ids per socket;
-4. normalizes snapshots and deltas into a fixed Parquet schema;
-5. buffers rows in an asyncio queue;
-6. writes immutable archive chunks into `data/l2_archive/`.
-
-The checked-in service defaults are:
-
-- output dir: `data/l2_archive/`
-- rotation: `hourly`
-- compression: `zstd`
-- flush rows: `10000`
-- flush seconds: `300`
-
-That means the VPS now stores fresh L2 capture as hourly Parquet parts like:
-
-- `data/l2_archive/YYYY-MM-DD/ticks_YYYY-MM-DD_HH_000001.parquet`
-
-The retained schema keeps replay-critical columns such as `local_ts`,
-`exchange_ts`, `msg_type`, `asset_id`, `market_id`, `outcome`, `price`,
-`size`, `sequence_id`, `side`, and the compact raw `payload` JSON. The raw
-payload is still preserved, but it now lives inside a compressed columnar file
-instead of growing as standalone JSON or CSV dumps.
-
-### Dynamic Universe Refresh
-
-The compressor does not keep a startup-only subscription set.
-
-The checked-in default `--universe-refresh-seconds 7200` means the service
-re-resolves the active tradeable universe every two hours and diffs it against
-the currently bound websocket pool.
-
-The rebinding policy is:
-
-- add and update subscriptions first;
-- remove stale subscriptions second;
-- fill existing sockets up to `max_assets_per_socket` before creating more;
-- retire sockets that become empty.
-
-That keeps the archive aligned with the live tradable universe without tearing
-down the full socket pool on every refresh.
-
-### Heartbeat and Archive Telemetry
-
-The checked-in default `--heartbeat-seconds 900` makes the service emit
-`tick_compressor_heartbeat` every fifteen minutes.
-
-Each heartbeat records:
-
-- `asset_count`
-- `socket_count`
-- `reconnect_count`
-- `refresh_count`
-- `last_refresh_reason`
-- `last_refresh_age_s`
-
-The service also emits `tick_parquet_chunk_written` whenever it flushes a new
-archive part, so journald shows both pool health and archive progress.
-
-Individual websocket shards reconnect with backoff, and the systemd unit
-restarts the process on failure, so the archiver is self-healing at both the
-socket and process layers.
-
-## Telemetry and Reporting
-
-The trading reporting contract is file-first and alert-second. The Data Lake
-loop is archive-first and journal-first.
-
-Each trading launcher produces:
-
-- a JSON summary for machines and downstream scripts;
-- a markdown receipt for humans.
-
-`scripts/send_strategy_telegram_alert.py` turns those artifacts into operator
-alerts.
-
-It supports four commands:
-
-- `shield`: load the Shield launch summary and send active target count,
-  staged/intercepted counts, notional, top categories, and sample questions.
-- `sword`: load the Sword scan summary plus optional launch summary and send
-  executable strip count, grouped event count, per-launch statuses, and the top
-  strip candidates.
-- `failure`: emit a strategy, stage, and message failure alert.
-- `comm-check`: perform a strict Telegram connectivity check and return a
-  failing exit code if Telegram does not acknowledge the message.
-
-`scripts/vps_smoke_test.sh` uses the same reporting surface to verify both
-strategy loops and the Telegram channel end to end.
-
-The compressor does not route through Telegram. Its operator surface is
-journald plus the archive directory. The important events are
-`tick_compressor_heartbeat`, `tick_parquet_chunk_written`,
-`tick_universe_refresh_complete`, and the socket disconnect or silence-timeout
-warnings.
-
-## Service Model and OS Resilience
-
-### Active VPS Services
-
-The active deployment units are:
-
-- `scripts/polymarket-sword-paper.service`
+Everything else in the repository is supporting code, offline research, or
+legacy experimentation that no longer defines the production operating model.
 - `scripts/polymarket-shield-paper.service`
 - `scripts/polymarket-tick-compressor.service`
 
@@ -461,7 +156,7 @@ The compressor unit:
 
 - runs as `botuser`;
 - sets the same project working directory and virtualenv `PATH`;
-- creates `/home/botuser/polymarket-bot/data/l2_archive` during
+- creates `/home/botuser/polymarket-bot/data/l2_book_live` during
    `ExecStartPre`;
 - runs `live_tick_compressor.py` with hourly rotation, `zstd`,
    `market-limit 200`, `--universe-refresh-seconds 7200`,

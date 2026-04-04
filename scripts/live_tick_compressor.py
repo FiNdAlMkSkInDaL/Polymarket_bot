@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import shutil
 import sys
 import time
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import pyarrow as pa
@@ -26,12 +28,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.core.config import settings
 from src.core.logger import get_logger, setup_logging
+from src.data.orderbook import OrderbookTracker
 from src.data.market_discovery import MarketInfo, fetch_active_markets
 
 
 log = get_logger(__name__)
 
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "l2_archive"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "l2_book_live"
+LEGACY_OUTPUT_DIR_NAME = "l2_archive"
 DEFAULT_FLUSH_ROWS = 10_000
 DEFAULT_FLUSH_SECONDS = 300.0
 DEFAULT_QUEUE_SIZE = 100_000
@@ -41,36 +45,32 @@ DEFAULT_CONNECT_STAGGER_SECONDS = 0.25
 DEFAULT_MIN_FREE_GB = 10.0
 DEFAULT_UNIVERSE_REFRESH_SECONDS = 7_200.0
 DEFAULT_HEARTBEAT_SECONDS = 900.0
+WRITER_STATE_DIR_NAME = "_state"
+HANDOFF_FILE_NAME = "writer_handoff.json"
 
 DELTA_EVENTS = frozenset(("price_change", "book_delta", "delta"))
 SNAPSHOT_EVENTS = frozenset(("book", "snapshot", "book_snapshot"))
-DICTIONARY_COLUMNS = ["msg_type", "asset_id", "market_id", "outcome", "side"]
+DICTIONARY_COLUMNS = ["market_id", "event_id", "token_id"]
 PARQUET_COLUMNS = [
-    "local_ts",
-    "exchange_ts",
-    "msg_type",
-    "asset_id",
+    "timestamp",
     "market_id",
-    "outcome",
-    "price",
-    "size",
-    "sequence_id",
-    "side",
-    "payload",
+    "event_id",
+    "token_id",
+    "best_bid",
+    "best_ask",
+    "bid_depth",
+    "ask_depth",
 ]
 PARQUET_SCHEMA = pa.schema(
     [
-        pa.field("local_ts", pa.float64(), nullable=False),
-        pa.field("exchange_ts", pa.float64(), nullable=True),
-        pa.field("msg_type", pa.string(), nullable=False),
-        pa.field("asset_id", pa.string(), nullable=False),
-        pa.field("market_id", pa.string(), nullable=True),
-        pa.field("outcome", pa.string(), nullable=True),
-        pa.field("price", pa.float64(), nullable=True),
-        pa.field("size", pa.float64(), nullable=True),
-        pa.field("sequence_id", pa.int64(), nullable=True),
-        pa.field("side", pa.string(), nullable=True),
-        pa.field("payload", pa.string(), nullable=False),
+        pa.field("timestamp", pa.timestamp("ms", tz="UTC"), nullable=False),
+        pa.field("market_id", pa.string(), nullable=False),
+        pa.field("event_id", pa.string(), nullable=False),
+        pa.field("token_id", pa.string(), nullable=False),
+        pa.field("best_bid", pa.float64(), nullable=False),
+        pa.field("best_ask", pa.float64(), nullable=False),
+        pa.field("bid_depth", pa.float64(), nullable=False),
+        pa.field("ask_depth", pa.float64(), nullable=False),
     ]
 )
 
@@ -83,16 +83,133 @@ class LowDiskSpaceError(RuntimeError):
 class AssetSubscription:
     asset_id: str
     market_id: str
-    outcome: str
+    event_id: str
+    token_id: str
+    yes_asset_id: str
+    no_asset_id: str
     question: str
     daily_volume_usd: float
+
+    @property
+    def outcome(self) -> str:
+        return self.token_id
 
 
 @dataclass(frozen=True, slots=True)
 class RotationBucket:
     bucket_id: str
     date_str: str
+    hour_str: str | None
     file_stem: str
+
+
+@dataclass(frozen=True, slots=True)
+class BookSummary:
+    best_bid: float | None
+    best_ask: float | None
+    bid_depth: float
+    ask_depth: float
+
+
+class MarketBookState:
+    def __init__(
+        self,
+        *,
+        market_id: str,
+        event_id: str,
+        yes_asset_id: str,
+        no_asset_id: str,
+    ) -> None:
+        self.market_id = market_id
+        self.event_id = event_id
+        self.yes_asset_id = yes_asset_id
+        self.no_asset_id = no_asset_id
+        self.yes_book = OrderbookTracker(yes_asset_id)
+        self.no_book = OrderbookTracker(no_asset_id)
+        self.seeded_assets: set[str] = set()
+
+    @property
+    def is_seeded(self) -> bool:
+        return (
+            self.yes_asset_id in self.seeded_assets
+            and self.no_asset_id in self.seeded_assets
+        )
+
+    def tracker_for(self, asset_id: str) -> OrderbookTracker | None:
+        if asset_id == self.yes_asset_id:
+            return self.yes_book
+        if asset_id == self.no_asset_id:
+            return self.no_book
+        return None
+
+
+class ShutdownSignalMonitor:
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._event: asyncio.Event | None = None
+        self._loop_handlers: list[signal.Signals] = []
+        self._previous_handlers: dict[signal.Signals, Any] = {}
+        self.reason: str | None = None
+
+    def install(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._event = asyncio.Event()
+        for current_signal in self._iter_signals():
+            try:
+                loop.add_signal_handler(
+                    current_signal,
+                    self.request_shutdown,
+                    f"signal:{current_signal.name}",
+                )
+                self._loop_handlers.append(current_signal)
+            except (NotImplementedError, RuntimeError):
+                try:
+                    self._previous_handlers[current_signal] = signal.getsignal(current_signal)
+                    signal.signal(current_signal, self._fallback_handler)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+
+    def restore(self) -> None:
+        if self._loop is not None:
+            for current_signal in self._loop_handlers:
+                self._loop.remove_signal_handler(current_signal)
+        for current_signal, previous_handler in self._previous_handlers.items():
+            try:
+                signal.signal(current_signal, previous_handler)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        self._loop_handlers.clear()
+        self._previous_handlers.clear()
+
+    async def wait(self) -> None:
+        if self._event is None:
+            raise RuntimeError("Shutdown monitor must be installed before waiting")
+        await self._event.wait()
+
+    def request_shutdown(self, reason: str) -> None:
+        if self.reason is None:
+            self.reason = reason
+            log.info("tick_compressor_shutdown_requested", reason=reason)
+        if self._event is not None and not self._event.is_set():
+            self._event.set()
+
+    def _fallback_handler(self, signum: int, _frame: Any) -> None:
+        if self._loop is None:
+            return
+        try:
+            current_signal = signal.Signals(signum)
+            reason = f"signal:{current_signal.name}"
+        except ValueError:
+            reason = f"signal:{signum}"
+        self._loop.call_soon_threadsafe(self.request_shutdown, reason)
+
+    @staticmethod
+    def _iter_signals() -> tuple[signal.Signals, ...]:
+        candidates: list[signal.Signals] = [signal.SIGINT]
+        sigterm = getattr(signal, "SIGTERM", None)
+        if sigterm is not None:
+            candidates.append(sigterm)
+        return tuple(candidates)
 
 
 def _log_task_exception(task: asyncio.Task[Any]) -> None:
@@ -107,6 +224,23 @@ def _log_task_exception(task: asyncio.Task[Any]) -> None:
         error=repr(exc),
         exc_info=exc,
     )
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=UTC).isoformat()
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f"{path.name}.tmp"
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    for _ in range(10):
+        try:
+            temp_path.replace(path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    temp_path.replace(path)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -149,74 +283,149 @@ def _normalize_exchange_ts(msg: dict[str, Any]) -> float | None:
     return timestamp
 
 
-def _normalize_sequence_id(msg: dict[str, Any]) -> int | None:
-    raw_value = msg.get("seq") or msg.get("sequence") or msg.get("seq_num")
-    if raw_value in (None, ""):
-        return None
-    try:
-        return int(raw_value)
-    except (TypeError, ValueError):
-        return None
+def _event_type(msg: dict[str, Any]) -> str:
+    return str(msg.get("event_type") or msg.get("type") or "").strip().lower()
 
 
-def _safe_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def _timestamp_ms(msg: dict[str, Any], *, received_at: float) -> int:
+    exchange_ts = _normalize_exchange_ts(msg)
+    base_ts = exchange_ts if exchange_ts is not None else float(received_at)
+    return int(round(base_ts * 1000.0))
 
 
-def _safe_text(value: Any) -> str | None:
-    text = str(value or "").strip()
-    return text or None
+def _normalize_delta_message(msg: dict[str, Any]) -> dict[str, Any]:
+    if msg.get("changes") is not None or msg.get("data") is not None or msg.get("price") is not None:
+        return msg
+    if msg.get("price_changes") is not None:
+        normalized = dict(msg)
+        normalized["changes"] = msg.get("price_changes")
+        return normalized
+    return msg
 
 
-def build_tick_row(
-    msg: dict[str, Any],
-    *,
-    received_at: float,
-    subscriptions_by_asset: dict[str, AssetSubscription],
-) -> dict[str, Any] | None:
-    event_type = str(msg.get("event_type") or msg.get("type") or "").strip().lower()
-    if event_type in SNAPSHOT_EVENTS:
-        msg_type = "snapshot"
-    elif event_type in DELTA_EVENTS:
-        msg_type = "delta"
-    else:
-        return None
+def _book_summary(book: OrderbookTracker) -> BookSummary:
+    bid_levels = book.levels("bid", 5)
+    ask_levels = book.levels("ask", 5)
+    best_bid = bid_levels[0].price if bid_levels else None
+    best_ask = ask_levels[0].price if ask_levels else None
+    bid_depth = sum(level.price * level.size for level in bid_levels)
+    ask_depth = sum(level.price * level.size for level in ask_levels)
+    return BookSummary(
+        best_bid=best_bid,
+        best_ask=best_ask,
+        bid_depth=round(bid_depth, 8),
+        ask_depth=round(ask_depth, 8),
+    )
 
-    asset_id = str(msg.get("asset_id") or "").strip()
-    if not asset_id:
-        return None
 
-    subscription = subscriptions_by_asset.get(asset_id)
-    market_id = subscription.market_id if subscription is not None else str(msg.get("market") or msg.get("condition_id") or "").strip() or None
-    outcome = subscription.outcome if subscription is not None else None
+def _summary_reason(summary: BookSummary) -> str | None:
+    if summary.best_bid is None or summary.best_ask is None:
+        return "missing_bbo"
+    if summary.best_bid <= 0 or summary.best_ask <= 0:
+        return "non_positive_bbo"
+    if summary.best_bid >= summary.best_ask:
+        return "crossed_book"
+    if summary.best_bid > 1.0 or summary.best_ask > 1.0:
+        return "price_out_of_bounds"
+    if summary.bid_depth <= 0 or summary.ask_depth <= 0:
+        return "missing_depth"
+    return None
 
-    price = None
-    size = None
-    side = None
-    price_changes = msg.get("price_changes")
-    if msg_type == "delta" and isinstance(price_changes, list) and len(price_changes) == 1 and isinstance(price_changes[0], dict):
-        price = _safe_float(price_changes[0].get("price"))
-        size = _safe_float(price_changes[0].get("size"))
-        side = _safe_text(price_changes[0].get("side"))
 
-    return {
-        "local_ts": float(received_at),
-        "exchange_ts": _normalize_exchange_ts(msg),
-        "msg_type": msg_type,
-        "asset_id": asset_id,
-        "market_id": market_id,
-        "outcome": outcome,
-        "price": price,
-        "size": size,
-        "sequence_id": _normalize_sequence_id(msg),
-        "side": side,
-        "payload": json.dumps(msg, separators=(",", ":"), default=str),
-    }
+class LiveBookAssembler:
+    def __init__(self, subscriptions_by_asset: dict[str, AssetSubscription]) -> None:
+        self._subscriptions_by_asset = subscriptions_by_asset
+        self._market_states: dict[str, MarketBookState] = {}
+        self.processed_messages = 0
+        self.ignored_messages = 0
+        self.preseed_deltas = 0
+        self.unpaired_events = 0
+        self.invalid_pairs = 0
+        self.emitted_rows = 0
+
+    @property
+    def market_count(self) -> int:
+        return len(self._market_states)
+
+    def process_message(self, msg: dict[str, Any], *, received_at: float) -> list[dict[str, Any]]:
+        self.processed_messages += 1
+        event_type = _event_type(msg)
+        if event_type not in SNAPSHOT_EVENTS and event_type not in DELTA_EVENTS:
+            self.ignored_messages += 1
+            return []
+
+        asset_id = str(msg.get("asset_id") or "").strip()
+        if not asset_id:
+            self.ignored_messages += 1
+            return []
+
+        subscription = self._subscriptions_by_asset.get(asset_id)
+        if subscription is None:
+            self.ignored_messages += 1
+            return []
+
+        state = self._market_state(subscription)
+        tracker = state.tracker_for(asset_id)
+        if tracker is None:
+            self.ignored_messages += 1
+            return []
+
+        if event_type in SNAPSHOT_EVENTS:
+            tracker.on_book_snapshot(msg)
+            state.seeded_assets.add(asset_id)
+        else:
+            if asset_id not in state.seeded_assets:
+                self.preseed_deltas += 1
+                return []
+            tracker.on_price_change(_normalize_delta_message(msg))
+
+        if not state.is_seeded:
+            self.unpaired_events += 1
+            return []
+
+        yes_summary = _book_summary(state.yes_book)
+        no_summary = _book_summary(state.no_book)
+        if _summary_reason(yes_summary) or _summary_reason(no_summary):
+            self.invalid_pairs += 1
+            return []
+
+        timestamp_ms = _timestamp_ms(msg, received_at=received_at)
+        rows = [
+            {
+                "timestamp": timestamp_ms,
+                "market_id": state.market_id,
+                "event_id": state.event_id,
+                "token_id": "YES",
+                "best_bid": yes_summary.best_bid,
+                "best_ask": yes_summary.best_ask,
+                "bid_depth": yes_summary.bid_depth,
+                "ask_depth": yes_summary.ask_depth,
+            },
+            {
+                "timestamp": timestamp_ms,
+                "market_id": state.market_id,
+                "event_id": state.event_id,
+                "token_id": "NO",
+                "best_bid": no_summary.best_bid,
+                "best_ask": no_summary.best_ask,
+                "bid_depth": no_summary.bid_depth,
+                "ask_depth": no_summary.ask_depth,
+            },
+        ]
+        self.emitted_rows += len(rows)
+        return rows
+
+    def _market_state(self, subscription: AssetSubscription) -> MarketBookState:
+        current = self._market_states.get(subscription.market_id)
+        if current is None or current.yes_asset_id != subscription.yes_asset_id or current.no_asset_id != subscription.no_asset_id:
+            current = MarketBookState(
+                market_id=subscription.market_id,
+                event_id=subscription.event_id,
+                yes_asset_id=subscription.yes_asset_id,
+                no_asset_id=subscription.no_asset_id,
+            )
+            self._market_states[subscription.market_id] = current
+        return current
 
 
 def _chunk_assets(asset_ids: list[str], max_assets_per_socket: int) -> list[list[str]]:
@@ -228,6 +437,18 @@ def _chunk_assets(asset_ids: list[str], max_assets_per_socket: int) -> list[list
         asset_ids[index : index + max_assets_per_socket]
         for index in range(0, len(asset_ids), max_assets_per_socket)
     ]
+
+
+def _effective_output_dir(output_dir: Path) -> Path:
+    if output_dir.name != LEGACY_OUTPUT_DIR_NAME:
+        return output_dir
+    redirected = output_dir.with_name("l2_book_live")
+    log.info(
+        "tick_output_dir_redirected",
+        requested_output_dir=str(output_dir),
+        effective_output_dir=str(redirected),
+    )
+    return redirected
 
 
 class ParquetTickWriter:
@@ -271,6 +492,15 @@ class ParquetTickWriter:
         self._bytes_written = 0
         self._high_watermark = 0
         self._part_counters: dict[str, int] = {}
+        self._session_id = uuid4().hex
+        self._started_at_iso = _now_iso()
+        self._state_dir = self._output_dir / WRITER_STATE_DIR_NAME
+        self._handoff_path = self._state_dir / HANDOFF_FILE_NAME
+        self._loaded_handoff = self._load_handoff_state()
+        self._last_flush_min_ts_ms: int | None = None
+        self._last_flush_max_ts_ms: int | None = None
+        self._last_written_files: list[str] = []
+        self._stop_reason: str | None = None
 
     async def enqueue(self, row: dict[str, Any]) -> None:
         await self._queue.put(row)
@@ -278,6 +508,26 @@ class ParquetTickWriter:
 
     async def run(self) -> None:
         self._running = True
+        if self._loaded_handoff is not None:
+            previous_ts = self._loaded_handoff.get("last_flush_max_ts_ms")
+            last_flush_age_s = None
+            if previous_ts is not None:
+                try:
+                    last_flush_age_s = round(max(0.0, time.time() - (float(previous_ts) / 1000.0)), 3)
+                except (TypeError, ValueError):
+                    last_flush_age_s = None
+            log_fn = log.warning if not bool(self._loaded_handoff.get("clean_shutdown")) else log.info
+            log_fn(
+                "tick_handoff_loaded",
+                previous_session_id=self._loaded_handoff.get("session_id"),
+                previous_status=self._loaded_handoff.get("status"),
+                previous_clean_shutdown=bool(self._loaded_handoff.get("clean_shutdown")),
+                previous_last_flush_max_ts_ms=previous_ts,
+                previous_last_flush_age_s=last_flush_age_s,
+                previous_rows_written=self._loaded_handoff.get("rows_written"),
+                previous_files_written=self._loaded_handoff.get("files_written"),
+            )
+        self._write_handoff_state(status="running", clean_shutdown=False)
         log.info(
             "tick_writer_started",
             output_dir=str(self._output_dir),
@@ -286,10 +536,20 @@ class ParquetTickWriter:
             rotation=self._rotation,
             compression=self._compression,
             min_free_gb=self._min_free_gb,
+            dataset_schema="l2_book_live",
         )
         try:
             while self._running:
                 await self._consume_and_flush_once()
+        except LowDiskSpaceError:
+            self._stop_reason = self._stop_reason or "low_disk_space"
+            raise
+        except asyncio.CancelledError:
+            self._stop_reason = self._stop_reason or "cancelled"
+            raise
+        except Exception:
+            self._stop_reason = self._stop_reason or "writer_failure"
+            raise
         finally:
             while True:
                 try:
@@ -300,15 +560,20 @@ class ParquetTickWriter:
                 pending_rows = self._buffer
                 self._buffer = []
                 await asyncio.to_thread(self._flush_rows_sync, pending_rows)
+            clean_shutdown = self._stop_reason not in {None, "writer_failure", "cancelled"}
+            self._write_handoff_state(status="stopped", clean_shutdown=clean_shutdown)
             log.info(
                 "tick_writer_stopped",
                 rows_written=self._rows_written,
                 files_written=self._files_written,
                 bytes_written=self._bytes_written,
                 queue_high_watermark=self._high_watermark,
+                stop_reason=self._stop_reason,
             )
 
-    def stop(self) -> None:
+    def stop(self, *, reason: str | None = None) -> None:
+        if reason is not None and self._stop_reason is None:
+            self._stop_reason = reason
         self._running = False
 
     async def _consume_and_flush_once(self) -> None:
@@ -353,10 +618,16 @@ class ParquetTickWriter:
         self._ensure_free_space()
 
         grouped_rows: dict[RotationBucket, list[dict[str, Any]]] = {}
+        min_ts_ms: int | None = None
+        max_ts_ms: int | None = None
         for row in rows:
-            bucket = self._rotation_bucket(row["local_ts"])
+            timestamp_ms = int(row["timestamp"])
+            min_ts_ms = timestamp_ms if min_ts_ms is None else min(min_ts_ms, timestamp_ms)
+            max_ts_ms = timestamp_ms if max_ts_ms is None else max(max_ts_ms, timestamp_ms)
+            bucket = self._rotation_bucket(timestamp_ms)
             grouped_rows.setdefault(bucket, []).append(row)
 
+        written_files: list[str] = []
         for bucket, bucket_rows in sorted(grouped_rows.items(), key=lambda item: item[0].bucket_id):
             file_path = self._next_file_path(bucket)
             temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
@@ -373,6 +644,7 @@ class ParquetTickWriter:
             self._rows_written += len(bucket_rows)
             self._files_written += 1
             self._bytes_written += file_size
+            written_files.append(file_path.relative_to(self._output_dir).as_posix())
             log.info(
                 "tick_parquet_chunk_written",
                 file_path=str(file_path),
@@ -380,7 +652,50 @@ class ParquetTickWriter:
                 bytes=file_size,
                 compression=self._compression,
                 rotation_bucket=bucket.bucket_id,
+                dataset_schema="l2_book_live",
             )
+        self._last_flush_min_ts_ms = min_ts_ms
+        self._last_flush_max_ts_ms = max_ts_ms
+        self._last_written_files = written_files
+        self._write_handoff_state(status="running", clean_shutdown=False)
+
+    def _load_handoff_state(self) -> dict[str, Any] | None:
+        if not self._handoff_path.exists():
+            return None
+        try:
+            return json.loads(self._handoff_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning(
+                "tick_handoff_load_failed",
+                handoff_path=str(self._handoff_path),
+                error=str(exc),
+            )
+            return None
+
+    def _write_handoff_state(self, *, status: str, clean_shutdown: bool) -> None:
+        payload = {
+            "schema": "tick_writer_handoff_v1",
+            "status": status,
+            "clean_shutdown": clean_shutdown,
+            "session_id": self._session_id,
+            "started_at": self._started_at_iso,
+            "updated_at": _now_iso(),
+            "output_dir": str(self._output_dir),
+            "rotation": self._rotation,
+            "compression": self._compression,
+            "rows_written": self._rows_written,
+            "files_written": self._files_written,
+            "bytes_written": self._bytes_written,
+            "queue_high_watermark": self._high_watermark,
+            "last_flush_min_ts_ms": self._last_flush_min_ts_ms,
+            "last_flush_max_ts_ms": self._last_flush_max_ts_ms,
+            "last_written_files": list(self._last_written_files),
+            "stop_reason": self._stop_reason,
+        }
+        if self._loaded_handoff is not None:
+            payload["resume_from_session_id"] = self._loaded_handoff.get("session_id")
+            payload["resume_from_last_flush_max_ts_ms"] = self._loaded_handoff.get("last_flush_max_ts_ms")
+        _write_json_atomic(self._handoff_path, payload)
 
     def _rows_to_arrow(self, rows: list[dict[str, Any]]) -> pa.Table:
         frame = pd.DataFrame(rows)
@@ -388,29 +703,35 @@ class ParquetTickWriter:
             if column not in frame.columns:
                 frame[column] = None
         frame = frame[PARQUET_COLUMNS].copy()
-        frame.sort_values("local_ts", inplace=True, kind="mergesort")
-        frame["local_ts"] = pd.to_numeric(frame["local_ts"], errors="coerce").astype("float64")
-        frame["exchange_ts"] = pd.to_numeric(frame["exchange_ts"], errors="coerce")
-        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
-        frame["size"] = pd.to_numeric(frame["size"], errors="coerce")
-        frame["sequence_id"] = pd.to_numeric(frame["sequence_id"], errors="coerce").astype("Int64")
-        for column in ("msg_type", "asset_id", "market_id", "outcome", "side", "payload"):
+        frame.sort_values(["timestamp", "market_id", "token_id"], inplace=True, kind="mergesort")
+        frame["timestamp"] = pd.to_datetime(
+            pd.to_numeric(frame["timestamp"], errors="coerce"),
+            unit="ms",
+            utc=True,
+        )
+        for column in ("best_bid", "best_ask", "bid_depth", "ask_depth"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
+        for column in ("market_id", "event_id", "token_id"):
             frame[column] = frame[column].astype("string")
         return pa.Table.from_pandas(frame, schema=PARQUET_SCHEMA, preserve_index=False)
 
-    def _rotation_bucket(self, local_ts: float) -> RotationBucket:
-        timestamp = datetime.fromtimestamp(local_ts, tz=UTC)
+    def _rotation_bucket(self, timestamp_ms: int) -> RotationBucket:
+        timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
         date_str = timestamp.strftime("%Y-%m-%d")
         if self._rotation == "hourly":
             bucket_id = timestamp.strftime("%Y-%m-%d-%H")
-            file_stem = timestamp.strftime("ticks_%Y-%m-%d_%H")
+            hour_str = timestamp.strftime("%H")
+            file_stem = timestamp.strftime("l2_book_%Y-%m-%d_%H")
         else:
             bucket_id = date_str
-            file_stem = timestamp.strftime("ticks_%Y-%m-%d")
-        return RotationBucket(bucket_id=bucket_id, date_str=date_str, file_stem=file_stem)
+            hour_str = None
+            file_stem = timestamp.strftime("l2_book_%Y-%m-%d")
+        return RotationBucket(bucket_id=bucket_id, date_str=date_str, hour_str=hour_str, file_stem=file_stem)
 
     def _next_file_path(self, bucket: RotationBucket) -> Path:
-        date_dir = self._output_dir / bucket.date_str
+        date_dir = self._output_dir / f"date={bucket.date_str}"
+        if bucket.hour_str is not None:
+            date_dir = date_dir / f"hour={bucket.hour_str}"
         date_dir.mkdir(parents=True, exist_ok=True)
         next_part = self._part_counters.get(bucket.bucket_id)
         if next_part is None:
@@ -453,6 +774,7 @@ class L2RecordingSocket:
         socket_id: int,
         asset_ids: list[str],
         writer: ParquetTickWriter,
+        message_processor: LiveBookAssembler,
         subscriptions_by_asset: dict[str, AssetSubscription],
         ws_url: str,
         silence_timeout_seconds: float,
@@ -460,6 +782,7 @@ class L2RecordingSocket:
         self.socket_id = socket_id
         self.asset_ids = list(asset_ids)
         self._writer = writer
+        self._message_processor = message_processor
         self._subscriptions_by_asset = subscriptions_by_asset
         self._ws_url = ws_url
         self._silence_timeout_seconds = silence_timeout_seconds
@@ -625,14 +948,9 @@ class L2RecordingSocket:
         if not isinstance(message, dict):
             return
 
-        row = build_tick_row(
-            message,
-            received_at=time.time(),
-            subscriptions_by_asset=self._subscriptions_by_asset,
-        )
-        if row is None:
-            return
-        await self._writer.enqueue(row)
+        rows = self._message_processor.process_message(message, received_at=time.time())
+        for row in rows:
+            await self._writer.enqueue(row)
 
 
 class L2RecordingPool:
@@ -641,6 +959,7 @@ class L2RecordingPool:
         *,
         asset_ids: list[str],
         writer: ParquetTickWriter,
+        message_processor: LiveBookAssembler,
         subscriptions_by_asset: dict[str, AssetSubscription],
         max_assets_per_socket: int,
         ws_url: str,
@@ -649,6 +968,7 @@ class L2RecordingPool:
         socket_factory: Any | None = None,
     ) -> None:
         self._writer = writer
+        self._message_processor = message_processor
         self._subscriptions_by_asset = subscriptions_by_asset
         self._max_assets_per_socket = max_assets_per_socket
         self._ws_url = ws_url
@@ -754,6 +1074,7 @@ class L2RecordingPool:
             socket_id=self._next_socket_id,
             asset_ids=list(asset_ids),
             writer=self._writer,
+            message_processor=self._message_processor,
             subscriptions_by_asset=self._subscriptions_by_asset,
             ws_url=self._ws_url,
             silence_timeout_seconds=self._silence_timeout_seconds,
@@ -946,12 +1267,14 @@ class CompressorHeartbeatLoop:
         *,
         pool: L2RecordingPool,
         refresh_loop: UniverseRefreshLoop,
+        message_processor: LiveBookAssembler,
         interval_seconds: float,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         self._pool = pool
         self._refresh_loop = refresh_loop
+        self._message_processor = message_processor
         self._interval_seconds = float(interval_seconds)
         self._running = False
 
@@ -975,6 +1298,10 @@ class CompressorHeartbeatLoop:
                     refresh_count=self._refresh_loop.refresh_count,
                     last_refresh_reason=self._refresh_loop.last_refresh_reason,
                     last_refresh_age_s=None if last_refresh_age_seconds is None else round(last_refresh_age_seconds, 1),
+                    tracked_market_count=self._message_processor.market_count,
+                    emitted_rows=self._message_processor.emitted_rows,
+                    preseed_deltas=self._message_processor.preseed_deltas,
+                    invalid_pairs=self._message_processor.invalid_pairs,
                 )
         finally:
             log.info("tick_heartbeat_stopped")
@@ -986,19 +1313,29 @@ class CompressorHeartbeatLoop:
 def _build_subscriptions(markets: list[MarketInfo]) -> dict[str, AssetSubscription]:
     subscriptions: dict[str, AssetSubscription] = {}
     for market in markets:
+        market_id = str(market.condition_id or "").strip().lower()
+        event_id = str(market.event_id or market.condition_id or "").strip()
+        yes_asset_id = str(market.yes_token_id or "").strip()
+        no_asset_id = str(market.no_token_id or "").strip()
         if market.yes_token_id:
             subscriptions[market.yes_token_id] = AssetSubscription(
-                asset_id=market.yes_token_id,
-                market_id=market.condition_id,
-                outcome="YES",
+                asset_id=yes_asset_id,
+                market_id=market_id,
+                event_id=event_id,
+                token_id="YES",
+                yes_asset_id=yes_asset_id,
+                no_asset_id=no_asset_id,
                 question=market.question,
                 daily_volume_usd=float(market.daily_volume_usd),
             )
         if market.no_token_id:
             subscriptions[market.no_token_id] = AssetSubscription(
-                asset_id=market.no_token_id,
-                market_id=market.condition_id,
-                outcome="NO",
+                asset_id=no_asset_id,
+                market_id=market_id,
+                event_id=event_id,
+                token_id="NO",
+                yes_asset_id=yes_asset_id,
+                no_asset_id=no_asset_id,
                 question=market.question,
                 daily_volume_usd=float(market.daily_volume_usd),
             )
@@ -1035,9 +1372,14 @@ async def _resolve_active_subscriptions(
 
 
 async def _run(args: argparse.Namespace) -> int:
+    loop = asyncio.get_running_loop()
+    shutdown_monitor = ShutdownSignalMonitor()
+    shutdown_monitor.install(loop)
     subscriptions_by_asset = await _resolve_active_subscriptions(args, reason="startup")
+    message_processor = LiveBookAssembler(subscriptions_by_asset)
+    effective_output_dir = _effective_output_dir(args.output_dir)
     writer = ParquetTickWriter(
-        output_dir=args.output_dir,
+        output_dir=effective_output_dir,
         flush_rows=args.flush_rows,
         flush_seconds=float(args.flush_seconds),
         queue_size=args.queue_size,
@@ -1048,6 +1390,7 @@ async def _run(args: argparse.Namespace) -> int:
     pool = L2RecordingPool(
         asset_ids=sorted(subscriptions_by_asset),
         writer=writer,
+        message_processor=message_processor,
         subscriptions_by_asset=subscriptions_by_asset,
         max_assets_per_socket=args.max_assets_per_socket,
         ws_url=args.ws_url,
@@ -1064,10 +1407,11 @@ async def _run(args: argparse.Namespace) -> int:
     writer_task = asyncio.create_task(writer.run(), name="tick_writer")
     writer_task.add_done_callback(_log_task_exception)
     await pool.start()
+    shutdown_task = asyncio.create_task(shutdown_monitor.wait(), name="tick_shutdown_wait")
     refresh_task: asyncio.Task[None] | None = None
     heartbeat_loop: CompressorHeartbeatLoop | None = None
     heartbeat_task: asyncio.Task[None] | None = None
-    wait_targets: list[asyncio.Future[Any] | asyncio.Task[Any]] = [writer_task, pool.failure_future]
+    wait_targets: list[asyncio.Future[Any] | asyncio.Task[Any]] = [writer_task, pool.failure_future, shutdown_task]
     if float(args.universe_refresh_seconds) > 0:
         refresh_task = asyncio.create_task(refresh_loop.run(), name="tick_universe_refresh")
         refresh_task.add_done_callback(_log_task_exception)
@@ -1078,6 +1422,7 @@ async def _run(args: argparse.Namespace) -> int:
         heartbeat_loop = CompressorHeartbeatLoop(
             pool=pool,
             refresh_loop=refresh_loop,
+            message_processor=message_processor,
             interval_seconds=float(args.heartbeat_seconds),
         )
         heartbeat_task = asyncio.create_task(heartbeat_loop.run(), name="tick_heartbeat")
@@ -1085,27 +1430,46 @@ async def _run(args: argparse.Namespace) -> int:
         wait_targets.append(heartbeat_task)
     else:
         log.info("tick_heartbeat_disabled")
+    exit_reason = "shutdown"
     try:
         done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
         for completed in done:
             if completed.cancelled():
                 continue
+            if completed is shutdown_task:
+                exit_reason = shutdown_monitor.reason or "shutdown_requested"
+                log.info("tick_compressor_shutdown_received", reason=exit_reason)
+                return 0
             exc = completed.exception()
             if exc is not None:
+                if completed is writer_task and isinstance(exc, LowDiskSpaceError):
+                    exit_reason = "low_disk_space"
+                elif completed is pool.failure_future:
+                    exit_reason = "socket_failure"
+                elif completed is refresh_task:
+                    exit_reason = "universe_refresh_failure"
+                elif completed is heartbeat_task:
+                    exit_reason = "heartbeat_failure"
+                else:
+                    exit_reason = "failure"
                 raise exc
             if completed is writer_task:
+                exit_reason = "writer_unexpected_exit"
                 raise RuntimeError("tick_writer exited unexpectedly")
             if completed is refresh_task:
+                exit_reason = "universe_refresh_unexpected_exit"
                 raise RuntimeError("tick_universe_refresh exited unexpectedly")
             if completed is heartbeat_task:
+                exit_reason = "heartbeat_unexpected_exit"
                 raise RuntimeError("tick_heartbeat exited unexpectedly")
     finally:
+        shutdown_monitor.restore()
         if heartbeat_loop is not None:
             heartbeat_loop.stop()
         refresh_loop.stop()
         await pool.stop()
-        writer.stop()
-        tasks_to_join = [writer_task]
+        writer.stop(reason=shutdown_monitor.reason or exit_reason)
+        tasks_to_join = [writer_task, shutdown_task]
         if refresh_task is not None:
             tasks_to_join.append(refresh_task)
         if heartbeat_task is not None:
@@ -1130,7 +1494,7 @@ def main() -> int:
         log.error("tick_compressor_low_disk_stop", error=str(exc))
         return 0
     except KeyboardInterrupt:
-        log.info("tick_compressor_stopped_by_signal")
+        log.info("tick_compressor_stopped_by_signal", reason="keyboard_interrupt")
         return 0
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -10,19 +11,33 @@ import pytest
 from scripts.live_tick_compressor import (
     AssetSubscription,
     CompressorHeartbeatLoop,
+    HANDOFF_FILE_NAME,
     L2RecordingPool,
+    LiveBookAssembler,
     LowDiskSpaceError,
     ParquetTickWriter,
     UniverseRefreshLoop,
-    build_tick_row,
+    WRITER_STATE_DIR_NAME,
 )
 
 
-def _subscription(asset_id: str, *, market_id: str | None = None, outcome: str = "YES") -> AssetSubscription:
+def _subscription(
+    asset_id: str,
+    *,
+    market_id: str | None = None,
+    event_id: str | None = None,
+    outcome: str = "YES",
+    yes_asset_id: str | None = None,
+    no_asset_id: str | None = None,
+) -> AssetSubscription:
+    resolved_market_id = market_id or f"condition-{asset_id}"
     return AssetSubscription(
         asset_id=asset_id,
-        market_id=market_id or f"condition-{asset_id}",
-        outcome=outcome,
+        market_id=resolved_market_id,
+        event_id=event_id or f"event-{resolved_market_id}",
+        token_id=outcome,
+        yes_asset_id=yes_asset_id or (asset_id if outcome == "YES" else f"{resolved_market_id}-yes"),
+        no_asset_id=no_asset_id or (asset_id if outcome == "NO" else f"{resolved_market_id}-no"),
         question=f"Question for {asset_id}",
         daily_volume_usd=1000.0,
     )
@@ -35,10 +50,12 @@ class _FakeSocket:
         socket_id: int,
         asset_ids: list[str],
         writer: object,
+        message_processor: object,
         subscriptions_by_asset: dict[str, AssetSubscription],
         ws_url: str,
         silence_timeout_seconds: float,
     ) -> None:
+        del writer, message_processor, subscriptions_by_asset, ws_url, silence_timeout_seconds
         self.socket_id = socket_id
         self.asset_ids = list(asset_ids)
         self.history: list[tuple[str, list[str]]] = []
@@ -70,18 +87,44 @@ class _FakeSocket:
         self.history.append(("remove", list(removing)))
 
 
-def test_build_tick_row_classifies_snapshot_and_uses_subscription_metadata() -> None:
+def test_live_book_assembler_emits_clean_pair_rows_after_both_books_seed() -> None:
     subscriptions = {
         "yes-1": AssetSubscription(
             asset_id="yes-1",
             market_id="condition-1",
-            outcome="YES",
+            event_id="event-1",
+            token_id="YES",
+            yes_asset_id="yes-1",
+            no_asset_id="no-1",
             question="Will BTC close above 100k?",
             daily_volume_usd=12345.0,
-        )
+        ),
+        "no-1": AssetSubscription(
+            asset_id="no-1",
+            market_id="condition-1",
+            event_id="event-1",
+            token_id="NO",
+            yes_asset_id="yes-1",
+            no_asset_id="no-1",
+            question="Will BTC close above 100k?",
+            daily_volume_usd=12345.0,
+        ),
     }
+    assembler = LiveBookAssembler(subscriptions)
 
-    row = build_tick_row(
+    rows = assembler.process_message(
+        {
+            "event_type": "price_change",
+            "asset_id": "yes-1",
+            "timestamp": "1712145600122",
+            "changes": [{"side": "BUY", "price": "0.43", "size": "11"}],
+        },
+        received_at=1712145600.122,
+    )
+    assert rows == []
+    assert assembler.preseed_deltas == 1
+
+    rows = assembler.process_message(
         {
             "event_type": "book",
             "asset_id": "yes-1",
@@ -90,17 +133,43 @@ def test_build_tick_row_classifies_snapshot_and_uses_subscription_metadata() -> 
             "asks": [{"price": "0.44", "size": "12"}],
         },
         received_at=1712145600.456,
-        subscriptions_by_asset=subscriptions,
+    )
+    assert rows == []
+
+    rows = assembler.process_message(
+        {
+            "event_type": "book",
+            "asset_id": "no-1",
+            "timestamp": "1712145600124",
+            "bids": [{"price": "0.55", "size": "9"}],
+            "asks": [{"price": "0.57", "size": "13"}],
+        },
+        received_at=1712145600.457,
     )
 
-    assert row is not None
-    assert row["msg_type"] == "snapshot"
-    assert row["asset_id"] == "yes-1"
-    assert row["market_id"] == "condition-1"
-    assert row["outcome"] == "YES"
-    assert row["exchange_ts"] == pytest.approx(1712145600.123)
-    assert row["sequence_id"] is None
-    assert '"event_type":"book"' in row["payload"]
+    assert len(rows) == 2
+    assert rows == [
+        {
+            "timestamp": 1712145600124,
+            "market_id": "condition-1",
+            "event_id": "event-1",
+            "token_id": "YES",
+            "best_bid": 0.42,
+            "best_ask": 0.44,
+            "bid_depth": 4.2,
+            "ask_depth": 5.28,
+        },
+        {
+            "timestamp": 1712145600124,
+            "market_id": "condition-1",
+            "event_id": "event-1",
+            "token_id": "NO",
+            "best_bid": 0.55,
+            "best_ask": 0.57,
+            "bid_depth": 4.95,
+            "ask_depth": 7.41,
+        },
+    ]
 
 
 def test_writer_flush_groups_rows_into_hourly_chunks(tmp_path: Path) -> None:
@@ -117,46 +186,40 @@ def test_writer_flush_groups_rows_into_hourly_chunks(tmp_path: Path) -> None:
     writer._flush_rows_sync(
         [
             {
-                "local_ts": 1712145600.0,
-                "exchange_ts": 1712145600.0,
-                "msg_type": "snapshot",
-                "asset_id": "yes-1",
+                "timestamp": 1712145600000,
                 "market_id": "condition-1",
-                "outcome": "YES",
-                "price": None,
-                "size": None,
-                "sequence_id": 10,
-                "side": None,
-                "payload": '{"event_type":"book"}',
+                "event_id": "event-1",
+                "token_id": "YES",
+                "best_bid": 0.42,
+                "best_ask": 0.44,
+                "bid_depth": 4.2,
+                "ask_depth": 5.28,
             },
             {
-                "local_ts": 1712149200.0,
-                "exchange_ts": 1712149200.0,
-                "msg_type": "delta",
-                "asset_id": "yes-2",
+                "timestamp": 1712149200000,
                 "market_id": "condition-2",
-                "outcome": "NO",
-                "price": 0.45,
-                "size": 7.0,
-                "sequence_id": 11,
-                "side": "SELL",
-                "payload": '{"event_type":"price_change"}',
+                "event_id": "event-2",
+                "token_id": "NO",
+                "best_bid": 0.55,
+                "best_ask": 0.57,
+                "bid_depth": 7.15,
+                "ask_depth": 8.22,
             },
         ]
     )
 
     files = sorted(tmp_path.rglob("*.parquet"))
-    assert [path.name for path in files] == [
-        "ticks_2024-04-03_12_000001.parquet",
-        "ticks_2024-04-03_13_000001.parquet",
+    assert [path.relative_to(tmp_path).as_posix() for path in files] == [
+        "date=2024-04-03/hour=12/l2_book_2024-04-03_12_000001.parquet",
+        "date=2024-04-03/hour=13/l2_book_2024-04-03_13_000001.parquet",
     ]
 
     first_table = pq.read_table(files[0])
     second_table = pq.read_table(files[1])
     assert first_table.num_rows == 1
     assert second_table.num_rows == 1
-    assert first_table.column("msg_type").to_pylist() == ["snapshot"]
-    assert second_table.column("side").to_pylist() == ["SELL"]
+    assert first_table.column("token_id").to_pylist() == ["YES"]
+    assert second_table.column("event_id").to_pylist() == ["event-2"]
 
 
 def test_writer_raises_when_disk_guard_is_breached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,20 +244,92 @@ def test_writer_raises_when_disk_guard_is_breached(tmp_path: Path, monkeypatch: 
         writer._flush_rows_sync(
             [
                 {
-                    "local_ts": 1712145600.0,
-                    "exchange_ts": 1712145600.0,
-                    "msg_type": "snapshot",
-                    "asset_id": "yes-1",
+                    "timestamp": 1712145600000,
                     "market_id": "condition-1",
-                    "outcome": "YES",
-                    "price": None,
-                    "size": None,
-                    "sequence_id": 10,
-                    "side": None,
-                    "payload": '{"event_type":"book"}',
+                    "event_id": "event-1",
+                    "token_id": "YES",
+                    "best_bid": 0.42,
+                    "best_ask": 0.44,
+                    "bid_depth": 4.2,
+                    "ask_depth": 5.28,
                 }
             ]
         )
+
+
+def test_writer_persists_handoff_checkpoint_after_flush(tmp_path: Path) -> None:
+    writer = ParquetTickWriter(
+        output_dir=tmp_path,
+        flush_rows=10,
+        flush_seconds=60.0,
+        queue_size=100,
+        rotation="hourly",
+        compression="zstd",
+        min_free_gb=0.0,
+    )
+
+    writer._flush_rows_sync(
+        [
+            {
+                "timestamp": 1712145600000,
+                "market_id": "condition-1",
+                "event_id": "event-1",
+                "token_id": "YES",
+                "best_bid": 0.42,
+                "best_ask": 0.44,
+                "bid_depth": 4.2,
+                "ask_depth": 5.28,
+            }
+        ]
+    )
+
+    handoff_path = tmp_path / WRITER_STATE_DIR_NAME / HANDOFF_FILE_NAME
+    payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+
+    assert payload["status"] == "running"
+    assert payload["clean_shutdown"] is False
+    assert payload["rows_written"] == 1
+    assert payload["files_written"] == 1
+    assert payload["last_flush_min_ts_ms"] == 1712145600000
+    assert payload["last_flush_max_ts_ms"] == 1712145600000
+    assert payload["last_written_files"] == ["date=2024-04-03/hour=12/l2_book_2024-04-03_12_000001.parquet"]
+
+
+@pytest.mark.asyncio
+async def test_writer_records_clean_shutdown_reason(tmp_path: Path) -> None:
+    writer = ParquetTickWriter(
+        output_dir=tmp_path,
+        flush_rows=1,
+        flush_seconds=60.0,
+        queue_size=100,
+        rotation="hourly",
+        compression="zstd",
+        min_free_gb=0.0,
+    )
+
+    task = asyncio.create_task(writer.run())
+    await writer.enqueue(
+        {
+            "timestamp": 1712145600000,
+            "market_id": "condition-1",
+            "event_id": "event-1",
+            "token_id": "YES",
+            "best_bid": 0.42,
+            "best_ask": 0.44,
+            "bid_depth": 4.2,
+            "ask_depth": 5.28,
+        }
+    )
+    await asyncio.sleep(0.05)
+    writer.stop(reason="signal:SIGTERM")
+    await asyncio.wait_for(task, timeout=1.0)
+
+    handoff_path = tmp_path / WRITER_STATE_DIR_NAME / HANDOFF_FILE_NAME
+    payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+
+    assert payload["status"] == "stopped"
+    assert payload["clean_shutdown"] is True
+    assert payload["stop_reason"] == "signal:SIGTERM"
 
 
 @pytest.mark.asyncio
@@ -213,6 +348,7 @@ async def test_pool_apply_universe_adds_before_removing_on_existing_socket() -> 
     pool = L2RecordingPool(
         asset_ids=["a", "b"],
         writer=object(),
+        message_processor=LiveBookAssembler({}),
         subscriptions_by_asset=dict(subscriptions),
         max_assets_per_socket=4,
         ws_url="wss://example.test/ws",
@@ -251,6 +387,7 @@ async def test_pool_apply_universe_creates_and_retires_sockets() -> None:
     pool = L2RecordingPool(
         asset_ids=["a"],
         writer=object(),
+        message_processor=LiveBookAssembler({}),
         subscriptions_by_asset={"a": _subscription("a")},
         max_assets_per_socket=1,
         ws_url="wss://example.test/ws",
@@ -354,6 +491,7 @@ async def test_heartbeat_loop_logs_pool_and_refresh_metrics(monkeypatch: pytest.
     heartbeat_loop = CompressorHeartbeatLoop(
         pool=_FakePool(),
         refresh_loop=refresh_loop,
+        message_processor=LiveBookAssembler({}),
         interval_seconds=0.01,
     )
 
@@ -370,4 +508,6 @@ async def test_heartbeat_loop_logs_pool_and_refresh_metrics(monkeypatch: pytest.
     assert heartbeat_entries[0]["refresh_count"] == 1
     assert heartbeat_entries[0]["last_refresh_reason"] == "periodic_refresh"
     assert heartbeat_entries[0]["last_refresh_age_s"] is not None
+    assert heartbeat_entries[0]["tracked_market_count"] == 0
+    assert heartbeat_entries[0]["emitted_rows"] == 0
     assert float(heartbeat_entries[0]["last_refresh_age_s"]) >= 0.0
