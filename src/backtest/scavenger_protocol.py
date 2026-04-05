@@ -463,11 +463,19 @@ def _normalize_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def _strict_resolution_window_expr(
+    config: ScavengerConfig,
+    *,
+    column: str = "time_to_resolution_seconds",
+) -> pl.Expr:
+    signal_window_seconds = float(config.resolution_window_hours) * SECONDS_PER_HOUR
+    return (pl.col(column) > 0.0) & (pl.col(column) < signal_window_seconds)
+
+
 def _build_candidate_frames(
     frame: pl.LazyFrame,
     config: ScavengerConfig,
 ) -> tuple[pl.LazyFrame, pl.LazyFrame, pl.LazyFrame, pl.LazyFrame]:
-    signal_window_seconds = float(config.resolution_window_hours) * SECONDS_PER_HOUR
     maker_bid_price = float(config.maker_bid_price)
     ticket_notional_usdc = float(config.max_notional_per_market_usdc)
     near_miss_price_tolerance = float(config.near_miss_price_tolerance)
@@ -504,10 +512,7 @@ def _build_candidate_frames(
         frame.with_columns(
             time_to_resolution_seconds.alias("time_to_resolution_seconds"),
         )
-        .filter(
-            (pl.col("time_to_resolution_seconds") >= 0.0)
-            & (pl.col("time_to_resolution_seconds") <= signal_window_seconds)
-        )
+        .filter(_strict_resolution_window_expr(config))
         .with_columns(
             signal_expr.alias("entry_signal"),
             fill_trigger_expr.alias("fill_trigger"),
@@ -945,6 +950,7 @@ def _collect_lazy_frame(frame: pl.LazyFrame) -> pl.DataFrame:
 
 def _build_scavenger_price_distribution_partial_frame(
     source: pl.DataFrame | pl.LazyFrame | str | Path | Sequence[str | Path],
+    config: ScavengerConfig = ScavengerConfig(),
     *,
     metadata_frame: pl.DataFrame | None = None,
 ) -> pl.LazyFrame:
@@ -955,7 +961,7 @@ def _build_scavenger_price_distribution_partial_frame(
     )
     return (
         normalized.with_columns(time_to_resolution_seconds.alias("time_to_resolution_seconds"))
-        .filter(pl.col("time_to_resolution_seconds") >= 0.0)
+        .filter(_strict_resolution_window_expr(config))
         .group_by(GROUP_COLUMNS)
         .agg(
             pl.col("timestamp").min().alias("first_observation_timestamp"),
@@ -1003,10 +1009,10 @@ def build_scavenger_price_distribution_frame(
     *,
     metadata_frame: pl.DataFrame | None = None,
 ) -> pl.LazyFrame:
-    _ = config
     return _finalize_scavenger_price_distribution_frame(
         _build_scavenger_price_distribution_partial_frame(
             source,
+            config=config,
             metadata_frame=metadata_frame,
         )
     )
@@ -1019,7 +1025,6 @@ def collect_scavenger_price_distribution(
     metadata_frame: pl.DataFrame | None = None,
     chunk_size: int = 64,
 ) -> pl.DataFrame:
-    _ = config
     if chunk_size <= 0:
         raise ValueError("chunk_size must be strictly positive")
 
@@ -1027,6 +1032,7 @@ def collect_scavenger_price_distribution(
         return _collect_lazy_frame(
             build_scavenger_price_distribution_frame(
                 source,
+                config=config,
                 metadata_frame=metadata_frame,
             )
         )
@@ -1041,6 +1047,7 @@ def collect_scavenger_price_distribution(
             _collect_lazy_frame(
                 _build_scavenger_price_distribution_partial_frame(
                     paths[start : start + chunk_size],
+                    config=config,
                     metadata_frame=metadata_frame,
                 )
             )

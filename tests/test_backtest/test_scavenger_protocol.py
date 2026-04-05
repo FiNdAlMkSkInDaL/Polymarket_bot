@@ -504,3 +504,86 @@ def test_scavenger_collects_price_distribution_in_chunks_for_raw_book_sources(
     assert distribution_row["deepest_dip"] == pytest.approx(0.94)
     assert distribution_row["highest_spike"] == pytest.approx(0.98)
     assert distribution_row["observation_count"] == 2
+
+
+def test_scavenger_excludes_exact_and_outside_resolution_window_from_candidates() -> None:
+    resolution = datetime(2026, 4, 11, 12, 0, 0)
+    rows = [
+        _row(
+            timestamp=resolution - timedelta(hours=72),
+            resolution_timestamp=resolution,
+            market_id="boundary-market",
+            event_id="boundary_signal",
+            best_bid=0.96,
+            best_ask=0.99,
+        ),
+        _row(
+            timestamp=resolution - timedelta(hours=71, minutes=59),
+            resolution_timestamp=resolution,
+            market_id="boundary-market",
+            event_id="strict_signal",
+            best_bid=0.96,
+            best_ask=0.99,
+        ),
+        _row(
+            timestamp=resolution - timedelta(hours=71, minutes=58),
+            resolution_timestamp=resolution,
+            market_id="boundary-market",
+            event_id="strict_fill",
+            best_bid=0.94,
+            best_ask=0.96,
+        ),
+    ]
+
+    result = run_scavenger_backtest(pl.DataFrame(rows), config=ScavengerConfig())
+
+    assert result.orders.height == 1
+    assert result.fills.height == 1
+    assert result.orders.row(0, named=True)["signal_event_id"] == "strict_signal"
+    assert result.fills.row(0, named=True)["fill_event_id"] == "strict_fill"
+
+
+def test_scavenger_price_distribution_respects_strict_resolution_window() -> None:
+    resolution = datetime(2026, 4, 12, 12, 0, 0)
+    rows = [
+        _row(
+            timestamp=resolution - timedelta(hours=80),
+            resolution_timestamp=resolution,
+            market_id="windowed-market",
+            event_id="far_outside",
+            best_bid=0.20,
+            best_ask=0.10,
+            final_resolution_value=1.0,
+        ),
+        _row(
+            timestamp=resolution - timedelta(hours=72),
+            resolution_timestamp=resolution,
+            market_id="windowed-market",
+            event_id="exact_boundary",
+            best_bid=0.30,
+            best_ask=0.20,
+            final_resolution_value=1.0,
+        ),
+        _row(
+            timestamp=resolution - timedelta(hours=71, minutes=30),
+            resolution_timestamp=resolution,
+            market_id="windowed-market",
+            event_id="strict_window",
+            best_bid=0.97,
+            best_ask=0.96,
+            final_resolution_value=1.0,
+        ),
+    ]
+
+    distribution = collect_scavenger_price_distribution(
+        pl.DataFrame(rows),
+        config=ScavengerConfig(),
+        chunk_size=1,
+    )
+
+    assert distribution.height == 1
+    distribution_row = distribution.row(0, named=True)
+    assert distribution_row["market_id"] == "windowed-market"
+    assert distribution_row["deepest_dip"] == pytest.approx(0.96)
+    assert distribution_row["highest_spike"] == pytest.approx(0.97)
+    assert distribution_row["observation_count"] == 1
