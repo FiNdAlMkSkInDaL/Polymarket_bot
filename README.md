@@ -41,7 +41,8 @@ The deployed VPS shadow runner executes at minute `5` of every hour through
 That cron entry first refreshes the live-universe metadata cache and checks
 cache coverage against today's active live lake. If coverage drops below `95%`,
 it emits a visible warning into `cron_runner.log`. It then runs three wrappers
-sequentially against the live rolling lake for the current UTC date:
+sequentially against the live rolling lake for the current UTC date and sends a
+compact Telegram summary after the run completes.
 
 1. Agent 2: `scripts/run_scavenger_protocol_historical_sweep.py`
 2. Agent 3: `scripts/run_conditional_probability_squeeze_batch.py`

@@ -71,7 +71,8 @@ on the VPS.
 
 At minute `5` of every hour it first refreshes the shadow metadata cache from
 Gamma for the current live-lake universe, emits a coverage alarm if cache
-coverage drops below `95%`, and then runs, in order:
+coverage drops below `95%`, runs the three shadow sentinels, and then sends a
+compact Telegram summary for the completed run.
 
 1. `scripts/run_scavenger_protocol_historical_sweep.py`
 2. `scripts/run_conditional_probability_squeeze_batch.py`
