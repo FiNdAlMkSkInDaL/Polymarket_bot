@@ -69,7 +69,9 @@ now is the clean live lake.
 The shadow evaluation plane is driven by the deployed `shadow_sentinel_cron.sh`
 on the VPS.
 
-At minute `5` of every hour it runs, in order:
+At minute `5` of every hour it first refreshes the shadow metadata cache from
+Gamma for the current live-lake universe, emits a coverage alarm if cache
+coverage drops below `95%`, and then runs, in order:
 
 1. `scripts/run_scavenger_protocol_historical_sweep.py`
 2. `scripts/run_conditional_probability_squeeze_batch.py`
