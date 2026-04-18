@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+set -eu
+
+if command -v python >/dev/null 2>&1; then
+  PYTHON=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v py >/dev/null 2>&1; then
+  PYTHON='py -3'
+else
+  echo 'pre-commit secret scan skipped: Python not found' >&2
+  exit 1
+fi
+
+eval "$PYTHON -m src.tools.secret_scan --staged"
