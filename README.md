@@ -6,6 +6,14 @@ stack, not around the legacy local backtest workflow.
 The production truth surface is the VPS. The local workstation is a research,
 mirror, and code-authoring environment.
 
+## Secret Hygiene
+
+This repo now includes a focused secret scan for tracked and staged files.
+
+- Local hook: `git config core.hooksPath .githooks`
+- Manual scan: `python -m src.tools.secret_scan --tracked`
+- CI: `.github/workflows/secret-scan.yml` runs on push and pull request
+
 ## What Changed
 
 The old operating model leaned too heavily on local CSV exports, frozen local
